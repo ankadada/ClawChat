@@ -186,6 +186,16 @@ class AppStrings {
   static const notifyOnComplete = '完成通知';
   static const notifyOnCompleteSubtitle = 'AI 回复完成后发送通知（后台时）';
 
+  // ── Phone integration ─────────────────────────────────────────────
+  static const phoneIntegration = '手机集成';
+  static const phoneIntegrationDesc =
+      'AI 可以通过 phone_intent 工具操作系统：设闹钟、加日历、打开网页、分享等。'
+      '日历/联系人首次使用时会弹运行时权限。下面两项默认关闭，开启后 AI 才能直接打电话或发短信。';
+  static const allowCall = '允许直接拨打电话';
+  static const allowCallSubtitle = '关闭时 AI 只能跳到拨号面板等你确认';
+  static const allowSms = '允许直接发送短信';
+  static const allowSmsSubtitle = '高风险：AI 可读银行/登录验证码或乱发短信，谨慎开启';
+
   // ── Export ─────────────────────────────────────────────────────────
   static const exportChat = '导出对话';
   static const exportedToClipboard = '对话已复制到剪贴板';

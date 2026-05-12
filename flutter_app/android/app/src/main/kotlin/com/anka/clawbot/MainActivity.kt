@@ -27,6 +27,7 @@ class MainActivity : FlutterActivity() {
 
     private lateinit var bootstrapManager: BootstrapManager
     private lateinit var processManager: ProcessManager
+    private lateinit var phoneIntentManager: PhoneIntentManager
     @Volatile
     private var setupDone = false
 
@@ -45,6 +46,7 @@ class MainActivity : FlutterActivity() {
 
         bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
         processManager = ProcessManager(filesDir, nativeLibDir)
+        phoneIntentManager = PhoneIntentManager(this)
 
         if (!setupDone) {
             setupDone = true
@@ -275,6 +277,20 @@ class MainActivity : FlutterActivity() {
                         }.start()
                     } else {
                         result.error("INVALID_ARGS", "path and content required", null)
+                    }
+                }
+                "phoneIntent" -> {
+                    val action = call.argument<String>("action")
+                    @Suppress("UNCHECKED_CAST")
+                    val params = (call.argument<Map<String, Any?>>("params") ?: emptyMap())
+                    if (action == null) {
+                        result.error("INVALID_ARGS", "action required", null)
+                    } else {
+                        try {
+                            result.success(phoneIntentManager.dispatch(action, params))
+                        } catch (e: Exception) {
+                            result.error("PHONE_INTENT_ERROR", e.message, null)
+                        }
                     }
                 }
                 "bringToForeground" -> {

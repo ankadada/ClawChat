@@ -21,6 +21,8 @@ class PreferencesService {
   static const _keyDarkMode = 'dark_mode';
   static const _keyFontSize = 'font_size';
   static const _keyNotifyOnComplete = 'notify_on_complete';
+  static const _keyAllowPhoneCall = 'allow_phone_call';
+  static const _keyAllowSms = 'allow_sms';
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -150,4 +152,10 @@ class PreferencesService {
 
   bool get notifyOnComplete => _prefs.getBool(_keyNotifyOnComplete) ?? true;
   set notifyOnComplete(bool v) => _prefs.setBool(_keyNotifyOnComplete, v);
+
+  bool get allowPhoneCall => _prefs.getBool(_keyAllowPhoneCall) ?? false;
+  set allowPhoneCall(bool v) => _prefs.setBool(_keyAllowPhoneCall, v);
+
+  bool get allowSms => _prefs.getBool(_keyAllowSms) ?? false;
+  set allowSms(bool v) => _prefs.setBool(_keyAllowSms, v);
 }

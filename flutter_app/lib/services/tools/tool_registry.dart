@@ -1,5 +1,7 @@
 import '../../services/llm_service.dart';
+import '../preferences_service.dart';
 import 'bash_tool.dart';
+import 'phone_intent_tool.dart';
 import 'read_file_tool.dart';
 import 'write_file_tool.dart';
 import 'web_fetch_tool.dart';
@@ -23,12 +25,13 @@ class ToolRegistry {
 
   ToolRegistry();
 
-  factory ToolRegistry.withDefaults() {
+  factory ToolRegistry.withDefaults({PreferencesService? prefs}) {
     final registry = ToolRegistry();
     registry.register(BashTool());
     registry.register(ReadFileTool());
     registry.register(WriteFileTool());
     registry.register(WebFetchTool());
+    if (prefs != null) registry.register(PhoneIntentTool(prefs));
     return registry;
   }
 

@@ -38,6 +38,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _themeMode = 'system';
   double _fontScale = 1.0;
   bool _notifyOnComplete = true;
+  bool _allowPhoneCall = false;
+  bool _allowSms = false;
 
   static const _thinkingBudgets = [0, 4096, 10000, 20000, 32000];
   static const _thinkingLabels = [
@@ -64,6 +66,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _themeMode = _prefs.themeMode;
       _fontScale = _prefs.fontScale;
       _notifyOnComplete = _prefs.notifyOnComplete;
+      _allowPhoneCall = _prefs.allowPhoneCall;
+      _allowSms = _prefs.allowSms;
 
       final budget = _prefs.thinkingBudget;
       _thinkingLevel = _thinkingBudgets.indexOf(budget);
@@ -225,6 +229,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onChanged: (v) {
                     setState(() => _notifyOnComplete = v);
                     _prefs.notifyOnComplete = v;
+                  },
+                ),
+
+                const Divider(),
+                _sectionHeader(theme, AppStrings.phoneIntegration),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Text(
+                    AppStrings.phoneIntegrationDesc,
+                    style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                  ),
+                ),
+                SwitchListTile(
+                  title: const Text(AppStrings.allowCall),
+                  subtitle: const Text(AppStrings.allowCallSubtitle),
+                  value: _allowPhoneCall,
+                  onChanged: (v) {
+                    setState(() => _allowPhoneCall = v);
+                    _prefs.allowPhoneCall = v;
+                  },
+                ),
+                SwitchListTile(
+                  title: const Text(AppStrings.allowSms),
+                  subtitle: const Text(AppStrings.allowSmsSubtitle),
+                  value: _allowSms,
+                  onChanged: (v) {
+                    setState(() => _allowSms = v);
+                    _prefs.allowSms = v;
                   },
                 ),
 

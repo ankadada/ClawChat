@@ -29,7 +29,7 @@ class ChatProvider extends ChangeNotifier {
   String streamingText = '';
 
   final SessionStorage _storage = SessionStorage();
-  final ToolRegistry _tools = ToolRegistry.withDefaults();
+  late final ToolRegistry _tools;
   AgentService? _agent;
   final _uuid = const Uuid();
 
@@ -57,6 +57,7 @@ class ChatProvider extends ChangeNotifier {
   }
 
   ChatProvider() {
+    _tools = ToolRegistry.withDefaults(prefs: _prefs);
     _init();
   }
 
