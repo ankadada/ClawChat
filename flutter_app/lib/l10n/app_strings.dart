@@ -1,0 +1,224 @@
+/// Centralized UI strings for ClawChat.
+///
+/// All user-facing text lives here so that future localization only
+/// requires swapping out this single file (or adding a locale lookup).
+class AppStrings {
+  AppStrings._();
+
+  // ── General ──────────────────────────────────────────────────────
+  static const appName = 'ClawChat';
+  static const cancel = '取消';
+  static const confirm = '确定';
+  static const delete = '删除';
+  static const copy = '复制';
+  static const copied = '已复制';
+  static const save = '保存';
+  static const done = '完成';
+  static const loading = '加载中...';
+  static const error = '错误';
+  static const retry = '重试';
+  static const open = 'Open';
+
+  // ── Chat screen ──────────────────────────────────────────────────
+  static const newChat = '新对话';
+  static const settings = '设置';
+  static const switchModel = '切换模型';
+  static const editSystemPrompt = '编辑系统提示词';
+  static const resetDefault = '恢复默认';
+  static const useGlobalDefault = '使用全局默认';
+  static const leaveEmptyForDefault = '留空则使用全局设置中的模型';
+  static const sendMessageToStart = '发送消息开始对话';
+  static const aiAssistantCapabilities = 'AI 助手可以执行命令、读写文件、访问网页';
+  static const userLabel = '你';
+  static const aiLabel = 'AI';
+  static const aiProcessing = 'AI 正在处理...';
+  static const inputHint = '输入消息...';
+
+  // ── Chat sessions screen ─────────────────────────────────────────
+  static const chatHistory = '对话记录';
+  static const noChats = '暂无对话';
+  static const deleteChat = '删除对话';
+  static String deleteChatConfirm(String title) => '确定删除 "$title" ?';
+  static const justNow = '刚刚';
+  static String minutesAgo(int n) => '$n 分钟前';
+  static String hoursAgo(int n) => '$n 小时前';
+  static String daysAgo(int n) => '$n 天前';
+
+  // ── Dashboard screen ─────────────────────────────────────────────
+  static const chat = '聊天';
+  static const chatSubtitle = '与 AI 助手对话';
+  static const terminal = '终端';
+  static const terminalSubtitle = '打开 Alpine Linux 终端';
+  static const configureApiKey = '配置 API Key';
+  static const configureApiKeySubtitle = '设置 AI 模型和 API 密钥';
+  static const settingsSubtitle = '系统配置和信息';
+
+  // ── Onboarding screen ────────────────────────────────────────────
+  static const welcomeTitle = '欢迎使用 ClawChat';
+  static const selectApiFormat = '选择 API 格式';
+  static const anthropicSubtitle = '直接使用 Anthropic API';
+  static const openaiCompatible = 'OpenAI 兼容';
+  static const openaiCompatibleSubtitle = '支持 OpenAI, DeepSeek, OpenRouter 等';
+  static const enterApiKey = '输入 API Key';
+  static const baseUrlDefaultHint = 'Base URL (留空使用默认)';
+  static const modelName = '模型名称';
+  static const stepComplete = '完成';
+  static const allReadyMessage = '一切就绪! 点击完成开始使用 ClawChat。';
+  static const pleaseEnterApiKey = '请输入 API Key';
+  static const fetchingModels = '正在获取模型列表...';
+  static const fetchModelsFailed = '获取失败，请手动输入';
+  static const manualInput = '手动输入...';
+  static const selectModel = '选择模型';
+  static const fetchModelsButton = '获取模型列表';
+
+  // ── Settings screen ──────────────────────────────────────────────
+  static const apiConfig = 'API 配置';
+  static const apiFormat = 'API 格式';
+  static const baseUrlOptional = 'Base URL (可选)';
+  static const model = '模型';
+  static const saveSettings = '保存设置';
+  static const settingsSaved = '设置已保存';
+  static String loadSettingsFailed(String e) => '加载设置失败: $e';
+  static const systemInfo = '系统信息';
+  static const architecture = '架构';
+  static const rootfs = 'Rootfs';
+  static const installed = '已安装';
+  static const notInstalled = '未安装';
+  static const maintenance = '维护';
+  static const reinitialize = '重新初始化';
+  static const reinstallAlpine = '重新安装 Alpine 环境';
+  static const about = '关于';
+
+  // ── Setup wizard screen ──────────────────────────────────────────
+  static const initClawChat = '初始化 ClawChat';
+  static const initializingMessage = '正在初始化环境，可能需要几分钟。';
+  static const downloadMessage = '将下载 Alpine Linux 到设备上，约 3MB。';
+  static const startingInit = '开始初始化...';
+  static const unknownError = '未知错误';
+  static const startSetup = '开始初始化';
+  static const downloadRootfs = '下载 Alpine rootfs';
+  static const extractRootfs = '解压根文件系统';
+  static const installPackages = '安装软件包';
+  static const initComplete = '初始化完成!';
+
+  // ── Splash screen ────────────────────────────────────────────────
+  static const tagline = 'AI Agent for Android';
+  static const splashLoading = 'Loading...';
+  static const checkingSetupStatus = 'Checking setup status...';
+
+  // ── Terminal screen ──────────────────────────────────────────────
+  static const terminalTitle = 'Terminal';
+  static const screenshot = 'Screenshot';
+  static const openUrl = 'Open URL';
+  static const paste = 'Paste';
+  static const restart = 'Restart';
+  static const startingTerminal = 'Starting terminal...';
+  static const screenshotUnavailable = '截图功能暂不可用';
+  static const copiedToClipboard = 'Copied to clipboard';
+  static const linkCopied = 'Link copied';
+  static const noUrlFound = 'No URL found in selection';
+  static const openLink = 'Open Link';
+
+  // ── Tool call card ───────────────────────────────────────────────
+  static const readFile = '读取文件';
+  static const writeFile = '写入文件';
+  static const webRequest = '网页请求';
+  static const inputLabel = 'Input';
+  static const outputLabel = 'Output';
+
+  // ── Agent status bar ──────────────────────────────────────────────
+  static const statusThinking = '思考中...';
+  static const statusStreaming = '生成回复...';
+  static const statusTooling = '执行工具...';
+  static const statusError = '出错';
+  static const statusProcessing = '处理中...';
+
+  // ── Code block ───────────────────────────────────────────────────
+  // (copy/copied already defined in General)
+
+  // ── Thinking intensity ────────────────────────────────────────────
+  static const thinkingIntensity = '思考强度';
+  static const thinkingOff = '关闭';
+  static const thinkingLow = '低';
+  static const thinkingMedium = '中';
+  static const thinkingHigh = '高';
+  static const thinkingMax = '最大';
+
+  // ── Advanced LLM config ────────────────────────────────────────────
+  static const contextLength = '上下文长度';
+  static const autoCompact = '自动压缩';
+  static const autoCompactSubtitle = '超出上下文长度时自动截断旧消息';
+  static const temperature = '温度';
+  static const temperatureLow = '精确';
+  static const temperatureHigh = '创意';
+  static const chars50k = '50K 字符';
+  static const chars100k = '100K 字符 (默认)';
+  static const chars200k = '200K 字符';
+
+  // ── Skills ────────────────────────────────────────────────────────
+  static const skills = '技能';
+  static const noSkillsFound = '未发现技能。将 SKILL.md 放入 /root/workspace/skills/ 目录。';
+  static const skillsLoaded = '已加载技能';
+  static const importSkill = '导入技能';
+  static const importLocalSkill = '导入本地技能';
+  static const localFilePath = '文件路径';
+  static const skillUrl = '技能仓库地址';
+  static const importButton = '导入';
+  static const importFailed = '导入失败';
+  static const installPresets = '安装预设技能';
+
+  // ── Environment Variables ─────────────────────────────────────────
+  static const envVars = '环境变量';
+  static const addEnvVar = '添加环境变量';
+  static const envVarName = '变量名';
+  static const envVarValue = '变量值';
+
+  // ── Theme ──────────────────────────────────────────────────────────
+  static const theme = '主题';
+  static const themeSystem = '跟随系统';
+  static const themeLight = '浅色';
+  static const themeDark = '深色';
+
+  // ── Font size ──────────────────────────────────────────────────────
+  static const fontSize = '字体大小';
+
+  // ── Notifications ─────────────────────────────────────────────────
+  static const notifyOnComplete = '完成通知';
+  static const notifyOnCompleteSubtitle = 'AI 回复完成后发送通知（后台时）';
+
+  // ── Export ─────────────────────────────────────────────────────────
+  static const exportChat = '导出对话';
+  static const exportedToClipboard = '对话已复制到剪贴板';
+
+  // ── Search ─────────────────────────────────────────────────────────
+  static const searchConversations = '搜索对话...';
+
+  // ── Attach ─────────────────────────────────────────────────────────
+  static const attachFile = '添加附件';
+  static const pickImage = '选择图片';
+  static const pickFile = '选择文件';
+  static const attachFailed = '附件上传失败';
+
+  // ── Regenerate ─────────────────────────────────────────────────────
+  static const regenerate = '重新生成';
+
+  // ── Message edit ───────────────────────────────────────────────────
+  static const editMessage = '编辑消息';
+  static const deleteMessage = '删除消息';
+
+  // ── Session management ──────────────────────────────────────────
+  static const renameSession = '重命名会话';
+  static const sessionTitle = '会话标题';
+  static const clearAllSessions = '清空所有会话';
+  static const clearAllConfirm = '确定要删除所有会话吗？此操作不可恢复。';
+
+  // ── About ─────────────────────────────────────────────────────────
+  static const aboutDescription = 'ClawChat 是一个运行在 Android 上的 AI 助手，内置 Alpine Linux 环境，支持工具调用和技能扩展。';
+  static const license = '开源协议';
+
+  // ── Network ───────────────────────────────────────────────────────
+  static const networkError = '网络连接失败，请检查网络后重试';
+
+  // ── Chat provider ────────────────────────────────────────────────
+  static const apiKeyNotConfigured = '请先在设置中配置 API Key';
+}
