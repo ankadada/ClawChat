@@ -83,7 +83,8 @@ class SkillService {
 
   /// Imports a skill from a local directory or zip/tar.gz file on the device.
   static Future<String> importSkillFromLocalPath(String sourcePath) async {
-    final name = sourcePath.split('/').last
+    final safePath = sourcePath.replaceAll(RegExp(r'[;&|`$"\\]'), '');
+    final name = safePath.split('/').last
         .replaceAll('.tar.gz', '')
         .replaceAll('.tgz', '')
         .replaceAll('.zip', '');
@@ -91,16 +92,16 @@ class SkillService {
 
     if (sourcePath.endsWith('.tar.gz') || sourcePath.endsWith('.tgz')) {
       await NativeBridge.runInProot(
-        'mkdir -p "$targetDir" && tar xzf "$sourcePath" -C "$targetDir"',
+        'mkdir -p "$targetDir" && tar xzf "$safePath" -C "$targetDir"',
       );
     } else if (sourcePath.endsWith('.zip')) {
       await NativeBridge.runInProot(
-        'mkdir -p "$targetDir" && unzip -o "$sourcePath" -d "$targetDir"',
+        'mkdir -p "$targetDir" && unzip -o "$safePath" -d "$targetDir"',
       );
     } else {
       // Assume it's a directory, copy it
       await NativeBridge.runInProot(
-        'cp -r "$sourcePath" "$targetDir"',
+        'cp -r "$safePath" "$targetDir"',
       );
     }
     return name;

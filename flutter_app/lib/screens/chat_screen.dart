@@ -312,7 +312,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     switch (content) {
       case TextContent(:final text):
         return Semantics(
-          label: isUser ? 'User message' : 'AI message',
+          label: isUser ? '用户消息' : 'AI 消息',
           child: GestureDetector(
           onLongPress: () {
             showModalBottomSheet(

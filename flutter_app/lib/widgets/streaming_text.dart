@@ -79,7 +79,6 @@ class _StreamingTextState extends State<StreamingText> {
         parseText.startsWith(_cachedText!);
 
     if (isNewAppend && _cachedSpans != null) {
-      _disposeRecognizers(); // dispose old recognizers before incremental update
       final newSpans = List<InlineSpan>.from(_cachedSpans!);
       _appendParsedSpans(parseText, theme, newSpans, _lastParseEnd);
       _cachedSpans = newSpans;

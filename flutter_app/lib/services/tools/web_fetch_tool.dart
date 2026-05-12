@@ -78,7 +78,15 @@ class WebFetchTool extends Tool {
 
     if (addr.type == InternetAddressType.IPv6) {
       final raw = addr.rawAddress;
-      if (raw.length >= 2) {
+      if (raw.length == 16) {
+        // IPv4-mapped IPv6 (::ffff:x.x.x.x) — extract IPv4 and check
+        bool isMapped = true;
+        for (int i = 0; i < 10; i++) { if (raw[i] != 0) { isMapped = false; break; } }
+        if (isMapped && raw[10] == 0xff && raw[11] == 0xff) {
+          final a = raw[12], b = raw[13];
+          if (a == 10 || (a == 172 && b >= 16 && b <= 31) ||
+              (a == 192 && b == 168) || a == 127 || (a == 169 && b == 254)) return true;
+        }
         if (raw[0] == 0xfc || raw[0] == 0xfd) return true;
         if (raw[0] == 0xfe && (raw[1] & 0xc0) == 0x80) return true;
       }
