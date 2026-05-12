@@ -17,7 +17,7 @@ dependencies:
   http: ^1.2.0        # Used for LLM API streaming calls (lighter weight; dio not needed for SSE)
   provider: ^6.1.0
   flutter_secure_storage: ^9.0.0
-  shared_preferences: ^2.2.0
+  shared_preferences: ^2.5.5
   path_provider: ^2.1.0
 
   url_launcher: ^6.2.0
