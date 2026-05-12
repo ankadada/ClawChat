@@ -50,8 +50,8 @@ class ChatSession {
     return ChatSession(
       id: json['id'] as String,
       title: json['title'] as String? ?? '新对话',
-      createdAt: DateTime.parse(json['createdAt'] as String),
-      updatedAt: DateTime.parse(json['updatedAt'] as String),
+      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ?? DateTime.now(),
+      updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ?? DateTime.now(),
       messages: (json['messages'] as List)
           .map((m) => ChatMessage.fromJson(m))
           .toList(),
@@ -156,7 +156,7 @@ class ChatMessage {
     return ChatMessage(
       role: json['role'] as String,
       content: content.cast<MessageContent>(),
-      timestamp: DateTime.parse(json['timestamp'] as String),
+      timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '') ?? DateTime.now(),
     );
   }
 }

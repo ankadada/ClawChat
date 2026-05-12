@@ -212,6 +212,33 @@ class AppStrings {
   // ── Regenerate ─────────────────────────────────────────────────────
   static const regenerate = '重新生成';
 
+  // ── Voice ──────────────────────────────────────────────────────────
+  static const voiceUnavailable = '语音识别不可用';
+
+  // ── Message actions ────────────────────────────────────────────────
+  static const quoteReply = '引用回复';
+
+  // ── Environment Variables (additional) ─────────────────────────────
+  static const noEnvVars = '暂无环境变量';
+
+  // ── Preset skills ──────────────────────────────────────────────────
+  static String presetSkillsInstalled(int count) => '已安装 $count 个预设技能';
+  static const installFailed = '安装失败';
+
+  // ── Quick prompts ──────────────────────────────────────────────────
+  static const promptTranslate = '翻译这段';
+  static const promptTranslateTemplate = '请翻译以下内容：\n';
+  static const promptSummarize = '总结一下';
+  static const promptSummarizeTemplate = '请总结：\n';
+  static const promptExplainCode = '解释代码';
+  static const promptExplainCodeTemplate = '请解释这段代码：\n';
+  static const promptWriteEmail = '写邮件';
+  static const promptWriteEmailTemplate = '请帮我写一封邮件：\n';
+  static const promptPolish = '修改润色';
+  static const promptPolishTemplate = '请帮我修改润色以下文字：\n';
+  static const promptBrainstorm = '头脑风暴';
+  static const promptBrainstormTemplate = '请帮我头脑风暴：\n';
+
   // ── Message edit ───────────────────────────────────────────────────
   static const editMessage = '编辑消息';
   static const deleteMessage = '删除消息';

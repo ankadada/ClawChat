@@ -420,7 +420,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   title: const Text(AppStrings.autoCompact),
                   subtitle: const Text(AppStrings.autoCompactSubtitle),
                   value: _autoCompact,
-                  onChanged: (v) => setState(() => _autoCompact = v),
+                  onChanged: (v) {
+                    setState(() => _autoCompact = v);
+                    _prefs.autoCompact = v;  // persist immediately
+                  },
                 ),
 
                 Padding(
@@ -514,7 +517,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       if (_envVars.isEmpty)
                         const Padding(
                           padding: EdgeInsets.symmetric(vertical: 8),
-                          child: Text('暂无环境变量', style: TextStyle(color: Colors.grey)),
+                          child: Text(AppStrings.noEnvVars, style: TextStyle(color: Colors.grey)),
                         )
                       else
                         ..._envVars.entries.map((e) => ListTile(
@@ -604,13 +607,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await _loadSkills();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已安装 $count 个预设技能')),
+          SnackBar(content: Text(AppStrings.presetSkillsInstalled(count))),
         );
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('安装失败: $e')),
+          SnackBar(content: Text('${AppStrings.installFailed}: $e')),
         );
       }
     } finally {

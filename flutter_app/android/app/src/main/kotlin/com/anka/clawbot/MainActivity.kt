@@ -18,6 +18,7 @@ import androidx.core.content.ContextCompat
 import android.app.Activity
 import android.content.Context
 import android.os.Environment
+import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -52,8 +53,8 @@ class MainActivity : FlutterActivity() {
             setupDone = true
             // TODO: Replace Thread{} with coroutines (requires lifecycle-runtime-ktx dependency)
             Thread {
-                try { bootstrapManager.setupDirectories() } catch (_: Exception) {}
-                try { bootstrapManager.writeResolvConf() } catch (_: Exception) {}
+                try { bootstrapManager.setupDirectories() } catch (e: Exception) { Log.e("ClawChat", "setupDirectories failed", e) }
+                try { bootstrapManager.writeResolvConf() } catch (e: Exception) { Log.e("ClawChat", "writeResolvConf failed", e) }
             }.start()
         }
 
@@ -244,7 +245,8 @@ class MainActivity : FlutterActivity() {
                     try {
                         val extDir = getExternalFilesDir(null)
                         result.success(extDir?.absolutePath ?: Environment.getExternalStorageDirectory().absolutePath)
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        Log.w("ClawChat", "getExternalFilesDir failed, using fallback", e)
                         result.success(Environment.getExternalStorageDirectory().absolutePath)
                     }
                 }
@@ -283,8 +285,21 @@ class MainActivity : FlutterActivity() {
                     val action = call.argument<String>("action")
                     @Suppress("UNCHECKED_CAST")
                     val params = (call.argument<Map<String, Any?>>("params") ?: emptyMap())
+                    val allowed = call.argument<Boolean>("allowed") ?: false
                     if (action == null) {
                         result.error("INVALID_ARGS", "action required", null)
+                    } else if (action in setOf("callPhone", "sendSms") && !allowed) {
+                        result.error("DISABLED", "Action $action is disabled by user setting", null)
+                    } else if (action in setOf("listCalendarEvents", "listContacts", "insertCalendarEvent")) {
+                        // Content provider queries run off the main thread
+                        Thread {
+                            try {
+                                val data = phoneIntentManager.dispatch(action, params)
+                                safeRunOnUiThread { result.success(data) }
+                            } catch (e: Exception) {
+                                safeRunOnUiThread { result.error("PHONE_INTENT_ERROR", e.message, null) }
+                            }
+                        }.start()
                     } else {
                         try {
                             result.success(phoneIntentManager.dispatch(action, params))

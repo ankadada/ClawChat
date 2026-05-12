@@ -453,7 +453,8 @@ class BootstrapManager(
             if (!file.absolutePath.startsWith(normalizedBase)) {
                 return
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w("ClawChat", "deleteRecursively: path boundary check failed for ${file.absolutePath}", e)
             return // If we can't resolve the path, don't risk deleting
         }
 
@@ -463,7 +464,9 @@ class BootstrapManager(
                 file.delete()
                 return
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w("ClawChat", "deleteRecursively: symlink check failed for ${file.absolutePath}", e)
+        }
         if (file.isDirectory) {
             file.listFiles()?.forEach { deleteRecursively(it) }
         }
@@ -489,7 +492,9 @@ class BootstrapManager(
                     }
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w("ClawChat", "getSystemDnsServers: failed to read system DNS", e)
+        }
         return "nameserver 8.8.8.8\nnameserver 8.8.4.4\n"
     }
 
@@ -501,7 +506,8 @@ class BootstrapManager(
             val dir = File(context.filesDir, "config")
             dir.mkdirs()
             File(dir, "resolv.conf").writeText(content)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w("ClawChat", "writeResolvConf: primary path failed, using fallback", e)
             // Fallback: use the string-based path
             File(configDir).mkdirs()
             File(configDir, "resolv.conf").writeText(content)
@@ -513,7 +519,9 @@ class BootstrapManager(
             val rootfsResolv = File(rootfsDir, "etc/resolv.conf")
             rootfsResolv.parentFile?.mkdirs()
             rootfsResolv.writeText(content)
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w("ClawChat", "writeResolvConf: rootfs resolv.conf write failed", e)
+        }
     }
 
     private fun validateRootfsPath(path: String): File {

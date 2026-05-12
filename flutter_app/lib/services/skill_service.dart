@@ -60,12 +60,13 @@ class SkillService {
 
   /// Downloads a skill from a URL (git repo or tar.gz) into the skills directory.
   static Future<String> importSkillFromUrl(String url) async {
-    final skillName = url.split('/').last.replaceAll('.git', '').replaceAll('.tar.gz', '');
+    final safeUrl = url.replaceAll(RegExp(r'[;&|`$"\\]'), '');
+    final skillName = safeUrl.split('/').last.replaceAll('.git', '').replaceAll('.tar.gz', '');
     final targetDir = '$_skillsDir/$skillName';
 
-    if (url.endsWith('.git') || url.contains('github.com')) {
+    if (safeUrl.endsWith('.git') || safeUrl.contains('github.com')) {
       final output = await NativeBridge.runInProot(
-        'git clone "$url" "$targetDir" 2>&1 || echo "CLONE_FAILED"',
+        'git clone "$safeUrl" "$targetDir" 2>&1 || echo "CLONE_FAILED"',
       );
       if (output.contains('CLONE_FAILED')) {
         throw Exception('Git clone failed: $output');
@@ -74,7 +75,7 @@ class SkillService {
     } else {
       // Download and extract tar.gz
       await NativeBridge.runInProot(
-        'mkdir -p "$targetDir" && curl -fsSL "$url" | tar xz -C "$targetDir" 2>&1',
+        'mkdir -p "$targetDir" && curl -fsSL "$safeUrl" | tar xz -C "$targetDir" 2>&1',
       );
       return skillName;
     }

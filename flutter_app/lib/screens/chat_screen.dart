@@ -63,7 +63,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (!_speech.isAvailable) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('语音识别不可用')),
+          const SnackBar(content: Text(AppStrings.voiceUnavailable)),
         );
       }
       return;
@@ -91,16 +91,44 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeMetrics() {
-    // Keyboard appeared/disappeared — with reverse ListView, scroll to 0
+    // Only scroll to bottom if keyboard actually appeared
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
+      if (!mounted) return;
+      final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
+      if (bottomInset > 0 && _scrollController.hasClients) {
         _scrollController.jumpTo(0);
       }
     });
   }
 
-  bool _isStreaming = false;
-  String? _currentDraftSessionId;
+  String? _lastSessionId;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncDraftForSession();
+  }
+
+  void _syncDraftForSession() {
+    final provider = context.read<ChatProvider>();
+    final currentId = provider.currentSession?.id;
+    if (currentId != null && currentId != _lastSessionId) {
+      if (_lastSessionId != null) {
+        provider.saveDraft(_lastSessionId!, _inputController.text);
+      }
+      _lastSessionId = currentId;
+      final draft = provider.getDraft(currentId);
+      if (_inputController.text != draft) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          _inputController.text = draft;
+          _inputController.selection = TextSelection.collapsed(
+            offset: draft.length,
+          );
+        });
+      }
+    }
+  }
 
   void _sendMessage() {
     final text = _inputController.text.trim();
@@ -161,7 +189,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 if (provider.currentSession?.messages.isNotEmpty == true)
                   const PopupMenuItem(value: 'regenerate', child: ListTile(
                     leading: Icon(Icons.refresh),
-                    title: Text('重新生成'),
+                    title: Text(AppStrings.regenerate),
                     dense: true,
                   )),
                 const PopupMenuItem(value: 'switch_model', child: ListTile(
@@ -198,28 +226,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 final messages = data.messages;
                 final hasStreaming = data.hasStreaming;
 
-                // Draft saving / restoring on session switch
+                // Sync draft when session changes via Selector rebuild
                 final currentId = data.sessionId;
-                if (currentId != null && currentId != _currentDraftSessionId) {
-                  if (_currentDraftSessionId != null) {
-                    context.read<ChatProvider>().saveDraft(
-                      _currentDraftSessionId!, _inputController.text);
-                  }
-                  _currentDraftSessionId = currentId;
-                  final draft = context.read<ChatProvider>().getDraft(currentId);
-                  if (_inputController.text != draft) {
-                    WidgetsBinding.instance.addPostFrameCallback((_) {
-                      _inputController.text = draft;
-                      _inputController.selection = TextSelection.collapsed(
-                        offset: draft.length);
-                    });
-                  }
-                }
-
-                if (hasStreaming && !_isStreaming) {
-                  _isStreaming = true;
-                } else if (!hasStreaming && _isStreaming) {
-                  _isStreaming = false;
+                if (currentId != null && currentId != _lastSessionId) {
+                  _syncDraftForSession();
                 }
 
                 if (messages.isEmpty && !hasStreaming) {
@@ -301,7 +311,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Widget _buildContentBlock(MessageContent content, bool isUser, ThemeData theme) {
     switch (content) {
       case TextContent(:final text):
-        return GestureDetector(
+        return Semantics(
+          label: isUser ? 'User message' : 'AI message',
+          child: GestureDetector(
           onLongPress: () {
             showModalBottomSheet(
               context: context,
@@ -311,7 +323,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   children: [
                     ListTile(
                       leading: const Icon(Icons.copy),
-                      title: const Text('复制'),
+                      title: const Text(AppStrings.copy),
                       onTap: () {
                         Clipboard.setData(ClipboardData(text: text));
                         Navigator.pop(ctx);
@@ -322,7 +334,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ),
                     ListTile(
                       leading: const Icon(Icons.format_quote),
-                      title: const Text('引用回复'),
+                      title: const Text(AppStrings.quoteReply),
                       onTap: () {
                         Navigator.pop(ctx);
                         final quoted = text.length > 200
@@ -358,6 +370,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
             child: StreamingText(text: text),
           ),
+        ),
         );
 
       case ToolUseContent():
@@ -531,12 +544,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           children: [
             ListTile(
               leading: const Icon(Icons.image),
-              title: const Text('选择图片'),
+              title: const Text(AppStrings.pickImage),
               onTap: () { Navigator.pop(ctx); _pickAndAttach(FileType.image); },
             ),
             ListTile(
               leading: const Icon(Icons.insert_drive_file),
-              title: const Text('选择文件'),
+              title: const Text(AppStrings.pickFile),
               onTap: () { Navigator.pop(ctx); _pickAndAttach(FileType.any); },
             ),
           ],
@@ -557,7 +570,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('附件失败: $e')),
+            SnackBar(content: Text('${AppStrings.attachFailed}: $e')),
           );
         }
       }
@@ -566,12 +579,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Widget _buildQuickPrompts() {
     const prompts = [
-      ('翻译这段', '请翻译以下内容：\n'),
-      ('总结一下', '请总结：\n'),
-      ('解释代码', '请解释这段代码：\n'),
-      ('写邮件', '请帮我写一封邮件：\n'),
-      ('修改润色', '请帮我修改润色以下文字：\n'),
-      ('头脑风暴', '请帮我头脑风暴：\n'),
+      (AppStrings.promptTranslate, AppStrings.promptTranslateTemplate),
+      (AppStrings.promptSummarize, AppStrings.promptSummarizeTemplate),
+      (AppStrings.promptExplainCode, AppStrings.promptExplainCodeTemplate),
+      (AppStrings.promptWriteEmail, AppStrings.promptWriteEmailTemplate),
+      (AppStrings.promptPolish, AppStrings.promptPolishTemplate),
+      (AppStrings.promptBrainstorm, AppStrings.promptBrainstormTemplate),
     ];
 
     return SizedBox(
@@ -616,7 +629,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               children: [
                 IconButton(
                   icon: const Icon(Icons.attach_file),
-                  tooltip: '附件',
+                  tooltip: AppStrings.attachFile,
                   onPressed: isRunning ? null : _showAttachOptions,
                 ),
                 Expanded(

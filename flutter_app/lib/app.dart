@@ -322,14 +322,29 @@ class ClawChatApp extends StatelessWidget {
   }
 }
 
-class ResponsiveShell extends StatelessWidget {
+class ResponsiveShell extends StatefulWidget {
   const ResponsiveShell({super.key});
+
+  @override
+  State<ResponsiveShell> createState() => _ResponsiveShellState();
+}
+
+class _ResponsiveShellState extends State<ResponsiveShell> {
+  bool _isDualPane = false;
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        if (constraints.maxWidth >= 700) {
+        final shouldBeDual = _isDualPane
+            ? constraints.maxWidth >= 680  // stay dual until drops below 680
+            : constraints.maxWidth >= 700; // switch to dual at 700
+        if (shouldBeDual != _isDualPane) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            setState(() => _isDualPane = shouldBeDual);
+          });
+        }
+        if (_isDualPane) {
           return const DualPaneLayout();
         }
         return const ChatScreen();

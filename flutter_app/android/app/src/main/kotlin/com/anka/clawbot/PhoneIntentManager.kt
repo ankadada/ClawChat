@@ -10,6 +10,7 @@ import android.net.Uri
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
+import android.os.Build
 import android.telephony.SmsManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -77,7 +78,7 @@ class PhoneIntentManager(private val activity: Activity) {
     }
 
     private fun dialPad(p: Map<String, Any?>): Map<String, Any?> {
-        val number = p["number"] as? String ?: error("number required")
+        val number = validatePhoneNumber(p["number"] as? String ?: error("number required"))
         return startActivityChecked(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")))
     }
 
@@ -134,7 +135,21 @@ class PhoneIntentManager(private val activity: Activity) {
         return startActivityChecked(intent)
     }
 
+    // ── Phone number validation ─────────────────────────────────────
+
+    private fun validatePhoneNumber(number: String): String {
+        val cleaned = number.replace(Regex("[^+0-9]"), "")
+        if (cleaned.isEmpty() || cleaned.length > 15) error("Invalid phone number")
+        return cleaned
+    }
+
     // ── L2: dangerous permissions, requested at use time ───────────
+    //
+    // Permission flow: ensurePermission() calls ActivityCompat.requestPermissions()
+    // which is fire-and-forget from the native side. When a permission is not yet
+    // granted, the function returns a map with "error" = "permission_required".
+    // The Dart/Flutter side should show an appropriate message and retry the call
+    // after the user grants the permission in the system dialog.
 
     private fun ensurePermission(perm: String): Boolean {
         if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) return true
@@ -276,7 +291,7 @@ class PhoneIntentManager(private val activity: Activity) {
         if (!ensurePermission(Manifest.permission.CALL_PHONE)) {
             return mapOf("ok" to false, "error" to "permission_required", "permission" to "CALL_PHONE")
         }
-        val number = p["number"] as? String ?: error("number required")
+        val number = validatePhoneNumber(p["number"] as? String ?: error("number required"))
         val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number"))
         return startActivityChecked(intent)
     }
@@ -285,10 +300,14 @@ class PhoneIntentManager(private val activity: Activity) {
         if (!ensurePermission(Manifest.permission.SEND_SMS)) {
             return mapOf("ok" to false, "error" to "permission_required", "permission" to "SEND_SMS")
         }
-        val number = p["number"] as? String ?: error("number required")
+        val number = validatePhoneNumber(p["number"] as? String ?: error("number required"))
         val body = p["body"] as? String ?: error("body required")
-        @Suppress("DEPRECATION")
-        val sm = SmsManager.getDefault()
+        val sm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            activity.getSystemService(SmsManager::class.java)!!
+        } else {
+            @Suppress("DEPRECATION")
+            SmsManager.getDefault()
+        }
         val parts = sm.divideMessage(body)
         sm.sendMultipartTextMessage(number, null, parts, null, null)
         return mapOf("ok" to true, "parts" to parts.size)

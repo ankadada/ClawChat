@@ -109,10 +109,11 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('writeRootfsFile', {'path': path, 'content': content}))!;
   }
 
-  static Future<Map<String, dynamic>> phoneIntent(String action, Map<String, dynamic> params) async {
+  static Future<Map<String, dynamic>> phoneIntent(String action, Map<String, dynamic> params, {bool allowed = false}) async {
     final result = await _channel.invokeMethod<Map>('phoneIntent', {
       'action': action,
       'params': params,
+      'allowed': allowed,
     });
     return Map<String, dynamic>.from(result ?? {});
   }

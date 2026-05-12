@@ -2,6 +2,7 @@ package com.anka.clawbot
 
 import android.os.Build
 import android.os.Environment
+import android.util.Log
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -72,7 +73,9 @@ class ProcessManager(
                 resolvFile.parentFile?.mkdirs()
                 resolvFile.writeText(content)
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w("ClawChat", "ensureResolvConf: primary resolv.conf write failed", e)
+        }
 
         // Fallback: write directly into rootfs /etc/resolv.conf
         // so DNS works even if the bind-mount fails
@@ -82,7 +85,9 @@ class ProcessManager(
                 rootfsResolv.parentFile?.mkdirs()
                 rootfsResolv.writeText(content)
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w("ClawChat", "ensureResolvConf: rootfs resolv.conf write failed", e)
+        }
     }
 
     private fun commonProotFlags(): List<String> {
@@ -148,7 +153,8 @@ class ProcessManager(
                         Runtime.getRuntime().exec(
                             arrayOf("ln", "-sf", "/storage/emulated/0", "$rootfsDir/sdcard")
                         ).waitFor()
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        Log.w("ClawChat", "sdcard symlink creation failed, using directory fallback", e)
                         // Fallback: create as directory if symlink fails
                         sdcardLink.mkdirs()
                     }

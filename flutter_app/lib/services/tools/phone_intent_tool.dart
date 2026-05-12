@@ -51,6 +51,8 @@ class PhoneIntentTool extends Tool {
   };
 
   static const _restrictedActions = {'callPhone', 'sendSms'};
+  static final Map<String, DateTime> _lastCallTime = {};
+  static const _minInterval = Duration(seconds: 30);
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
@@ -58,7 +60,10 @@ class PhoneIntentTool extends Tool {
     if (action == null || action.isEmpty) {
       return jsonEncode({'ok': false, 'error': 'invalid_args', 'message': 'action required'});
     }
-    if (_restrictedActions.contains(action)) {
+
+    final isRestricted = _restrictedActions.contains(action);
+
+    if (isRestricted) {
       final allowed = (action == 'callPhone' && _prefs.allowPhoneCall) ||
           (action == 'sendSms' && _prefs.allowSms);
       if (!allowed) {
@@ -69,10 +74,25 @@ class PhoneIntentTool extends Tool {
               'Settings → Phone integration before this can be used.',
         });
       }
+
+      // Rate limit restricted actions
+      final now = DateTime.now();
+      final lastCall = _lastCallTime[action];
+      if (lastCall != null && now.difference(lastCall) < _minInterval) {
+        final remaining = _minInterval - now.difference(lastCall);
+        return jsonEncode({
+          'ok': false,
+          'error': 'rate_limited',
+          'message': 'Action `$action` was called too recently. '
+              'Please wait ${remaining.inSeconds} seconds before retrying.',
+        });
+      }
+      _lastCallTime[action] = now;
     }
+
     final params = (input['params'] as Map?)?.cast<String, dynamic>() ?? const {};
     try {
-      final result = await NativeBridge.phoneIntent(action, params);
+      final result = await NativeBridge.phoneIntent(action, params, allowed: isRestricted);
       return jsonEncode(result);
     } catch (e) {
       return jsonEncode({'ok': false, 'error': 'exception', 'message': e.toString()});

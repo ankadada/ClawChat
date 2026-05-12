@@ -44,6 +44,8 @@ class ChatProvider extends ChangeNotifier {
   Timer? _streamThrottle;
   StringBuffer _streamBuffer = StringBuffer();
 
+  bool _disposed = false;
+
   final Map<String, String> _drafts = {};
 
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
@@ -63,6 +65,7 @@ class ChatProvider extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     _streamThrottle?.cancel();
     _agentSubscription?.cancel();
     if (_agentCompleter != null && !_agentCompleter!.isCompleted) {
@@ -74,6 +77,8 @@ class ChatProvider extends ChangeNotifier {
 
   Future<void> _init() async {
     try {
+      await _prefs.init();
+      _prefsInitialized = true;
       await _storage.init();
       sessions = await _storage.getSessionsSummary();
       notifyListeners();
@@ -168,14 +173,6 @@ class ChatProvider extends ChangeNotifier {
     _isSending = true;
 
     try {
-      if (currentSession == null) await createSession();
-
-      final session = currentSession!;
-      session.messages.add(ChatMessage.user(text));
-      session.autoTitle();
-      await _storage.saveSession(session);
-      notifyListeners();
-
       await _ensurePrefs();
       final apiKey = _prefs.apiKey;
       if (apiKey == null || apiKey.isEmpty) {
@@ -184,6 +181,14 @@ class ChatProvider extends ChangeNotifier {
         notifyListeners();
         return;
       }
+
+      if (currentSession == null) await createSession();
+
+      final session = currentSession!;
+      session.messages.add(ChatMessage.user(text));
+      session.autoTitle();
+      await _storage.saveSession(session);
+      notifyListeners();
 
       final llmConfig = _buildLlmConfig(_prefs);
       if (_cachedLlm == null || _cachedLlmConfig != llmConfig) {
@@ -244,7 +249,12 @@ class ChatProvider extends ChangeNotifier {
                 agentStatus = AgentStatus.idle;
                 streamingText = '';
                 _applyFinalAgentMessages(session, _agent!.messages);
-                _storage.saveSession(session).then((_) => notifyListeners());
+                _storage.saveSession(session).then((_) {
+                  if (!_disposed) notifyListeners();
+                });
+                if (_agentCompleter != null && !_agentCompleter!.isCompleted) {
+                  _agentCompleter!.complete();
+                }
 
               case AgentError(:final message):
                 _streamThrottle?.cancel();
@@ -365,6 +375,22 @@ class ChatProvider extends ChangeNotifier {
     return 0;
   }
 
+  bool _hasToolUseContent(Map<String, dynamic> msg) {
+    final content = msg['content'];
+    if (content is List) {
+      return content.any((item) => item is Map && item['type'] == 'tool_use');
+    }
+    return false;
+  }
+
+  bool _hasToolResultContent(Map<String, dynamic> msg) {
+    final content = msg['content'];
+    if (content is List) {
+      return content.any((item) => item is Map && item['type'] == 'tool_result');
+    }
+    return false;
+  }
+
   List<Map<String, dynamic>> _truncateToFit(List<Map<String, dynamic>> messages) {
     final result = List<Map<String, dynamic>>.from(messages);
     int totalChars = 0;
@@ -372,7 +398,20 @@ class ChatProvider extends ChangeNotifier {
       totalChars += _charCount(msg);
     }
     while (result.length > 2 && totalChars > _maxContextChars) {
-      totalChars -= _charCount(result.removeAt(0));
+      final front = result[0];
+      // If this is an assistant message with tool_use, also remove the following
+      // user message containing the tool_result to keep them paired.
+      if (_hasToolUseContent(front) && result.length > 2 && _hasToolResultContent(result[1])) {
+        totalChars -= _charCount(result.removeAt(0));
+        if (result.isNotEmpty) {
+          totalChars -= _charCount(result.removeAt(0));
+        }
+      } else if (_hasToolResultContent(front)) {
+        // Skip orphaned tool_result at the front — remove it
+        totalChars -= _charCount(result.removeAt(0));
+      } else {
+        totalChars -= _charCount(result.removeAt(0));
+      }
     }
     return result;
   }

@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 
 class SetupService : Service() {
     companion object {
@@ -133,6 +134,8 @@ class SetupService : Service() {
         try {
             val manager = getSystemService(NotificationManager::class.java)
             manager.notify(NOTIFICATION_ID, buildNotification(text, progress))
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w("ClawChat", "updateNotificationWith failed", e)
+        }
     }
 }

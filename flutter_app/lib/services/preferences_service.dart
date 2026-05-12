@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -32,6 +33,7 @@ class PreferencesService {
   static String? _cachedApiKey;
 
   late SharedPreferences _prefs;
+  bool _initialized = false;
 
   factory PreferencesService() {
     return _instance ??= PreferencesService._();
@@ -40,9 +42,11 @@ class PreferencesService {
   PreferencesService._();
 
   Future<void> init() async {
+    if (_initialized) return;
     _prefs = await SharedPreferences.getInstance();
     await _migrateApiKeyToSecureStorage();
     _cachedApiKey = await _secureStorage.read(key: _keyApiKey);
+    _initialized = true;
   }
 
   /// Migrates API key from plaintext SharedPreferences to secure storage.
@@ -90,9 +94,13 @@ class PreferencesService {
   set apiKey(String? v) {
     _cachedApiKey = v;
     if (v != null) {
-      _secureStorage.write(key: _keyApiKey, value: v);
+      _secureStorage.write(key: _keyApiKey, value: v).catchError((e) {
+        debugPrint('Failed to persist API key: $e');
+      });
     } else {
-      _secureStorage.delete(key: _keyApiKey);
+      _secureStorage.delete(key: _keyApiKey).catchError((e) {
+        debugPrint('Failed to delete API key: $e');
+      });
     }
   }
 
@@ -153,9 +161,9 @@ class PreferencesService {
   bool get notifyOnComplete => _prefs.getBool(_keyNotifyOnComplete) ?? true;
   set notifyOnComplete(bool v) => _prefs.setBool(_keyNotifyOnComplete, v);
 
-  bool get allowPhoneCall => _prefs.getBool(_keyAllowPhoneCall) ?? false;
+  bool get allowPhoneCall => _initialized ? (_prefs.getBool(_keyAllowPhoneCall) ?? false) : false;
   set allowPhoneCall(bool v) => _prefs.setBool(_keyAllowPhoneCall, v);
 
-  bool get allowSms => _prefs.getBool(_keyAllowSms) ?? false;
+  bool get allowSms => _initialized ? (_prefs.getBool(_keyAllowSms) ?? false) : false;
   set allowSms(bool v) => _prefs.setBool(_keyAllowSms, v);
 }
