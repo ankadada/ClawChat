@@ -1,10 +1,15 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../app.dart' show themeNotifier, fontScaleNotifier;
 import '../constants.dart';
 import '../services/llm_service.dart';
+import '../services/memory_service.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
+import '../services/session_storage.dart';
 import '../services/skill_service.dart';
 import 'setup_wizard_screen.dart';
 import '../l10n/app_strings.dart';
@@ -40,6 +45,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _notifyOnComplete = true;
   bool _allowPhoneCall = false;
   bool _allowSms = false;
+  List<String> _memories = [];
+  bool _loadingMemories = false;
 
   static const _thinkingBudgets = [0, 4096, 10000, 20000, 32000];
   static const _thinkingLabels = [
@@ -93,6 +100,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
 
       _loadSkills();
+      _loadMemories();
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
@@ -533,6 +541,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
 
                 const Divider(),
+                _sectionHeader(theme, AppStrings.dataManagement),
+                ListTile(
+                  title: const Text(AppStrings.exportAll),
+                  leading: const Icon(Icons.upload_file),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _exportAllConversations,
+                ),
+                ListTile(
+                  title: const Text(AppStrings.importConversations),
+                  leading: const Icon(Icons.download),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _importConversations,
+                ),
+
+                const Divider(),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(AppStrings.memoryManagement, style: TextStyle(
+                            color: theme.colorScheme.primary,
+                            fontWeight: FontWeight.bold,
+                          )),
+                          IconButton(
+                            icon: const Icon(Icons.add),
+                            tooltip: AppStrings.addMemory,
+                            onPressed: _addMemory,
+                          ),
+                        ],
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text(
+                          AppStrings.memoryDesc,
+                          style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                        ),
+                      ),
+                      if (_loadingMemories)
+                        const Center(child: Padding(
+                          padding: EdgeInsets.all(16),
+                          child: CircularProgressIndicator(),
+                        ))
+                      else if (_memories.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 8),
+                          child: Text(AppStrings.noMemories, style: TextStyle(color: Colors.grey)),
+                        )
+                      else
+                        ..._memories.asMap().entries.map((entry) => ListTile(
+                          title: Text(entry.value),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.delete_outline),
+                            onPressed: () => _removeMemory(entry.key),
+                          ),
+                        )),
+                    ],
+                  ),
+                ),
+
+                const Divider(),
                 _sectionHeader(theme, AppStrings.systemInfo),
 
                 ListTile(
@@ -751,6 +823,97 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } finally {
       if (mounted) setState(() => _loadingSkills = false);
     }
+  }
+
+  Future<void> _loadMemories() async {
+    setState(() => _loadingMemories = true);
+    _memories = List.from(await MemoryService.getMemories());
+    if (mounted) setState(() => _loadingMemories = false);
+  }
+
+  Future<void> _exportAllConversations() async {
+    try {
+      final storage = SessionStorage();
+      await storage.init();
+      final jsonStr = await storage.exportAllAsJson();
+      await Clipboard.setData(ClipboardData(text: jsonStr));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text(AppStrings.exportSuccess)),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${AppStrings.exportAll}: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _importConversations() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+      );
+      if (result == null || result.files.isEmpty) return;
+      final path = result.files.single.path;
+      if (path == null) return;
+      final file = File(path);
+      final jsonStr = await file.readAsString();
+      final storage = SessionStorage();
+      await storage.init();
+      final count = await storage.importFromJson(jsonStr);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(AppStrings.importSuccess(count))),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${AppStrings.importFailed}: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _addMemory() async {
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.addMemory),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            hintText: AppStrings.memoryHint,
+          ),
+          maxLines: 3,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text(AppStrings.confirm),
+          ),
+        ],
+      ),
+    );
+    if (result != null && result.isNotEmpty) {
+      await MemoryService.addMemory(result);
+      await _loadMemories();
+    }
+  }
+
+  Future<void> _removeMemory(int index) async {
+    await MemoryService.removeMemory(index);
+    await _loadMemories();
   }
 
   Widget _sectionHeader(ThemeData theme, String title) {

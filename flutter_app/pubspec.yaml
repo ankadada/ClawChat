@@ -25,6 +25,8 @@ dependencies:
   uuid: ^4.2.0
   file_picker: ^8.0.0
   speech_to_text: ^6.6.0
+  flutter_tts: ^3.8.0
+  webview_flutter: ^4.10.0
 
 dev_dependencies:
   flutter_test:

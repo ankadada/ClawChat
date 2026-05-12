@@ -5,6 +5,8 @@ import 'phone_intent_tool.dart';
 import 'read_file_tool.dart';
 import 'write_file_tool.dart';
 import 'web_fetch_tool.dart';
+import 'web_search_tool.dart';
+import 'image_gen_tool.dart';
 
 abstract class Tool {
   String get name;
@@ -32,6 +34,8 @@ class ToolRegistry {
     registry.register(WriteFileTool());
     registry.register(WebFetchTool());
     if (prefs != null) registry.register(PhoneIntentTool(prefs));
+    registry.register(WebSearchTool());
+    if (prefs != null) registry.register(ImageGenTool(prefs));
     return registry;
   }
 

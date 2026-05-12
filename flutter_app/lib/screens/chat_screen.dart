@@ -13,6 +13,8 @@ import '../services/llm_service.dart';
 import '../widgets/streaming_text.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/agent_status_bar.dart';
+import '../widgets/compare_view.dart';
+import '../services/tts_service.dart';
 import 'settings_screen.dart';
 import 'chat_sessions_screen.dart';
 import '../l10n/app_strings.dart';
@@ -29,6 +31,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final _scrollController = ScrollController();
   final _focusNode = FocusNode();
   final stt.SpeechToText _speech = stt.SpeechToText();
+  final TtsService _tts = TtsService();
   bool _isListening = false;
 
   @override
@@ -177,10 +180,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SettingsScreen()));
                 case 'system_prompt':
                   _showSystemPromptDialog();
+                case 'session_system_prompt':
+                  _showSessionSystemPromptDialog();
                 case 'switch_model':
                   _showSwitchModelDialog();
                 case 'regenerate':
                   context.read<ChatProvider>().regenerateLastResponse();
+                case 'compare':
+                  _showCompareDialog();
               }
             },
             itemBuilder: (_) {
@@ -192,9 +199,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     title: Text(AppStrings.regenerate),
                     dense: true,
                   )),
+                const PopupMenuItem(value: 'compare', child: ListTile(
+                  leading: Icon(Icons.compare_arrows),
+                  title: Text(AppStrings.compareMode),
+                  dense: true,
+                )),
                 const PopupMenuItem(value: 'switch_model', child: ListTile(
                   leading: Icon(Icons.swap_horiz),
                   title: Text(AppStrings.switchModel),
+                  dense: true,
+                )),
+                const PopupMenuItem(value: 'session_system_prompt', child: ListTile(
+                  leading: Icon(Icons.tune),
+                  title: Text(AppStrings.systemPromptTitle),
                   dense: true,
                 )),
                 const PopupMenuItem(value: 'system_prompt', child: ListTile(
@@ -250,11 +267,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             _buildStreamingBubble(provider.streamingText, theme),
                       );
                     }
-                    return _buildMessageBubble(messages[reversedIndex], theme);
+                    return _buildMessageBubble(messages[reversedIndex], reversedIndex, theme);
                   },
                 );
               },
             ),
+          ),
+          // Compare view
+          Consumer<ChatProvider>(
+            builder: (_, provider, __) {
+              if (provider.compareResults == null) return const SizedBox.shrink();
+              return CompareView(
+                results: provider.compareResults!,
+                isComparing: provider.isComparing,
+                onDismiss: () => provider.clearCompareResults(),
+              );
+            },
           ),
           _buildQuickPrompts(),
           _buildInputArea(theme),
@@ -283,8 +311,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildMessageBubble(ChatMessage message, ThemeData theme) {
+  Widget _buildMessageBubble(ChatMessage message, int messageIndex, ThemeData theme) {
     final isUser = message.role == 'user';
+    final messageId = '${message.timestamp.millisecondsSinceEpoch}_$messageIndex';
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -302,13 +331,65 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
           ),
           for (final content in message.content)
-            _buildContentBlock(content, isUser, theme),
+            _buildContentBlock(content, isUser, theme, messageId: messageId),
+          if (!isUser && message.alternatives != null && message.alternatives!.isNotEmpty)
+            _buildAlternativesNav(message, messageIndex, theme),
+          if (!isUser) _buildAssistantFooter(message, messageId, theme),
         ],
       ),
     );
   }
 
-  Widget _buildContentBlock(MessageContent content, bool isUser, ThemeData theme) {
+  Widget _buildAssistantFooter(ChatMessage message, String messageId, ThemeData theme) {
+    final textContent = message.textContent;
+    final hasText = textContent.isNotEmpty;
+    final hasTokens = message.inputTokens != null || message.outputTokens != null;
+
+    if (!hasText && !hasTokens) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (hasText)
+            SizedBox(
+              height: 28,
+              width: 28,
+              child: IconButton(
+                padding: EdgeInsets.zero,
+                iconSize: 16,
+                icon: Icon(
+                  _tts.isPlayingMessage(messageId) ? Icons.stop : Icons.volume_up,
+                  color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
+                ),
+                tooltip: _tts.isPlayingMessage(messageId) ? AppStrings.ttsStop : AppStrings.ttsPlay,
+                onPressed: () {
+                  _tts.speak(textContent, messageId).then((_) {
+                    if (mounted) setState(() {});
+                  });
+                },
+              ),
+            ),
+          if (hasTokens) ...[
+            const SizedBox(width: 8),
+            Text(
+              [
+                if (message.inputTokens != null) '↑${message.inputTokens}',
+                if (message.outputTokens != null) '↓${message.outputTokens}',
+              ].join(' '),
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant.withAlpha(120),
+                fontSize: 11,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildContentBlock(MessageContent content, bool isUser, ThemeData theme, {String? messageId}) {
     switch (content) {
       case TextContent(:final text):
         return Semantics(
@@ -448,6 +529,56 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
     if (result != null) {
       prefs.systemPrompt = result;
+    }
+  }
+
+  Future<void> _showSessionSystemPromptDialog() async {
+    final provider = context.read<ChatProvider>();
+    final session = provider.currentSession;
+    if (session == null) return;
+
+    final controller = TextEditingController(text: session.systemPrompt ?? '');
+
+    final result = await showDialog<String?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.systemPromptTitle),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 300,
+          child: TextField(
+            controller: controller,
+            maxLines: null,
+            expands: true,
+            textAlignVertical: TextAlignVertical.top,
+            decoration: InputDecoration(
+              border: const OutlineInputBorder(),
+              hintText: AppStrings.systemPromptHint,
+              helperText: controller.text.isEmpty ? AppStrings.useGlobalDefault : null,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.cancel),
+          ),
+          TextButton(
+            onPressed: () {
+              controller.text = '';
+              Navigator.pop(ctx, '');
+            },
+            child: const Text(AppStrings.useGlobalDefault),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text(AppStrings.save),
+          ),
+        ],
+      ),
+    );
+    if (result != null) {
+      provider.updateSessionSystemPrompt(result.isEmpty ? null : result);
     }
   }
 
@@ -606,6 +737,185 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             },
           ),
         )).toList(),
+      ),
+    );
+  }
+
+  Widget _buildAlternativesNav(ChatMessage message, int messageIndex, ThemeData theme) {
+    final current = message.displayIndex;
+    final total = message.totalVersions;
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 28,
+            height: 28,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              iconSize: 16,
+              icon: Icon(
+                Icons.chevron_left,
+                color: current > 1
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant.withAlpha(80),
+              ),
+              onPressed: current > 1
+                  ? () => context.read<ChatProvider>().previousAlternative(messageIndex)
+                  : null,
+            ),
+          ),
+          Text(
+            AppStrings.alternativeOf(current, total),
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          SizedBox(
+            width: 28,
+            height: 28,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              iconSize: 16,
+              icon: Icon(
+                Icons.chevron_right,
+                color: current < total
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant.withAlpha(80),
+              ),
+              onPressed: current < total
+                  ? () => context.read<ChatProvider>().nextAlternative(messageIndex)
+                  : null,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showCompareDialog() async {
+    final prefs = PreferencesService();
+    await prefs.init();
+
+    List<String> availableModels = [];
+    final selectedModels = <String>{};
+    bool loading = false;
+    final textController = TextEditingController();
+
+    // Pre-populate with the current input text
+    textController.text = _inputController.text;
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text(AppStrings.compareMode),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: textController,
+                  maxLines: 3,
+                  minLines: 1,
+                  decoration: InputDecoration(
+                    hintText: AppStrings.inputHint,
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  AppStrings.selectModels,
+                  style: Theme.of(ctx).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                if (loading)
+                  const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(16),
+                      child: CircularProgressIndicator(),
+                    ),
+                  )
+                else if (availableModels.isNotEmpty)
+                  SizedBox(
+                    height: 200,
+                    child: ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: availableModels.length,
+                      itemBuilder: (_, i) {
+                        final model = availableModels[i];
+                        return CheckboxListTile(
+                          dense: true,
+                          title: Text(model, overflow: TextOverflow.ellipsis),
+                          value: selectedModels.contains(model),
+                          onChanged: (v) {
+                            setDialogState(() {
+                              if (v == true) {
+                                selectedModels.add(model);
+                              } else {
+                                selectedModels.remove(model);
+                              }
+                            });
+                          },
+                        );
+                      },
+                    ),
+                  )
+                else
+                  Text(
+                    AppStrings.fetchModelsButton,
+                    style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: const Text(AppStrings.fetchModelsButton),
+                  onPressed: () async {
+                    setDialogState(() => loading = true);
+                    try {
+                      availableModels = await LlmService.fetchModels(
+                        apiFormat: prefs.apiFormat ?? 'anthropic',
+                        apiKey: prefs.apiKey ?? '',
+                        baseUrl: prefs.baseUrl,
+                      );
+                    } catch (_) {}
+                    setDialogState(() => loading = false);
+                  },
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel),
+            ),
+            FilledButton(
+              onPressed: selectedModels.length >= 2
+                  ? () {
+                      Navigator.pop(ctx);
+                      final text = textController.text.trim();
+                      if (text.isNotEmpty) {
+                        _inputController.clear();
+                        final provider = context.read<ChatProvider>();
+                        if (provider.currentSession != null) {
+                          provider.saveDraft(provider.currentSession!.id, '');
+                        }
+                        provider.sendCompare(text, selectedModels.toList());
+                      }
+                    }
+                  : null,
+              child: const Text(AppStrings.compareStart),
+            ),
+          ],
+        ),
       ),
     );
   }

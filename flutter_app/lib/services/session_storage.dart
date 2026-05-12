@@ -9,12 +9,14 @@ class SessionSummary {
   final String title;
   final DateTime createdAt;
   final DateTime updatedAt;
+  final String? folder;
 
   SessionSummary({
     required this.id,
     required this.title,
     required this.createdAt,
     required this.updatedAt,
+    this.folder,
   });
 }
 
@@ -93,6 +95,7 @@ class SessionStorage {
           title: map['title'] as String? ?? '新对话',
           createdAt: DateTime.parse(map['createdAt'] as String),
           updatedAt: DateTime.parse(map['updatedAt'] as String),
+          folder: map['folder'] as String?,
         ));
       } catch (_) {
         // Skip corrupted session files
@@ -133,5 +136,24 @@ class SessionStorage {
     await for (final entity in _sessionsDir!.list()) {
       if (entity is File) await entity.delete();
     }
+  }
+
+  Future<String> exportAllAsJson() async {
+    final sessions = await getAllSessions();
+    final data = sessions.map((s) => s.toJson()).toList();
+    return jsonEncode({'version': 1, 'sessions': data});
+  }
+
+  Future<int> importFromJson(String jsonStr) async {
+    final data = jsonDecode(jsonStr) as Map<String, dynamic>;
+    final sessions = (data['sessions'] as List)
+        .map((j) => ChatSession.fromJson(j as Map<String, dynamic>))
+        .toList();
+    int count = 0;
+    for (final session in sessions) {
+      await saveSession(session);
+      count++;
+    }
+    return count;
   }
 }

@@ -27,7 +27,9 @@ class AgentToolDone extends AgentEvent {
 
 class AgentComplete extends AgentEvent {
   final String finalText;
-  AgentComplete(this.finalText);
+  final int? inputTokens;
+  final int? outputTokens;
+  AgentComplete(this.finalText, {this.inputTokens, this.outputTokens});
 }
 
 class AgentError extends AgentEvent {
@@ -127,7 +129,11 @@ class AgentService {
             .where((b) => b.type == 'text')
             .map((b) => b.text ?? '')
             .join();
-        yield AgentComplete(finalText);
+        yield AgentComplete(
+          finalText,
+          inputTokens: response.inputTokens,
+          outputTokens: response.outputTokens,
+        );
         return;
       }
 

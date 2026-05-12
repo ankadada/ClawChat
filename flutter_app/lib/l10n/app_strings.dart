@@ -133,8 +133,10 @@ class AppStrings {
   static const statusError = '出错';
   static const statusProcessing = '处理中...';
 
-  // ── Code block ───────────────────────────────────────────────────
+  // ── Code block / Artifacts ────────────────────────────────────────
   // (copy/copied already defined in General)
+  static const preview = '预览';
+  static const artifactsPreview = '网页预览';
 
   // ── Thinking intensity ────────────────────────────────────────────
   static const thinkingIntensity = '思考强度';
@@ -258,4 +260,44 @@ class AppStrings {
 
   // ── Chat provider ────────────────────────────────────────────────
   static const apiKeyNotConfigured = '请先在设置中配置 API Key';
+
+  // ── TTS ──────────────────────────────────────────────────────────
+  static const ttsPlay = '朗读';
+  static const ttsStop = '停止朗读';
+
+  // ── Per-session system prompt ────────────────────────────────────
+  static const systemPromptTitle = '系统提示词';
+  static const systemPromptHint = '自定义此会话的系统提示词...';
+
+  // ── Data management (export/import) ───────────────────────────────
+  static const dataManagement = '数据管理';
+  static const exportAll = '导出全部对话';
+  static const importConversations = '导入对话';
+  static const exportSuccess = '已导出到剪贴板';
+  static String importSuccess(int count) => '成功导入 $count 个对话';
+  // importFailed is already defined in the Skills section above
+
+  // ── Folder / grouping ─────────────────────────────────────────────
+  static const allConversations = '全部对话';
+  static const moveToFolder = '移动到文件夹';
+  static const newFolder = '新建文件夹';
+  static const folderName = '文件夹名称';
+  static const noFolder = '无分组';
+
+  // ── Memory ────────────────────────────────────────────────────────
+  static const memoryManagement = '记忆管理';
+  static const addMemory = '添加记忆';
+  static const memoryHint = '输入要记住的信息...';
+  static const noMemories = '暂无记忆';
+  static const memoryDesc = 'AI 会在所有对话中记住这些信息';
+
+  // ── Alternatives / regenerate branches ────────────────────────────
+  static String alternativeOf(int current, int total) => '$current/$total';
+
+  // ── Multi-model compare ──────────────────────────────────────────
+  static const compareMode = '多模型对比';
+  static const selectModels = '选择对比模型';
+  static const comparing = '正在对比...';
+  static const compareStart = '开始对比';
+  static const noModelsSelected = '请至少选择两个模型';
 }

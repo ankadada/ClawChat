@@ -16,6 +16,8 @@ class ChatSessionsScreen extends StatefulWidget {
 class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
   final _searchController = TextEditingController();
   String _searchQuery = '';
+  String? _selectedFolder; // null = show all
+  final Set<String> _collapsedFolders = {};
 
   @override
   void dispose() {
@@ -74,12 +76,43 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           );
         }
 
-        final filteredSessions = _searchQuery.isEmpty
-            ? sessions
-            : sessions
-                .where(
-                    (s) => s.title.toLowerCase().contains(_searchQuery))
-                .toList();
+        // Collect unique folders
+        final folders = <String>{};
+        for (final s in sessions) {
+          if (s.folder != null && s.folder!.isNotEmpty) {
+            folders.add(s.folder!);
+          }
+        }
+        final sortedFolders = folders.toList()..sort();
+
+        // Apply search and folder filter
+        var filteredSessions = sessions.toList();
+        if (_searchQuery.isNotEmpty) {
+          filteredSessions = filteredSessions
+              .where((s) => s.title.toLowerCase().contains(_searchQuery))
+              .toList();
+        }
+        if (_selectedFolder != null) {
+          if (_selectedFolder == '__none__') {
+            filteredSessions = filteredSessions.where((s) => s.folder == null || s.folder!.isEmpty).toList();
+          } else {
+            filteredSessions = filteredSessions.where((s) => s.folder == _selectedFolder).toList();
+          }
+        }
+
+        // Group by folder
+        final grouped = <String?, List<SessionSummary>>{};
+        for (final s in filteredSessions) {
+          final key = (s.folder != null && s.folder!.isNotEmpty) ? s.folder : null;
+          grouped.putIfAbsent(key, () => []).add(s);
+        }
+
+        // Build ordered keys: null (ungrouped) first, then sorted folder names
+        final groupKeys = <String?>[];
+        if (grouped.containsKey(null)) groupKeys.add(null);
+        for (final f in sortedFolders) {
+          if (grouped.containsKey(f)) groupKeys.add(f);
+        }
 
         return Column(
           children: [
@@ -109,6 +142,42 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                     setState(() => _searchQuery = v.toLowerCase()),
               ),
             ),
+            if (sortedFolders.isNotEmpty)
+              SizedBox(
+                height: 40,
+                child: ListView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: FilterChip(
+                        label: Text(AppStrings.allConversations),
+                        selected: _selectedFolder == null,
+                        onSelected: (_) => setState(() => _selectedFolder = null),
+                      ),
+                    ),
+                    ...sortedFolders.map((f) => Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: FilterChip(
+                        label: Text(f),
+                        selected: _selectedFolder == f,
+                        onSelected: (_) => setState(() =>
+                          _selectedFolder = _selectedFolder == f ? null : f),
+                      ),
+                    )),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: FilterChip(
+                        label: Text(AppStrings.noFolder),
+                        selected: _selectedFolder == '__none__',
+                        onSelected: (_) => setState(() =>
+                          _selectedFolder = _selectedFolder == '__none__' ? null : '__none__'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             Expanded(
               child: filteredSessions.isEmpty
                   ? Center(
@@ -116,10 +185,46 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                           style: theme.textTheme.bodyLarge?.copyWith(
                               color: theme.colorScheme.onSurfaceVariant)),
                     )
-                  : ListView.builder(
-                      itemCount: filteredSessions.length,
+                  : Builder(builder: (context) {
+                      final items = _buildListItems(groupKeys, grouped);
+                      return ListView.builder(
+                      itemCount: items.length,
                       itemBuilder: (context, index) {
-                        final session = filteredSessions[index];
+                        final item = items[index];
+                        if (item is _FolderHeaderItem) {
+                          final isCollapsed = _collapsedFolders.contains(item.folderName);
+                          return ListTile(
+                            dense: true,
+                            leading: Icon(
+                              isCollapsed ? Icons.folder : Icons.folder_open,
+                              color: theme.colorScheme.primary,
+                              size: 20,
+                            ),
+                            title: Text(
+                              item.folderName,
+                              style: TextStyle(
+                                fontWeight: FontWeight.w600,
+                                color: theme.colorScheme.primary,
+                                fontSize: 13,
+                              ),
+                            ),
+                            trailing: Icon(
+                              isCollapsed ? Icons.expand_more : Icons.expand_less,
+                              size: 20,
+                            ),
+                            onTap: () {
+                              setState(() {
+                                if (isCollapsed) {
+                                  _collapsedFolders.remove(item.folderName);
+                                } else {
+                                  _collapsedFolders.add(item.folderName);
+                                }
+                              });
+                            },
+                          );
+                        }
+                        final sessionItem = item as _SessionItem;
+                        final session = sessionItem.session;
                         final isSelected =
                             session.id == provider.currentSession?.id;
 
@@ -189,7 +294,8 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                           ),
                         );
                       },
-                    ),
+                    );
+                    }),
             ),
           ],
         );
@@ -258,6 +364,25 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     );
   }
 
+  List<Object> _buildListItems(List<String?> groupKeys, Map<String?, List<SessionSummary>> grouped) {
+    final items = <Object>[];
+    for (final key in groupKeys) {
+      if (key != null) {
+        items.add(_FolderHeaderItem(key));
+        if (!_collapsedFolders.contains(key)) {
+          for (final s in grouped[key]!) {
+            items.add(_SessionItem(s));
+          }
+        }
+      } else {
+        for (final s in grouped[key]!) {
+          items.add(_SessionItem(s));
+        }
+      }
+    }
+    return items;
+  }
+
   void _showSessionOptions(BuildContext context, SessionSummary session, ChatProvider provider) {
     showModalBottomSheet(
       context: context,
@@ -274,6 +399,14 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
               },
             ),
             ListTile(
+              leading: const Icon(Icons.folder),
+              title: const Text(AppStrings.moveToFolder),
+              onTap: () {
+                Navigator.pop(ctx);
+                _showMoveToFolderDialog(context, session, provider);
+              },
+            ),
+            ListTile(
               leading: const Icon(Icons.delete),
               title: const Text(AppStrings.deleteChat),
               onTap: () {
@@ -285,6 +418,90 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
         ),
       ),
     );
+  }
+
+  Future<void> _showMoveToFolderDialog(BuildContext context, SessionSummary session, ChatProvider provider) async {
+    // Collect existing folders
+    final folders = <String>{};
+    for (final s in provider.sessions) {
+      if (s.folder != null && s.folder!.isNotEmpty) {
+        folders.add(s.folder!);
+      }
+    }
+    final sortedFolders = folders.toList()..sort();
+
+    final result = await showDialog<String?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.moveToFolder),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.clear),
+              title: const Text(AppStrings.noFolder),
+              onTap: () => Navigator.pop(ctx, '__remove__'),
+            ),
+            ...sortedFolders.map((f) => ListTile(
+              leading: const Icon(Icons.folder),
+              title: Text(f),
+              selected: session.folder == f,
+              onTap: () => Navigator.pop(ctx, f),
+            )),
+            const Divider(),
+            ListTile(
+              leading: const Icon(Icons.create_new_folder),
+              title: const Text(AppStrings.newFolder),
+              onTap: () async {
+                Navigator.pop(ctx, '__new__');
+              },
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.cancel),
+          ),
+        ],
+      ),
+    );
+
+    if (result == null) return;
+
+    if (result == '__remove__') {
+      await provider.moveToFolder(session.id, null);
+    } else if (result == '__new__') {
+      final controller = TextEditingController();
+      final folderName = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text(AppStrings.newFolder),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: AppStrings.folderName,
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+              child: const Text(AppStrings.confirm),
+            ),
+          ],
+        ),
+      );
+      if (folderName != null && folderName.isNotEmpty) {
+        await provider.moveToFolder(session.id, folderName);
+      }
+    } else {
+      await provider.moveToFolder(session.id, result);
+    }
   }
 
   Future<void> _renameSession(BuildContext context, SessionSummary session, ChatProvider provider) async {
@@ -342,4 +559,14 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     if (diff.inDays < 7) return AppStrings.daysAgo(diff.inDays);
     return '${dt.month}/${dt.day}';
   }
+}
+
+class _FolderHeaderItem {
+  final String folderName;
+  _FolderHeaderItem(this.folderName);
+}
+
+class _SessionItem {
+  final SessionSummary session;
+  _SessionItem(this.session);
 }

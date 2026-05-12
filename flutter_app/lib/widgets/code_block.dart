@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../l10n/app_strings.dart';
+import 'artifacts_view.dart';
 
 class CodeBlock extends StatelessWidget {
   final String code;
@@ -85,6 +86,52 @@ class CodeBlock extends StatelessWidget {
     return spans;
   }
 
+  bool get _isPreviewableHtml {
+    if (language.toLowerCase() != 'html') return false;
+    final lower = code.toLowerCase();
+    return lower.contains('<html') ||
+        lower.contains('<!doctype') ||
+        lower.contains('<body');
+  }
+
+  void _showPreview(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.85,
+        minChildSize: 0.4,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (ctx, scrollController) => Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    AppStrings.artifactsPreview,
+                    style: Theme.of(ctx).textTheme.titleMedium,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    onPressed: () => Navigator.pop(ctx),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: ArtifactsView(htmlContent: code),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -96,6 +143,8 @@ class CodeBlock extends StatelessWidget {
 
     final defaultColor = theme.colorScheme.onSurface;
     final highlightedSpans = _highlightCode(displayCode, language, defaultColor);
+
+    final showPreview = _isPreviewableHtml;
 
     return Container(
       width: double.infinity,
@@ -123,33 +172,59 @@ class CodeBlock extends StatelessWidget {
                     Text(language, style: theme.textTheme.labelSmall?.copyWith(
                       color: theme.colorScheme.onSurfaceVariant,
                     )),
-                  SizedBox(
-                    height: 48,
-                    child: InkWell(
-                      onTap: () {
-                        Clipboard.setData(ClipboardData(text: code));
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text(AppStrings.copied),
-                            duration: Duration(seconds: 1),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (showPreview)
+                        SizedBox(
+                          height: 48,
+                          child: InkWell(
+                            onTap: () => _showPreview(context),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 8),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.visibility, size: 14,
+                                      color: theme.colorScheme.primary),
+                                  const SizedBox(width: 4),
+                                  Text(AppStrings.preview, style: theme.textTheme.labelSmall?.copyWith(
+                                    color: theme.colorScheme.primary,
+                                  )),
+                                ],
+                              ),
+                            ),
                           ),
-                        );
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.copy, size: 14,
-                                color: theme.colorScheme.onSurfaceVariant),
-                            const SizedBox(width: 4),
-                            Text(AppStrings.copy, style: theme.textTheme.labelSmall?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant,
-                            )),
-                          ],
+                        ),
+                      SizedBox(
+                        height: 48,
+                        child: InkWell(
+                          onTap: () {
+                            Clipboard.setData(ClipboardData(text: code));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(AppStrings.copied),
+                                duration: Duration(seconds: 1),
+                              ),
+                            );
+                          },
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.copy, size: 14,
+                                    color: theme.colorScheme.onSurfaceVariant),
+                                const SizedBox(width: 4),
+                                Text(AppStrings.copy, style: theme.textTheme.labelSmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                )),
+                              ],
+                            ),
+                          ),
                         ),
                       ),
-                    ),
+                    ],
                   ),
                 ],
               ),

@@ -9,9 +9,10 @@ import '../services/session_storage.dart';
 import '../services/tools/tool_registry.dart';
 import '../services/preferences_service.dart';
 import '../services/skill_service.dart';
+import '../services/memory_service.dart';
 import '../l10n/app_strings.dart';
 
-const int _maxContextChars = 100000; // ~25k tokens
+int _defaultMaxContextChars = 100000;
 
 enum AgentStatus {
   idle,
@@ -83,6 +84,7 @@ class ChatProvider extends ChangeNotifier {
       sessions = await _storage.getSessionsSummary();
       notifyListeners();
       await loadSkills();
+      MemoryService.getMemories();
     } catch (e) {
       debugPrint('ChatProvider init failed: $e');
       // Initialize with empty state rather than silently failing
@@ -162,6 +164,27 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> moveToFolder(String sessionId, String? folder) async {
+    final session = await _storage.getSession(sessionId);
+    if (session == null) return;
+    session.folder = folder;
+    await _storage.saveSession(session);
+    final idx = sessions.indexWhere((s) => s.id == sessionId);
+    if (idx >= 0) {
+      sessions[idx] = SessionSummary(
+        id: session.id,
+        title: session.title,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        folder: folder,
+      );
+    }
+    if (currentSession?.id == sessionId) {
+      currentSession!.folder = folder;
+    }
+    notifyListeners();
+  }
+
   Future<void> sendMessage(String text) async {
     if (text.trim().isEmpty) return;
     // Guard against concurrent sends. In single-threaded Dart, the check-then-set
@@ -198,9 +221,10 @@ class ChatProvider extends ChangeNotifier {
       }
       final llm = _cachedLlm!;
 
-      final basePrompt = _prefs.systemPrompt ?? AppConstants.defaultSystemPrompt;
+      final basePrompt = session.systemPrompt ?? _prefs.systemPrompt ?? AppConstants.defaultSystemPrompt;
       final skillIndex = SkillService.buildSkillIndex(_skills);
-      final fullPrompt = basePrompt + skillIndex;
+      final memoryPrompt = MemoryService.buildMemoryPrompt();
+      final fullPrompt = basePrompt + skillIndex + memoryPrompt;
 
       _agent = AgentService(
         llm: llm,
@@ -241,7 +265,7 @@ class ChatProvider extends ChangeNotifier {
               case AgentToolDone():
                 notifyListeners();
 
-              case AgentComplete():
+              case AgentComplete(:final inputTokens, :final outputTokens):
                 _streamThrottle?.cancel();
                 _streamThrottle = null;
                 streamingText = _streamBuffer.toString();
@@ -249,6 +273,14 @@ class ChatProvider extends ChangeNotifier {
                 agentStatus = AgentStatus.idle;
                 streamingText = '';
                 _applyFinalAgentMessages(session, _agent!.messages);
+                // Store token usage on the last assistant message
+                for (int i = session.messages.length - 1; i >= 0; i--) {
+                  if (session.messages[i].role == 'assistant') {
+                    session.messages[i].inputTokens = inputTokens;
+                    session.messages[i].outputTokens = outputTokens;
+                    break;
+                  }
+                }
                 _storage.saveSession(session).then((_) {
                   if (!_disposed) notifyListeners();
                 });
@@ -305,9 +337,40 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  // Stored alternatives from previous generations, used during regeneration
+  List<String>? _pendingAlternatives;
+
   Future<void> regenerateLastResponse() async {
     if (currentSession == null || _isSending) return;
     final messages = currentSession!.messages;
+
+    // Find the last assistant message to preserve its text as an alternative
+    ChatMessage? lastAssistant;
+    for (int i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role == 'assistant') {
+        lastAssistant = messages[i];
+        break;
+      }
+    }
+
+    // Find the last user message text
+    String? lastUserText;
+    for (int i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role == 'user' && messages[i].textContent.isNotEmpty) {
+        lastUserText = messages[i].textContent;
+        break;
+      }
+    }
+    if (lastUserText == null) return;
+
+    // Save the old assistant text into _pendingAlternatives for reuse after regeneration
+    if (lastAssistant != null) {
+      _pendingAlternatives = List<String>.from(lastAssistant.alternatives ?? []);
+      final currentText = lastAssistant.textContent;
+      if (currentText.isNotEmpty) {
+        _pendingAlternatives!.add(currentText);
+      }
+    }
 
     // Remove messages from the end until we hit the last user message
     while (messages.isNotEmpty && messages.last.role != 'user') {
@@ -315,14 +378,152 @@ class ChatProvider extends ChangeNotifier {
     }
     if (messages.isEmpty) return;
 
-    // Get the last user message text and re-send
-    final lastUserText = messages.last.textContent;
-    messages.removeLast(); // Remove it too, sendMessage will re-add it
+    // Remove the user message too; sendMessage will re-add it
+    messages.removeLast();
 
     await _storage.saveSession(currentSession!);
     notifyListeners();
 
     await sendMessage(lastUserText);
+  }
+
+  void switchAlternative(int messageIndex, int altIndex) {
+    if (currentSession == null) return;
+    final messages = currentSession!.messages;
+    if (messageIndex < 0 || messageIndex >= messages.length) return;
+
+    final msg = messages[messageIndex];
+    if (msg.alternatives == null || msg.alternatives!.isEmpty) return;
+
+    // Build a list of all versions: alternatives (older) + current content (newest)
+    final allTexts = [...msg.alternatives!, msg.textContent];
+    final totalVersions = allTexts.length;
+    if (altIndex < 0 || altIndex >= totalVersions) return;
+
+    // The target text to display
+    final targetText = allTexts[altIndex];
+    final currentText = msg.textContent;
+
+    // Rebuild the alternatives list with the current content placed where the target was
+    final newAlts = List<String>.from(msg.alternatives!);
+    if (altIndex < newAlts.length) {
+      // Swapping with an alternative
+      newAlts[altIndex] = currentText;
+    }
+    // else altIndex == totalVersions-1, meaning "show current" -- no swap needed
+
+    // Replace the message in the session
+    messages[messageIndex] = ChatMessage(
+      role: msg.role,
+      content: [TextContent(targetText)],
+      timestamp: msg.timestamp,
+      inputTokens: msg.inputTokens,
+      outputTokens: msg.outputTokens,
+      alternatives: altIndex == totalVersions - 1 ? msg.alternatives : newAlts,
+      activeAlternative: altIndex == totalVersions - 1 ? -1 : altIndex,
+    );
+
+    _storage.saveSession(currentSession!);
+    notifyListeners();
+  }
+
+  /// Navigate to the previous alternative for a message.
+  void previousAlternative(int messageIndex) {
+    if (currentSession == null) return;
+    final msg = currentSession!.messages[messageIndex];
+    final current = msg.displayIndex; // 1-based
+    if (current > 1) {
+      switchAlternative(messageIndex, current - 2);
+    }
+  }
+
+  /// Navigate to the next alternative for a message.
+  void nextAlternative(int messageIndex) {
+    if (currentSession == null) return;
+    final msg = currentSession!.messages[messageIndex];
+    final current = msg.displayIndex; // 1-based
+    if (current < msg.totalVersions) {
+      switchAlternative(messageIndex, current);
+    }
+  }
+
+  // ── Multi-model compare ──────────────────────────────────────────
+  List<CompareResult>? compareResults;
+  bool _isComparing = false;
+  bool get isComparing => _isComparing;
+
+  Future<void> sendCompare(String text, List<String> models) async {
+    if (_isSending || _isComparing || currentSession == null) return;
+    if (text.trim().isEmpty || models.isEmpty) return;
+
+    _isComparing = true;
+    compareResults = [];
+    notifyListeners();
+
+    await _ensurePrefs();
+    final apiKey = _prefs.apiKey;
+    if (apiKey == null || apiKey.isEmpty) {
+      errorMessage = AppStrings.apiKeyNotConfigured;
+      _isComparing = false;
+      notifyListeners();
+      return;
+    }
+
+    final session = currentSession!;
+    session.messages.add(ChatMessage.user(text));
+    session.autoTitle();
+    await _storage.saveSession(session);
+    notifyListeners();
+
+    final formatStr = session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
+    final format = formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
+
+    for (final model in models) {
+      if (_disposed) break;
+      try {
+        final config = LlmConfig(
+          format: format,
+          apiKey: apiKey,
+          model: model,
+          baseUrl: session.baseUrlOverride ?? _prefs.baseUrl ?? (format == ApiFormat.anthropic
+              ? 'https://api.anthropic.com'
+              : 'https://api.openai.com'),
+          maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
+          thinkingBudget: _prefs.thinkingBudget,
+        );
+        final llm = LlmService(config);
+        try {
+          final basePrompt = session.systemPrompt ?? _prefs.systemPrompt ?? AppConstants.defaultSystemPrompt;
+          final response = await llm.chat(
+            system: basePrompt,
+            messages: _truncateToFit(session.toApiMessages()),
+            tools: [],
+          );
+          final responseText = response.content
+              .where((b) => b.type == 'text')
+              .map((b) => b.text ?? '')
+              .join();
+          compareResults!.add(CompareResult(
+            model: model,
+            text: responseText,
+            tokens: response.outputTokens,
+          ));
+        } finally {
+          llm.dispose();
+        }
+      } catch (e) {
+        compareResults!.add(CompareResult(model: model, text: 'Error: $e'));
+      }
+      notifyListeners();
+    }
+
+    _isComparing = false;
+    notifyListeners();
+  }
+
+  void clearCompareResults() {
+    compareResults = null;
+    notifyListeners();
   }
 
   Future<void> updateSessionModel({
@@ -338,6 +539,13 @@ class ChatProvider extends ChangeNotifier {
     _cachedLlm?.dispose();
     _cachedLlm = null;
     _cachedLlmConfig = null;
+    notifyListeners();
+  }
+
+  Future<void> updateSessionSystemPrompt(String? systemPrompt) async {
+    if (currentSession == null) return;
+    currentSession!.systemPrompt = systemPrompt;
+    await _storage.saveSession(currentSession!);
     notifyListeners();
   }
 
@@ -397,7 +605,9 @@ class ChatProvider extends ChangeNotifier {
     for (final msg in result) {
       totalChars += _charCount(msg);
     }
-    while (result.length > 2 && totalChars > _maxContextChars) {
+    if (!_prefs.autoCompact) return result;
+    final maxChars = _prefs.contextLength;
+    while (result.length > 2 && totalChars > maxChars) {
       final front = result[0];
       // If this is an assistant message with tool_use, also remove the following
       // user message containing the tool_result to keep them paired.
@@ -484,5 +694,32 @@ class ChatProvider extends ChangeNotifier {
         ));
       }
     }
+
+    // If we have pending alternatives from a regeneration, attach them to the last assistant message
+    if (_pendingAlternatives != null && _pendingAlternatives!.isNotEmpty) {
+      for (int i = session.messages.length - 1; i >= 0; i--) {
+        if (session.messages[i].role == 'assistant') {
+          final msg = session.messages[i];
+          session.messages[i] = ChatMessage(
+            role: msg.role,
+            content: msg.content,
+            timestamp: msg.timestamp,
+            inputTokens: msg.inputTokens,
+            outputTokens: msg.outputTokens,
+            alternatives: _pendingAlternatives,
+            activeAlternative: -1,
+          );
+          break;
+        }
+      }
+      _pendingAlternatives = null;
+    }
   }
+}
+
+class CompareResult {
+  final String model;
+  final String text;
+  final int? tokens;
+  CompareResult({required this.model, required this.text, this.tokens});
 }

@@ -7,6 +7,8 @@ class ChatSession {
   String? modelOverride;      // null = use global default
   String? baseUrlOverride;    // null = use global default
   String? apiFormatOverride;  // null = use global default
+  String? systemPrompt;       // null = use global default
+  String? folder;             // null = ungrouped
 
   ChatSession({
     required this.id,
@@ -17,6 +19,8 @@ class ChatSession {
     this.modelOverride,
     this.baseUrlOverride,
     this.apiFormatOverride,
+    this.systemPrompt,
+    this.folder,
   })  : createdAt = createdAt ?? DateTime.now(),
         updatedAt = updatedAt ?? DateTime.now(),
         messages = messages ?? [];
@@ -44,6 +48,8 @@ class ChatSession {
     if (modelOverride != null) 'modelOverride': modelOverride,
     if (baseUrlOverride != null) 'baseUrlOverride': baseUrlOverride,
     if (apiFormatOverride != null) 'apiFormatOverride': apiFormatOverride,
+    if (systemPrompt != null) 'systemPrompt': systemPrompt,
+    if (folder != null) 'folder': folder,
   };
 
   factory ChatSession.fromJson(Map<String, dynamic> json) {
@@ -58,20 +64,83 @@ class ChatSession {
       modelOverride: json['modelOverride'] as String?,
       baseUrlOverride: json['baseUrlOverride'] as String?,
       apiFormatOverride: json['apiFormatOverride'] as String?,
+      systemPrompt: json['systemPrompt'] as String?,
+      folder: json['folder'] as String?,
+    );
+  }
+
+  ChatSession copyWith({
+    String? id,
+    String? title,
+    DateTime? createdAt,
+    DateTime? updatedAt,
+    List<ChatMessage>? messages,
+    String? modelOverride,
+    String? baseUrlOverride,
+    String? apiFormatOverride,
+    String? systemPrompt,
+    String? folder,
+    bool clearFolder = false,
+  }) {
+    return ChatSession(
+      id: id ?? this.id,
+      title: title ?? this.title,
+      createdAt: createdAt ?? this.createdAt,
+      updatedAt: updatedAt ?? this.updatedAt,
+      messages: messages ?? this.messages,
+      modelOverride: modelOverride ?? this.modelOverride,
+      baseUrlOverride: baseUrlOverride ?? this.baseUrlOverride,
+      apiFormatOverride: apiFormatOverride ?? this.apiFormatOverride,
+      systemPrompt: systemPrompt ?? this.systemPrompt,
+      folder: clearFolder ? null : (folder ?? this.folder),
     );
   }
 }
 
 class ChatMessage {
   final String role;
-  final List<MessageContent> content;
+  List<MessageContent> content;
   final DateTime timestamp;
+  int? inputTokens;
+  int? outputTokens;
+  final List<String>? alternatives;  // previous generation texts
+  int activeAlternative;  // -1 = current content, 0+ = index into alternatives
 
   ChatMessage({
     required this.role,
     required this.content,
     DateTime? timestamp,
+    this.inputTokens,
+    this.outputTokens,
+    this.alternatives,
+    this.activeAlternative = -1,
   }) : timestamp = timestamp ?? DateTime.now();
+
+  /// Total number of versions (current + alternatives).
+  int get totalVersions => 1 + (alternatives?.length ?? 0);
+
+  /// Which version is currently showing (1-based for display).
+  /// Current content is the latest (totalVersions), alternatives are 1..N.
+  int get displayIndex {
+    if (activeAlternative == -1) return totalVersions;
+    return activeAlternative + 1;
+  }
+
+  /// Create a copy with current text pushed into alternatives and new content set.
+  ChatMessage withNewAlternative(List<MessageContent> newContent) {
+    final alts = List<String>.from(alternatives ?? []);
+    // Push current text content into alternatives
+    alts.add(textContent);
+    return ChatMessage(
+      role: role,
+      content: newContent,
+      timestamp: DateTime.now(),
+      alternatives: alts,
+      activeAlternative: -1,
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
+    );
+  }
 
   factory ChatMessage.user(String text) {
     return ChatMessage(
@@ -128,6 +197,10 @@ class ChatMessage {
     'role': role,
     'timestamp': timestamp.toIso8601String(),
     'content': content.map((c) => c.toJson()).toList(),
+    if (inputTokens != null) 'inputTokens': inputTokens,
+    if (outputTokens != null) 'outputTokens': outputTokens,
+    if (alternatives != null && alternatives!.isNotEmpty) 'alternatives': alternatives,
+    if (activeAlternative != -1) 'activeAlternative': activeAlternative,
   };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
@@ -153,10 +226,15 @@ class ChatMessage {
           return TextContent(c.toString());
       }
     }).toList();
+    final altsList = json['alternatives'] as List?;
     return ChatMessage(
       role: json['role'] as String,
       content: content.cast<MessageContent>(),
       timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '') ?? DateTime.now(),
+      inputTokens: json['inputTokens'] as int?,
+      outputTokens: json['outputTokens'] as int?,
+      alternatives: altsList?.map((e) => e as String).toList(),
+      activeAlternative: json['activeAlternative'] as int? ?? -1,
     );
   }
 }

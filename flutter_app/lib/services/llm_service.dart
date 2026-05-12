@@ -76,7 +76,14 @@ class LlmConfig {
 class LlmResponse {
   final String stopReason;
   final List<ContentBlock> content;
-  const LlmResponse({required this.stopReason, required this.content});
+  final int? inputTokens;
+  final int? outputTokens;
+  const LlmResponse({
+    required this.stopReason,
+    required this.content,
+    this.inputTokens,
+    this.outputTokens,
+  });
 }
 
 class ContentBlock {
@@ -379,6 +386,8 @@ class LlmService {
     final List<String> _sseDataLines = [];
     bool receivedMessageStop = false;
     bool _isThinkingBlock = false;
+    int? _inputTokens;
+    int? _outputTokens;
 
     await for (final chunk in streamedResponse.stream
         .transform(utf8.decoder)
@@ -405,6 +414,16 @@ class LlmService {
           final type = event['type'] as String?;
 
           switch (type) {
+            case 'message_start':
+              final message = event['message'] as Map<String, dynamic>?;
+              if (message != null) {
+                final usage = message['usage'] as Map<String, dynamic>?;
+                if (usage != null) {
+                  _inputTokens = usage['input_tokens'] as int?;
+                }
+              }
+              break;
+
             case 'content_block_start':
               final block = event['content_block'] as Map<String, dynamic>;
               if (block['type'] == 'thinking') {
@@ -465,6 +484,10 @@ class LlmService {
             case 'message_delta':
               final delta = event['delta'] as Map<String, dynamic>;
               stopReason = delta['stop_reason'] as String? ?? 'end_turn';
+              final usage = event['usage'] as Map<String, dynamic>?;
+              if (usage != null) {
+                _outputTokens = usage['output_tokens'] as int?;
+              }
               break;
 
             case 'message_stop':
@@ -492,7 +515,12 @@ class LlmService {
       collectedBlocks.add(ContentBlock(type: 'text', text: currentText));
     }
 
-    yield StreamDone(LlmResponse(stopReason: stopReason, content: collectedBlocks));
+    yield StreamDone(LlmResponse(
+      stopReason: stopReason,
+      content: collectedBlocks,
+      inputTokens: _inputTokens,
+      outputTokens: _outputTokens,
+    ));
   }
 
   Map<String, dynamic> _buildAnthropicBody(
@@ -612,6 +640,8 @@ class LlmService {
     String stopReason = 'stop';
     final List<String> _sseDataLines = [];
     bool receivedDone = false;
+    int? _inputTokens;
+    int? _outputTokens;
 
     await for (final chunk in streamedResponse.stream
         .transform(utf8.decoder)
@@ -636,6 +666,13 @@ class LlmService {
 
         try {
           final event = jsonDecode(data) as Map<String, dynamic>;
+          // Parse usage from streaming chunk (OpenAI sends it in final chunk)
+          final usage = event['usage'] as Map<String, dynamic>?;
+          if (usage != null) {
+            _inputTokens = usage['prompt_tokens'] as int?;
+            _outputTokens = usage['completion_tokens'] as int?;
+          }
+
           final choices = event['choices'] as List?;
           if (choices == null || choices.isEmpty) continue;
           final choice = choices[0] as Map<String, dynamic>;
@@ -710,7 +747,12 @@ class LlmService {
       _ => stopReason,
     };
 
-    yield StreamDone(LlmResponse(stopReason: mappedStopReason, content: collectedBlocks));
+    yield StreamDone(LlmResponse(
+      stopReason: mappedStopReason,
+      content: collectedBlocks,
+      inputTokens: _inputTokens,
+      outputTokens: _outputTokens,
+    ));
   }
 
   Map<String, dynamic> _buildOpenAIBody(
@@ -730,6 +772,7 @@ class LlmService {
       'max_completion_tokens': config.maxTokens,
       'messages': openaiMessages,
       'stream': stream,
+      if (stream) 'stream_options': {'include_usage': true},
     };
     if (tools.isNotEmpty) {
       body['tools'] = tools.map((t) => t.toOpenAIJson()).toList();
