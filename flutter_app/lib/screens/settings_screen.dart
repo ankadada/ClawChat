@@ -405,7 +405,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         max: 4,
                         divisions: 4,
                         label: _thinkingLabels[_thinkingLevel],
-                        onChanged: (v) => setState(() => _thinkingLevel = v.round()),
+                        onChanged: (v) {
+                          setState(() => _thinkingLevel = v.round());
+                          _prefs.thinkingBudget = _thinkingBudgets[_thinkingLevel];
+                        },
                       ),
                     ],
                   ),
@@ -420,7 +423,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       DropdownMenuItem(value: 100000, child: Text(AppStrings.chars100k)),
                       DropdownMenuItem(value: 200000, child: Text(AppStrings.chars200k)),
                     ],
-                    onChanged: (v) => setState(() => _contextLength = v!),
+                    onChanged: (v) {
+                      setState(() => _contextLength = v!);
+                      _prefs.contextLength = _contextLength;
+                    },
                   ),
                 ),
 
@@ -440,7 +446,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               max: 1.0,
                               divisions: 10,
                               label: _temperature.toStringAsFixed(1),
-                              onChanged: (v) => setState(() => _temperature = v),
+                              onChanged: (v) {
+                                setState(() => _temperature = v);
+                                _prefs.temperature = _temperature;
+                              },
                             ),
                           ),
                           const Text(AppStrings.temperatureHigh, style: TextStyle(fontSize: 12)),
