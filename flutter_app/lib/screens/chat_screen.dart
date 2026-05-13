@@ -428,8 +428,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ),
                 tooltip: _tts.isPlayingMessage(messageId) ? AppStrings.ttsStop : AppStrings.ttsPlay,
                 onPressed: () {
-                  _tts.speak(textContent, messageId).then((_) {
-                    if (mounted) setState(() {});
+                  _tts.speak(textContent, messageId).then((ok) {
+                    if (!mounted) return;
+                    if (!ok && _tts.lastError != null) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text(_tts.lastError!)),
+                      );
+                    }
+                    setState(() {});
                   });
                 },
               ),
