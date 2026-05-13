@@ -15,6 +15,7 @@ import '../widgets/tool_call_card.dart';
 import '../widgets/agent_status_bar.dart';
 import '../widgets/compare_view.dart';
 import '../services/tts_service.dart';
+import '../services/whisper_service.dart';
 import 'settings_screen.dart';
 import 'chat_sessions_screen.dart';
 import '../l10n/app_strings.dart';
@@ -32,7 +33,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final _focusNode = FocusNode();
   final stt.SpeechToText _speech = stt.SpeechToText();
   final TtsService _tts = TtsService();
+  final WhisperService _whisper = WhisperService();
   bool _isListening = false;
+  bool _isWhisperRecording = false;
 
   @override
   void initState() {
@@ -42,11 +45,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _initSpeech() async {
-    await _speech.initialize(
-      onError: (error) {
-        if (mounted) setState(() => _isListening = false);
-      },
-    );
+    try {
+      final available = await _speech.initialize(
+        onError: (error) {
+          if (mounted) setState(() => _isListening = false);
+        },
+      );
+      debugPrint('Speech init: available=$available');
+    } catch (e) {
+      debugPrint('Speech init failed: $e');
+    }
   }
 
   @override
@@ -60,31 +68,86 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _startListening() async {
+    // Request RECORD_AUDIO permission
+    try {
+      const channel = MethodChannel('com.anka.clawbot/native');
+      await channel.invokeMethod('requestAudioPermission');
+    } catch (_) {}
+
     if (!_speech.isAvailable) {
       await _initSpeech();
     }
-    if (!_speech.isAvailable) {
+
+    if (_speech.isAvailable) {
+      setState(() => _isListening = true);
+      try {
+        await _speech.listen(
+          onResult: (result) {
+            if (result.finalResult) {
+              _inputController.text += result.recognizedWords;
+              _inputController.selection = TextSelection.collapsed(
+                offset: _inputController.text.length,
+              );
+            }
+          },
+          localeId: 'zh_CN',
+          listenMode: stt.ListenMode.dictation,
+        );
+      } catch (e) {
+        debugPrint('Speech listen failed: $e');
+        if (mounted) setState(() => _isListening = false);
+      }
+    } else {
+      // Fallback: native recording + Whisper API transcription
+      _startWhisperRecording();
+    }
+  }
+
+  void _startWhisperRecording() async {
+    final prefs = PreferencesService();
+    final model = prefs.whisperModel;
+    if (model == null || model.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text(AppStrings.voiceUnavailable)),
+          const SnackBar(content: Text(AppStrings.whisperModelRequired)),
         );
       }
       return;
     }
+    await _whisper.startRecording();
+    if (_whisper.isRecording && mounted) {
+      setState(() => _isWhisperRecording = true);
+    } else if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.voiceUnavailable)),
+      );
+    }
+  }
 
-    setState(() => _isListening = true);
-    await _speech.listen(
-      onResult: (result) {
-        if (result.finalResult) {
-          _inputController.text += result.recognizedWords;
-          _inputController.selection = TextSelection.collapsed(
-            offset: _inputController.text.length,
-          );
-        }
-      },
-      localeId: 'zh_CN',
-      listenMode: stt.ListenMode.dictation,
-    );
+  void _stopWhisperRecording() async {
+    if (!_isWhisperRecording) return;
+    setState(() => _isWhisperRecording = false);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.transcribing), duration: Duration(seconds: 10)),
+      );
+    }
+
+    final text = await _whisper.stopAndTranscribe();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+    if (text != null && text.isNotEmpty) {
+      _inputController.text += text;
+      _inputController.selection = TextSelection.collapsed(
+        offset: _inputController.text.length,
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.transcribeFailed)),
+      );
+    }
   }
 
   void _stopListening() {
@@ -963,15 +1026,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ),
                 if (!isRunning)
                   GestureDetector(
-                    onLongPressStart: (_) => _startListening(),
+                    onLongPressStart: (_) {
+                      if (!_isWhisperRecording) _startListening();
+                    },
                     onLongPressEnd: (_) => _stopListening(),
                     child: IconButton(
                       icon: Icon(
-                        _isListening ? Icons.mic : Icons.mic_none,
-                        color: _isListening ? Colors.red : null,
+                        (_isListening || _isWhisperRecording) ? Icons.mic : Icons.mic_none,
+                        color: (_isListening || _isWhisperRecording) ? Colors.red : null,
                       ),
                       onPressed: () {
-                        if (_isListening) {
+                        if (_isWhisperRecording) {
+                          _stopWhisperRecording();
+                        } else if (_isListening) {
                           _stopListening();
                         } else {
                           _startListening();

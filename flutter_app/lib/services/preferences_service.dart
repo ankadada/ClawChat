@@ -24,6 +24,7 @@ class PreferencesService {
   static const _keyNotifyOnComplete = 'notify_on_complete';
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
+  static const _keyWhisperModel = 'whisper_model';
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -166,4 +167,13 @@ class PreferencesService {
 
   bool get allowSms => _initialized ? (_prefs.getBool(_keyAllowSms) ?? false) : false;
   set allowSms(bool v) => _prefs.setBool(_keyAllowSms, v);
+
+  String? get whisperModel => _initialized ? _prefs.getString(_keyWhisperModel) : null;
+  set whisperModel(String? v) {
+    if (v != null && v.isNotEmpty) {
+      _prefs.setString(_keyWhisperModel, v);
+    } else {
+      _prefs.remove(_keyWhisperModel);
+    }
+  }
 }

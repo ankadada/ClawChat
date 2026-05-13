@@ -19,6 +19,8 @@ import android.app.Activity
 import android.content.Context
 import android.os.Environment
 import android.util.Log
+import android.media.MediaRecorder
+import android.speech.RecognizerIntent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -31,6 +33,9 @@ class MainActivity : FlutterActivity() {
     private lateinit var phoneIntentManager: PhoneIntentManager
     @Volatile
     private var setupDone = false
+    private var pendingSpeechResult: MethodChannel.Result? = null
+    private var mediaRecorder: MediaRecorder? = null
+    private var recordingPath: String? = null
 
     private fun safeRunOnUiThread(action: () -> Unit) {
         if (isDestroyed || isFinishing) return
@@ -308,6 +313,83 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                "requestAudioPermission" -> {
+                    try {
+                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                            != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            ActivityCompat.requestPermissions(
+                                this,
+                                arrayOf(Manifest.permission.RECORD_AUDIO),
+                                AUDIO_PERMISSION_REQUEST
+                            )
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("AUDIO_ERROR", e.message, null)
+                    }
+                }
+                "startRecording" -> {
+                    try {
+                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                            != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), AUDIO_PERMISSION_REQUEST)
+                            result.error("PERMISSION_DENIED", "Audio permission not granted", null)
+                            return@setMethodCallHandler
+                        }
+                        val path = "${applicationContext.cacheDir.absolutePath}/whisper_recording.m4a"
+                        @Suppress("DEPRECATION")
+                        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            MediaRecorder(this)
+                        } else {
+                            MediaRecorder()
+                        }
+                        recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+                        recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                        recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                        recorder.setAudioSamplingRate(16000)
+                        recorder.setAudioEncodingBitRate(64000)
+                        recorder.setAudioChannels(1)
+                        recorder.setOutputFile(path)
+                        recorder.prepare()
+                        recorder.start()
+                        mediaRecorder = recorder
+                        recordingPath = path
+                        result.success(path)
+                    } catch (e: Exception) {
+                        result.error("RECORD_ERROR", e.message, null)
+                    }
+                }
+                "stopRecording" -> {
+                    try {
+                        mediaRecorder?.stop()
+                        mediaRecorder?.release()
+                        mediaRecorder = null
+                        result.success(recordingPath ?: "")
+                    } catch (e: Exception) {
+                        mediaRecorder?.release()
+                        mediaRecorder = null
+                        result.error("RECORD_ERROR", e.message, null)
+                    }
+                }
+                "startSpeechRecognition" -> {
+                    try {
+                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, call.argument<String>("language") ?: "zh-CN")
+                            putExtra(RecognizerIntent.EXTRA_PROMPT, "请说话...")
+                        }
+                        if (intent.resolveActivity(packageManager) != null) {
+                            pendingSpeechResult = result
+                            startActivityForResult(intent, SPEECH_REQUEST)
+                        } else {
+                            result.error("SPEECH_UNAVAILABLE", "No speech recognition available", null)
+                        }
+                    } catch (e: Exception) {
+                        result.error("SPEECH_ERROR", e.message, null)
+                    }
+                }
                 "bringToForeground" -> {
                     try {
                         val intent = Intent(applicationContext, MainActivity::class.java).apply {
@@ -351,9 +433,25 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == SPEECH_REQUEST) {
+            val pending = pendingSpeechResult
+            pendingSpeechResult = null
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                val results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                pending?.success(results?.firstOrNull() ?: "")
+            } else {
+                pending?.success("")
+            }
+        }
+    }
+
     companion object {
         const val CHANNEL_ID = "clawchat_main"
         const val NOTIFICATION_PERMISSION_REQUEST = 1001
         const val STORAGE_PERMISSION_REQUEST = 1003
+        const val AUDIO_PERMISSION_REQUEST = 1004
+        const val SPEECH_REQUEST = 1005
     }
 }

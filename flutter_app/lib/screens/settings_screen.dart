@@ -26,6 +26,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _apiKeyController = TextEditingController();
   final _baseUrlController = TextEditingController();
   final _modelController = TextEditingController();
+  final _whisperModelController = TextEditingController();
   String _apiFormat = 'anthropic';
   bool _loading = true;
   String _arch = '';
@@ -75,6 +76,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _notifyOnComplete = _prefs.notifyOnComplete;
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
+      _whisperModelController.text = _prefs.whisperModel ?? '';
 
       final budget = _prefs.thinkingBudget;
       _thinkingLevel = _thinkingBudgets.indexOf(budget);
@@ -239,6 +241,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     _prefs.notifyOnComplete = v;
                   },
                 ),
+
+                const Divider(),
+                _sectionHeader(theme, AppStrings.voiceRecognition),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Text(
+                    AppStrings.voiceRecognitionDesc,
+                    style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: TextField(
+                    controller: _whisperModelController,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.whisperModelLabel,
+                      hintText: 'whisper-1',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onChanged: (v) => _prefs.whisperModel = v.trim(),
+                  ),
+                ),
+                const SizedBox(height: 12),
 
                 const Divider(),
                 _sectionHeader(theme, AppStrings.phoneIntegration),
@@ -935,6 +961,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _apiKeyController.dispose();
     _baseUrlController.dispose();
     _modelController.dispose();
+    _whisperModelController.dispose();
     super.dispose();
   }
 }

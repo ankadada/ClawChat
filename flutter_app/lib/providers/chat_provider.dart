@@ -12,7 +12,6 @@ import '../services/skill_service.dart';
 import '../services/memory_service.dart';
 import '../l10n/app_strings.dart';
 
-int _defaultMaxContextChars = 100000;
 
 enum AgentStatus {
   idle,

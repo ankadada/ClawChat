@@ -31,8 +31,8 @@ class _ArtifactsViewState extends State<ArtifactsView> {
     final csp = '<meta http-equiv="Content-Security-Policy" '
         'content="default-src \'none\'; style-src \'unsafe-inline\'; '
         'script-src \'unsafe-inline\'; img-src data:;">';
-    return html.contains('<head')
-        ? html.replaceFirst('<head', '<head>$csp<head')
+    return html.contains(RegExp(r'<head[\s>]'))
+        ? html.replaceFirst(RegExp(r'<head[^>]*>'), '\$0$csp')
         : '<html><head>$csp</head><body>$html</body></html>';
   }
 

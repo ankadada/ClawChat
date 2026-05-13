@@ -216,6 +216,14 @@ class AppStrings {
 
   // ── Voice ──────────────────────────────────────────────────────────
   static const voiceUnavailable = '语音识别不可用';
+  static const transcribing = '正在识别语音...';
+  static const transcribeFailed = '语音识别失败，请重试';
+  static const voiceRecognition = '语音识别';
+  static const voiceRecognitionDesc =
+      '没有系统语音引擎时，通过录音 + API 转写实现语音输入。'
+      '填写代理支持的语音模型名称（如 whisper-1、whisper-large-v3），留空则使用系统语音。';
+  static const whisperModelLabel = '语音识别模型';
+  static const whisperModelRequired = '请在设置 → 语音识别模型中填写模型名称（如 whisper-1）';
 
   // ── Message actions ────────────────────────────────────────────────
   static const quoteReply = '引用回复';
