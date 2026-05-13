@@ -1,4 +1,5 @@
 import '../native_bridge.dart';
+import '../preferences_service.dart';
 import 'tool_registry.dart';
 
 class BashTool extends Tool {
@@ -108,12 +109,16 @@ class BashTool extends Tool {
           'Potentially dangerous commands (rm -rf /, mkfs, dd, fork bombs, etc.) are not allowed.';
     }
 
+    // Inject user-configured environment variables
+    final envVars = PreferencesService().envVars;
+    final envPrefix = envVars.entries
+        .map((e) => 'export ${_shellSafeKey(e.key)}=${_shellQuote(e.value)}')
+        .join('; ');
+
     // Prepend workspace cd for commands that don't explicitly set their own directory
     final workingDir = '/root/workspace';
-    String effectiveCommand = command;
-    if (!command.trimLeft().startsWith('cd ')) {
-      effectiveCommand = 'cd $workingDir 2>/dev/null; $command';
-    }
+    final cdPrefix = command.trimLeft().startsWith('cd ') ? '' : 'cd $workingDir 2>/dev/null; ';
+    final effectiveCommand = '${envPrefix.isNotEmpty ? "$envPrefix; " : ""}$cdPrefix$command';
 
     try {
       final output = await NativeBridge.runInProot(effectiveCommand, timeout: timeout);
@@ -125,5 +130,13 @@ class BashTool extends Tool {
     } catch (e) {
       return 'Error: $e';
     }
+  }
+
+  static String _shellSafeKey(String key) {
+    return key.replaceAll(RegExp(r'[^a-zA-Z0-9_]'), '_');
+  }
+
+  static String _shellQuote(String value) {
+    return "'${value.replaceAll("'", "'\\''")}'";
   }
 }
