@@ -559,7 +559,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           subtitle: Text('••••••'),
                           trailing: IconButton(
                             icon: const Icon(Icons.delete_outline),
-                            onPressed: () => setState(() { _envVars.remove(e.key); }),
+                            onPressed: () {
+                              setState(() { _envVars.remove(e.key); });
+                              _prefs.envVars = _envVars;
+                            },
                           ),
                         )),
                     ],
@@ -801,6 +804,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() {
         _envVars[keyController.text.trim()] = valueController.text;
       });
+      _prefs.envVars = _envVars;
     }
   }
 
