@@ -37,13 +37,19 @@ class TtsService extends ChangeNotifier {
         return;
       }
 
+      bool langSet = false;
       for (final lang in ['zh-CN', 'zh', 'zh_CN', 'en-US']) {
         final result = await _tts.setLanguage(lang);
         debugPrint('TTS setLanguage($lang) = $result');
-        if (result == 1) break;
+        if (result == 1) { langSet = true; break; }
       }
 
-      _systemAvailable = true;
+      _systemAvailable = langSet;
+      if (!_systemAvailable) {
+        debugPrint('TTS: engines exist but no language supported');
+        _initialized = true;
+        return;
+      }
       await _tts.setSpeechRate(0.5);
       await _tts.setVolume(1.0);
       await _tts.setPitch(1.0);

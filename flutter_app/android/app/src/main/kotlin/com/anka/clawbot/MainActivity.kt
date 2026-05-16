@@ -315,6 +315,11 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                "hasAudioPermission" -> {
+                    result.success(
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                    )
+                }
                 "requestAudioPermission" -> {
                     try {
                         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -403,14 +408,22 @@ class MainActivity : FlutterActivity() {
                                 setDataSource(path)
                                 setOnCompletionListener {
                                     safeRunOnUiThread {
-                                        MethodChannel(flutterEngine!!.dartExecutor.binaryMessenger, CHANNEL)
-                                            .invokeMethod("onAudioComplete", null)
+                                        flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
+                                            MethodChannel(messenger, CHANNEL)
+                                                .invokeMethod("onAudioComplete", null)
+                                        }
                                     }
                                     release()
                                     mediaPlayer = null
                                 }
                                 setOnErrorListener { _, what, extra ->
                                     Log.e("ClawChat", "MediaPlayer error: what=$what extra=$extra")
+                                    safeRunOnUiThread {
+                                        flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
+                                            MethodChannel(messenger, CHANNEL)
+                                                .invokeMethod("onAudioComplete", null)
+                                        }
+                                    }
                                     release()
                                     mediaPlayer = null
                                     true

@@ -74,10 +74,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _startListening() async {
-    // Request RECORD_AUDIO permission
+    // Check and request RECORD_AUDIO permission
+    const channel = MethodChannel('com.anka.clawbot/native');
     try {
-      const channel = MethodChannel('com.anka.clawbot/native');
-      await channel.invokeMethod('requestAudioPermission');
+      final hasPermission = await channel.invokeMethod<bool>('hasAudioPermission') ?? false;
+      if (!hasPermission) {
+        await channel.invokeMethod('requestAudioPermission');
+        // Wait for user to respond to permission dialog
+        await Future.delayed(const Duration(milliseconds: 500));
+        final granted = await channel.invokeMethod<bool>('hasAudioPermission') ?? false;
+        if (!granted) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('请授予录音权限后重试')),
+            );
+          }
+          return;
+        }
+      }
     } catch (_) {}
 
     if (!_speech.isAvailable) {
@@ -1041,7 +1055,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     onLongPressStart: (_) {
                       if (!_isWhisperRecording) _startListening();
                     },
-                    onLongPressEnd: (_) => _stopListening(),
+                    onLongPressEnd: (_) {
+                      if (_isWhisperRecording) {
+                        _stopWhisperRecording();
+                      } else {
+                        _stopListening();
+                      }
+                    },
                     child: IconButton(
                       icon: Icon(
                         (_isListening || _isWhisperRecording) ? Icons.mic : Icons.mic_none,
