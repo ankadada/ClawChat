@@ -41,7 +41,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _tts.addListener(_onTtsStateChanged);
     _initSpeech();
+  }
+
+  void _onTtsStateChanged() {
+    if (mounted) setState(() {});
   }
 
   Future<void> _initSpeech() async {
@@ -60,6 +65,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _tts.removeListener(_onTtsStateChanged);
     _speech.cancel();
     _inputController.dispose();
     _scrollController.dispose();
