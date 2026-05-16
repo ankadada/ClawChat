@@ -25,6 +25,7 @@ class PreferencesService {
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
   static const _keyWhisperModel = 'whisper_model';
+  static const _keyTtsModel = 'tts_model';
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -174,6 +175,15 @@ class PreferencesService {
       _prefs.setString(_keyWhisperModel, v);
     } else {
       _prefs.remove(_keyWhisperModel);
+    }
+  }
+
+  String? get ttsModel => _initialized ? _prefs.getString(_keyTtsModel) : null;
+  set ttsModel(String? v) {
+    if (v != null && v.isNotEmpty) {
+      _prefs.setString(_keyTtsModel, v);
+    } else {
+      _prefs.remove(_keyTtsModel);
     }
   }
 }

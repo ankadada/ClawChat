@@ -27,6 +27,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _baseUrlController = TextEditingController();
   final _modelController = TextEditingController();
   final _whisperModelController = TextEditingController();
+  final _ttsModelController = TextEditingController();
   String _apiFormat = 'anthropic';
   bool _loading = true;
   String _arch = '';
@@ -77,6 +78,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
       _whisperModelController.text = _prefs.whisperModel ?? '';
+      _ttsModelController.text = _prefs.ttsModel ?? '';
 
       final budget = _prefs.thinkingBudget;
       _thinkingLevel = _thinkingBudgets.indexOf(budget);
@@ -262,6 +264,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       isDense: true,
                     ),
                     onChanged: (v) => _prefs.whisperModel = v.trim(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: TextField(
+                    controller: _ttsModelController,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.ttsModelLabel,
+                      hintText: 'tts-1',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onChanged: (v) => _prefs.ttsModel = v.trim(),
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -975,6 +991,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _baseUrlController.dispose();
     _modelController.dispose();
     _whisperModelController.dispose();
+    _ttsModelController.dispose();
     super.dispose();
   }
 }

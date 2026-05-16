@@ -19,6 +19,7 @@ import android.app.Activity
 import android.content.Context
 import android.os.Environment
 import android.util.Log
+import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.speech.RecognizerIntent
 import io.flutter.embedding.android.FlutterActivity
@@ -36,6 +37,7 @@ class MainActivity : FlutterActivity() {
     private var pendingSpeechResult: MethodChannel.Result? = null
     private var mediaRecorder: MediaRecorder? = null
     private var recordingPath: String? = null
+    private var mediaPlayer: MediaPlayer? = null
 
     private fun safeRunOnUiThread(action: () -> Unit) {
         if (isDestroyed || isFinishing) return
@@ -388,6 +390,48 @@ class MainActivity : FlutterActivity() {
                         }
                     } catch (e: Exception) {
                         result.error("SPEECH_ERROR", e.message, null)
+                    }
+                }
+                "playAudio" -> {
+                    val path = call.argument<String>("path")
+                    if (path == null) {
+                        result.error("INVALID_ARGS", "path required", null)
+                    } else {
+                        try {
+                            mediaPlayer?.release()
+                            mediaPlayer = MediaPlayer().apply {
+                                setDataSource(path)
+                                setOnCompletionListener {
+                                    safeRunOnUiThread {
+                                        MethodChannel(flutterEngine!!.dartExecutor.binaryMessenger, CHANNEL)
+                                            .invokeMethod("onAudioComplete", null)
+                                    }
+                                    release()
+                                    mediaPlayer = null
+                                }
+                                setOnErrorListener { _, what, extra ->
+                                    Log.e("ClawChat", "MediaPlayer error: what=$what extra=$extra")
+                                    release()
+                                    mediaPlayer = null
+                                    true
+                                }
+                                prepare()
+                                start()
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("PLAY_ERROR", e.message, null)
+                        }
+                    }
+                }
+                "stopAudio" -> {
+                    try {
+                        mediaPlayer?.stop()
+                        mediaPlayer?.release()
+                        mediaPlayer = null
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("STOP_ERROR", e.message, null)
                     }
                 }
                 "bringToForeground" -> {
