@@ -45,8 +45,8 @@ class LlmConfig {
           temperature == other.temperature;
 
   @override
-  int get hashCode =>
-      Object.hash(format, apiKey, model, baseUrl, maxTokens, thinkingBudget, temperature);
+  int get hashCode => Object.hash(
+      format, apiKey, model, baseUrl, maxTokens, thinkingBudget, temperature);
 
   factory LlmConfig.anthropic({
     required String apiKey,
@@ -137,19 +137,19 @@ class ToolDefinition {
   });
 
   Map<String, dynamic> toAnthropicJson() => {
-    'name': name,
-    'description': description,
-    'input_schema': inputSchema,
-  };
+        'name': name,
+        'description': description,
+        'input_schema': inputSchema,
+      };
 
   Map<String, dynamic> toOpenAIJson() => {
-    'type': 'function',
-    'function': {
-      'name': name,
-      'description': description,
-      'parameters': inputSchema,
-    },
-  };
+        'type': 'function',
+        'function': {
+          'name': name,
+          'description': description,
+          'parameters': inputSchema,
+        },
+      };
 }
 
 sealed class StreamEvent {}
@@ -215,9 +215,10 @@ class LlmService {
 
   /// Validates that [url] uses HTTPS and targets a known AI provider host.
   void _validateApiHost(String url) {
-    final uri = ApiValidator.validateBearerUrl(url, context: 'LLM API endpoint');
+    final uri =
+        ApiValidator.validateBearerUrl(url, context: 'LLM API endpoint');
     // Allow known providers and any user-configured custom baseUrl
-    final configHost = Uri.parse(config.baseUrl).host;
+    final configHost = Uri.tryParse(config.baseUrl)?.host ?? '';
     if (!_allowedApiHosts.contains(uri.host) && uri.host != configHost) {
       throw Exception(
           'Unknown API host: ${uri.host}. Only known AI provider endpoints are allowed.');
@@ -236,10 +237,11 @@ class LlmService {
       final effectiveBaseUrl = (baseUrl != null && baseUrl.isNotEmpty)
           ? baseUrl
           : 'https://api.anthropic.com';
-      final url = _joinBaseUrl(effectiveBaseUrl, '/v1/models');
+      final url = _joinEndpointUrl(effectiveBaseUrl, '/v1/models');
       final client = _createPinnedClient();
       try {
-        final uri = ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
+        final uri =
+            ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
         final response = await client.get(
           uri,
           headers: {
@@ -268,10 +270,11 @@ class LlmService {
     final effectiveBaseUrl = (baseUrl != null && baseUrl.isNotEmpty)
         ? baseUrl
         : 'https://api.openai.com';
-    final url = _joinBaseUrl(effectiveBaseUrl, '/v1/models');
+    final url = _joinEndpointUrl(effectiveBaseUrl, '/v1/models');
     final client = _createPinnedClient();
     try {
-      final uri = ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
+      final uri =
+          ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
       final response = await client.get(
         uri,
         headers: {'Authorization': 'Bearer $apiKey'},
@@ -319,6 +322,44 @@ class LlmService {
     return '${baseUrl.replaceFirst(RegExp(r'/+$'), '')}$path';
   }
 
+  static String _joinEndpointUrl(String baseUrl, String endpointPath) {
+    final trimmedBase = baseUrl.trim();
+    final endpoint =
+        endpointPath.startsWith('/') ? endpointPath : '/$endpointPath';
+    final uri = Uri.tryParse(trimmedBase.replaceFirst(RegExp(r'/+$'), ''));
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+      return _joinBaseUrl(trimmedBase, endpoint);
+    }
+
+    final basePath = uri.path.replaceFirst(RegExp(r'/+$'), '');
+    const knownEndpoints = [
+      '/v1/messages',
+      '/v1/chat/completions',
+      '/v1/models',
+    ];
+
+    for (final knownEndpoint in knownEndpoints) {
+      if (basePath == knownEndpoint || basePath.endsWith(knownEndpoint)) {
+        final prefix =
+            basePath.substring(0, basePath.length - knownEndpoint.length);
+        return uri
+            .replace(path: '$prefix$endpoint', query: null, fragment: null)
+            .toString();
+      }
+    }
+
+    if (basePath == '/v1' || basePath.endsWith('/v1')) {
+      final endpointTail = endpoint.startsWith('/v1/')
+          ? endpoint.substring('/v1'.length)
+          : endpoint;
+      return uri
+          .replace(path: '$basePath$endpointTail', query: null, fragment: null)
+          .toString();
+    }
+
+    return _joinBaseUrl(trimmedBase, endpoint);
+  }
+
   /// Closes the underlying HTTP client. Must be called when the service
   /// is no longer needed to avoid connection pool leaks.
   void dispose() => _client.close();
@@ -326,7 +367,8 @@ class LlmService {
   /// Sanitize error response bodies to prevent leaking sensitive data
   /// (e.g. API keys) in exception messages.
   static String _sanitizeErrorBody(String body) {
-    String sanitized = body.length > 500 ? '${body.substring(0, 500)}...' : body;
+    String sanitized =
+        body.length > 500 ? '${body.substring(0, 500)}...' : body;
     // Remove potential API key patterns (sk-..., key-..., api-..., etc.)
     sanitized = sanitized.replaceAll(
       RegExp(r'(sk-|key-|api-)[a-zA-Z0-9_-]{10,}'),
@@ -394,7 +436,7 @@ class LlmService {
     List<Map<String, dynamic>> messages,
     List<ToolDefinition> tools,
   ) async {
-    final url = '${config.baseUrl}/v1/messages';
+    final url = _joinEndpointUrl(config.baseUrl, '/v1/messages');
     _validateApiHost(url);
     return _retryWithBackoff(() async {
       final body = _buildAnthropicBody(system, messages, tools, stream: false);
@@ -404,7 +446,8 @@ class LlmService {
         body: jsonEncode(body),
       );
       if (response.statusCode != 200) {
-        throw Exception('Anthropic API error (${response.statusCode}): ${_sanitizeErrorBody(response.body)}');
+        throw Exception(
+            'Anthropic API error (${response.statusCode}): ${_sanitizeErrorBody(response.body)}');
       }
       return _parseAnthropicResponse(jsonDecode(response.body));
     });
@@ -415,7 +458,7 @@ class LlmService {
     List<Map<String, dynamic>> messages,
     List<ToolDefinition> tools,
   ) async* {
-    final url = '${config.baseUrl}/v1/messages';
+    final url = _joinEndpointUrl(config.baseUrl, '/v1/messages');
     _validateApiHost(url);
     final body = _buildAnthropicBody(system, messages, tools, stream: true);
 
@@ -428,7 +471,8 @@ class LlmService {
         final response = await _client.send(request);
         if (response.statusCode != 200) {
           final errorBody = await response.stream.bytesToString();
-          throw Exception('Anthropic API error (${response.statusCode}): ${_sanitizeErrorBody(errorBody)}');
+          throw Exception(
+              'Anthropic API error (${response.statusCode}): ${_sanitizeErrorBody(errorBody)}');
         }
         return response;
       });
@@ -448,6 +492,113 @@ class LlmService {
     bool _isThinkingBlock = false;
     int? _inputTokens;
     int? _outputTokens;
+    bool streamFailed = false;
+
+    void finishCurrentAnthropicBlock() {
+      if (_isThinkingBlock) {
+        _isThinkingBlock = false;
+        return;
+      }
+      if (currentToolName.isNotEmpty && currentToolId.isNotEmpty) {
+        Map<String, dynamic> input = {};
+        try {
+          final inputStr = currentToolInput.toString();
+          if (inputStr.isNotEmpty) input = jsonDecode(inputStr);
+        } catch (_) {
+          // Malformed tool input JSON - proceed with empty input
+        }
+        collectedBlocks.add(ContentBlock(
+          type: 'tool_use',
+          toolUseId: currentToolId,
+          toolName: currentToolName,
+          toolInput: input,
+        ));
+        currentToolId = '';
+        currentToolName = '';
+        currentToolInput = StringBuffer();
+      } else if (currentText.isNotEmpty) {
+        collectedBlocks.add(ContentBlock(type: 'text', text: currentText));
+        currentText = '';
+      }
+    }
+
+    Iterable<StreamEvent> parseAnthropicSseData(String data) sync* {
+      if (data == '[DONE]') {
+        receivedMessageStop = true;
+        return;
+      }
+
+      try {
+        final event = jsonDecode(data) as Map<String, dynamic>;
+        final type = event['type'] as String?;
+
+        switch (type) {
+          case 'message_start':
+            final message = event['message'] as Map<String, dynamic>?;
+            if (message != null) {
+              final usage = message['usage'] as Map<String, dynamic>?;
+              if (usage != null) {
+                _inputTokens = usage['input_tokens'] as int?;
+              }
+            }
+            break;
+
+          case 'content_block_start':
+            final block = event['content_block'] as Map<String, dynamic>;
+            if (block['type'] == 'thinking') {
+              _isThinkingBlock = true;
+            } else if (block['type'] == 'tool_use') {
+              _isThinkingBlock = false;
+              currentToolId = block['id'] as String;
+              currentToolName = block['name'] as String;
+              currentToolInput = StringBuffer();
+              yield ToolUseStart(currentToolId, currentToolName);
+            } else {
+              _isThinkingBlock = false;
+            }
+            break;
+
+          case 'content_block_delta':
+            if (_isThinkingBlock) break;
+            final delta = event['delta'] as Map<String, dynamic>;
+            if (delta['type'] == 'text_delta') {
+              final text = delta['text'] as String;
+              currentText += text;
+              yield TextDelta(text);
+            } else if (delta['type'] == 'input_json_delta') {
+              final json = delta['partial_json'] as String;
+              currentToolInput.write(json);
+              yield ToolInputDelta(json);
+            }
+            break;
+
+          case 'content_block_stop':
+            finishCurrentAnthropicBlock();
+            break;
+
+          case 'message_delta':
+            final delta = event['delta'] as Map<String, dynamic>;
+            stopReason = delta['stop_reason'] as String? ?? 'end_turn';
+            final usage = event['usage'] as Map<String, dynamic>?;
+            if (usage != null) {
+              _outputTokens = usage['output_tokens'] as int?;
+            }
+            break;
+
+          case 'message_stop':
+            receivedMessageStop = true;
+            break;
+
+          case 'error':
+            final error = event['error'] as Map<String, dynamic>;
+            streamFailed = true;
+            yield StreamError(error['message'] as String? ?? 'Unknown error');
+            return;
+        }
+      } catch (_) {
+        // Malformed SSE event JSON - skip and continue to next event
+      }
+    }
 
     await for (final chunk in streamedResponse.stream
         .transform(utf8.decoder)
@@ -461,7 +612,9 @@ class LlmService {
         continue;
       }
       // event:, id:, retry: are part of the SSE spec — ignore them silently
-      if (chunk.startsWith('event:') || chunk.startsWith('id:') || chunk.startsWith('retry:')) {
+      if (chunk.startsWith('event:') ||
+          chunk.startsWith('id:') ||
+          chunk.startsWith('retry:')) {
         continue;
       }
       // Flush buffer on empty line (normal SSE delimiter) OR when stream ends
@@ -469,112 +622,27 @@ class LlmService {
       if (chunk.trim().isEmpty && _sseDataLines.isNotEmpty) {
         final data = _sseDataLines.join('\n').trim();
         _sseDataLines.clear();
-        if (data == '[DONE]') break;
-
-        try {
-          final event = jsonDecode(data) as Map<String, dynamic>;
-          final type = event['type'] as String?;
-
-          switch (type) {
-            case 'message_start':
-              final message = event['message'] as Map<String, dynamic>?;
-              if (message != null) {
-                final usage = message['usage'] as Map<String, dynamic>?;
-                if (usage != null) {
-                  _inputTokens = usage['input_tokens'] as int?;
-                }
-              }
-              break;
-
-            case 'content_block_start':
-              final block = event['content_block'] as Map<String, dynamic>;
-              if (block['type'] == 'thinking') {
-                _isThinkingBlock = true;
-              } else if (block['type'] == 'tool_use') {
-                _isThinkingBlock = false;
-                currentToolId = block['id'] as String;
-                currentToolName = block['name'] as String;
-                currentToolInput = StringBuffer();
-                yield ToolUseStart(currentToolId, currentToolName);
-              } else {
-                _isThinkingBlock = false;
-              }
-              break;
-
-            case 'content_block_delta':
-              if (_isThinkingBlock) break;
-              final delta = event['delta'] as Map<String, dynamic>;
-              if (delta['type'] == 'text_delta') {
-                final text = delta['text'] as String;
-                currentText += text;
-                yield TextDelta(text);
-              } else if (delta['type'] == 'input_json_delta') {
-                final json = delta['partial_json'] as String;
-                currentToolInput.write(json);
-                yield ToolInputDelta(json);
-              }
-              break;
-
-            case 'content_block_stop':
-              if (_isThinkingBlock) {
-                _isThinkingBlock = false;
-                break;
-              }
-              if (currentToolName.isNotEmpty && currentToolId.isNotEmpty) {
-                Map<String, dynamic> input = {};
-                try {
-                  final inputStr = currentToolInput.toString();
-                  if (inputStr.isNotEmpty) input = jsonDecode(inputStr);
-                } catch (_) {
-                  // Malformed tool input JSON — proceed with empty input
-                }
-                collectedBlocks.add(ContentBlock(
-                  type: 'tool_use',
-                  toolUseId: currentToolId,
-                  toolName: currentToolName,
-                  toolInput: input,
-                ));
-                currentToolId = '';
-                currentToolName = '';
-                currentToolInput = StringBuffer();
-              } else if (currentText.isNotEmpty) {
-                collectedBlocks.add(ContentBlock(type: 'text', text: currentText));
-                currentText = '';
-              }
-              break;
-
-            case 'message_delta':
-              final delta = event['delta'] as Map<String, dynamic>;
-              stopReason = delta['stop_reason'] as String? ?? 'end_turn';
-              final usage = event['usage'] as Map<String, dynamic>?;
-              if (usage != null) {
-                _outputTokens = usage['output_tokens'] as int?;
-              }
-              break;
-
-            case 'message_stop':
-              receivedMessageStop = true;
-              break;
-
-            case 'error':
-              final error = event['error'] as Map<String, dynamic>;
-              yield StreamError(error['message'] as String? ?? 'Unknown error');
-              return;
-          }
-        } catch (e) {
-          // Malformed SSE event JSON — skip and continue to next event
-          continue;
+        for (final event in parseAnthropicSseData(data)) {
+          yield event;
         }
+        if (streamFailed) return;
       }
     }
 
-    if (!receivedMessageStop) {
-      yield StreamError('Anthropic stream ended without message_stop event');
-      return;
+    if (_sseDataLines.isNotEmpty) {
+      final data = _sseDataLines.join('\n').trim();
+      _sseDataLines.clear();
+      for (final event in parseAnthropicSseData(data)) {
+        yield event;
+      }
+      if (streamFailed) return;
     }
 
-    if (currentText.isNotEmpty) {
-      collectedBlocks.add(ContentBlock(type: 'text', text: currentText));
+    finishCurrentAnthropicBlock();
+
+    if (!receivedMessageStop && collectedBlocks.isEmpty) {
+      yield StreamError('Anthropic stream ended without message_stop event');
+      return;
     }
 
     yield StreamDone(LlmResponse(
@@ -592,13 +660,13 @@ class LlmService {
     required bool stream,
   }) {
     final body = <String, dynamic>{
-      'model': config.model,
+      'model': modelIdFromDisplay(config.model),
       'max_tokens': config.maxTokens,
       'system': system,
       'messages': messages,
       'stream': stream,
     };
-    if (config.temperature != null) {
+    if (config.temperature != null && !_isReasoningModel(config.model)) {
       body['temperature'] = config.temperature;
     }
     if (tools.isNotEmpty) {
@@ -656,7 +724,7 @@ class LlmService {
     List<Map<String, dynamic>> messages,
     List<ToolDefinition> tools,
   ) async {
-    final url = '${config.baseUrl}/v1/chat/completions';
+    final url = _joinEndpointUrl(config.baseUrl, '/v1/chat/completions');
     _validateApiHost(url);
     return _retryWithBackoff(() async {
       final body = _buildOpenAIBody(system, messages, tools, stream: false);
@@ -666,7 +734,8 @@ class LlmService {
         body: jsonEncode(body),
       );
       if (response.statusCode != 200) {
-        throw Exception('OpenAI API error (${response.statusCode}): ${_sanitizeErrorBody(response.body)}');
+        throw Exception(
+            'OpenAI API error (${response.statusCode}): ${_sanitizeErrorBody(response.body)}');
       }
       return _parseOpenAIResponse(jsonDecode(response.body));
     });
@@ -677,7 +746,7 @@ class LlmService {
     List<Map<String, dynamic>> messages,
     List<ToolDefinition> tools,
   ) async* {
-    final url = '${config.baseUrl}/v1/chat/completions';
+    final url = _joinEndpointUrl(config.baseUrl, '/v1/chat/completions');
     _validateApiHost(url);
     final body = _buildOpenAIBody(system, messages, tools, stream: true);
 
@@ -690,7 +759,8 @@ class LlmService {
         final response = await _client.send(request);
         if (response.statusCode != 200) {
           final errorBody = await response.stream.bytesToString();
-          throw Exception('OpenAI API error (${response.statusCode}): ${_sanitizeErrorBody(errorBody)}');
+          throw Exception(
+              'OpenAI API error (${response.statusCode}): ${_sanitizeErrorBody(errorBody)}');
         }
         return response;
       });
@@ -708,6 +778,69 @@ class LlmService {
     int? _inputTokens;
     int? _outputTokens;
 
+    Iterable<StreamEvent> parseOpenAiSseData(String data) sync* {
+      if (data == '[DONE]') {
+        receivedDone = true;
+        return;
+      }
+
+      try {
+        final event = jsonDecode(data) as Map<String, dynamic>;
+        // Parse usage from streaming chunk (OpenAI sends it in final chunk)
+        final usage = event['usage'] as Map<String, dynamic>?;
+        if (usage != null) {
+          _inputTokens = usage['prompt_tokens'] as int?;
+          _outputTokens = usage['completion_tokens'] as int?;
+        }
+
+        final choices = event['choices'] as List?;
+        if (choices == null || choices.isEmpty) return;
+        final choice = choices[0] as Map<String, dynamic>;
+        final delta = choice['delta'] as Map<String, dynamic>?;
+        final finishReason = choice['finish_reason'] as String?;
+
+        if (finishReason != null) stopReason = finishReason;
+        if (delta == null) return;
+
+        final content = delta['content'] as String?;
+        if (content != null) {
+          currentText += content;
+          yield TextDelta(content);
+        }
+
+        final toolCalls = delta['tool_calls'] as List?;
+        if (toolCalls != null) {
+          for (final tc in toolCalls) {
+            final index = tc['index'] as int;
+            final entry = toolCallsAccum.putIfAbsent(
+              index,
+              () => {'id': '', 'name': '', 'arguments': '', 'started': ''},
+            );
+            if (tc['id'] != null) entry['id'] = tc['id'];
+            if (tc['function'] != null) {
+              final func = tc['function'] as Map<String, dynamic>;
+              if (func['name'] != null) {
+                entry['name'] = func['name'];
+              }
+              // Only emit ToolUseStart once both id and name are known
+              if (entry['started']!.isEmpty &&
+                  entry['id']!.isNotEmpty &&
+                  entry['name']!.isNotEmpty) {
+                entry['started'] = '1';
+                yield ToolUseStart(entry['id']!, entry['name']!);
+              }
+              if (func['arguments'] != null) {
+                entry['arguments'] = entry['arguments']! + func['arguments'];
+                yield ToolInputDelta(func['arguments']);
+              }
+            }
+          }
+        }
+      } catch (_) {
+        // Malformed SSE event JSON - skip and continue to next event
+      }
+    }
+
     await for (final chunk in streamedResponse.stream
         .transform(utf8.decoder)
         .transform(const LineSplitter())) {
@@ -718,79 +851,27 @@ class LlmService {
         _sseDataLines.add(payload);
         continue;
       }
-      if (chunk.startsWith('event:') || chunk.startsWith('id:') || chunk.startsWith('retry:')) {
+      if (chunk.startsWith('event:') ||
+          chunk.startsWith('id:') ||
+          chunk.startsWith('retry:')) {
         continue;
       }
       if (chunk.trim().isEmpty && _sseDataLines.isNotEmpty) {
         final data = _sseDataLines.join('\n').trim();
         _sseDataLines.clear();
-        if (data == '[DONE]') {
-          receivedDone = true;
-          break;
+        for (final event in parseOpenAiSseData(data)) {
+          yield event;
         }
-
-        try {
-          final event = jsonDecode(data) as Map<String, dynamic>;
-          // Parse usage from streaming chunk (OpenAI sends it in final chunk)
-          final usage = event['usage'] as Map<String, dynamic>?;
-          if (usage != null) {
-            _inputTokens = usage['prompt_tokens'] as int?;
-            _outputTokens = usage['completion_tokens'] as int?;
-          }
-
-          final choices = event['choices'] as List?;
-          if (choices == null || choices.isEmpty) continue;
-          final choice = choices[0] as Map<String, dynamic>;
-          final delta = choice['delta'] as Map<String, dynamic>?;
-          final finishReason = choice['finish_reason'] as String?;
-
-          if (finishReason != null) stopReason = finishReason;
-          if (delta == null) continue;
-
-          final content = delta['content'] as String?;
-          if (content != null) {
-            currentText += content;
-            yield TextDelta(content);
-          }
-
-          final toolCalls = delta['tool_calls'] as List?;
-          if (toolCalls != null) {
-            for (final tc in toolCalls) {
-              final index = tc['index'] as int;
-              final entry = toolCallsAccum.putIfAbsent(
-                index,
-                () => {'id': '', 'name': '', 'arguments': '', 'started': ''},
-              );
-              if (tc['id'] != null) entry['id'] = tc['id'];
-              if (tc['function'] != null) {
-                final func = tc['function'] as Map<String, dynamic>;
-                if (func['name'] != null) {
-                  entry['name'] = func['name'];
-                }
-                // Only emit ToolUseStart once both id and name are known
-                if (entry['started']!.isEmpty &&
-                    entry['id']!.isNotEmpty &&
-                    entry['name']!.isNotEmpty) {
-                  entry['started'] = '1';
-                  yield ToolUseStart(entry['id']!, entry['name']!);
-                }
-                if (func['arguments'] != null) {
-                  entry['arguments'] = entry['arguments']! + func['arguments'];
-                  yield ToolInputDelta(func['arguments']);
-                }
-              }
-            }
-          }
-        } catch (e) {
-          // Malformed SSE event JSON — skip and continue to next event
-          continue;
-        }
+        if (receivedDone) break;
       }
     }
 
-    if (!receivedDone) {
-      yield StreamError('OpenAI stream ended without [DONE] marker');
-      return;
+    if (_sseDataLines.isNotEmpty) {
+      final data = _sseDataLines.join('\n').trim();
+      _sseDataLines.clear();
+      for (final event in parseOpenAiSseData(data)) {
+        yield event;
+      }
     }
 
     if (currentText.isNotEmpty) {
@@ -799,6 +880,7 @@ class LlmService {
 
     for (final entry in toolCallsAccum.entries) {
       final tc = entry.value;
+      if (tc['id']!.isEmpty || tc['name']!.isEmpty) continue;
       Map<String, dynamic> args = {};
       try {
         if (tc['arguments']!.isNotEmpty) args = jsonDecode(tc['arguments']!);
@@ -811,6 +893,11 @@ class LlmService {
         toolName: tc['name'],
         toolInput: args,
       ));
+    }
+
+    if (!receivedDone && collectedBlocks.isEmpty) {
+      yield StreamError('OpenAI stream ended without [DONE] marker');
+      return;
     }
 
     final mappedStopReason = switch (stopReason) {
@@ -843,17 +930,18 @@ class LlmService {
     final provider = _detectOpenAICompatibleProvider();
     final thinkingEnabled = config.thinkingBudget > 0 &&
         provider == _OpenAICompatibleProvider.anthropicCompatible;
+    final tokenLimitKey = _openAITokenLimitKey(provider);
     final body = <String, dynamic>{
-      'model': config.model,
+      'model': modelIdFromDisplay(config.model),
       if (thinkingEnabled)
         'max_completion_tokens': config.thinkingBudget + config.maxTokens
       else
-        'max_tokens': config.maxTokens,
+        tokenLimitKey: config.maxTokens,
       'messages': openaiMessages,
       'stream': stream,
       if (stream) 'stream_options': {'include_usage': true},
     };
-    if (config.temperature != null) {
+    if (config.temperature != null && !_isReasoningModel(config.model)) {
       body['temperature'] = config.temperature;
     }
     if (tools.isNotEmpty) {
@@ -866,6 +954,24 @@ class LlmService {
       };
     }
     return body;
+  }
+
+  static bool _isReasoningModel(String model) {
+    final m = model.toLowerCase();
+    return m.startsWith('o1') ||
+        m.startsWith('o3') ||
+        m.startsWith('o4') ||
+        m.contains('gpt-5') ||
+        m.contains('reasoning');
+  }
+
+  String _openAITokenLimitKey(_OpenAICompatibleProvider provider) {
+    return switch (provider) {
+      // Restore the pre-regression OpenAI parameter for native OpenAI models,
+      // including reasoning/new-generation models that reject max_tokens.
+      _OpenAICompatibleProvider.openaiNative => 'max_completion_tokens',
+      _ => 'max_tokens',
+    };
   }
 
   _OpenAICompatibleProvider _detectOpenAICompatibleProvider() {
@@ -883,12 +989,18 @@ class LlmService {
     final role = msg['role'] as String;
     final content = msg['content'];
 
-    if (content is String) return [{'role': role, 'content': content}];
+    if (content is String) {
+      return [
+        {'role': role, 'content': content}
+      ];
+    }
 
     if (content is List) {
       final firstItem = content.isNotEmpty ? content[0] : null;
       if (firstItem is Map && firstItem['type'] == 'tool_result') {
-        return content.where((item) => item is Map && item['type'] == 'tool_result').map<Map<String, dynamic>>((item) {
+        return content
+            .where((item) => item is Map && item['type'] == 'tool_result')
+            .map<Map<String, dynamic>>((item) {
           return {
             'role': 'tool',
             'tool_call_id': item['tool_use_id'],
@@ -943,10 +1055,13 @@ class LlmService {
       return [result];
     }
 
-    return [{'role': role, 'content': content.toString()}];
+    return [
+      {'role': role, 'content': content.toString()}
+    ];
   }
 
-  Map<String, dynamic>? _convertImageBlockToOpenAI(Map<dynamic, dynamic> block) {
+  Map<String, dynamic>? _convertImageBlockToOpenAI(
+      Map<dynamic, dynamic> block) {
     final imageUrl = block['image_url'];
     if (imageUrl is Map && imageUrl['url'] is String) {
       return {
@@ -957,7 +1072,9 @@ class LlmService {
 
     final source = block['source'];
     final sourceMap = source is Map ? source : const <String, dynamic>{};
-    final mediaType = (sourceMap['media_type'] ?? block['media_type'] ?? 'image/png') as String;
+    final mediaType = (sourceMap['media_type'] ??
+        block['media_type'] ??
+        'image/png') as String;
     final data = (sourceMap['data'] ?? block['data']) as String?;
     if (data == null || data.isEmpty) return null;
 
@@ -970,10 +1087,10 @@ class LlmService {
   }
 
   Map<String, String> _openaiHeaders() => {
-    'Content-Type': 'application/json',
-    'Authorization': 'Bearer ${config.apiKey}',
-    'Accept-Encoding': 'identity',
-  };
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ${config.apiKey}',
+        'Accept-Encoding': 'identity',
+      };
 
   LlmResponse _parseOpenAIResponse(Map<String, dynamic> json) {
     final choice = (json['choices'] as List)[0] as Map<String, dynamic>;

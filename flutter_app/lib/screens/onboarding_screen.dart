@@ -64,7 +64,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         _fetchingModels = false;
         _manualModelInput = models.isEmpty;
         if (models.isNotEmpty && _modelController.text.isEmpty) {
-          _modelController.text = models.first;
+          _modelController.text = LlmService.modelIdFromDisplay(models.first);
         }
       });
     } catch (_) {
@@ -86,9 +86,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       body: Stepper(
         currentStep: _currentStep,
         onStepContinue: _onStepContinue,
-        onStepCancel: _currentStep > 0
-            ? () => setState(() => _currentStep--)
-            : null,
+        onStepCancel:
+            _currentStep > 0 ? () => setState(() => _currentStep--) : null,
         steps: [
           Step(
             title: const Text(AppStrings.selectApiFormat),
@@ -128,7 +127,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   obscureText: true,
                   decoration: InputDecoration(
                     labelText: 'API Key',
-                    hintText: _apiFormat == 'anthropic' ? 'sk-ant-...' : 'sk-...',
+                    hintText:
+                        _apiFormat == 'anthropic' ? 'sk-ant-...' : 'sk-...',
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -146,23 +146,30 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   children: [
                     Expanded(
                       child: _fetchingModels
-                          ? const Center(child: Padding(
+                          ? const Center(
+                              child: Padding(
                               padding: EdgeInsets.all(16),
                               child: CircularProgressIndicator(),
                             ))
                           : (_availableModels.isNotEmpty && !_manualModelInput)
                               ? DropdownButtonFormField<String>(
-                                  value: _availableModels.contains(_modelController.text)
+                                  value: _availableModels.any((model) =>
+                                          LlmService.modelIdFromDisplay(
+                                              model) ==
+                                          _modelController.text)
                                       ? _modelController.text
                                       : null,
                                   decoration: const InputDecoration(
                                     labelText: AppStrings.selectModel,
                                   ),
                                   items: [
-                                    ..._availableModels.map((m) => DropdownMenuItem(
-                                      value: m,
-                                      child: Text(m, overflow: TextOverflow.ellipsis),
-                                    )),
+                                    ..._availableModels.map((m) =>
+                                        DropdownMenuItem(
+                                          value:
+                                              LlmService.modelIdFromDisplay(m),
+                                          child: Text(m,
+                                              overflow: TextOverflow.ellipsis),
+                                        )),
                                     const DropdownMenuItem(
                                       value: '__manual__',
                                       child: Text(AppStrings.manualInput),
@@ -227,7 +234,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         ? _baseUrlController.text.trim()
         : null;
     _prefs.model = _modelController.text.trim().isNotEmpty
-        ? _modelController.text.trim()
+        ? LlmService.modelIdFromDisplay(_modelController.text.trim())
         : null;
     _prefs.setupComplete = true;
     _prefs.isFirstRun = false;

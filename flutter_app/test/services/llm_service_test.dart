@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -36,7 +37,8 @@ void main() {
     });
 
     test('redacts key- prefixed tokens', () async {
-      final result = await sanitizedErrorBody('Error with key-abcdefghijklmnop');
+      final result =
+          await sanitizedErrorBody('Error with key-abcdefghijklmnop');
       expect(result, contains('[REDACTED]'));
       expect(result, isNot(contains('key-abcdefghijklmnop')));
     });
@@ -47,7 +49,8 @@ void main() {
       expect(result, isNot(contains('api-1234567890abcdef')));
     });
 
-    test('does not redact short key-like strings (less than 10 chars)', () async {
+    test('does not redact short key-like strings (less than 10 chars)',
+        () async {
       final result = await sanitizedErrorBody('sk-short');
       expect(result, 'sk-short');
     });
@@ -74,7 +77,8 @@ void main() {
     });
 
     test('redacts keys with underscores and dashes', () async {
-      final result = await sanitizedErrorBody('sk-ant_api03-key_with-dashes_123');
+      final result =
+          await sanitizedErrorBody('sk-ant_api03-key_with-dashes_123');
       expect(result, contains('[REDACTED]'));
     });
 
@@ -189,6 +193,142 @@ void main() {
       expect(json['function']['parameters'], isNotNull);
     });
   });
+
+  group('LlmService request body compatibility', () {
+    test('strips Anthropic preset display suffix from request model', () async {
+      final body = await captureAnthropicBody(
+        model: 'claude-sonnet-4-20250514${LlmService.presetModelSuffix}',
+      );
+
+      expect(body['model'], 'claude-sonnet-4-20250514');
+    });
+
+    test('strips OpenAI-compatible preset display suffix from request model',
+        () async {
+      final body = await captureOpenAiBody(
+        model: 'gpt-test${LlmService.presetModelSuffix}',
+      );
+
+      expect(body['model'], 'gpt-test');
+    });
+
+    test('generic OpenAI-compatible requests keep max_tokens parameter',
+        () async {
+      final body = await captureOpenAiBody(model: 'gpt-test');
+
+      expect(body['max_tokens'], 8192);
+      expect(body.containsKey('max_completion_tokens'), isFalse);
+    });
+
+    test('builds valid Anthropic simple text request body', () async {
+      final captured = await captureAnthropicRequest(
+        model: 'claude-sonnet-4-20250514${LlmService.presetModelSuffix}',
+        system: 'You are concise.',
+        messages: const [
+          {'role': 'user', 'content': 'hi'},
+        ],
+        baseUrlForPort: (port) => 'http://127.0.0.1:$port/v1/messages',
+      );
+
+      expect(captured.uri.path, '/v1/messages');
+      expect(captured.body['model'], 'claude-sonnet-4-20250514');
+      expect(captured.body['system'], 'You are concise.');
+      expect(captured.body['messages'], [
+        {'role': 'user', 'content': 'hi'},
+      ]);
+      expect(captured.body['max_tokens'], 8192);
+      expect(jsonDecode(jsonEncode(captured.body)), captured.body);
+    });
+
+    test('builds valid OpenAI-compatible simple text request body', () async {
+      final captured = await captureOpenAiRequest(
+        model: 'gpt-test${LlmService.presetModelSuffix}',
+        system: 'You are concise.',
+        messages: const [
+          {'role': 'user', 'content': 'hi'},
+        ],
+        baseUrlForPort: (port) => 'http://127.0.0.1:$port/v1/chat/completions',
+      );
+
+      expect(captured.uri.path, '/v1/chat/completions');
+      expect(captured.body['model'], 'gpt-test');
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': 'You are concise.'},
+        {'role': 'user', 'content': 'hi'},
+      ]);
+      expect(captured.body['max_tokens'], 8192);
+      expect(captured.body.containsKey('max_completion_tokens'), isFalse);
+      expect(jsonDecode(jsonEncode(captured.body)), captured.body);
+    });
+  });
+
+  group('LlmService streaming compatibility', () {
+    test(
+        'accepts Anthropic stream ending without final delimiter or stop event',
+        () async {
+      final events = await collectAnthropicStreamEvents([
+        sseData({
+          'type': 'message_start',
+          'message': {
+            'usage': {'input_tokens': 1},
+          },
+        }),
+        sseData({
+          'type': 'content_block_start',
+          'content_block': {'type': 'text'},
+        }),
+        sseData({
+          'type': 'content_block_delta',
+          'delta': {'type': 'text_delta', 'text': 'ok'},
+        }),
+        sseData({'type': 'content_block_stop'}),
+        sseData({
+          'type': 'message_delta',
+          'delta': {'stop_reason': 'end_turn'},
+          'usage': {'output_tokens': 1},
+        }, delimiter: false),
+      ]);
+
+      expect(events.whereType<StreamError>().map((e) => e.message), isEmpty);
+      final done = events.whereType<StreamDone>().single;
+      expect(done.response.content.single.text, 'ok');
+      expect(done.response.inputTokens, 1);
+      expect(done.response.outputTokens, 1);
+    });
+
+    test('accepts OpenAI stream ending without final delimiter or done marker',
+        () async {
+      final events = await collectOpenAiStreamEvents([
+        sseData({
+          'choices': [
+            {
+              'delta': {'content': 'ok'},
+              'finish_reason': null,
+            }
+          ],
+        }),
+        sseData({
+          'choices': [
+            {
+              'delta': {},
+              'finish_reason': 'stop',
+            }
+          ],
+          'usage': {
+            'prompt_tokens': 1,
+            'completion_tokens': 1,
+          },
+        }, delimiter: false),
+      ]);
+
+      expect(events.whereType<StreamError>().map((e) => e.message), isEmpty);
+      final done = events.whereType<StreamDone>().single;
+      expect(done.response.content.single.text, 'ok');
+      expect(done.response.stopReason, 'end_turn');
+      expect(done.response.inputTokens, 1);
+      expect(done.response.outputTokens, 1);
+    });
+  });
 }
 
 Future<String> sanitizedErrorBody(String responseBody) async {
@@ -284,4 +424,184 @@ Future<int> requestCountForAlwaysStatus(int statusCode) async {
     await server.close(force: true);
   }
   fail('Expected chat request to fail');
+}
+
+class CapturedLlmRequest {
+  final Uri uri;
+  final Map<String, dynamic> body;
+
+  const CapturedLlmRequest({
+    required this.uri,
+    required this.body,
+  });
+}
+
+Future<Map<String, dynamic>> captureAnthropicBody({
+  required String model,
+}) async =>
+    (await captureAnthropicRequest(model: model)).body;
+
+Future<CapturedLlmRequest> captureAnthropicRequest({
+  required String model,
+  String system = '',
+  List<Map<String, dynamic>> messages = const [],
+  String Function(int port)? baseUrlForPort,
+}) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  final capturedRequest = Completer<CapturedLlmRequest>();
+  server.listen((request) async {
+    final body = await utf8.decoder.bind(request).join();
+    if (!capturedRequest.isCompleted) {
+      capturedRequest.complete(CapturedLlmRequest(
+        uri: request.uri,
+        body: jsonDecode(body) as Map<String, dynamic>,
+      ));
+    }
+    request.response.statusCode = 200;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode({
+      'stop_reason': 'end_turn',
+      'content': [
+        {'type': 'text', 'text': 'ok'}
+      ],
+    }));
+    await request.response.close();
+  });
+
+  final service = LlmService(LlmConfig.anthropic(
+    apiKey: 'sk-test',
+    model: model,
+    baseUrl:
+        baseUrlForPort?.call(server.port) ?? 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    await service.chat(system: system, messages: messages, tools: const []);
+    return await capturedRequest.future;
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
+}
+
+Future<Map<String, dynamic>> captureOpenAiBody({
+  required String model,
+}) async =>
+    (await captureOpenAiRequest(model: model)).body;
+
+Future<CapturedLlmRequest> captureOpenAiRequest({
+  required String model,
+  String system = '',
+  List<Map<String, dynamic>> messages = const [],
+  String Function(int port)? baseUrlForPort,
+}) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  final capturedRequest = Completer<CapturedLlmRequest>();
+  server.listen((request) async {
+    final body = await utf8.decoder.bind(request).join();
+    if (!capturedRequest.isCompleted) {
+      capturedRequest.complete(CapturedLlmRequest(
+        uri: request.uri,
+        body: jsonDecode(body) as Map<String, dynamic>,
+      ));
+    }
+    request.response.statusCode = 200;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode({
+      'choices': [
+        {
+          'message': {'content': 'ok'},
+          'finish_reason': 'stop',
+        }
+      ],
+    }));
+    await request.response.close();
+  });
+
+  final service = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: model,
+    baseUrl:
+        baseUrlForPort?.call(server.port) ?? 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    await service.chat(system: system, messages: messages, tools: const []);
+    return await capturedRequest.future;
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
+}
+
+String sseData(Map<String, dynamic> data, {bool delimiter = true}) {
+  return 'data: ${jsonEncode(data)}${delimiter ? '\n\n' : '\n'}';
+}
+
+Future<List<StreamEvent>> collectAnthropicStreamEvents(
+  List<String> responseChunks,
+) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    await utf8.decoder.bind(request).join();
+    request.response.statusCode = 200;
+    request.response.headers.contentType =
+        ContentType('text', 'event-stream', charset: 'utf-8');
+    for (final chunk in responseChunks) {
+      request.response.write(chunk);
+      await request.response.flush();
+    }
+    await request.response.close();
+  });
+
+  final service = LlmService(LlmConfig.anthropic(
+    apiKey: 'sk-test',
+    model: 'claude-sonnet-4-20250514',
+    baseUrl: 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    return await service.chatStream(
+      system: '',
+      messages: const [
+        {'role': 'user', 'content': 'hi'},
+      ],
+      tools: const [],
+    ).toList();
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
+}
+
+Future<List<StreamEvent>> collectOpenAiStreamEvents(
+  List<String> responseChunks,
+) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    await utf8.decoder.bind(request).join();
+    request.response.statusCode = 200;
+    request.response.headers.contentType =
+        ContentType('text', 'event-stream', charset: 'utf-8');
+    for (final chunk in responseChunks) {
+      request.response.write(chunk);
+      await request.response.flush();
+    }
+    await request.response.close();
+  });
+
+  final service = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: 'gpt-test',
+    baseUrl: 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    return await service.chatStream(
+      system: '',
+      messages: const [
+        {'role': 'user', 'content': 'hi'},
+      ],
+      tools: const [],
+    ).toList();
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
 }

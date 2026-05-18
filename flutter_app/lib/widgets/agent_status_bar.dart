@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../app.dart';
 import '../providers/chat_provider.dart';
@@ -25,6 +26,8 @@ class AgentStatusBar extends StatelessWidget {
           _ => (Icons.hourglass_empty, AppStrings.statusProcessing, theme.colorScheme.primary),
         };
 
+        final isError = provider.agentStatus == AgentStatus.error;
+
         return Container(
           width: double.infinity,
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -35,8 +38,9 @@ class AgentStatusBar extends StatelessWidget {
             ),
           ),
           child: Row(
+            crossAxisAlignment: isError ? CrossAxisAlignment.start : CrossAxisAlignment.center,
             children: [
-              if (provider.agentStatus != AgentStatus.error)
+              if (!isError)
                 SizedBox(
                   width: 14, height: 14,
                   child: CircularProgressIndicator(
@@ -45,16 +49,33 @@ class AgentStatusBar extends StatelessWidget {
                   ),
                 )
               else
-                Icon(icon, size: 14, color: color),
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Icon(icon, size: 14, color: color),
+                ),
               const SizedBox(width: 8),
               Expanded(
-                child: Text(
-                  label,
-                  style: theme.textTheme.bodySmall?.copyWith(color: color),
-                  overflow: TextOverflow.ellipsis,
-                ),
+                child: isError
+                    ? GestureDetector(
+                        onLongPress: () {
+                          Clipboard.setData(ClipboardData(text: label));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('已复制错误信息')),
+                          );
+                        },
+                        child: Text(
+                          label,
+                          style: theme.textTheme.bodySmall?.copyWith(color: color),
+                          maxLines: 10,
+                        ),
+                      )
+                    : Text(
+                        label,
+                        style: theme.textTheme.bodySmall?.copyWith(color: color),
+                        overflow: TextOverflow.ellipsis,
+                      ),
               ),
-              if (provider.agentStatus != AgentStatus.error)
+              if (!isError)
                 TextButton(
                   onPressed: provider.cancelAgent,
                   style: TextButton.styleFrom(
