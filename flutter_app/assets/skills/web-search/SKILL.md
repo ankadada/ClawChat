@@ -1,7 +1,7 @@
 ---
 name: web-search
 description: 网页搜索与信息摘要 — 使用搜索引擎查找信息
-tools: [shell, web_fetch]
+tools: [bash, web_fetch]
 ---
 
 ## Use This Skill When

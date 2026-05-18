@@ -58,6 +58,9 @@ class ClawChatApp extends StatelessWidget {
         builder: (_, mode, __) => ValueListenableBuilder<double>(
           valueListenable: fontScaleNotifier,
           builder: (_, scale, __) => MaterialApp(
+            // ClawChat currently uses AppStrings, a static Chinese-first string
+            // table with English technical labels. Flutter generated i18n is
+            // intentionally deferred until the app targets multiple locales.
             title: 'ClawChat',
             debugShowCheckedModeBanner: false,
             theme: _buildLightTheme(),

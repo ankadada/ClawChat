@@ -7,6 +7,7 @@ import '../services/agent_service.dart';
 import '../services/chat_context_utils.dart';
 import '../services/llm_service.dart';
 import '../services/session_storage.dart';
+import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
 import '../services/preferences_service.dart';
 import '../services/skill_service.dart';
@@ -48,6 +49,9 @@ class ChatProvider extends ChangeNotifier {
   bool _disposed = false;
 
   final Map<String, String> _drafts = {};
+  final Set<String> _sessionApprovedTools = {};
+  ToolApprovalRequest? pendingApproval;
+  Completer<bool>? _approvalCompleter;
 
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
 
@@ -67,6 +71,7 @@ class ChatProvider extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _completePendingApproval(false);
     _streamThrottle?.cancel();
     _agentSubscription?.cancel();
     if (_agentCompleter != null && !_agentCompleter!.isCompleted) {
@@ -115,11 +120,15 @@ class ChatProvider extends ChangeNotifier {
       updatedAt: session.updatedAt,
     ));
     currentSession = session;
+    _sessionApprovedTools.clear();
     notifyListeners();
     return session;
   }
 
   Future<void> selectSession(String id) async {
+    if (currentSession?.id != id) {
+      _sessionApprovedTools.clear();
+    }
     currentSession = await _storage.getSession(id);
     notifyListeners();
   }
@@ -129,6 +138,7 @@ class ChatProvider extends ChangeNotifier {
     sessions.removeWhere((s) => s.id == id);
     if (currentSession?.id == id) {
       currentSession = null;
+      _sessionApprovedTools.clear();
       if (sessions.isNotEmpty) {
         currentSession = await _storage.getSession(sessions.first.id);
       }
@@ -161,7 +171,37 @@ class ChatProvider extends ChangeNotifier {
     await _storage.clearAll();
     sessions.clear();
     currentSession = null;
+    _sessionApprovedTools.clear();
     notifyListeners();
+  }
+
+  Future<bool> _requestToolApproval(ToolApprovalRequest request) async {
+    if (_disposed) return false;
+    if (_sessionApprovedTools.contains(request.toolName)) return true;
+
+    _completePendingApproval(false, notify: false);
+    final completer = Completer<bool>();
+    _approvalCompleter = completer;
+    pendingApproval = request;
+    notifyListeners();
+    return completer.future;
+  }
+
+  void resolveToolApproval(bool approved, {bool rememberForSession = false}) {
+    if (approved && rememberForSession && pendingApproval != null) {
+      _sessionApprovedTools.add(pendingApproval!.toolName);
+    }
+    _completePendingApproval(approved);
+  }
+
+  void _completePendingApproval(bool approved, {bool notify = true}) {
+    pendingApproval = null;
+    final completer = _approvalCompleter;
+    _approvalCompleter = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(approved);
+    }
+    if (notify && !_disposed) notifyListeners();
   }
 
   Future<void> moveToFolder(String sessionId, String? folder) async {
@@ -185,8 +225,12 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> sendMessage(String text) async {
-    if (text.trim().isEmpty) return;
+  Future<void> sendMessage(
+    String text, {
+    List<MessageContent> attachments = const [],
+  }) async {
+    final trimmedText = text.trim();
+    if (trimmedText.isEmpty && attachments.isEmpty) return;
     // Guard against concurrent sends. In single-threaded Dart, the check-then-set
     // is safe because no other code can run between the check and the assignment
     // (no preemption between await points). The real protection is that _isSending
@@ -208,7 +252,10 @@ class ChatProvider extends ChangeNotifier {
       if (currentSession == null) await createSession();
 
       final session = currentSession!;
-      session.messages.add(ChatMessage.user(text));
+      session.messages.add(ChatMessage.userContent([
+        if (trimmedText.isNotEmpty) TextContent(trimmedText),
+        ...attachments,
+      ]));
       session.autoTitle();
       await _storage.saveSession(session);
       notifyListeners();
@@ -234,6 +281,7 @@ class ChatProvider extends ChangeNotifier {
         llm: llm,
         tools: _tools,
         systemPrompt: fullPrompt,
+        toolPolicy: ToolPolicy(onApprovalRequired: _requestToolApproval),
       );
 
       agentStatus = AgentStatus.thinking;
@@ -331,6 +379,7 @@ class ChatProvider extends ChangeNotifier {
 
   void cancelAgent() {
     _agent?.cancel();
+    _completePendingApproval(false);
     _agentSubscription?.cancel();
     _agentSubscription = null;
     _streamThrottle?.cancel();
@@ -612,6 +661,14 @@ class ChatProvider extends ChangeNotifier {
             switch (item['type']) {
               case 'text':
                 return TextContent(item['text'] as String);
+              case 'image':
+                final source = item['source'];
+                final sourceMap = source is Map ? source : const <String, dynamic>{};
+                return ImageContent(
+                  data: (sourceMap['data'] ?? item['data'] ?? '') as String,
+                  mediaType: (sourceMap['media_type'] ?? item['media_type'] ?? 'image/png') as String,
+                  filename: item['filename'] as String?,
+                );
               case 'tool_use':
                 return ToolUseContent(
                   id: item['id'] as String,

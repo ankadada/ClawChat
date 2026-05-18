@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'code_block.dart';
+
 class StreamingText extends StatefulWidget {
   final String text;
   final bool isStreaming;
@@ -38,7 +40,7 @@ class _StreamingTextState extends State<StreamingText> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final spans = _getOrParseSpans(widget.text, theme);
+    final spans = _getOrParseSpans(widget.text, context, theme);
 
     return SelectableText.rich(
       TextSpan(children: spans),
@@ -46,7 +48,11 @@ class _StreamingTextState extends State<StreamingText> {
     );
   }
 
-  List<InlineSpan> _getOrParseSpans(String text, ThemeData theme) {
+  List<InlineSpan> _getOrParseSpans(
+    String text,
+    BuildContext context,
+    ThemeData theme,
+  ) {
     // During streaming, only parse up to the last newline to avoid
     // partial markdown patterns causing visual flashes.
     // Text after the last newline is shown as plain text.
@@ -74,13 +80,14 @@ class _StreamingTextState extends State<StreamingText> {
       return result;
     }
 
-    final isNewAppend = _cachedText != null &&
+    final isNewAppend = !parseText.contains('```') &&
+        _cachedText != null &&
         parseText.length > _cachedText!.length &&
         parseText.startsWith(_cachedText!);
 
     if (isNewAppend && _cachedSpans != null) {
       final newSpans = List<InlineSpan>.from(_cachedSpans!);
-      _appendParsedSpans(parseText, theme, newSpans, _lastParseEnd);
+      _appendParsedSpans(parseText, context, theme, newSpans, _lastParseEnd);
       _cachedSpans = newSpans;
       _cachedText = parseText;
       final result = List<InlineSpan>.from(newSpans);
@@ -97,7 +104,7 @@ class _StreamingTextState extends State<StreamingText> {
     }
 
     _disposeRecognizers();
-    final spans = _parseFullText(parseText, theme);
+    final spans = _parseFullText(parseText, context, theme);
     _cachedSpans = spans;
     _cachedText = parseText;
     final result = List<InlineSpan>.from(spans);
@@ -113,7 +120,7 @@ class _StreamingTextState extends State<StreamingText> {
     return result;
   }
 
-  static final _codeBlockRegex = RegExp(r'```(\w*)\n([\s\S]*?)```');
+  static final _codeBlockRegex = RegExp(r'```([^\n`]*)\n([\s\S]*?)```');
   static final _tableRegex = RegExp(
     r'(?:^|\n)((?:\|[^\n]*\|\n){2,})',
     multiLine: true,
@@ -126,19 +133,41 @@ class _StreamingTextState extends State<StreamingText> {
   static final _blockquoteRegex = RegExp(r'^>\s*(.+)$', multiLine: true);
   static final _linkRegex = RegExp(r'\[([^\]]+)\]\(([^)]+)\)');
 
-  List<InlineSpan> _parseFullText(String text, ThemeData theme) {
+  List<InlineSpan> _parseFullText(
+    String text,
+    BuildContext context,
+    ThemeData theme,
+  ) {
     final spans = <InlineSpan>[];
     _lastParseEnd = 0;
-    _appendParsedSpans(text, theme, spans, 0);
+    _appendParsedSpans(text, context, theme, spans, 0);
     return spans;
   }
 
   void _appendParsedSpans(
-      String text, ThemeData theme, List<InlineSpan> spans, int from) {
+    String text,
+    BuildContext context,
+    ThemeData theme,
+    List<InlineSpan> spans,
+    int from,
+  ) {
     final allMatches = <_MatchInfo>[];
 
     for (final match in _codeBlockRegex.allMatches(text, from)) {
       allMatches.add(_MatchInfo(match.start, match.end, 'codeblock', match));
+    }
+    if (widget.isStreaming) {
+      final openStart = text.lastIndexOf('```');
+      if (openStart >= from &&
+          !allMatches.any((m) => openStart >= m.start && openStart < m.end)) {
+        final beforeOpen = text.substring(0, openStart);
+        final fenceCount = '```'.allMatches(beforeOpen).length;
+        final openMatch = RegExp(r'^```([^\n`]*)\n([\s\S]*)$')
+            .firstMatch(text.substring(openStart));
+        if (fenceCount.isEven && openMatch != null) {
+          allMatches.add(_MatchInfo(openStart, text.length, 'codeblock', openMatch));
+        }
+      }
     }
     for (final match in _tableRegex.allMatches(text, from)) {
       if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
@@ -191,14 +220,23 @@ class _StreamingTextState extends State<StreamingText> {
 
       switch (info.type) {
         case 'codeblock':
-          spans.add(TextSpan(
-            text: info.match.group(2),
-            style: TextStyle(
-              fontFamily: 'monospace',
-              fontSize: 13,
-              backgroundColor: theme.colorScheme.surfaceContainerHighest,
+          spans.add(const TextSpan(text: '\n'));
+          spans.add(WidgetSpan(
+            alignment: PlaceholderAlignment.middle,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: MediaQuery.sizeOf(context).width * 0.78,
+                ),
+                child: CodeBlock(
+                  code: info.match.group(2) ?? '',
+                  language: info.match.group(1) ?? '',
+                ),
+              ),
             ),
           ));
+          spans.add(const TextSpan(text: '\n'));
         case 'table':
           final tableText = info.match.group(1)!;
           final rows = tableText.trim().split('\n')

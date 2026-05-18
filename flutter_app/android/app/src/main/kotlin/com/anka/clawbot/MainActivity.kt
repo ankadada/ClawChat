@@ -56,7 +56,8 @@ class MainActivity : FlutterActivity() {
         phoneIntentManager = PhoneIntentManager(this)
 
         if (setupDone.compareAndSet(false, true)) {
-            // TODO: Replace Thread{} with coroutines (requires lifecycle-runtime-ktx dependency)
+            // Keep bootstrap preflight on a plain background thread to avoid
+            // adding lifecycle coroutine dependencies for this small startup task.
             Thread {
                 try { bootstrapManager.setupDirectories() } catch (e: Exception) { Log.e("ClawChat", "setupDirectories failed", e) }
                 try { bootstrapManager.writeResolvConf() } catch (e: Exception) { Log.e("ClawChat", "writeResolvConf failed", e) }

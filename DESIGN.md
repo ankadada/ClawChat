@@ -2,13 +2,22 @@
 
 > **版本**: 1.0  
 > **日期**: 2026-05-11  
-> **目标**: 将 OpenClaw (mithun50/openclaw-termux) 改造为独立 AI Agent 聊天应用  
+> **目标**: 说明 ClawChat 当前架构，并保留从 OpenClaw 迁移而来的历史设计记录
 > **一句话**: 一个 APK = 原生聊天 UI + Dart Agent Loop + 嵌入式 Alpine Linux 环境
+
+---
+
+## Current Architecture
+
+ClawChat 当前包名为 `com.anka.clawbot`。应用由 Flutter/Dart UI、`ChangeNotifier` 状态管理、Dart 侧 `AgentService` 工具循环、Kotlin `NativeBridge`/`ProcessManager` 原生桥接，以及通过 proot 运行的 Alpine Linux rootfs 组成。
+
+当前执行路径是直接工具调用：用户消息进入 `ChatProvider`，由 `AgentService` 调用 `LlmService`，需要工具时通过 `ToolRegistry` 直接执行 Bash、文件读写、网页抓取等工具；Shell/文件操作通过 Kotlin MethodChannel 进入 proot Alpine 环境。当前架构不再使用中间服务进程、OpenClaw 服务进程或 Ubuntu rootfs。
 
 ---
 
 ## 目录
 
+0. [Current Architecture](#current-architecture)
 1. [架构总览](#1-架构总览)
 2. [Phase 1: 项目瘦身 — 砍 OpenClaw，换 Alpine](#2-phase-1-项目瘦身--砍-openclaw换-alpine1-天)
 3. [Phase 2: Dart Agent Loop + 工具系统](#3-phase-2-dart-agent-loop--工具系统2-天)
@@ -20,6 +29,10 @@
 9. [测试检查清单](#9-测试检查清单)
 
 ---
+
+## Migration History (Archive)
+
+> 以下编号章节保留为从 OpenClaw/Ubuntu/Node/Gateway 迁移到当前 ClawChat/Alpine/Dart 直连工具架构的历史设计记录。内容中的 before/after 代码块和删除清单属于迁移档案；当前实现以本文顶部的 **Current Architecture** 为准。
 
 ## 1. 架构总览
 
@@ -150,7 +163,7 @@ tool_result 追加到 messages                      │
 ```
 flutter_app/
 ├── android/
-│   └── app/src/main/kotlin/com/nxg/clawchat/
+│   └── app/src/main/kotlin/com/anka/clawbot/
 │       ├── MainActivity.kt          [修改] 精简方法, 改包名
 │       ├── BootstrapManager.kt      [修改] ubuntu→alpine, 去 APT/Node
 │       ├── ProcessManager.kt        [修改] 路径 ubuntu→alpine

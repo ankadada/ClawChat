@@ -1,7 +1,9 @@
 /// Centralized UI strings for ClawChat.
 ///
-/// All user-facing text lives here so that future localization only
-/// requires swapping out this single file (or adding a locale lookup).
+/// ClawChat is Chinese-first while keeping established English technical
+/// labels such as API, Terminal, Anthropic, and OpenAI. The app intentionally
+/// uses this static table for now instead of Flutter's generated i18n stack.
+/// Future localization can replace this file with locale-aware lookups.
 class AppStrings {
   AppStrings._();
 
@@ -18,6 +20,7 @@ class AppStrings {
   static const error = '错误';
   static const retry = '重试';
   static const open = 'Open';
+  static const renderError = '渲染错误';
 
   // ── Chat screen ──────────────────────────────────────────────────
   static const newChat = '新对话';
@@ -33,6 +36,17 @@ class AppStrings {
   static const aiLabel = 'AI';
   static const aiProcessing = 'AI 正在处理...';
   static const inputHint = '输入消息...';
+  static const toolApprovalTitle = '工具执行确认';
+  static const toolApprovalArguments = '参数';
+  static const toolApprovalDeny = '拒绝';
+  static const toolApprovalAllowOnce = '允许一次';
+  static const toolApprovalAllowSession = '本会话允许';
+  static const riskLow = '低风险';
+  static const riskMedium = '中风险';
+  static const riskHigh = '高风险';
+  static String imageAttachmentLabel(String label) => '图片附件 $label';
+  static const modelFetchPresetNotice = 'Failed to fetch models, showing presets';
+  static String modelFetchFailed(String e) => 'Failed to fetch models: $e';
 
   // ── Chat sessions screen ─────────────────────────────────────────
   static const chatHistory = '对话记录';
@@ -168,6 +182,9 @@ class AppStrings {
   static const importButton = '导入';
   static const importFailed = '导入失败';
   static const installPresets = '安装预设技能';
+  static const archiveSkill = 'Archive (.zip, .tar.gz, .tgz)';
+  static const directory = 'Directory';
+  static const selectSkillArchive = 'Select a .zip, .tar.gz, or .tgz skill archive';
 
   // ── Environment Variables ─────────────────────────────────────────
   static const envVars = '环境变量';

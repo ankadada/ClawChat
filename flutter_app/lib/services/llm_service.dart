@@ -7,6 +7,12 @@ import 'api_validator.dart';
 
 enum ApiFormat { anthropic, openai }
 
+enum _OpenAICompatibleProvider {
+  anthropicCompatible,
+  openaiNative,
+  generic,
+}
+
 class LlmConfig {
   final ApiFormat format;
   final String apiKey;
@@ -188,6 +194,13 @@ class LlmService {
     'api.x.ai',
   };
 
+  static const presetModelSuffix = ' (preset)';
+  static const _anthropicPresetModelIds = [
+    'claude-sonnet-4-20250514',
+    'claude-opus-4-20250514',
+    'claude-haiku-4-20250514',
+  ];
+
   LlmService(this.config) : _client = _createPinnedClient();
 
   /// Creates an HTTP client that rejects bad TLS certificates (self-signed,
@@ -212,25 +225,50 @@ class LlmService {
   }
 
   /// Fetches available model IDs from the API provider.
-  /// Returns hardcoded list for Anthropic (no public model listing API).
-  /// For OpenAI-compatible APIs, calls GET /v1/models.
+  /// For Anthropic, calls GET /v1/models and falls back to preset labels.
+  /// For OpenAI-compatible APIs, calls GET /v1/models and throws on errors.
   static Future<List<String>> fetchModels({
     required String apiFormat,
     required String apiKey,
     String? baseUrl,
   }) async {
     if (apiFormat == 'anthropic') {
-      return [
-        'claude-sonnet-4-20250514',
-        'claude-opus-4-20250514',
-        'claude-haiku-4-20250514',
-      ];
+      final effectiveBaseUrl = (baseUrl != null && baseUrl.isNotEmpty)
+          ? baseUrl
+          : 'https://api.anthropic.com';
+      final url = _joinBaseUrl(effectiveBaseUrl, '/v1/models');
+      final client = _createPinnedClient();
+      try {
+        final uri = ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
+        final response = await client.get(
+          uri,
+          headers: {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+          },
+        ).timeout(const Duration(seconds: 10));
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body) as Map<String, dynamic>;
+          final models = (data['data'] as List? ?? const [])
+              .map((m) => m is Map ? m['id']?.toString() : null)
+              .whereType<String>()
+              .where((id) => id.isNotEmpty)
+              .toList()
+            ..sort();
+          if (models.isNotEmpty) return models;
+        }
+        return _anthropicPresetModels();
+      } catch (_) {
+        return _anthropicPresetModels();
+      } finally {
+        client.close();
+      }
     }
 
     final effectiveBaseUrl = (baseUrl != null && baseUrl.isNotEmpty)
         ? baseUrl
         : 'https://api.openai.com';
-    final url = '$effectiveBaseUrl/v1/models';
+    final url = _joinBaseUrl(effectiveBaseUrl, '/v1/models');
     final client = _createPinnedClient();
     try {
       final uri = ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
@@ -240,9 +278,9 @@ class LlmService {
       ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
         final models = (data['data'] as List)
-            .map((m) => m['id'] as String)
+            .map((m) => (m as Map)['id'] as String)
             .where((id) =>
                 !id.contains('embed') &&
                 !id.contains('tts') &&
@@ -253,12 +291,32 @@ class LlmService {
           ..sort();
         return models;
       }
-      return [];
-    } catch (_) {
-      return [];
+      throw Exception(
+        'Models API error (${response.statusCode}): ${_sanitizeErrorBody(response.body)}',
+      );
+    } catch (e) {
+      throw Exception('Failed to fetch models: $e');
     } finally {
       client.close();
     }
+  }
+
+  static bool isPresetModel(String model) => model.endsWith(presetModelSuffix);
+
+  static String modelIdFromDisplay(String model) {
+    return isPresetModel(model)
+        ? model.substring(0, model.length - presetModelSuffix.length)
+        : model;
+  }
+
+  static List<String> _anthropicPresetModels() {
+    return _anthropicPresetModelIds
+        .map((id) => '$id$presetModelSuffix')
+        .toList();
+  }
+
+  static String _joinBaseUrl(String baseUrl, String path) {
+    return '${baseUrl.replaceFirst(RegExp(r'/+$'), '')}$path';
   }
 
   /// Closes the underlying HTTP client. Must be called when the service
@@ -782,9 +840,15 @@ class LlmService {
     for (final msg in messages) {
       openaiMessages.addAll(_convertMessageToOpenAI(msg));
     }
+    final provider = _detectOpenAICompatibleProvider();
+    final thinkingEnabled = config.thinkingBudget > 0 &&
+        provider == _OpenAICompatibleProvider.anthropicCompatible;
     final body = <String, dynamic>{
       'model': config.model,
-      'max_completion_tokens': config.maxTokens,
+      if (thinkingEnabled)
+        'max_completion_tokens': config.thinkingBudget + config.maxTokens
+      else
+        'max_tokens': config.maxTokens,
       'messages': openaiMessages,
       'stream': stream,
       if (stream) 'stream_options': {'include_usage': true},
@@ -795,14 +859,24 @@ class LlmService {
     if (tools.isNotEmpty) {
       body['tools'] = tools.map((t) => t.toOpenAIJson()).toList();
     }
-    if (config.thinkingBudget > 0) {
+    if (thinkingEnabled) {
       body['thinking'] = {
         'type': 'enabled',
         'budget_tokens': config.thinkingBudget,
       };
-      body['max_completion_tokens'] = config.thinkingBudget + config.maxTokens;
     }
     return body;
+  }
+
+  _OpenAICompatibleProvider _detectOpenAICompatibleProvider() {
+    final baseUrl = config.baseUrl.toLowerCase();
+    if (baseUrl.contains('anthropic') || baseUrl.contains('claude')) {
+      return _OpenAICompatibleProvider.anthropicCompatible;
+    }
+    if (baseUrl.contains('openai.com')) {
+      return _OpenAICompatibleProvider.openaiNative;
+    }
+    return _OpenAICompatibleProvider.generic;
   }
 
   List<Map<String, dynamic>> _convertMessageToOpenAI(Map<String, dynamic> msg) {
@@ -826,11 +900,21 @@ class LlmService {
       }
 
       final textParts = <String>[];
+      final contentParts = <Map<String, dynamic>>[];
       final toolCalls = <Map<String, dynamic>>[];
+      var hasImage = false;
       for (final block in content) {
         if (block is Map) {
           if (block['type'] == 'text') {
-            textParts.add(block['text'] as String);
+            final text = block['text'] as String? ?? '';
+            textParts.add(text);
+            contentParts.add({'type': 'text', 'text': text});
+          } else if (block['type'] == 'image') {
+            final imageContent = _convertImageBlockToOpenAI(block);
+            if (imageContent != null) {
+              hasImage = true;
+              contentParts.add(imageContent);
+            }
           } else if (block['type'] == 'tool_use') {
             toolCalls.add({
               'id': block['id'],
@@ -843,6 +927,14 @@ class LlmService {
           }
         }
       }
+      if (hasImage && toolCalls.isEmpty) {
+        return [
+          {
+            'role': role,
+            'content': contentParts,
+          }
+        ];
+      }
       final result = <String, dynamic>{
         'role': role,
         'content': textParts.join('\n'),
@@ -852,6 +944,29 @@ class LlmService {
     }
 
     return [{'role': role, 'content': content.toString()}];
+  }
+
+  Map<String, dynamic>? _convertImageBlockToOpenAI(Map<dynamic, dynamic> block) {
+    final imageUrl = block['image_url'];
+    if (imageUrl is Map && imageUrl['url'] is String) {
+      return {
+        'type': 'image_url',
+        'image_url': {'url': imageUrl['url'] as String},
+      };
+    }
+
+    final source = block['source'];
+    final sourceMap = source is Map ? source : const <String, dynamic>{};
+    final mediaType = (sourceMap['media_type'] ?? block['media_type'] ?? 'image/png') as String;
+    final data = (sourceMap['data'] ?? block['data']) as String?;
+    if (data == null || data.isEmpty) return null;
+
+    return {
+      'type': 'image_url',
+      'image_url': {
+        'url': 'data:$mediaType;base64,$data',
+      },
+    };
   }
 
   Map<String, String> _openaiHeaders() => {

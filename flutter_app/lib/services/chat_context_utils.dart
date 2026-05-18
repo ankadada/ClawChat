@@ -8,6 +8,10 @@ class ChatContextUtils {
         if (item is Map) {
           count += (item['text'] as String?)?.length ?? 0;
           count += (item['content'] as String?)?.length ?? 0;
+          final source = item['source'];
+          if (source is Map) {
+            count += (source['data'] as String?)?.length ?? 0;
+          }
         }
       }
       return count;

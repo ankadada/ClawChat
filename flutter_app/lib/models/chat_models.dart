@@ -152,9 +152,13 @@ class ChatMessage {
   }
 
   factory ChatMessage.user(String text) {
+    return ChatMessage.userContent([TextContent(text)]);
+  }
+
+  factory ChatMessage.userContent(List<MessageContent> content) {
     return ChatMessage(
       role: 'user',
-      content: [TextContent(text)],
+      content: content,
     );
   }
 
@@ -163,6 +167,8 @@ class ChatMessage {
       switch (block['type']) {
         case 'text':
           return TextContent(block['text'] as String);
+        case 'image':
+          return _imageContentFromMap(block);
         case 'tool_use':
           return ToolUseContent(
             id: block['id'] as String,
@@ -219,6 +225,8 @@ class ChatMessage {
       switch (type) {
         case 'text':
           return TextContent(c['text'] as String);
+        case 'image':
+          return _imageContentFromMap(c);
         case 'tool_use':
           return ToolUseContent(
             id: c['id'] as String,
@@ -246,6 +254,16 @@ class ChatMessage {
       activeAlternative: json['activeAlternative'] as int? ?? -1,
     );
   }
+
+  static ImageContent _imageContentFromMap(Map<dynamic, dynamic> block) {
+    final source = block['source'];
+    final sourceMap = source is Map ? source : const <String, dynamic>{};
+    return ImageContent(
+      data: (sourceMap['data'] ?? block['data'] ?? '') as String,
+      mediaType: (sourceMap['media_type'] ?? block['media_type'] ?? 'image/png') as String,
+      filename: block['filename'] as String?,
+    );
+  }
 }
 
 sealed class MessageContent {
@@ -262,6 +280,34 @@ class TextContent extends MessageContent {
 
   @override
   Map<String, dynamic> toJson() => {'type': 'text', 'text': text};
+}
+
+class ImageContent extends MessageContent {
+  final String data;
+  final String mediaType;
+  final String? filename;
+
+  ImageContent({
+    required this.data,
+    required this.mediaType,
+    this.filename,
+  });
+
+  @override
+  Map<String, dynamic> toApiJson() => {
+    'type': 'image',
+    'source': {
+      'type': 'base64',
+      'media_type': mediaType,
+      'data': data,
+    },
+  };
+
+  @override
+  Map<String, dynamic> toJson() => {
+    ...toApiJson(),
+    if (filename != null) 'filename': filename,
+  };
 }
 
 class ToolUseContent extends MessageContent {

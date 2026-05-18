@@ -33,6 +33,7 @@ class PreferencesService {
 
   static PreferencesService? _instance;
   static String? _cachedApiKey;
+  Map<String, String> _cachedEnvVars = {};
 
   late SharedPreferences _prefs;
   bool _initialized = false;
@@ -47,7 +48,9 @@ class PreferencesService {
     if (_initialized) return;
     _prefs = await SharedPreferences.getInstance();
     await _migrateApiKeyToSecureStorage();
+    await _migrateEnvVarsToSecureStorage();
     _cachedApiKey = await _secureStorage.read(key: _keyApiKey);
+    _cachedEnvVars = _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
     _initialized = true;
   }
 
@@ -71,6 +74,29 @@ class PreferencesService {
     // Move to secure storage and remove from SharedPreferences
     await _secureStorage.write(key: _keyApiKey, value: plainKey);
     await _prefs.remove(_keyApiKey);
+  }
+
+  Future<void> _migrateEnvVarsToSecureStorage() async {
+    final oldVars = _prefs.getString(_keyEnvVars);
+    if (oldVars == null) return;
+
+    try {
+      final existing = await _secureStorage.read(key: _keyEnvVars);
+      if (existing == null) {
+        final decoded = _decodeEnvVars(oldVars);
+        if (decoded.isNotEmpty) {
+          await _secureStorage.write(
+            key: _keyEnvVars,
+            value: jsonEncode(decoded),
+          );
+        } else {
+          await _secureStorage.delete(key: _keyEnvVars);
+        }
+      }
+      await _prefs.remove(_keyEnvVars);
+    } catch (e) {
+      debugPrint('Failed to migrate environment variables: $e');
+    }
   }
 
   bool get autoStartGateway => _prefs.getBool(_keyAutoStart) ?? false;
@@ -139,17 +165,42 @@ class PreferencesService {
   set temperature(double v) => _prefs.setDouble(_keyTemperature, v);
 
   Map<String, String> get envVars {
-    final json = _prefs.getString(_keyEnvVars);
-    if (json == null) return {};
-    try {
-      return Map<String, String>.from(jsonDecode(json));
-    } catch (_) {
-      return {};
-    }
+    return Map<String, String>.from(_cachedEnvVars);
   }
 
   set envVars(Map<String, String> vars) {
-    _prefs.setString(_keyEnvVars, jsonEncode(vars));
+    _cachedEnvVars = Map<String, String>.from(vars);
+    if (_initialized) {
+      _prefs.remove(_keyEnvVars).catchError((e) {
+        debugPrint('Failed to remove plaintext environment variables: $e');
+        return false;
+      });
+    }
+    if (_cachedEnvVars.isEmpty) {
+      _secureStorage.delete(key: _keyEnvVars).catchError((e) {
+        debugPrint('Failed to delete environment variables: $e');
+      });
+    } else {
+      _secureStorage.write(
+        key: _keyEnvVars,
+        value: jsonEncode(_cachedEnvVars),
+      ).catchError((e) {
+        debugPrint('Failed to persist environment variables: $e');
+      });
+    }
+  }
+
+  Map<String, String> _decodeEnvVars(String? json) {
+    if (json == null || json.isEmpty) return {};
+    try {
+      final decoded = jsonDecode(json);
+      if (decoded is! Map) return {};
+      return decoded.map<String, String>(
+        (key, value) => MapEntry(key.toString(), value?.toString() ?? ''),
+      );
+    } catch (_) {
+      return {};
+    }
   }
 
   // 'system' | 'light' | 'dark'

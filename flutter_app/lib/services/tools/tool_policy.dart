@@ -27,7 +27,7 @@ class ToolPolicy {
   final ToolApprovalCallback? onApprovalRequired;
 
   const ToolPolicy({
-    this.approvalRequiredFor = const {ToolRisk.dangerous},
+    this.approvalRequiredFor = const {ToolRisk.moderate, ToolRisk.dangerous},
     this.onApprovalRequired,
   });
 

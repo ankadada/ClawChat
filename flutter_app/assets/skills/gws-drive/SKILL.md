@@ -1,7 +1,7 @@
 ---
 name: gws-drive
 description: Google Drive — 查看文件、搜索文件、管理云端硬盘
-tools: [shell]
+tools: [bash]
 ---
 
 ## Use This Skill When

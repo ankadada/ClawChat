@@ -150,21 +150,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
             : null,
       );
       if (!mounted) return;
+      final showingPresets = models.any(LlmService.isPresetModel);
       setState(() {
         _availableModels = models;
         _fetchingModels = false;
         _manualModelInput = models.isEmpty;
         if (models.isNotEmpty && _modelController.text.isEmpty) {
-          _modelController.text = models.first;
+          _modelController.text = LlmService.modelIdFromDisplay(models.first);
         }
       });
-    } catch (_) {
+      if (showingPresets) {
+        _showModelFetchNotice(AppStrings.modelFetchPresetNotice);
+      }
+    } catch (e) {
       if (!mounted) return;
       setState(() {
         _fetchingModels = false;
         _manualModelInput = true;
       });
+      _showModelFetchNotice(AppStrings.modelFetchFailed(_briefError(e)));
     }
+  }
+
+  void _showModelFetchNotice(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  String _briefError(Object error) {
+    final text = error.toString().replaceFirst('Exception: ', '');
+    return text.length > 160 ? '${text.substring(0, 160)}...' : text;
   }
 
   Future<void> _loadSkills() async {
@@ -367,15 +384,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               ))
                             : (_availableModels.isNotEmpty && !_manualModelInput)
                                 ? DropdownButtonFormField<String>(
-                                    value: _availableModels.contains(_modelController.text)
-                                        ? _modelController.text
-                                        : null,
+                                value: _availableModels.any((m) =>
+                                        LlmService.modelIdFromDisplay(m) ==
+                                        _modelController.text)
+                                    ? _modelController.text
+                                    : null,
                                     decoration: const InputDecoration(
                                       labelText: AppStrings.selectModel,
                                     ),
                                     items: [
                                       ..._availableModels.map((m) => DropdownMenuItem(
-                                        value: m,
+                                        value: LlmService.modelIdFromDisplay(m),
                                         child: Text(m, overflow: TextOverflow.ellipsis),
                                       )),
                                       const DropdownMenuItem(
@@ -837,30 +856,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _showLocalImportDialog() async {
-    final controller = TextEditingController();
-    final path = await showDialog<String>(
+    final mode = await showModalBottomSheet<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text(AppStrings.importLocalSkill),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(
-            hintText: '/sdcard/Download/my-skill.tar.gz',
-            labelText: AppStrings.localFilePath,
-          ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.archive),
+              title: const Text(AppStrings.archiveSkill),
+              onTap: () => Navigator.pop(ctx, 'archive'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder),
+              title: const Text(AppStrings.directory),
+              onTap: () => Navigator.pop(ctx, 'directory'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text(AppStrings.cancel),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text(AppStrings.importButton),
-          ),
-        ],
       ),
     );
+    if (mode == null) return;
+
+    String? path;
+    if (mode == 'archive') {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['zip', 'tgz', 'gz'],
+        withData: false,
+        withReadStream: false,
+      );
+      if (result == null || result.files.isEmpty) return;
+      path = result.files.single.path;
+      final lowerPath = path?.toLowerCase() ?? '';
+      if (!lowerPath.endsWith('.zip') &&
+          !lowerPath.endsWith('.tgz') &&
+          !lowerPath.endsWith('.tar.gz')) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text(AppStrings.selectSkillArchive)),
+          );
+        }
+        return;
+      }
+    } else {
+      path = await FilePicker.platform.getDirectoryPath();
+    }
     if (path == null || path.isEmpty) return;
 
     setState(() => _loadingSkills = true);

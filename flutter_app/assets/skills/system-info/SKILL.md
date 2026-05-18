@@ -1,7 +1,7 @@
 ---
 name: system-info
 description: 系统信息 — 查看进程、磁盘、网络、环境状态
-tools: [shell]
+tools: [bash]
 ---
 
 ## Use This Skill When

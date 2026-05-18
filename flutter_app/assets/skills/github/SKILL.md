@@ -1,7 +1,7 @@
 ---
 name: github
 description: GitHub 操作 — 查看 Issue/PR、搜索代码、管理仓库
-tools: [shell]
+tools: [bash]
 ---
 
 ## Use This Skill When

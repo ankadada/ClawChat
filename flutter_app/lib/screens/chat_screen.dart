@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -10,6 +12,7 @@ import '../providers/chat_provider.dart';
 import '../services/preferences_service.dart';
 import '../services/file_attachment_service.dart';
 import '../services/llm_service.dart';
+import '../services/tools/tool_policy.dart';
 import '../widgets/streaming_text.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/agent_status_bar.dart';
@@ -36,6 +39,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final WhisperService _whisper = WhisperService();
   bool _isListening = false;
   bool _isWhisperRecording = false;
+  bool _approvalDialogOpen = false;
+  ToolApprovalRequest? _shownApprovalRequest;
+  final List<MessageContent> _pendingAttachments = [];
 
   @override
   void initState() {
@@ -47,6 +53,209 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _onTtsStateChanged() {
     if (mounted) setState(() {});
+  }
+
+  String _briefError(Object error) {
+    final text = error.toString().replaceFirst('Exception: ', '');
+    return text.length > 160 ? '${text.substring(0, 160)}...' : text;
+  }
+
+  void _scheduleToolApprovalDialog(ToolApprovalRequest? request) {
+    if (request == null ||
+        _approvalDialogOpen ||
+        identical(request, _shownApprovalRequest)) {
+      return;
+    }
+    _approvalDialogOpen = true;
+    _shownApprovalRequest = request;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      if (!identical(context.read<ChatProvider>().pendingApproval, request)) {
+        _approvalDialogOpen = false;
+        _shownApprovalRequest = null;
+        return;
+      }
+      await _showToolApprovalDialog(request);
+      if (!mounted) return;
+      final provider = context.read<ChatProvider>();
+      if (identical(provider.pendingApproval, request)) {
+        provider.resolveToolApproval(false);
+      }
+      _approvalDialogOpen = false;
+      if (provider.pendingApproval == null) {
+        _shownApprovalRequest = null;
+      }
+    });
+  }
+
+  Future<void> _showToolApprovalDialog(ToolApprovalRequest request) {
+    final provider = context.read<ChatProvider>();
+    final riskColor = _riskColor(request.risk);
+    final arguments = _formatToolArguments(request);
+
+    return showModalBottomSheet<void>(
+      context: context,
+      isDismissible: false,
+      enableDrag: false,
+      showDragHandle: false,
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    CircleAvatar(
+                      backgroundColor: riskColor.withAlpha(28),
+                      foregroundColor: riskColor,
+                      child: Icon(_riskIcon(request.risk)),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            AppStrings.toolApprovalTitle,
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '${request.toolName} · ${_riskLabel(request.risk)}',
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: riskColor,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  AppStrings.toolApprovalArguments,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Container(
+                  width: double.infinity,
+                  constraints: const BoxConstraints(maxHeight: 220),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: theme.colorScheme.outline.withAlpha(50),
+                    ),
+                  ),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      arguments,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Wrap(
+                  alignment: WrapAlignment.end,
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    TextButton(
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        provider.resolveToolApproval(false);
+                      },
+                      child: const Text(AppStrings.toolApprovalDeny),
+                    ),
+                    OutlinedButton(
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        provider.resolveToolApproval(true);
+                      },
+                      child: const Text(AppStrings.toolApprovalAllowOnce),
+                    ),
+                    FilledButton(
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        provider.resolveToolApproval(
+                          true,
+                          rememberForSession: true,
+                        );
+                      },
+                      child: const Text(AppStrings.toolApprovalAllowSession),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  String _formatToolArguments(ToolApprovalRequest request) {
+    if (request.toolName == 'bash') {
+      final command = request.arguments['command'];
+      if (command is String && command.isNotEmpty) return command;
+    }
+    if (request.toolName == 'read_file' || request.toolName == 'write_file') {
+      final path = request.arguments['path'];
+      if (path is String && path.isNotEmpty) {
+        final buffer = StringBuffer(path);
+        if (request.arguments.containsKey('content')) {
+          final content = request.arguments['content']?.toString() ?? '';
+          buffer
+            ..writeln()
+            ..writeln()
+            ..write(content.length > 4000
+                ? '${content.substring(0, 4000)}\n\n[content truncated]'
+                : content);
+        }
+        return buffer.toString();
+      }
+    }
+    try {
+      return const JsonEncoder.withIndent('  ').convert(request.arguments);
+    } catch (_) {
+      return request.arguments.toString();
+    }
+  }
+
+  String _riskLabel(ToolRisk risk) {
+    return switch (risk) {
+      ToolRisk.safe => AppStrings.riskLow,
+      ToolRisk.moderate => AppStrings.riskMedium,
+      ToolRisk.dangerous => AppStrings.riskHigh,
+    };
+  }
+
+  IconData _riskIcon(ToolRisk risk) {
+    return switch (risk) {
+      ToolRisk.safe => Icons.verified_outlined,
+      ToolRisk.moderate => Icons.warning_amber_outlined,
+      ToolRisk.dangerous => Icons.report_problem_outlined,
+    };
+  }
+
+  Color _riskColor(ToolRisk risk) {
+    return switch (risk) {
+      ToolRisk.safe => AppColors.statusGreen,
+      ToolRisk.moderate => AppColors.statusAmber,
+      ToolRisk.dangerous => AppColors.statusRed,
+    };
   }
 
   Future<void> _initSpeech() async {
@@ -202,6 +411,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (_lastSessionId != null) {
         provider.saveDraft(_lastSessionId!, _inputController.text);
       }
+      _pendingAttachments.clear();
       _lastSessionId = currentId;
       final draft = provider.getDraft(currentId);
       if (_inputController.text != draft) {
@@ -218,18 +428,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _sendMessage() {
     final text = _inputController.text.trim();
-    if (text.isEmpty) return;
+    final attachments = List<MessageContent>.from(_pendingAttachments);
+    if (text.isEmpty && attachments.isEmpty) return;
     _inputController.clear();
+    _pendingAttachments.clear();
     final provider = context.read<ChatProvider>();
     if (provider.currentSession != null) {
       provider.saveDraft(provider.currentSession!.id, '');
     }
-    provider.sendMessage(text);
+    provider.sendMessage(text, attachments: attachments);
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final pendingApproval = context.select<ChatProvider, ToolApprovalRequest?>(
+      (provider) => provider.pendingApproval,
+    );
+    _scheduleToolApprovalDialog(pendingApproval);
 
     return Scaffold(
       appBar: AppBar(
@@ -560,6 +776,48 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
       case ToolResultContent():
         return const SizedBox.shrink();
+
+      case ImageContent(:final filename, :final mediaType):
+        final label = filename ?? mediaType;
+        return Semantics(
+          label: AppStrings.imageAttachmentLabel(label),
+          child: Container(
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.of(context).size.width * 0.85,
+            ),
+            margin: const EdgeInsets.only(top: 4),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: isUser
+                  ? AppColors.accent.withAlpha(20)
+                  : theme.colorScheme.surface,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: isUser
+                    ? AppColors.accent.withAlpha(50)
+                    : theme.colorScheme.outline.withAlpha(50),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.image,
+                  color: theme.colorScheme.primary,
+                  size: 20,
+                ),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    label,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
     }
   }
 
@@ -710,7 +968,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 )
               else if (availableModels.isNotEmpty)
                 DropdownButtonFormField<String>(
-                  value: availableModels.contains(controller.text) ? controller.text : null,
+                  value: availableModels.any((m) =>
+                          LlmService.modelIdFromDisplay(m) == controller.text)
+                      ? controller.text
+                      : null,
                   decoration: InputDecoration(
                     labelText: AppStrings.selectModel,
                     hintText: AppStrings.useGlobalDefault,
@@ -719,7 +980,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   items: [
                     const DropdownMenuItem(value: '', child: Text(AppStrings.useGlobalDefault)),
                     ...availableModels.map((m) => DropdownMenuItem(
-                      value: m,
+                      value: LlmService.modelIdFromDisplay(m),
                       child: Text(m, overflow: TextOverflow.ellipsis),
                     )),
                   ],
@@ -746,7 +1007,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       apiKey: prefs.apiKey ?? '',
                       baseUrl: prefs.baseUrl,
                     );
-                  } catch (_) {}
+                    if (availableModels.any(LlmService.isPresetModel) && mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text(AppStrings.modelFetchPresetNotice),
+                        ),
+                      );
+                    }
+                  } catch (e) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text(AppStrings.modelFetchFailed(_briefError(e)))),
+                      );
+                    }
+                  }
                   setDialogState(() => loading = false);
                 },
               ),
@@ -796,9 +1070,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     for (final file in files) {
       try {
-        final path = await FileAttachmentService.importToWorkspace(file);
-        final size = FileAttachmentService.formatFileSize(file.size);
-        _inputController.text += '[Attached: $path ($size)]';
+        final prepared = await FileAttachmentService.prepareForMessage(file);
+        if (prepared.includeAsContentBlock) {
+          _pendingAttachments.add(prepared.content);
+        }
+        _appendAttachmentText(prepared.inputText);
       } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -807,6 +1083,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         }
       }
     }
+  }
+
+  void _appendAttachmentText(String text) {
+    final current = _inputController.text;
+    final separator = current.isEmpty || current.endsWith('\n') ? '' : '\n';
+    _inputController.text = '$current$separator$text\n';
+    _inputController.selection = TextSelection.collapsed(
+      offset: _inputController.text.length,
+    );
   }
 
   Widget _buildQuickPrompts() {
@@ -950,16 +1235,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       itemCount: availableModels.length,
                       itemBuilder: (_, i) {
                         final model = availableModels[i];
+                        final modelId = LlmService.modelIdFromDisplay(model);
                         return CheckboxListTile(
                           dense: true,
                           title: Text(model, overflow: TextOverflow.ellipsis),
-                          value: selectedModels.contains(model),
+                          value: selectedModels.contains(modelId),
                           onChanged: (v) {
                             setDialogState(() {
                               if (v == true) {
-                                selectedModels.add(model);
+                                selectedModels.add(modelId);
                               } else {
-                                selectedModels.remove(model);
+                                selectedModels.remove(modelId);
                               }
                             });
                           },
@@ -986,7 +1272,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         apiKey: prefs.apiKey ?? '',
                         baseUrl: prefs.baseUrl,
                       );
-                    } catch (_) {}
+                      if (availableModels.any(LlmService.isPresetModel) && mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(AppStrings.modelFetchPresetNotice),
+                          ),
+                        );
+                      }
+                    } catch (e) {
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text(AppStrings.modelFetchFailed(_briefError(e)))),
+                        );
+                      }
+                    }
                     setDialogState(() => loading = false);
                   },
                 ),

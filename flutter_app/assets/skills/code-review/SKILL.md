@@ -1,7 +1,7 @@
 ---
 name: code-review
 description: 代码审查 — 读取项目代码进行 review，发现 bug 和改进建议
-tools: [shell, read_file]
+tools: [bash, read_file]
 ---
 
 ## Use This Skill When

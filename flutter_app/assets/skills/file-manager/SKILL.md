@@ -1,7 +1,7 @@
 ---
 name: file-manager
 description: 文件管理 — 搜索、重命名、分析目录结构、文件操作
-tools: [shell, read_file, write_file]
+tools: [bash, read_file, write_file]
 ---
 
 ## Use This Skill When

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' as io;
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'native_bridge.dart';
@@ -119,25 +120,36 @@ class SkillService {
 
   /// Imports a skill from a local directory or zip/tar.gz file on the device.
   static Future<String> importSkillFromLocalPath(String sourcePath) async {
-    final safePath = sourcePath.trim();
+    final safePath = sourcePath.trim().replaceAll(RegExp(r'/+$'), '');
     final name = _normalizeSkillName(safePath.split('/').last);
     final targetDir = _targetDirForSkillName(name);
-    final quotedPath = _shellQuote(safePath);
     final quotedTarget = _shellQuote(targetDir);
+    final lowerPath = safePath.toLowerCase();
 
-    if (sourcePath.endsWith('.tar.gz') || sourcePath.endsWith('.tgz')) {
-      await NativeBridge.runInProot(
-        'mkdir -p $quotedTarget && tar xzf $quotedPath -C $quotedTarget',
-      );
-    } else if (sourcePath.endsWith('.zip')) {
-      await NativeBridge.runInProot(
-        'mkdir -p $quotedTarget && unzip -o $quotedPath -d $quotedTarget',
-      );
+    if (lowerPath.endsWith('.tar.gz') || lowerPath.endsWith('.tgz')) {
+      final archivePath = await _stageLocalArchiveForProot(safePath);
+      try {
+        await NativeBridge.runInProot(
+          'mkdir -p $quotedTarget && tar xzf ${_shellQuote(archivePath)} -C $quotedTarget',
+        );
+      } finally {
+        await NativeBridge.runInProot('rm -f ${_shellQuote(archivePath)}');
+      }
+    } else if (lowerPath.endsWith('.zip')) {
+      final archivePath = await _stageLocalArchiveForProot(safePath);
+      try {
+        await NativeBridge.runInProot(
+          'mkdir -p $quotedTarget && unzip -o ${_shellQuote(archivePath)} -d $quotedTarget',
+        );
+      } finally {
+        await NativeBridge.runInProot('rm -f ${_shellQuote(archivePath)}');
+      }
     } else {
-      // Assume it's a directory, copy it
-      await NativeBridge.runInProot(
-        'cp -r $quotedPath $quotedTarget',
-      );
+      final directory = io.Directory(safePath);
+      if (!await directory.exists()) {
+        throw Exception('Unsupported local skill path');
+      }
+      await _copyDirectoryToRootfs(directory, targetDir);
     }
     return name;
   }
@@ -184,8 +196,9 @@ class SkillService {
 
   static String _normalizeSkillName(String rawName) {
     var name = rawName.trim();
+    final lowerName = name.toLowerCase();
     for (final suffix in ['.tar.gz', '.tgz', '.zip', '.git']) {
-      if (name.endsWith(suffix)) {
+      if (lowerName.endsWith(suffix)) {
         name = name.substring(0, name.length - suffix.length);
         break;
       }
@@ -214,6 +227,85 @@ class SkillService {
     return targetPath.endsWith('/')
         ? targetPath.substring(0, targetPath.length - 1)
         : targetPath;
+  }
+
+  static Future<String> _stageLocalArchiveForProot(String sourcePath) async {
+    final sourceFile = io.File(sourcePath);
+    if (!await sourceFile.exists()) {
+      throw Exception('Local skill archive not found');
+    }
+
+    final filesDir = await NativeBridge.getFilesDir();
+    final tempDir = io.Directory('$filesDir/skill_imports');
+    await tempDir.create(recursive: true);
+    final tempName = '${DateTime.now().microsecondsSinceEpoch}_${_sanitizeFilename(sourcePath.split('/').last)}';
+    final tempFile = await sourceFile.copy('${tempDir.path}/$tempName');
+    try {
+      return await NativeBridge.importFileToWorkspace(tempFile.path, tempName);
+    } finally {
+      try {
+        await tempFile.delete();
+      } catch (_) {}
+    }
+  }
+
+  static Future<void> _copyDirectoryToRootfs(
+    io.Directory sourceDir,
+    String targetDir,
+  ) async {
+    final sourceBase = sourceDir.absolute.path.endsWith(io.Platform.pathSeparator)
+        ? sourceDir.absolute.path
+        : '${sourceDir.absolute.path}${io.Platform.pathSeparator}';
+    await NativeBridge.runInProot('mkdir -p ${_shellQuote(targetDir)}');
+
+    await for (final entity in sourceDir.list(recursive: true, followLinks: false)) {
+      var relativePath = entity.absolute.path.substring(sourceBase.length);
+      if (io.Platform.pathSeparator != '/') {
+        relativePath = relativePath.replaceAll(io.Platform.pathSeparator, '/');
+      }
+      if (relativePath.isEmpty ||
+          relativePath.split('/').any((part) => part.isEmpty || part == '..')) {
+        continue;
+      }
+
+      final rootfsPath = '$targetDir/$relativePath';
+      if (entity is io.Directory) {
+        await NativeBridge.runInProot('mkdir -p ${_shellQuote(rootfsPath)}');
+      } else if (entity is io.File) {
+        await _writeHostFileToRootfs(entity, rootfsPath);
+      }
+    }
+  }
+
+  static Future<void> _writeHostFileToRootfs(
+    io.File sourceFile,
+    String rootfsPath,
+  ) async {
+    final slashIndex = rootfsPath.lastIndexOf('/');
+    if (slashIndex <= 0) {
+      throw Exception('Invalid skill file path');
+    }
+    final parentDir = rootfsPath.substring(0, slashIndex);
+    await NativeBridge.runInProot('mkdir -p ${_shellQuote(parentDir)}');
+
+    final bytes = await sourceFile.readAsBytes();
+    final base64Content = base64Encode(bytes);
+    final tmpPath = '/root/workspace/uploads/.skill_import_${DateTime.now().microsecondsSinceEpoch}.b64';
+    await NativeBridge.runInProot('mkdir -p /root/workspace/uploads');
+    await NativeBridge.writeRootfsFile(_bridgeRootfsPath(tmpPath), base64Content);
+    await NativeBridge.runInProot(
+      'base64 -d ${_shellQuote(tmpPath)} > ${_shellQuote(rootfsPath)} && rm -f ${_shellQuote(tmpPath)}',
+    );
+  }
+
+  static String _bridgeRootfsPath(String rootfsPath) {
+    if (rootfsPath.startsWith('/')) return rootfsPath.substring(1);
+    return rootfsPath;
+  }
+
+  static String _sanitizeFilename(String name) {
+    final safeName = name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    return safeName.isEmpty ? 'skill_import' : safeName;
   }
 
   static String _shellQuote(String value) {

@@ -2,9 +2,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'app.dart' show ClawChatApp, initThemeFromPreferences;
-
-// TODO: i18n - The app mixes Chinese and English strings throughout.
-// Consider using flutter_localizations + intl for proper internationalization.
+import 'l10n/app_strings.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -26,7 +24,7 @@ void main() {
         child: Padding(
           padding: const EdgeInsets.all(16),
           child: Text(
-            '渲染错误',
+            AppStrings.renderError,
             style: TextStyle(color: Colors.red.shade700),
           ),
         ),
@@ -42,7 +40,7 @@ void main() {
       debugPrint('Uncaught error: $error');
       debugPrint('$stackTrace');
     } else {
-      // TODO: Add crash reporting (e.g., Firebase Crashlytics)
+      // Crash reporting is deferred until post-launch provider selection.
       debugPrint('Error: $error');
     }
   });

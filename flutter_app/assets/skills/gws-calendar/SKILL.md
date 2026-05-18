@@ -1,7 +1,7 @@
 ---
 name: gws-calendar
 description: Google Calendar — 查看日程、创建事件、管理日历
-tools: [shell]
+tools: [bash]
 ---
 
 ## Use This Skill When

@@ -83,6 +83,7 @@ jobs:
       - name: Verify PRoot binaries
         run: |
           echo "Checking jniLibs contents..."
+          MIN_SIZE=102400
           for abi in arm64-v8a armeabi-v7a x86_64; do
             for lib in libproot.so libprootloader.so; do
               FILE="flutter_app/android/app/src/main/jniLibs/${abi}/${lib}"
@@ -91,11 +92,16 @@ jobs:
                 exit 1
               fi
               SIZE=$(stat -c%s "$FILE")
-              if [ "$SIZE" -lt 1000 ]; then
-                echo "WARN: $FILE looks like a placeholder (${SIZE} bytes)"
-              else
-                echo "OK: $FILE (${SIZE} bytes)"
+              if [ "$SIZE" -lt "$MIN_SIZE" ]; then
+                echo "ERROR: $FILE looks like a placeholder (${SIZE} bytes; minimum ${MIN_SIZE})"
+                exit 1
               fi
+              MAGIC=$(xxd -p -l 4 "$FILE")
+              if [ "$MAGIC" != "7f454c46" ]; then
+                echo "ERROR: $FILE is not an ELF binary"
+                exit 1
+              fi
+              echo "OK: $FILE (${SIZE} bytes)"
             done
           done
 
@@ -311,12 +317,13 @@ jobs:
 
             ### First Run
             1. Install the APK
-            2. Follow the setup wizard (downloads ~500MB Alpine Linux rootfs)
-            3. Start the gateway from the app
+            2. Follow the setup wizard (downloads a small Alpine minirootfs, then installs packages)
+            3. Configure your API key and model
+            4. Open Chat or Terminal
 
             ### Requirements
             - Android 10+ (API 29)
-            - ~500MB free storage for initial setup
+            - ~300-500MB free storage after package installation
             - Internet connection for first-time setup
           files: artifacts/*
           draft: false

@@ -29,6 +29,7 @@ class TerminalService {
     final homeDir = '$filesDir/home';
     final prootPath = '$nativeLibDir/libproot.so';
     final libDir = '$filesDir/lib';
+    final machine = await _getMachineString();
 
     const resolvContent = 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n';
     try {
@@ -66,6 +67,7 @@ class TerminalService {
       'PROOT_LOADER': '$nativeLibDir/libprootloader.so',
       'PROOT_LOADER_32': '$nativeLibDir/libprootloader32.so',
       'LD_LIBRARY_PATH': '$libDir:$nativeLibDir',
+      'machine': machine,
     };
   }
 
@@ -75,7 +77,7 @@ class TerminalService {
     final sysFakes = '${config['configDir']}/sys_fakes';
     final rootfsDir = config['rootfsDir']!;
 
-    const machine = 'aarch64';
+    final machine = config['machine'] ?? 'aarch64';
 
     final kernelRelease = '\\Linux\\localhost\\$_fakeKernelRelease'
         '\\$_fakeKernelVersion\\$machine\\localdomain\\-1\\';
@@ -141,6 +143,24 @@ class TerminalService {
       'PROOT_LOADER': config['PROOT_LOADER']!,
       'PROOT_LOADER_32': config['PROOT_LOADER_32']!,
       'LD_LIBRARY_PATH': config['LD_LIBRARY_PATH']!,
+    };
+  }
+
+  static Future<String> _getMachineString() async {
+    try {
+      return _machineForArch(await NativeBridge.getArch());
+    } catch (_) {
+      return 'aarch64';
+    }
+  }
+
+  static String _machineForArch(String arch) {
+    return switch (arch) {
+      'arm64-v8a' => 'aarch64',
+      'armeabi-v7a' => 'armv7l',
+      'x86_64' => 'x86_64',
+      'x86' => 'i686',
+      _ => arch.isEmpty ? 'aarch64' : arch,
     };
   }
 }

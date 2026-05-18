@@ -1,6 +1,10 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+
+import '../models/chat_models.dart';
 import '../providers/chat_provider.dart';
 import '../services/session_storage.dart';
 import '../l10n/app_strings.dart';
@@ -40,7 +44,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     for (final msg in fullSession.messages) {
       final role = msg.role == 'user' ? '**User**' : '**AI**';
       buffer.writeln('$role:');
-      buffer.writeln(msg.textContent);
+      buffer.write(_messageContentToMarkdown(msg));
       buffer.writeln('');
     }
 
@@ -50,6 +54,34 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
         const SnackBar(content: Text(AppStrings.exportedToClipboard)),
       );
     }
+  }
+
+  String _messageContentToMarkdown(ChatMessage message) {
+    final buffer = StringBuffer();
+    for (final content in message.content) {
+      switch (content) {
+        case TextContent(:final text):
+          if (text.isNotEmpty) buffer.writeln(text);
+        case ImageContent(:final filename, :final mediaType):
+          buffer.writeln('[Image: ${filename ?? mediaType}]');
+        case ToolUseContent(:final name, :final input):
+          buffer.writeln('**Tool call**: `$name`');
+          buffer.writeln('```json');
+          buffer.writeln(const JsonEncoder.withIndent('  ').convert(input));
+          buffer.writeln('```');
+        case ToolResultContent(:final output):
+          buffer.writeln('**Tool result**:');
+          buffer.writeln('```');
+          buffer.writeln(_truncateToolOutput(output));
+          buffer.writeln('```');
+      }
+    }
+    return buffer.toString();
+  }
+
+  String _truncateToolOutput(String output) {
+    if (output.length <= 2000) return output;
+    return '${output.substring(0, 2000)}\n\n[tool output truncated]';
   }
 
   @override

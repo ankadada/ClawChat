@@ -93,6 +93,12 @@
 
 从 [Releases](https://github.com/ankadada/ClawChat/releases) 下载最新 APK。
 
+首次使用流程：
+1. 安装 APK
+2. 运行 Setup Wizard 初始化 Alpine 环境
+3. 配置 API Key 和模型
+4. 打开聊天或终端开始使用
+
 ### Build from Source
 
 ```bash
@@ -115,7 +121,7 @@ flutter build apk --release
 | 要求 | 详情 |
 |------|------|
 | Android | 10+ (API 29) |
-| 存储 | ~500MB（Alpine rootfs + 软件包） |
+| 存储 | 初始 Alpine minirootfs 下载约 5MB；安装运行时软件包后约 300-500MB |
 | 架构 | arm64-v8a, armeabi-v7a, x86_64 |
 
 ---

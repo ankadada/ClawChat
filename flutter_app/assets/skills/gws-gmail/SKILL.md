@@ -1,7 +1,7 @@
 ---
 name: gws-gmail
 description: Gmail — 查看邮件、搜索邮件、发送邮件
-tools: [shell]
+tools: [bash]
 ---
 
 ## Use This Skill When
