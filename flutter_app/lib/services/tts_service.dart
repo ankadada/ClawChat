@@ -1,6 +1,6 @@
 import 'dart:io';
 import 'dart:convert';
-import 'package:dio/dio.dart';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -34,6 +34,15 @@ class TtsService extends ChangeNotifier {
 
   Future<void> init() async {
     if (_initialized) return;
+
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onAudioComplete') {
+        isSpeaking = false;
+        _currentMessageId = null;
+        notifyListeners();
+      }
+    });
+
     try {
       final engines = await _tts.getEngines;
       debugPrint('TTS engines: $engines');
@@ -107,14 +116,6 @@ class TtsService extends ChangeNotifier {
       _systemAvailable = false;
     }
     _initialized = true;
-
-    _channel.setMethodCallHandler((call) async {
-      if (call.method == 'onAudioComplete') {
-        isSpeaking = false;
-        _currentMessageId = null;
-        notifyListeners();
-      }
-    });
   }
 
   Future<bool> speak(String text, String messageId) async {
@@ -199,7 +200,7 @@ class TtsService extends ChangeNotifier {
       debugPrint('TTS API: status=${response.statusCode} contentLength=${response.contentLength} contentType=${response.headers.contentType}');
 
       // Read response body as bytes
-      final bytesBuilder = BytesBuilder();
+      final bytesBuilder = BytesBuilder(copy: false);
       await for (final chunk in response) {
         bytesBuilder.add(chunk);
       }

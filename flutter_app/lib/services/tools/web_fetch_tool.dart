@@ -183,6 +183,12 @@ class WebFetchTool extends Tool {
       if (location == null || location.isEmpty) return response;
 
       final nextUri = currentUri.resolve(location);
+      if (currentUri.scheme == 'https' && nextUri.scheme == 'http') {
+        throw http.ClientException(
+          'Blocked HTTPS-to-HTTP downgrade redirect',
+          nextUri,
+        );
+      }
       await _validatePublicUrl(nextUri);
       currentUri = nextUri;
 

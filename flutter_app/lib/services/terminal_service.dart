@@ -157,7 +157,7 @@ class TerminalService {
   static String _machineForArch(String arch) {
     return switch (arch) {
       'arm64-v8a' => 'aarch64',
-      'armeabi-v7a' => 'armv7l',
+      'armeabi-v7a' || 'arm' => 'armv7l',
       'x86_64' => 'x86_64',
       'x86' => 'i686',
       _ => arch.isEmpty ? 'aarch64' : arch,
