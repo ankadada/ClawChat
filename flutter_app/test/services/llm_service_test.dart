@@ -212,12 +212,10 @@ void main() {
       expect(body['model'], 'gpt-test');
     });
 
-    test('generic OpenAI-compatible requests keep max_tokens parameter',
-        () async {
+    test('OpenAI-compatible requests use max_completion_tokens', () async {
       final body = await captureOpenAiBody(model: 'gpt-test');
 
-      expect(body['max_tokens'], 8192);
-      expect(body.containsKey('max_completion_tokens'), isFalse);
+      expect(body['max_completion_tokens'], 8192);
     });
 
     test('builds valid Anthropic simple text request body', () async {
@@ -256,8 +254,7 @@ void main() {
         {'role': 'system', 'content': 'You are concise.'},
         {'role': 'user', 'content': 'hi'},
       ]);
-      expect(captured.body['max_tokens'], 8192);
-      expect(captured.body.containsKey('max_completion_tokens'), isFalse);
+      expect(captured.body['max_completion_tokens'], 8192);
       expect(jsonDecode(jsonEncode(captured.body)), captured.body);
     });
   });

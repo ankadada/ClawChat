@@ -966,12 +966,7 @@ class LlmService {
   }
 
   String _openAITokenLimitKey(_OpenAICompatibleProvider provider) {
-    return switch (provider) {
-      // Restore the pre-regression OpenAI parameter for native OpenAI models,
-      // including reasoning/new-generation models that reject max_tokens.
-      _OpenAICompatibleProvider.openaiNative => 'max_completion_tokens',
-      _ => 'max_tokens',
-    };
+    return 'max_completion_tokens';
   }
 
   _OpenAICompatibleProvider _detectOpenAICompatibleProvider() {
