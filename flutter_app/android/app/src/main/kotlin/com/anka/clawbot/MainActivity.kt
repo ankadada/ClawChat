@@ -405,6 +405,13 @@ class MainActivity : FlutterActivity() {
                         try {
                             mediaPlayer?.release()
                             mediaPlayer = MediaPlayer().apply {
+                                setAudioAttributes(
+                                    android.media.AudioAttributes.Builder()
+                                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                                        .build()
+                                )
+                                setVolume(1.0f, 1.0f)
                                 setDataSource(path)
                                 setOnCompletionListener {
                                     safeRunOnUiThread {

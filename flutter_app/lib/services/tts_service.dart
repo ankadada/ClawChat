@@ -1,10 +1,10 @@
 import 'dart:io';
 import 'dart:convert';
+import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:http/http.dart' as http;
 import 'preferences_service.dart';
 
 class TtsService extends ChangeNotifier {
@@ -16,9 +16,15 @@ class TtsService extends ChangeNotifier {
   final FlutterTts _tts = FlutterTts();
   bool _initialized = false;
   bool _systemAvailable = false;
+  bool _systemFailedOnce = false;
   bool isSpeaking = false;
+  bool isLoading = false;
   String? _currentMessageId;
+  String? _lastSpokenText;
   String? lastError;
+
+  bool isLoadingMessage(String messageId) =>
+      isLoading && _currentMessageId == messageId;
 
   bool get isAvailable {
     final ttsModel = PreferencesService().ttsModel;
@@ -70,10 +76,30 @@ class TtsService extends ChangeNotifier {
       });
       _tts.setErrorHandler((msg) {
         debugPrint('TTS error: $msg');
-        isSpeaking = false;
-        _currentMessageId = null;
-        lastError = '语音合成出错: $msg';
-        notifyListeners();
+        _systemFailedOnce = true;
+        // Try API fallback if model configured and we have text + messageId
+        final prefs = PreferencesService();
+        final ttsModel = prefs.ttsModel;
+        final text = _lastSpokenText;
+        final msgId = _currentMessageId;
+        if (ttsModel != null && ttsModel.isNotEmpty && text != null && msgId != null) {
+          debugPrint('TTS: system failed, falling back to API');
+          _speakViaApi(text, ttsModel, prefs).then((ok) {
+            if (!ok) {
+              isSpeaking = false;
+              _currentMessageId = null;
+              lastError = '系统语音合成失败，API 也失败';
+              notifyListeners();
+            }
+          });
+        } else {
+          isSpeaking = false;
+          _currentMessageId = null;
+          lastError = ttsModel == null || ttsModel.isEmpty
+              ? '系统语音合成失败（可能缺少中文语音包），请在设置 → 语音能力 中填写 TTS 模型名称启用 API 兜底'
+              : '语音合成出错: $msg';
+          notifyListeners();
+        }
       });
     } catch (e) {
       debugPrint('TTS init failed: $e');
@@ -103,8 +129,11 @@ class TtsService extends ChangeNotifier {
     lastError = null;
 
     final truncated = text.length > 4000 ? text.substring(0, 4000) : text;
+    _lastSpokenText = truncated;
 
-    if (_systemAvailable) {
+    // Skip system TTS if it failed before (e.g., missing voice data).
+    // Go straight to API if configured.
+    if (_systemAvailable && !_systemFailedOnce) {
       isSpeaking = true;
       notifyListeners();
       await _tts.speak(truncated);
@@ -143,40 +172,63 @@ class TtsService extends ChangeNotifier {
     final url = '$baseUrl/v1/audio/speech';
 
     debugPrint('TTS API: POST $url model=$model');
+    isLoading = true;
+    notifyListeners();
 
+    final client = HttpClient();
+    client.connectionTimeout = const Duration(seconds: 15);
+    client.idleTimeout = const Duration(seconds: 30);
     try {
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {
-          'Authorization': 'Bearer $apiKey',
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode({
-          'model': model,
-          'input': text,
-          'voice': 'alloy',
-          'response_format': 'mp3',
-        }),
-      ).timeout(const Duration(seconds: 30));
+      final request = await client.postUrl(Uri.parse(url));
+      request.headers.set('Authorization', 'Bearer $apiKey');
+      request.headers.contentType = ContentType('application', 'json', charset: 'utf-8');
+      request.headers.set('Accept', 'audio/mpeg');
+      request.headers.set('User-Agent', 'ClawChat/1.0');
+      final bodyJson = jsonEncode({
+        'model': model,
+        'input': text,
+        'voice': 'alloy',
+        'response_format': 'mp3',
+      });
+      request.add(utf8.encode(bodyJson));
+      // Long text + ElevenLabs can take 30-60s; allow up to 90s
+      final response = await request.close().timeout(const Duration(seconds: 90));
+      debugPrint('TTS API: status=${response.statusCode} contentLength=${response.contentLength} contentType=${response.headers.contentType}');
 
-      debugPrint('TTS API: ${response.statusCode}, ${response.bodyBytes.length} bytes');
+      // Read response body as bytes
+      final bytesBuilder = BytesBuilder();
+      await for (final chunk in response) {
+        bytesBuilder.add(chunk);
+      }
+      final body = bytesBuilder.toBytes();
+      debugPrint('TTS API: received ${body.length} bytes');
 
       if (response.statusCode != 200) {
-        lastError = '语音合成失败 (${response.statusCode})';
-        debugPrint('TTS API error: ${response.body}');
+        final errText = utf8.decode(body, allowMalformed: true);
+        lastError = '语音合成失败 (${response.statusCode}): ${errText.length > 200 ? errText.substring(0, 200) : errText}';
+        return false;
+      }
+      if (body.isEmpty) {
+        lastError = '语音合成失败: 服务器返回空响应';
         return false;
       }
 
       final dir = await getTemporaryDirectory();
       final file = File('${dir.path}/tts_${DateTime.now().millisecondsSinceEpoch}.mp3');
-      await file.writeAsBytes(response.bodyBytes);
+      await file.writeAsBytes(body);
 
       await _channel.invokeMethod('playAudio', {'path': file.path});
+      isLoading = false;
+      notifyListeners();
       return true;
     } catch (e) {
       debugPrint('TTS API exception: $e');
       lastError = '语音合成失败: $e';
       return false;
+    } finally {
+      isLoading = false;
+      notifyListeners();
+      client.close(force: true);
     }
   }
 

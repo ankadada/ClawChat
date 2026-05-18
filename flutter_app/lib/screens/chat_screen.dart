@@ -439,26 +439,38 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             SizedBox(
               height: 28,
               width: 28,
-              child: IconButton(
-                padding: EdgeInsets.zero,
-                iconSize: 16,
-                icon: Icon(
-                  _tts.isPlayingMessage(messageId) ? Icons.stop : Icons.volume_up,
-                  color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
-                ),
-                tooltip: _tts.isPlayingMessage(messageId) ? AppStrings.ttsStop : AppStrings.ttsPlay,
-                onPressed: () {
-                  _tts.speak(textContent, messageId).then((ok) {
-                    if (!mounted) return;
-                    if (!ok && _tts.lastError != null) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(_tts.lastError!)),
-                      );
-                    }
-                    setState(() {});
-                  });
-                },
-              ),
+              child: _tts.isLoadingMessage(messageId)
+                  ? Padding(
+                      padding: const EdgeInsets.all(6),
+                      child: SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
+                        ),
+                      ),
+                    )
+                  : IconButton(
+                      padding: EdgeInsets.zero,
+                      iconSize: 16,
+                      icon: Icon(
+                        _tts.isPlayingMessage(messageId) ? Icons.stop : Icons.volume_up,
+                        color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
+                      ),
+                      tooltip: _tts.isPlayingMessage(messageId) ? AppStrings.ttsStop : AppStrings.ttsPlay,
+                      onPressed: () {
+                        _tts.speak(textContent, messageId).then((ok) {
+                          if (!mounted) return;
+                          if (!ok && _tts.lastError != null) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text(_tts.lastError!)),
+                            );
+                          }
+                          setState(() {});
+                        });
+                      },
+                    ),
             ),
           if (hasTokens) ...[
             const SizedBox(width: 8),
