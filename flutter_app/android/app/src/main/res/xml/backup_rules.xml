@@ -3,4 +3,7 @@
 <full-backup-content>
     <include domain="sharedpref" path="." />
     <exclude domain="sharedpref" path="FlutterSharedPreferences.xml" />
+    <exclude domain="sharedpref" path="FlutterSecureStorage.xml" />
+    <exclude domain="sharedpref" path="FlutterSecureKeyStore.xml" />
+    <exclude domain="sharedpref" path="com.it_nomads.fluttersecurestorage.xml" />
 </full-backup-content>

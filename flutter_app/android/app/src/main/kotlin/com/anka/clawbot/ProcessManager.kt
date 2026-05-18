@@ -6,6 +6,7 @@ import android.util.Log
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.concurrent.TimeUnit
 
 /**
  * Manages proot process execution, matching Termux proot-distro as closely
@@ -90,7 +91,7 @@ class ProcessManager(
         }
     }
 
-    private fun commonProotFlags(): List<String> {
+    private fun commonProotFlags(mountStorage: Boolean): List<String> {
         // Guarantee resolv.conf exists before building the bind-mount list
         ensureResolvConf()
 
@@ -136,12 +137,14 @@ class ProcessManager(
             // Bind-mount shared storage into proot (Termux proot-distro style).
             // Bind the whole /storage tree so symlinks and sub-mounts resolve.
             // Then create /sdcard symlink inside rootfs pointing to the right path.
-            val hasAccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                Environment.isExternalStorageManager()
-            } else {
-                val sdcard = Environment.getExternalStorageDirectory()
-                sdcard.exists() && sdcard.canRead()
-            }
+            val hasAccess = mountStorage && (
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    Environment.isExternalStorageManager()
+                } else {
+                    val sdcard = Environment.getExternalStorageDirectory()
+                    sdcard.exists() && sdcard.canRead()
+                }
+            )
 
             if (hasAccess) {
                 val storageDir = File("$rootfsDir/storage")
@@ -174,8 +177,8 @@ class ProcessManager(
     // Used for: apt-get, dpkg, npm install, chmod, etc.
     // Simpler: no --sysvipc, simple kernel-release, minimal guest env.
     // ================================================================
-    fun buildInstallCommand(command: String): List<String> {
-        val flags = commonProotFlags().toMutableList()
+    fun buildInstallCommand(command: String, mountStorage: Boolean = false): List<String> {
+        val flags = commonProotFlags(mountStorage).toMutableList()
 
         // --root-id: fake root identity (same as proot-distro run_proot_cmd)
         flags.add(1, "--root-id")
@@ -206,8 +209,8 @@ class ProcessManager(
     // Used for: running openclaw gateway (long-lived Node.js process).
     // Full featured: --sysvipc, full uname struct, more guest env vars.
     // ================================================================
-    fun buildShellCommand(command: String): List<String> {
-        val flags = commonProotFlags().toMutableList()
+    fun buildShellCommand(command: String, mountStorage: Boolean = false): List<String> {
+        val flags = commonProotFlags(mountStorage).toMutableList()
         val arch = ArchUtils.getArch()
         val machine = when (arch) {
             "arm" -> "armv7l"
@@ -246,8 +249,12 @@ class ProcessManager(
     // Execute a command in proot (install mode) and return output.
     // Used during bootstrap for apt, npm, chmod, etc.
     // ================================================================
-    fun runInProotSync(command: String, timeoutSeconds: Long = 900): String {
-        val cmd = buildInstallCommand(command)
+    fun runInProotSync(
+        command: String,
+        timeoutSeconds: Long = 900,
+        mountStorage: Boolean = false
+    ): String {
+        val cmd = buildInstallCommand(command, mountStorage)
         val env = prootEnv()
 
         val pb = ProcessBuilder(cmd)
@@ -264,8 +271,10 @@ class ProcessManager(
         val process = pb.start()
         val output = StringBuilder()
         val errorLines = StringBuilder()
+        val outputLock = Any()
+        var readerFailure: Exception? = null
 
-        try {
+        val readerThread = Thread {
             BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
                 var line: String?
                 while (reader.readLine().also { line = it } != null) {
@@ -273,49 +282,73 @@ class ProcessManager(
                     if (l.contains("proot warning") || l.contains("can't sanitize")) {
                         continue
                     }
-                    output.appendLine(l)
-                    // Collect error-relevant lines (skip apt download noise)
-                    if (!l.startsWith("Get:") && !l.startsWith("Fetched ") &&
-                        !l.startsWith("Hit:") && !l.startsWith("Ign:") &&
-                        !l.contains(" kB]") && !l.contains(" MB]") &&
-                        !l.startsWith("Reading package") && !l.startsWith("Building dependency") &&
-                        !l.startsWith("Reading state") && !l.startsWith("The following") &&
-                        !l.startsWith("Need to get") && !l.startsWith("After this") &&
-                        l.trim().isNotEmpty()) {
-                        errorLines.appendLine(l)
+                    synchronized(outputLock) {
+                        output.appendLine(l)
+                        // Collect error-relevant lines (skip apt download noise)
+                        if (!l.startsWith("Get:") && !l.startsWith("Fetched ") &&
+                            !l.startsWith("Hit:") && !l.startsWith("Ign:") &&
+                            !l.contains(" kB]") && !l.contains(" MB]") &&
+                            !l.startsWith("Reading package") && !l.startsWith("Building dependency") &&
+                            !l.startsWith("Reading state") && !l.startsWith("The following") &&
+                            !l.startsWith("Need to get") && !l.startsWith("After this") &&
+                            l.trim().isNotEmpty()) {
+                            errorLines.appendLine(l)
+                        }
                     }
                 }
             }
-        } catch (e: Exception) {
-            process.destroyForcibly()
-            throw e
+        }.apply {
+            isDaemon = true
+            setUncaughtExceptionHandler { _, e ->
+                if (e is Exception) readerFailure = e
+            }
+            start()
         }
 
-        val exited = process.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+        val exited = try {
+            process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            process.destroyForcibly()
+            Thread.currentThread().interrupt()
+            throw e
+        }
         if (!exited) {
             process.destroyForcibly()
-            throw RuntimeException("Command timed out after ${timeoutSeconds}s")
+            readerThread.join(1000)
+            val partialOutput = synchronized(outputLock) {
+                output.toString().takeLast(3000)
+            }
+            val suffix = if (partialOutput.isBlank()) {
+                ""
+            } else {
+                " Partial output:\n$partialOutput"
+            }
+            throw RuntimeException("Command timed out after ${timeoutSeconds}s.$suffix")
         }
+        readerThread.join(1000)
+        readerFailure?.let { throw it }
 
         val exitCode = process.exitValue()
         if (exitCode != 0) {
-            val errorOutput = errorLines.toString().takeLast(3000).ifEmpty {
-                output.toString().takeLast(3000)
+            val errorOutput = synchronized(outputLock) {
+                errorLines.toString().takeLast(3000).ifEmpty {
+                    output.toString().takeLast(3000)
+                }
             }
             throw RuntimeException(
                 "Command failed (exit code $exitCode): $errorOutput"
             )
         }
 
-        return output.toString()
+        return synchronized(outputLock) { output.toString() }
     }
 
     // ================================================================
     // Start a long-lived gateway process (gateway mode).
     // Uses full proot-distro command_login() style configuration.
     // ================================================================
-    fun startProotProcess(command: String): Process {
-        val cmd = buildShellCommand(command)
+    fun startProotProcess(command: String, mountStorage: Boolean = false): Process {
+        val cmd = buildShellCommand(command, mountStorage)
         val env = prootEnv()
 
         val pb = ProcessBuilder(cmd)

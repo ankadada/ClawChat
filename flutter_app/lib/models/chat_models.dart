@@ -1,4 +1,8 @@
+import 'package:uuid/uuid.dart';
+
 class ChatSession {
+  static final _validIdPattern = RegExp(r'^[a-zA-Z0-9_-]+$');
+
   final String id;
   String title;
   final DateTime createdAt;
@@ -54,7 +58,7 @@ class ChatSession {
 
   factory ChatSession.fromJson(Map<String, dynamic> json) {
     return ChatSession(
-      id: json['id'] as String,
+      id: _sanitizeId(json['id']?.toString()),
       title: json['title'] as String? ?? '新对话',
       createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ?? DateTime.now(),
       updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ?? DateTime.now(),
@@ -67,6 +71,11 @@ class ChatSession {
       systemPrompt: json['systemPrompt'] as String?,
       folder: json['folder'] as String?,
     );
+  }
+
+  static String _sanitizeId(String? id) {
+    if (id != null && _validIdPattern.hasMatch(id)) return id;
+    return const Uuid().v4();
   }
 
   ChatSession copyWith({

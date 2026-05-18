@@ -65,7 +65,7 @@ class WriteFileTool extends Tool {
         return 'Error: Path contains invalid characters.';
       }
       final dir = resolved.substring(0, resolved.lastIndexOf('/'));
-      await NativeBridge.runInProot("mkdir -p '$dir'");
+      await NativeBridge.runInProot("mkdir -p '$dir'", mountStorage: false);
       await NativeBridge.writeRootfsFile(rootfsPath, content);
       return 'Successfully wrote ${content.length} bytes to $resolved';
     } catch (e) {

@@ -10,6 +10,7 @@ class BashTool extends Tool {
   String get description =>
       'Execute a shell command in the Alpine Linux environment. '
       'Commands run inside a proot container with /root/workspace as the default directory. '
+      'Shared Android storage is not mounted for agent commands. '
       'Use this for file operations, running scripts, installing packages, etc.';
 
   @override
@@ -120,7 +121,11 @@ class BashTool extends Tool {
     final effectiveCommand = '${envPrefix.isNotEmpty ? "$envPrefix; " : ""}$cdPrefix$command';
 
     try {
-      final output = await NativeBridge.runInProot(effectiveCommand, timeout: timeout);
+      final output = await NativeBridge.runInProot(
+        effectiveCommand,
+        timeout: timeout,
+        mountStorage: false,
+      );
       final sanitized = _sanitizeOutput(output);
       if (sanitized.length > 50000) {
         return '${sanitized.substring(0, 50000)}\n\n[Output truncated, original length: ${sanitized.length} chars]';

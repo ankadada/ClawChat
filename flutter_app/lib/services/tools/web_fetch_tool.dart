@@ -49,9 +49,9 @@ class WebFetchTool extends Tool {
           throw SocketException('Could not resolve host: ${uri.host}');
         }
         for (final addr in addresses) {
-          if (_isPrivateIP(addr)) {
+          if (!_isPublicIp(addr)) {
             throw SocketException(
-              'Blocked connection to private IP ${addr.address} (SSRF protection)',
+              'Blocked connection to non-public IP ${addr.address} (SSRF protection)',
             );
           }
         }
@@ -60,38 +60,28 @@ class WebFetchTool extends Tool {
     return IOClient(ioClient);
   }
 
-  static bool _isPrivateIP(InternetAddress addr) {
-    if (addr.isLoopback) return true;
+  static bool _isPublicIp(InternetAddress addr) {
+    if (addr.isLoopback || addr.isLinkLocal) return false;
 
     if (addr.type == InternetAddressType.IPv4) {
-      final parts = addr.address.split('.');
-      if (parts.length != 4) return false;
-      final a = int.parse(parts[0]);
-      final b = int.parse(parts[1]);
-      if (a == 10) return true;
-      if (a == 172 && b >= 16 && b <= 31) return true;
-      if (a == 192 && b == 168) return true;
-      if (a == 127) return true;
-      if (a == 169 && b == 254) return true;
-      return false;
+      return _isPublicIpv4Bytes(addr.rawAddress);
     }
 
     if (addr.type == InternetAddressType.IPv6) {
       final raw = addr.rawAddress;
       if (raw.length == 16) {
-        // IPv4-mapped IPv6 (::ffff:x.x.x.x) — extract IPv4 and check
-        bool isMapped = true;
-        for (int i = 0; i < 10; i++) { if (raw[i] != 0) { isMapped = false; break; } }
-        if (isMapped && raw[10] == 0xff && raw[11] == 0xff) {
-          final a = raw[12], b = raw[13];
-          if (a == 10 || (a == 172 && b >= 16 && b <= 31) ||
-              (a == 192 && b == 168) || a == 127 || (a == 169 && b == 254)) return true;
+        if (raw.every((b) => b == 0)) return false; // unspecified ::
+        if ((raw[0] & 0xfe) == 0xfc) return false; // unique local fc00::/7
+        if (raw[0] == 0xfe && (raw[1] & 0xc0) == 0x80) return false; // fe80::/10
+        if (raw[0] == 0xff) return false; // multicast ff00::/8
+        if (raw[0] == 0x20 && raw[1] == 0x01 && raw[2] == 0x0d && raw[3] == 0xb8) {
+          return false; // documentation 2001:db8::/32
         }
-        if (raw[0] == 0xfc || raw[0] == 0xfd) return true;
-        if (raw[0] == 0xfe && (raw[1] & 0xc0) == 0x80) return true;
+        if (_isIpv4MappedIpv6(raw)) {
+          return _isPublicIpv4Bytes(raw.sublist(12, 16));
+        }
+        return true;
       }
-      if (addr.address.startsWith('[') && addr.address.contains('%')) return true;
-      return false;
     }
 
     return false;
@@ -110,24 +100,25 @@ class WebFetchTool extends Tool {
 
     final uri = Uri.parse(url);
 
-    if (_isPrivateOrInternalHost(uri.host)) {
-      return 'Error: Access to private/internal IP addresses is blocked for security (SSRF protection).';
+    try {
+      await _validatePublicUrl(uri);
+    } on SocketException catch (e) {
+      return 'Error: $e';
+    } catch (e) {
+      return 'Error fetching URL: $e';
     }
 
     final reqHeaders = headers?.map((k, v) => MapEntry(k, v.toString())) ?? {};
 
     final client = _createSecureClient();
     try {
-      http.Response response;
-      if (method == 'POST') {
-        response = await client
-            .post(uri, headers: reqHeaders, body: body)
-            .timeout(_timeout);
-      } else {
-        response = await client
-            .get(uri, headers: reqHeaders)
-            .timeout(_timeout);
-      }
+      final response = await _sendWithRedirects(
+        client,
+        uri,
+        method,
+        reqHeaders,
+        body,
+      );
 
       final result = StringBuffer();
       result.writeln('Status: ${response.statusCode}');
@@ -161,7 +152,82 @@ class WebFetchTool extends Tool {
     }
   }
 
-  static bool _isPrivateOrInternalHost(String host) {
+  Future<http.Response> _sendWithRedirects(
+    http.Client client,
+    Uri initialUri,
+    String initialMethod,
+    Map<String, String> headers,
+    String? initialBody,
+  ) async {
+    var currentUri = initialUri;
+    var currentMethod = initialMethod.toUpperCase() == 'POST' ? 'POST' : 'GET';
+    var currentBody = currentMethod == 'POST' ? initialBody : null;
+
+    for (var redirectCount = 0; redirectCount < 5; redirectCount++) {
+      await _validatePublicUrl(currentUri);
+
+      final request = http.Request(currentMethod, currentUri)
+        ..headers.addAll(headers)
+        ..followRedirects = false;
+      if (currentBody != null) {
+        request.body = currentBody;
+      }
+
+      final streamedResponse = await client.send(request).timeout(_timeout);
+      final response =
+          await http.Response.fromStream(streamedResponse).timeout(_timeout);
+
+      if (!_isRedirect(response.statusCode)) return response;
+
+      final location = response.headers['location'];
+      if (location == null || location.isEmpty) return response;
+
+      final nextUri = currentUri.resolve(location);
+      await _validatePublicUrl(nextUri);
+      currentUri = nextUri;
+
+      if (response.statusCode == 303 ||
+          ((response.statusCode == 301 || response.statusCode == 302) &&
+              currentMethod == 'POST')) {
+        currentMethod = 'GET';
+        currentBody = null;
+      }
+    }
+
+    throw http.ClientException('Too many redirects', currentUri);
+  }
+
+  static bool _isRedirect(int statusCode) =>
+      statusCode == 301 ||
+      statusCode == 302 ||
+      statusCode == 303 ||
+      statusCode == 307 ||
+      statusCode == 308;
+
+  static Future<void> _validatePublicUrl(Uri uri) async {
+    if (uri.scheme != 'http' && uri.scheme != 'https') {
+      throw SocketException('Only HTTP and HTTPS URLs are allowed');
+    }
+    if (uri.host.isEmpty || _isInternalHostname(uri.host)) {
+      throw SocketException(
+        'Blocked connection to private/internal host ${uri.host} (SSRF protection)',
+      );
+    }
+
+    final addresses = await InternetAddress.lookup(uri.host);
+    if (addresses.isEmpty) {
+      throw SocketException('Could not resolve host: ${uri.host}');
+    }
+    for (final addr in addresses) {
+      if (!_isPublicIp(addr)) {
+        throw SocketException(
+          'Blocked connection to non-public IP ${addr.address} (SSRF protection)',
+        );
+      }
+    }
+  }
+
+  static bool _isInternalHostname(String host) {
     final lowerHost = host.toLowerCase();
     if (lowerHost == 'localhost' ||
         lowerHost.endsWith('.local') ||
@@ -171,32 +237,38 @@ class WebFetchTool extends Tool {
       return true;
     }
 
-    final ipv4Match = RegExp(r'^(\d+)\.(\d+)\.(\d+)\.(\d+)$').firstMatch(host);
-    if (ipv4Match != null) {
-      final a = int.parse(ipv4Match.group(1)!);
-      final b = int.parse(ipv4Match.group(2)!);
-      if (a == 10) return true;
-      if (a == 172 && b >= 16 && b <= 31) return true;
-      if (a == 192 && b == 168) return true;
-      if (a == 127) return true;
-      if (a == 169 && b == 254) return true;
-      return false;
-    }
-
-    if (host.contains(':')) {
-      if (host == '::1') return true;
-      try {
-        final addr = InternetAddress(host);
-        if (addr.type == InternetAddressType.IPv6) {
-          final raw = addr.rawAddress;
-          if (raw[0] == 0xfc || raw[0] == 0xfd) return true;
-          if (raw[0] == 0xfe && (raw[1] & 0xc0) == 0x80) return true;
-        }
-      } catch (_) {
-        // Address parsing failed — not a valid IPv6, skip
-      }
-    }
-
     return false;
+  }
+
+  static bool _isPublicIpv4Bytes(List<int> bytes) {
+    if (bytes.length != 4) return false;
+
+    final a = bytes[0];
+    final b = bytes[1];
+    final c = bytes[2];
+
+    if (a == 0) return false; // 0.0.0.0/8
+    if (a == 10) return false; // RFC1918 10/8
+    if (a == 100 && b >= 64 && b <= 127) return false; // CGNAT 100.64/10
+    if (a == 127) return false; // loopback
+    if (a == 169 && b == 254) return false; // link-local
+    if (a == 172 && b >= 16 && b <= 31) return false; // RFC1918 172.16/12
+    if (a == 192 && b == 0 && c == 0) return false; // IETF protocol assignments
+    if (a == 192 && b == 0 && c == 2) return false; // documentation
+    if (a == 192 && b == 168) return false; // RFC1918 192.168/16
+    if (a == 198 && (b == 18 || b == 19)) return false; // benchmarking
+    if (a == 198 && b == 51 && c == 100) return false; // documentation
+    if (a == 203 && b == 0 && c == 113) return false; // documentation
+    if (a >= 224) return false; // multicast, reserved, broadcast
+
+    return true;
+  }
+
+  static bool _isIpv4MappedIpv6(List<int> raw) {
+    if (raw.length != 16) return false;
+    for (var i = 0; i < 10; i++) {
+      if (raw[i] != 0) return false;
+    }
+    return raw[10] == 0xff && raw[11] == 0xff;
   }
 }

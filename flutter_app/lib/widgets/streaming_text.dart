@@ -311,7 +311,14 @@ class _StreamingTextState extends State<StreamingText> {
           final linkText = info.match.group(1)!;
           final url = info.match.group(2)!;
           final recognizer = TapGestureRecognizer()
-            ..onTap = () => launchUrl(Uri.parse(url));
+            ..onTap = () {
+              final uri = Uri.tryParse(url);
+              if (uri == null ||
+                  (uri.scheme != 'http' && uri.scheme != 'https')) {
+                return;
+              }
+              launchUrl(uri);
+            };
           _recognizers.add(recognizer);
           spans.add(TextSpan(
             text: linkText,

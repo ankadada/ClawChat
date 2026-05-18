@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
+import 'api_validator.dart';
 
 enum ApiFormat { anthropic, openai }
 
@@ -34,11 +35,12 @@ class LlmConfig {
           model == other.model &&
           baseUrl == other.baseUrl &&
           maxTokens == other.maxTokens &&
-          thinkingBudget == other.thinkingBudget;
+          thinkingBudget == other.thinkingBudget &&
+          temperature == other.temperature;
 
   @override
   int get hashCode =>
-      Object.hash(format, apiKey, model, baseUrl, maxTokens, thinkingBudget);
+      Object.hash(format, apiKey, model, baseUrl, maxTokens, thinkingBudget, temperature);
 
   factory LlmConfig.anthropic({
     required String apiKey,
@@ -200,10 +202,7 @@ class LlmService {
 
   /// Validates that [url] uses HTTPS and targets a known AI provider host.
   void _validateApiHost(String url) {
-    final uri = Uri.parse(url);
-    if (uri.scheme != 'https') {
-      throw Exception('Only HTTPS connections are allowed for API calls');
-    }
+    final uri = ApiValidator.validateBearerUrl(url, context: 'LLM API endpoint');
     // Allow known providers and any user-configured custom baseUrl
     final configHost = Uri.parse(config.baseUrl).host;
     if (!_allowedApiHosts.contains(uri.host) && uri.host != configHost) {
@@ -234,8 +233,9 @@ class LlmService {
     final url = '$effectiveBaseUrl/v1/models';
     final client = _createPinnedClient();
     try {
+      final uri = ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
       final response = await client.get(
-        Uri.parse(url),
+        uri,
         headers: {'Authorization': 'Bearer $apiKey'},
       ).timeout(const Duration(seconds: 10));
 
@@ -363,19 +363,19 @@ class LlmService {
 
     http.StreamedResponse streamedResponse;
     try {
-      streamedResponse = await _retryWithBackoff(() {
+      streamedResponse = await _retryWithBackoff(() async {
         final request = http.Request('POST', Uri.parse(url));
         request.headers.addAll(_anthropicHeaders());
         request.body = jsonEncode(body);
-        return _client.send(request);
+        final response = await _client.send(request);
+        if (response.statusCode != 200) {
+          final errorBody = await response.stream.bytesToString();
+          throw Exception('Anthropic API error (${response.statusCode}): ${_sanitizeErrorBody(errorBody)}');
+        }
+        return response;
       });
     } catch (e) {
       yield StreamError('Anthropic request failed after retries: $e');
-      return;
-    }
-    if (streamedResponse.statusCode != 200) {
-      final errorBody = await streamedResponse.stream.bytesToString();
-      yield StreamError('Anthropic API error (${streamedResponse.statusCode}): ${_sanitizeErrorBody(errorBody)}');
       return;
     }
 
@@ -625,19 +625,19 @@ class LlmService {
 
     http.StreamedResponse streamedResponse;
     try {
-      streamedResponse = await _retryWithBackoff(() {
+      streamedResponse = await _retryWithBackoff(() async {
         final request = http.Request('POST', Uri.parse(url));
         request.headers.addAll(_openaiHeaders());
         request.body = jsonEncode(body);
-        return _client.send(request);
+        final response = await _client.send(request);
+        if (response.statusCode != 200) {
+          final errorBody = await response.stream.bytesToString();
+          throw Exception('OpenAI API error (${response.statusCode}): ${_sanitizeErrorBody(errorBody)}');
+        }
+        return response;
       });
     } catch (e) {
       yield StreamError('OpenAI request failed after retries: $e');
-      return;
-    }
-    if (streamedResponse.statusCode != 200) {
-      final errorBody = await streamedResponse.stream.bytesToString();
-      yield StreamError('OpenAI API error (${streamedResponse.statusCode}): ${_sanitizeErrorBody(errorBody)}');
       return;
     }
 

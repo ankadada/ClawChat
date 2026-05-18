@@ -89,10 +89,15 @@ class MainActivity : FlutterActivity() {
                 "runInProot" -> {
                     val command = call.argument<String>("command")
                     val timeout = call.argument<Int>("timeout")?.toLong() ?: 900L
+                    val mountStorage = call.argument<Boolean>("mountStorage") ?: false
                     if (command != null) {
                         Thread {
                             try {
-                                val output = processManager.runInProotSync(command, timeout)
+                                val output = processManager.runInProotSync(
+                                    command,
+                                    timeout,
+                                    mountStorage
+                                )
                                 safeRunOnUiThread { result.success(output) }
                             } catch (e: Exception) {
                                 safeRunOnUiThread { result.error("PROOT_ERROR", e.message, null) }

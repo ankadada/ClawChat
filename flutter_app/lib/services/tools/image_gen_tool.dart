@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'tool_registry.dart';
+import '../api_validator.dart';
 import '../preferences_service.dart';
 
 class ImageGenTool extends Tool {
@@ -47,7 +48,8 @@ class ImageGenTool extends Tool {
 
     final client = HttpClient();
     try {
-      final request = await client.postUrl(Uri.parse(url));
+      final uri = ApiValidator.validateBearerUrl(url, context: 'Image API endpoint');
+      final request = await client.postUrl(uri);
       request.headers.set('Authorization', 'Bearer $apiKey');
       request.headers.contentType = ContentType.json;
       request.write(jsonEncode({

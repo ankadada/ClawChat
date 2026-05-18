@@ -110,8 +110,6 @@ jobs:
       - name: Run tests
         working-directory: flutter_app
         run: flutter test
-        # Tests may not exist yet; allow this step to fail until tests are added
-        continue-on-error: true
 
       - name: Build fat APK (all ABIs)
         working-directory: flutter_app

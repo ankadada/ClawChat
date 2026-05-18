@@ -1,37 +1,15 @@
+import 'package:clawchat/services/chat_context_utils.dart';
 import 'package:flutter_test/flutter_test.dart';
-
-// Extracted from ChatProvider for unit testing. These must be kept in sync
-// with lib/providers/chat_provider.dart.
 
 const int _maxContextChars = 100000; // ~25k tokens
 
-int charCount(Map<String, dynamic> msg) {
-  final content = msg['content'];
-  if (content is String) return content.length;
-  if (content is List) {
-    int count = 0;
-    for (final item in content) {
-      if (item is Map) {
-        count += (item['text'] as String?)?.length ?? 0;
-        count += (item['content'] as String?)?.length ?? 0;
-      }
-    }
-    return count;
-  }
-  return 0;
-}
+int charCount(Map<String, dynamic> msg) => ChatContextUtils.charCount(msg);
 
-List<Map<String, dynamic>> truncateToFit(
-    List<Map<String, dynamic>> messages) {
-  final result = List<Map<String, dynamic>>.from(messages);
-  int totalChars = 0;
-  for (final msg in result) {
-    totalChars += charCount(msg);
-  }
-  while (result.length > 2 && totalChars > _maxContextChars) {
-    totalChars -= charCount(result.removeAt(0));
-  }
-  return result;
+List<Map<String, dynamic>> truncateToFit(List<Map<String, dynamic>> messages) {
+  return ChatContextUtils.truncateToFit(
+    messages,
+    maxChars: _maxContextChars,
+  );
 }
 
 void main() {
@@ -191,7 +169,6 @@ void main() {
       );
       final result = truncateToFit(msgs);
       expect(result.length, lessThan(10));
-      // The last message should always be preserved
       expect(result.last['content'], contains('msg_9'));
     });
 
@@ -211,11 +188,8 @@ void main() {
         {'role': 'assistant', 'content': 'b' * 50000},
         {'role': 'user', 'content': 'c' * 50000},
       ];
-      // Total = 150000, limit = 100000. Remove first -> 100000, still not > limit
-      // so loop stops at length 2
       final result = truncateToFit(msgs);
       expect(result.length, 2);
-      // Oldest removed, newest two kept
       expect(result[0]['content'], startsWith('b'));
       expect(result[1]['content'], startsWith('c'));
     });
@@ -225,13 +199,11 @@ void main() {
         {'role': 'user', 'content': 'a' * 50000},
         {'role': 'assistant', 'content': 'b' * 50000},
       ];
-      // Total = 100000, which equals _maxContextChars, NOT greater
       final result = truncateToFit(msgs);
       expect(result.length, 2);
     });
 
     test('handles single message (does not truncate below 2)', () {
-      // With only 1 message, result.length > 2 is false, so no truncation
       final msgs = [
         {'role': 'user', 'content': 'x' * 200000},
       ];

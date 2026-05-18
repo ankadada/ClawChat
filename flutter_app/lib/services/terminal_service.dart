@@ -10,7 +10,9 @@ class TerminalService {
   static const _fakeKernelVersion =
       '#1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000';
 
-  static Future<Map<String, String>> getProotShellConfig() async {
+  static Future<Map<String, String>> getProotShellConfig({
+    bool mountStorage = true,
+  }) async {
     try { await NativeBridge.setupDirs(); } catch (_) {
       // Best-effort: dirs may already exist
     }
@@ -48,7 +50,8 @@ class TerminalService {
       // Best-effort: rootfs etc/ may not be writable
     }
 
-    final storageGranted = await NativeBridge.hasStoragePermission();
+    final storageGranted =
+        mountStorage ? await NativeBridge.hasStoragePermission() : false;
 
     return {
       'executable': prootPath,
@@ -67,7 +70,7 @@ class TerminalService {
   }
 
   static List<String> buildProotArgs(Map<String, String> config,
-      {int columns = 80, int rows = 24}) {
+      {int columns = 80, int rows = 24, bool mountStorage = true}) {
     final procFakes = '${config['configDir']}/proc_fakes';
     final sysFakes = '${config['configDir']}/sys_fakes';
     final rootfsDir = config['rootfsDir']!;
@@ -108,7 +111,7 @@ class TerminalService {
       '--bind=${config['homeDir']}:/root/home',
     ];
 
-    if (config['storageGranted'] == 'true') {
+    if (mountStorage && config['storageGranted'] == 'true') {
       args.addAll([
         '--bind=/storage:/storage',
         '--bind=/storage/emulated/0:/sdcard',

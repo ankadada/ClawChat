@@ -20,6 +20,7 @@ class SkillInfo {
 class SkillService {
   static const _skillsDir = '/root/workspace/skills';
   static const _kDisabledKey = 'disabled_skills';
+  static final _safeSkillNamePattern = RegExp(r'^[A-Za-z0-9._-]+$');
 
   /// Loads the persisted set of disabled skill names from SharedPreferences.
   static Future<Set<String>> _loadDisabled() async {
@@ -93,13 +94,15 @@ class SkillService {
 
   /// Downloads a skill from a URL (git repo or tar.gz) into the skills directory.
   static Future<String> importSkillFromUrl(String url) async {
-    final safeUrl = url.replaceAll(RegExp(r'[;&|`$"\\]'), '');
-    final skillName = safeUrl.split('/').last.replaceAll('.git', '').replaceAll('.tar.gz', '');
-    final targetDir = '$_skillsDir/$skillName';
+    final safeUrl = url.trim();
+    final skillName = _extractSkillNameFromUrl(safeUrl);
+    final targetDir = _targetDirForSkillName(skillName);
+    final quotedUrl = _shellQuote(safeUrl);
+    final quotedTarget = _shellQuote(targetDir);
 
     if (safeUrl.endsWith('.git') || safeUrl.contains('github.com')) {
       final output = await NativeBridge.runInProot(
-        'git clone "$safeUrl" "$targetDir" 2>&1 || echo "CLONE_FAILED"',
+        'git clone $quotedUrl $quotedTarget 2>&1 || echo "CLONE_FAILED"',
       );
       if (output.contains('CLONE_FAILED')) {
         throw Exception('Git clone failed: $output');
@@ -108,7 +111,7 @@ class SkillService {
     } else {
       // Download and extract tar.gz
       await NativeBridge.runInProot(
-        'mkdir -p "$targetDir" && curl -fsSL "$safeUrl" | tar xz -C "$targetDir" 2>&1',
+        'mkdir -p $quotedTarget && curl -fsSL $quotedUrl | tar xz -C $quotedTarget 2>&1',
       );
       return skillName;
     }
@@ -116,25 +119,24 @@ class SkillService {
 
   /// Imports a skill from a local directory or zip/tar.gz file on the device.
   static Future<String> importSkillFromLocalPath(String sourcePath) async {
-    final safePath = sourcePath.replaceAll(RegExp(r'[;&|`$"\\]'), '');
-    final name = safePath.split('/').last
-        .replaceAll('.tar.gz', '')
-        .replaceAll('.tgz', '')
-        .replaceAll('.zip', '');
-    final targetDir = '$_skillsDir/$name';
+    final safePath = sourcePath.trim();
+    final name = _normalizeSkillName(safePath.split('/').last);
+    final targetDir = _targetDirForSkillName(name);
+    final quotedPath = _shellQuote(safePath);
+    final quotedTarget = _shellQuote(targetDir);
 
     if (sourcePath.endsWith('.tar.gz') || sourcePath.endsWith('.tgz')) {
       await NativeBridge.runInProot(
-        'mkdir -p "$targetDir" && tar xzf "$safePath" -C "$targetDir"',
+        'mkdir -p $quotedTarget && tar xzf $quotedPath -C $quotedTarget',
       );
     } else if (sourcePath.endsWith('.zip')) {
       await NativeBridge.runInProot(
-        'mkdir -p "$targetDir" && unzip -o "$safePath" -d "$targetDir"',
+        'mkdir -p $quotedTarget && unzip -o $quotedPath -d $quotedTarget',
       );
     } else {
       // Assume it's a directory, copy it
       await NativeBridge.runInProot(
-        'cp -r "$safePath" "$targetDir"',
+        'cp -r $quotedPath $quotedTarget',
       );
     }
     return name;
@@ -169,5 +171,52 @@ class SkillService {
     final regex = RegExp('^$field:\\s*(.+)\$', multiLine: true);
     final match = regex.firstMatch(content);
     return match?.group(1)?.trim();
+  }
+
+  static String _extractSkillNameFromUrl(String url) {
+    final uri = Uri.tryParse(url);
+    final segments = uri?.pathSegments.where((s) => s.isNotEmpty).toList();
+    final rawName = segments != null && segments.isNotEmpty
+        ? segments.last
+        : url.split('/').last;
+    return _normalizeSkillName(rawName);
+  }
+
+  static String _normalizeSkillName(String rawName) {
+    var name = rawName.trim();
+    for (final suffix in ['.tar.gz', '.tgz', '.zip', '.git']) {
+      if (name.endsWith(suffix)) {
+        name = name.substring(0, name.length - suffix.length);
+        break;
+      }
+    }
+
+    if (name.isEmpty ||
+        name.startsWith('.') ||
+        name.contains('..') ||
+        !_safeSkillNamePattern.hasMatch(name)) {
+      throw Exception('Invalid skill name');
+    }
+    return name;
+  }
+
+  static String _targetDirForSkillName(String skillName) {
+    final name = _normalizeSkillName(skillName);
+    final baseUri = Uri.parse('file://$_skillsDir/');
+    final targetUri = baseUri.resolve('$name/');
+    final basePath = baseUri.toFilePath();
+    final targetPath = targetUri.toFilePath();
+
+    if (!targetPath.startsWith(basePath) || targetPath == basePath) {
+      throw Exception('Invalid skill target path');
+    }
+
+    return targetPath.endsWith('/')
+        ? targetPath.substring(0, targetPath.length - 1)
+        : targetPath;
+  }
+
+  static String _shellQuote(String value) {
+    return "'${value.replaceAll("'", "'\\''")}'";
   }
 }

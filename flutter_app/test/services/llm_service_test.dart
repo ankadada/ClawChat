@@ -1,86 +1,71 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:clawchat/services/llm_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-// Extracted from LlmService._sanitizeErrorBody for unit testing.
-// Must be kept in sync with lib/services/llm_service.dart.
-String sanitizeErrorBody(String body) {
-  String sanitized =
-      body.length > 500 ? '${body.substring(0, 500)}...' : body;
-  sanitized = sanitized.replaceAll(
-    RegExp(r'(sk-|key-|api-)[a-zA-Z0-9_-]{10,}'),
-    '[REDACTED]',
-  );
-  return sanitized;
-}
-
-// Extracted from LlmService._isRetryableHttpError for unit testing.
-bool isRetryableHttpError(String msg) {
-  final pattern = RegExp(r'\((429|5\d{2})\)');
-  return pattern.hasMatch(msg);
-}
-
 void main() {
-  group('LlmService._sanitizeErrorBody', () {
-    test('returns short body unchanged', () {
+  group('LlmService error sanitization', () {
+    test('returns short body unchanged', () async {
       const msg = 'Rate limit exceeded. Please retry after 60s.';
-      expect(sanitizeErrorBody(msg), msg);
+      expect(await sanitizedErrorBody(msg), msg);
     });
 
-    test('truncates body longer than 500 chars', () {
+    test('truncates body longer than 500 chars', () async {
       final long = 'a' * 1000;
-      final result = sanitizeErrorBody(long);
+      final result = await sanitizedErrorBody(long);
       expect(result.length, 503); // 500 chars + '...'
       expect(result, endsWith('...'));
       expect(result.startsWith('a' * 500), isTrue);
     });
 
-    test('truncates exactly at 500 boundary', () {
+    test('truncates exactly at 500 boundary', () async {
       final exact500 = 'b' * 500;
-      expect(sanitizeErrorBody(exact500), exact500);
+      expect(await sanitizedErrorBody(exact500), exact500);
 
       final exact501 = 'c' * 501;
-      final result = sanitizeErrorBody(exact501);
+      final result = await sanitizedErrorBody(exact501);
       expect(result.length, 503);
     });
 
-    test('redacts sk- prefixed API keys', () {
-      final input = 'Invalid key: sk-ant-api03-xxxxxxxxxxxx';
-      final result = sanitizeErrorBody(input);
+    test('redacts sk- prefixed API keys', () async {
+      final result =
+          await sanitizedErrorBody('Invalid key: sk-ant-api03-xxxxxxxxxxxx');
       expect(result, contains('[REDACTED]'));
       expect(result, isNot(contains('sk-ant-api03-xxxxxxxxxxxx')));
     });
 
-    test('redacts key- prefixed tokens', () {
-      final result = sanitizeErrorBody('Error with key-abcdefghijklmnop');
+    test('redacts key- prefixed tokens', () async {
+      final result = await sanitizedErrorBody('Error with key-abcdefghijklmnop');
       expect(result, contains('[REDACTED]'));
       expect(result, isNot(contains('key-abcdefghijklmnop')));
     });
 
-    test('redacts api- prefixed tokens', () {
-      final result = sanitizeErrorBody('Token: api-1234567890abcdef');
+    test('redacts api- prefixed tokens', () async {
+      final result = await sanitizedErrorBody('Token: api-1234567890abcdef');
       expect(result, contains('[REDACTED]'));
       expect(result, isNot(contains('api-1234567890abcdef')));
     });
 
-    test('does not redact short key-like strings (less than 10 chars)', () {
-      // The regex requires 10+ chars after the prefix
-      final result = sanitizeErrorBody('sk-short');
+    test('does not redact short key-like strings (less than 10 chars)', () async {
+      final result = await sanitizedErrorBody('sk-short');
       expect(result, 'sk-short');
     });
 
-    test('redacts multiple keys in same body', () {
+    test('redacts multiple keys in same body', () async {
       final input = 'Keys: sk-aaaaaaaaaa and api-bbbbbbbbbb found';
-      final result = sanitizeErrorBody(input);
+      final result = await sanitizedErrorBody(input);
       expect(result, isNot(contains('sk-aaaaaaaaaa')));
       expect(result, isNot(contains('api-bbbbbbbbbb')));
       expect('[REDACTED]'.allMatches(result).length, 2);
     });
 
-    test('handles empty body', () {
-      expect(sanitizeErrorBody(''), '');
+    test('handles empty body', () async {
+      expect(await sanitizedErrorBody(''), '');
     });
 
-    test('preserves non-key content around redacted keys', () {
-      final result = sanitizeErrorBody(
+    test('preserves non-key content around redacted keys', () async {
+      final result = await sanitizedErrorBody(
         'Error 401: key-abcdefghijklmnop is invalid',
       );
       expect(result, contains('Error 401:'));
@@ -88,69 +73,66 @@ void main() {
       expect(result, contains('[REDACTED]'));
     });
 
-    test('redacts keys with underscores and dashes', () {
-      final result = sanitizeErrorBody('sk-ant_api03-key_with-dashes_123');
+    test('redacts keys with underscores and dashes', () async {
+      final result = await sanitizedErrorBody('sk-ant_api03-key_with-dashes_123');
       expect(result, contains('[REDACTED]'));
     });
 
-    test('truncation happens before redaction', () {
-      // Place an API key after char 500 to verify it gets truncated away
+    test('truncation happens before redaction', () async {
       final body = '${'x' * 510}sk-aaaaaaaaaa';
-      final result = sanitizeErrorBody(body);
+      final result = await sanitizedErrorBody(body);
       expect(result.length, 503);
-      // Key is beyond truncation point, so it is gone
       expect(result, isNot(contains('sk-aaaaaaaaaa')));
     });
   });
 
-  group('LlmService._isRetryableHttpError', () {
-    test('matches 429 rate limit', () {
-      expect(isRetryableHttpError('API error (429): rate limited'), isTrue);
+  group('LlmService retryable HTTP status handling', () {
+    test('matches 429 rate limit', () async {
+      expect(await requestCountWhenFirstStatusIs(429), 2);
     });
 
-    test('matches 500 internal server error', () {
-      expect(isRetryableHttpError('API error (500): server error'), isTrue);
+    test('matches 500 internal server error', () async {
+      expect(await requestCountWhenFirstStatusIs(500), 2);
     });
 
-    test('matches 502 bad gateway', () {
-      expect(isRetryableHttpError('API error (502): bad gateway'), isTrue);
+    test('matches 502 bad gateway', () async {
+      expect(await requestCountWhenFirstStatusIs(502), 2);
     });
 
-    test('matches 503 service unavailable', () {
-      expect(isRetryableHttpError('API error (503): unavailable'), isTrue);
+    test('matches 503 service unavailable', () async {
+      expect(await requestCountWhenFirstStatusIs(503), 2);
     });
 
-    test('matches 504 gateway timeout', () {
-      expect(isRetryableHttpError('API error (504): timeout'), isTrue);
+    test('matches 504 gateway timeout', () async {
+      expect(await requestCountWhenFirstStatusIs(504), 2);
     });
 
-    test('does not match 400 bad request', () {
-      expect(isRetryableHttpError('API error (400): bad request'), isFalse);
+    test('does not match 400 bad request', () async {
+      expect(await requestCountForAlwaysStatus(400), 1);
     });
 
-    test('does not match 401 unauthorized', () {
-      expect(isRetryableHttpError('API error (401): unauthorized'), isFalse);
+    test('does not match 401 unauthorized', () async {
+      expect(await requestCountForAlwaysStatus(401), 1);
     });
 
-    test('does not match 403 forbidden', () {
-      expect(isRetryableHttpError('API error (403): forbidden'), isFalse);
+    test('does not match 403 forbidden', () async {
+      expect(await requestCountForAlwaysStatus(403), 1);
     });
 
-    test('does not match 404 not found', () {
-      expect(isRetryableHttpError('API error (404): not found'), isFalse);
+    test('does not match 404 not found', () async {
+      expect(await requestCountForAlwaysStatus(404), 1);
     });
 
-    test('does not match plain text without status code', () {
-      expect(isRetryableHttpError('some random error'), isFalse);
+    test('does not match plain text without status code', () async {
+      expect(await requestCountForAlwaysStatus(418), 1);
     });
 
-    test('does not match empty string', () {
-      expect(isRetryableHttpError(''), isFalse);
+    test('does not match empty string', () async {
+      expect(await sanitizedErrorBody(''), '');
     });
   });
 
   group('LlmConfig equality', () {
-    // These tests use the data classes directly; no HTTP dependency.
     test('ContentBlock.toJson produces correct text block', () {
       const block = ContentBlock(type: 'text', text: 'hello');
       final json = block.toJson();
@@ -209,61 +191,97 @@ void main() {
   });
 }
 
-// Re-declare data classes here since importing from the source would pull in
-// http and other Flutter dependencies. These are value-class copies for testing
-// serialization logic only.
-class ContentBlock {
-  final String type;
-  final String? text;
-  final String? toolUseId;
-  final String? toolName;
-  final Map<String, dynamic>? toolInput;
+Future<String> sanitizedErrorBody(String responseBody) async {
+  final error = await openAiChatError(400, responseBody);
+  const marker = 'OpenAI API error (400): ';
+  final start = error.indexOf(marker);
+  expect(start, isNonNegative);
+  return error.substring(start + marker.length);
+}
 
-  const ContentBlock({
-    required this.type,
-    this.text,
-    this.toolUseId,
-    this.toolName,
-    this.toolInput,
+Future<String> openAiChatError(int statusCode, String responseBody) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    request.response.statusCode = statusCode;
+    request.response.write(responseBody);
+    await request.response.close();
   });
 
-  Map<String, dynamic> toJson() {
-    if (type == 'text') {
-      return {'type': 'text', 'text': text};
+  final service = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: 'gpt-test',
+    baseUrl: 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    await service.chat(system: '', messages: const [], tools: const []);
+  } catch (e) {
+    return e.toString();
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
+  fail('Expected chat request to fail');
+}
+
+Future<int> requestCountWhenFirstStatusIs(int statusCode) async {
+  var count = 0;
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    count++;
+    if (count == 1) {
+      request.response.statusCode = statusCode;
+      request.response.write('retry me');
     } else {
-      return {
-        'type': 'tool_use',
-        'id': toolUseId,
-        'name': toolName,
-        'input': toolInput,
-      };
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode({
+        'choices': [
+          {
+            'message': {'content': 'ok'},
+            'finish_reason': 'stop',
+          }
+        ],
+      }));
     }
+    await request.response.close();
+  });
+
+  final service = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: 'gpt-test',
+    baseUrl: 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    await service.chat(system: '', messages: const [], tools: const []);
+    return count;
+  } finally {
+    service.dispose();
+    await server.close(force: true);
   }
 }
 
-class ToolDefinition {
-  final String name;
-  final String description;
-  final Map<String, dynamic> inputSchema;
-
-  const ToolDefinition({
-    required this.name,
-    required this.description,
-    required this.inputSchema,
+Future<int> requestCountForAlwaysStatus(int statusCode) async {
+  var count = 0;
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    count++;
+    request.response.statusCode = statusCode;
+    request.response.write('do not retry');
+    await request.response.close();
   });
 
-  Map<String, dynamic> toAnthropicJson() => {
-        'name': name,
-        'description': description,
-        'input_schema': inputSchema,
-      };
-
-  Map<String, dynamic> toOpenAIJson() => {
-        'type': 'function',
-        'function': {
-          'name': name,
-          'description': description,
-          'parameters': inputSchema,
-        },
-      };
+  final service = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: 'gpt-test',
+    baseUrl: 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    await service.chat(system: '', messages: const [], tools: const []);
+  } catch (_) {
+    return count;
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
+  fail('Expected chat request to fail');
 }

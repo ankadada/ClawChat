@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
+import 'api_validator.dart';
 import 'preferences_service.dart';
 
 class WhisperService {
@@ -62,10 +63,11 @@ class WhisperService {
     final baseUrl = prefs.baseUrl ?? 'https://api.openai.com';
     final url = '$baseUrl/v1/audio/transcriptions';
 
-    debugPrint('WhisperService: POST $url model=$model fileSize=$fileSize');
-
     try {
-      final request = http.MultipartRequest('POST', Uri.parse(url));
+      final uri = ApiValidator.validateBearerUrl(url, context: 'Whisper API endpoint');
+      debugPrint('WhisperService: POST $url model=$model fileSize=$fileSize');
+
+      final request = http.MultipartRequest('POST', uri);
       request.headers['Authorization'] = 'Bearer $apiKey';
       request.fields['model'] = model;
       request.fields['language'] = 'zh';

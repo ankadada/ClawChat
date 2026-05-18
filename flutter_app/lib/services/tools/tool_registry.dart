@@ -3,6 +3,7 @@ import '../preferences_service.dart';
 import 'bash_tool.dart';
 import 'phone_intent_tool.dart';
 import 'read_file_tool.dart';
+import 'tool_policy.dart';
 import 'write_file_tool.dart';
 import 'web_fetch_tool.dart';
 import 'web_search_tool.dart';
@@ -24,27 +25,34 @@ abstract class Tool {
 
 class ToolRegistry {
   final Map<String, Tool> _tools = {};
+  final Map<String, ToolRisk> _risks = {};
 
   ToolRegistry();
 
   factory ToolRegistry.withDefaults({PreferencesService? prefs}) {
     final registry = ToolRegistry();
-    registry.register(BashTool());
-    registry.register(ReadFileTool());
-    registry.register(WriteFileTool());
-    registry.register(WebFetchTool());
-    if (prefs != null) registry.register(PhoneIntentTool(prefs));
-    registry.register(WebSearchTool());
-    if (prefs != null) registry.register(ImageGenTool(prefs));
+    registry.register(BashTool(), risk: ToolRisk.dangerous);
+    registry.register(ReadFileTool(), risk: ToolRisk.moderate);
+    registry.register(WriteFileTool(), risk: ToolRisk.dangerous);
+    registry.register(WebFetchTool(), risk: ToolRisk.moderate);
+    if (prefs != null) {
+      registry.register(PhoneIntentTool(prefs), risk: ToolRisk.dangerous);
+    }
+    registry.register(WebSearchTool(), risk: ToolRisk.safe);
+    if (prefs != null) {
+      registry.register(ImageGenTool(prefs), risk: ToolRisk.safe);
+    }
     return registry;
   }
 
-  void register(Tool tool) {
+  void register(Tool tool, {ToolRisk risk = ToolRisk.dangerous}) {
     _tools[tool.name] = tool;
+    _risks[tool.name] = risk;
   }
 
   void unregister(String name) {
     _tools.remove(name);
+    _risks.remove(name);
   }
 
   List<ToolDefinition> getToolDefinitions() {
@@ -56,6 +64,10 @@ class ToolRegistry {
     if (tool == null) throw Exception('Unknown tool: $name');
     return tool.execute(input);
   }
+
+  bool hasTool(String name) => _tools.containsKey(name);
+
+  ToolRisk riskFor(String name) => _risks[name] ?? ToolRisk.dangerous;
 
   List<String> get availableTools => _tools.keys.toList();
 }

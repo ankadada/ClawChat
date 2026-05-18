@@ -21,6 +21,8 @@ class SessionSummary {
 }
 
 class SessionStorage {
+  static final _validSessionIdPattern = RegExp(r'^[a-zA-Z0-9_-]+$');
+
   Directory? _sessionsDir;
 
   Future<void> init() async {
@@ -34,7 +36,34 @@ class SessionStorage {
     await _migrateFromSharedPreferences();
   }
 
-  File _sessionFile(String id) => File('${_sessionsDir!.path}/$id.json');
+  Future<File?> _sessionFile(String id) async {
+    if (!_validSessionIdPattern.hasMatch(id)) return null;
+
+    final sessionsPath = await _canonicalSessionsDirPath();
+    final file = File('$sessionsPath${Platform.pathSeparator}$id.json');
+    final targetParentPath = await file.parent.resolveSymbolicLinks();
+    if (targetParentPath != sessionsPath) return null;
+
+    final targetPath = file.absolute.path;
+    if (!_isInsideSessionsDir(targetPath, sessionsPath)) return null;
+
+    return file;
+  }
+
+  Future<String> _canonicalSessionsDirPath() async {
+    try {
+      return await _sessionsDir!.resolveSymbolicLinks();
+    } catch (_) {
+      return _sessionsDir!.absolute.path;
+    }
+  }
+
+  bool _isInsideSessionsDir(String targetPath, String sessionsPath) {
+    final normalizedDir = sessionsPath.endsWith(Platform.pathSeparator)
+        ? sessionsPath
+        : '$sessionsPath${Platform.pathSeparator}';
+    return targetPath.startsWith(normalizedDir);
+  }
 
   /// Migrates existing sessions from SharedPreferences to individual JSON files.
   /// After migration, the SharedPreferences keys are removed.
@@ -46,9 +75,14 @@ class SessionStorage {
     for (final id in ids) {
       final json = prefs.getString('clawchat_session_$id');
       if (json == null) continue;
-      final file = _sessionFile(id);
-      if (!await file.exists()) {
-        await file.writeAsString(json);
+      try {
+        final session = ChatSession.fromJson(jsonDecode(json));
+        final file = await _sessionFile(session.id);
+        if (file != null && !await file.exists()) {
+          await file.writeAsString(jsonEncode(session.toJson()));
+        }
+      } catch (_) {
+        // Skip malformed legacy sessions
       }
       await prefs.remove('clawchat_session_$id');
     }
@@ -61,7 +95,8 @@ class SessionStorage {
     await for (final entity in _sessionsDir!.list()) {
       if (entity is! File || !entity.path.endsWith('.json')) continue;
       final filename = entity.uri.pathSegments.last;
-      ids.add(filename.substring(0, filename.length - 5)); // strip .json
+      final id = filename.substring(0, filename.length - 5); // strip .json
+      if (_validSessionIdPattern.hasMatch(id)) ids.add(id);
     }
     return ids;
   }
@@ -90,12 +125,13 @@ class SessionStorage {
       try {
         final content = await entity.readAsString();
         final map = jsonDecode(content) as Map<String, dynamic>;
+        final session = ChatSession.fromJson(map);
         summaries.add(SessionSummary(
-          id: map['id'] as String,
-          title: map['title'] as String? ?? '新对话',
-          createdAt: DateTime.parse(map['createdAt'] as String),
-          updatedAt: DateTime.parse(map['updatedAt'] as String),
-          folder: map['folder'] as String?,
+          id: session.id,
+          title: session.title,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+          folder: session.folder,
         ));
       } catch (_) {
         // Skip corrupted session files
@@ -107,7 +143,8 @@ class SessionStorage {
 
   Future<ChatSession?> getSession(String id) async {
     await init();
-    final file = _sessionFile(id);
+    final file = await _sessionFile(id);
+    if (file == null) return null;
     if (!await file.exists()) return null;
     try {
       final content = await file.readAsString();
@@ -121,13 +158,17 @@ class SessionStorage {
   Future<void> saveSession(ChatSession session) async {
     await init();
     session.updatedAt = DateTime.now();
-    final file = _sessionFile(session.id);
+    final file = await _sessionFile(session.id);
+    if (file == null) {
+      throw Exception('Invalid session id');
+    }
     await file.writeAsString(jsonEncode(session.toJson()));
   }
 
   Future<void> deleteSession(String id) async {
     await init();
-    final file = _sessionFile(id);
+    final file = await _sessionFile(id);
+    if (file == null) return;
     if (await file.exists()) await file.delete();
   }
 
@@ -151,6 +192,9 @@ class SessionStorage {
         .toList();
     int count = 0;
     for (final session in sessions) {
+      if (!_validSessionIdPattern.hasMatch(session.id)) continue;
+      final file = await _sessionFile(session.id);
+      if (file == null) continue;
       await saveSession(session);
       count++;
     }

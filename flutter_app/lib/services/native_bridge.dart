@@ -40,8 +40,16 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('extractRootfs', {'tarPath': tarPath}))!;
   }
 
-  static Future<String> runInProot(String command, {int timeout = 900}) async {
-    return (await _channel.invokeMethod<String>('runInProot', {'command': command, 'timeout': timeout}))!;
+  static Future<String> runInProot(
+    String command, {
+    int timeout = 900,
+    bool mountStorage = false,
+  }) async {
+    return (await _channel.invokeMethod<String>('runInProot', {
+      'command': command,
+      'timeout': timeout,
+      'mountStorage': mountStorage,
+    }))!;
   }
 
   static Future<bool> setupDirs() async {

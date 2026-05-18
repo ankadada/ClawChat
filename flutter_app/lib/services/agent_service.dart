@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'llm_service.dart';
+import 'tools/tool_policy.dart';
 import 'tools/tool_registry.dart';
 
 sealed class AgentEvent {}
@@ -41,6 +42,7 @@ class AgentService {
   final LlmService _llm;
   final ToolRegistry _tools;
   final String _systemPrompt;
+  final ToolPolicy _toolPolicy;
   final int maxIterations;
   final bool parallelTools;
   bool _cancelled = false;
@@ -50,11 +52,13 @@ class AgentService {
     required LlmService llm,
     required ToolRegistry tools,
     required String systemPrompt,
+    ToolPolicy? toolPolicy,
     this.maxIterations = 25,
     this.parallelTools = false,
   })  : _llm = llm,
         _tools = tools,
-        _systemPrompt = systemPrompt;
+        _systemPrompt = systemPrompt,
+        _toolPolicy = toolPolicy ?? const ToolPolicy();
 
   void cancel() => _cancelled = true;
   bool get isCancelled => _cancelled;
@@ -150,12 +154,7 @@ class AgentService {
           final toolUseId = block.toolUseId!;
           final toolName = block.toolName!;
           final toolInput = block.toolInput ?? {};
-          try {
-            final output = await _tools.executeTool(toolName, toolInput);
-            return _ToolResult(toolUseId, output, false);
-          } catch (e) {
-            return _ToolResult(toolUseId, 'Tool error: $e', true);
-          }
+          return _executeToolWithPolicy(toolUseId, toolName, toolInput);
         }).toList();
         final results = await Future.wait(futures);
         for (final r in results) {
@@ -175,24 +174,14 @@ class AgentService {
           final toolName = block.toolName!;
           final toolInput = block.toolInput ?? {};
 
-          try {
-            final output = await _tools.executeTool(toolName, toolInput);
-            yield AgentToolDone(toolUseId, output);
-            toolResults.add({
-              'type': 'tool_result',
-              'tool_use_id': toolUseId,
-              'content': output,
-            });
-          } catch (e) {
-            final errorMsg = 'Tool error: $e';
-            yield AgentToolDone(toolUseId, errorMsg, isError: true);
-            toolResults.add({
-              'type': 'tool_result',
-              'tool_use_id': toolUseId,
-              'content': errorMsg,
-              'is_error': true,
-            });
-          }
+          final result = await _executeToolWithPolicy(toolUseId, toolName, toolInput);
+          yield AgentToolDone(result.id, result.output, isError: result.isError);
+          toolResults.add({
+            'type': 'tool_result',
+            'tool_use_id': result.id,
+            'content': result.output,
+            if (result.isError) 'is_error': true,
+          });
         }
       }
 
@@ -201,6 +190,37 @@ class AgentService {
         'content': toolResults,
       });
       onMessagesUpdated?.call(messages);
+    }
+  }
+
+  Future<_ToolResult> _executeToolWithPolicy(
+    String toolUseId,
+    String toolName,
+    Map<String, dynamic> toolInput,
+  ) async {
+    if (!_tools.hasTool(toolName)) {
+      return _ToolResult(toolUseId, 'Tool error: Unknown tool: $toolName', true);
+    }
+
+    final request = ToolApprovalRequest(
+      toolName: toolName,
+      arguments: Map<String, dynamic>.from(toolInput),
+      risk: _tools.riskFor(toolName),
+    );
+    final approved = await _toolPolicy.approve(request);
+    if (!approved) {
+      return _ToolResult(
+        toolUseId,
+        'tool execution denied by user: $toolName',
+        true,
+      );
+    }
+
+    try {
+      final output = await _tools.executeTool(toolName, toolInput);
+      return _ToolResult(toolUseId, output, false);
+    } catch (e) {
+      return _ToolResult(toolUseId, 'Tool error: $e', true);
     }
   }
 }

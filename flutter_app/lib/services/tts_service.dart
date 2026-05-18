@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
+import 'api_validator.dart';
 import 'preferences_service.dart';
 
 class TtsService extends ChangeNotifier {
@@ -171,7 +172,6 @@ class TtsService extends ChangeNotifier {
     final baseUrl = prefs.baseUrl ?? 'https://api.openai.com';
     final url = '$baseUrl/v1/audio/speech';
 
-    debugPrint('TTS API: POST $url model=$model');
     isLoading = true;
     notifyListeners();
 
@@ -179,7 +179,10 @@ class TtsService extends ChangeNotifier {
     client.connectionTimeout = const Duration(seconds: 15);
     client.idleTimeout = const Duration(seconds: 30);
     try {
-      final request = await client.postUrl(Uri.parse(url));
+      final uri = ApiValidator.validateBearerUrl(url, context: 'TTS API endpoint');
+      debugPrint('TTS API: POST $url model=$model');
+
+      final request = await client.postUrl(uri);
       request.headers.set('Authorization', 'Bearer $apiKey');
       request.headers.contentType = ContentType('application', 'json', charset: 'utf-8');
       request.headers.set('Accept', 'audio/mpeg');

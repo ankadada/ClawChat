@@ -17,7 +17,7 @@ class _ArtifactsViewState extends State<ArtifactsView> {
   void initState() {
     super.initState();
     _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setJavaScriptMode(JavaScriptMode.disabled)
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
           if (request.url == 'about:blank') return NavigationDecision.navigate;

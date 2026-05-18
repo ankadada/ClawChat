@@ -4,6 +4,7 @@ import 'package:uuid/uuid.dart';
 import '../constants.dart';
 import '../models/chat_models.dart';
 import '../services/agent_service.dart';
+import '../services/chat_context_utils.dart';
 import '../services/llm_service.dart';
 import '../services/session_storage.dart';
 import '../services/tools/tool_registry.dart';
@@ -579,63 +580,12 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
-  int _charCount(Map<String, dynamic> msg) {
-    final content = msg['content'];
-    if (content is String) return content.length;
-    if (content is List) {
-      int count = 0;
-      for (final item in content) {
-        if (item is Map) {
-          count += (item['text'] as String?)?.length ?? 0;
-          count += (item['content'] as String?)?.length ?? 0;
-        }
-      }
-      return count;
-    }
-    return 0;
-  }
-
-  bool _hasToolUseContent(Map<String, dynamic> msg) {
-    final content = msg['content'];
-    if (content is List) {
-      return content.any((item) => item is Map && item['type'] == 'tool_use');
-    }
-    return false;
-  }
-
-  bool _hasToolResultContent(Map<String, dynamic> msg) {
-    final content = msg['content'];
-    if (content is List) {
-      return content.any((item) => item is Map && item['type'] == 'tool_result');
-    }
-    return false;
-  }
-
   List<Map<String, dynamic>> _truncateToFit(List<Map<String, dynamic>> messages) {
-    final result = List<Map<String, dynamic>>.from(messages);
-    int totalChars = 0;
-    for (final msg in result) {
-      totalChars += _charCount(msg);
-    }
-    if (!_prefs.autoCompact) return result;
-    final maxChars = _prefs.contextLength;
-    while (result.length > 2 && totalChars > maxChars) {
-      final front = result[0];
-      // If this is an assistant message with tool_use, also remove the following
-      // user message containing the tool_result to keep them paired.
-      if (_hasToolUseContent(front) && result.length > 2 && _hasToolResultContent(result[1])) {
-        totalChars -= _charCount(result.removeAt(0));
-        if (result.isNotEmpty) {
-          totalChars -= _charCount(result.removeAt(0));
-        }
-      } else if (_hasToolResultContent(front)) {
-        // Skip orphaned tool_result at the front — remove it
-        totalChars -= _charCount(result.removeAt(0));
-      } else {
-        totalChars -= _charCount(result.removeAt(0));
-      }
-    }
-    return result;
+    return ChatContextUtils.truncateToFit(
+      messages,
+      maxChars: _prefs.contextLength,
+      autoCompact: _prefs.autoCompact,
+    );
   }
 
   void _appendNewAgentMessages(
