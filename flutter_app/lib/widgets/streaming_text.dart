@@ -3,6 +3,7 @@ import 'package:flutter/gestures.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'code_block.dart';
+import 'markdown_table_view.dart';
 
 class StreamingText extends StatefulWidget {
   final String text;
@@ -80,7 +81,8 @@ class _StreamingTextState extends State<StreamingText> {
       return result;
     }
 
-    final isNewAppend = !parseText.contains('```') &&
+    final isNewAppend = !_tableRegex.hasMatch(parseText) &&
+        !parseText.contains('```') &&
         _cachedText != null &&
         parseText.length > _cachedText!.length &&
         parseText.startsWith(_cachedText!);
@@ -122,9 +124,10 @@ class _StreamingTextState extends State<StreamingText> {
 
   static final _codeBlockRegex = RegExp(r'```([^\n`]*)\n([\s\S]*?)```');
   static final _tableRegex = RegExp(
-    r'(?:^|\n)((?:\|[^\n]*\|\n){2,})',
+    r'^([^\n]*\|[^\n]*\n[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)*\|?[ \t]*(?:\n[^\n]*\|[^\n]*)*(?:\n|$))',
     multiLine: true,
   );
+  static final _tableDelimiterCellRegex = RegExp(r'^:?-{3,}:?$');
   static final _inlineCodeRegex = RegExp(r'`([^`]+)`');
   static final _boldRegex = RegExp(r'\*\*(.+?)\*\*');
   static final _headingRegex = RegExp(r'^(#{1,3})\s+(.+)$', multiLine: true);
@@ -165,47 +168,56 @@ class _StreamingTextState extends State<StreamingText> {
         final openMatch = RegExp(r'^```([^\n`]*)\n([\s\S]*)$')
             .firstMatch(text.substring(openStart));
         if (fenceCount.isEven && openMatch != null) {
-          allMatches.add(_MatchInfo(openStart, text.length, 'codeblock', openMatch));
+          allMatches
+              .add(_MatchInfo(openStart, text.length, 'codeblock', openMatch));
         }
       }
     }
     for (final match in _tableRegex.allMatches(text, from)) {
-      if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
+      if (!allMatches
+          .any((m) => match.start >= m.start && match.end <= m.end)) {
         allMatches.add(_MatchInfo(match.start, match.end, 'table', match));
       }
     }
     for (final match in _inlineCodeRegex.allMatches(text, from)) {
-      if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
+      if (!allMatches
+          .any((m) => match.start >= m.start && match.end <= m.end)) {
         allMatches.add(_MatchInfo(match.start, match.end, 'inline', match));
       }
     }
     for (final match in _boldRegex.allMatches(text, from)) {
-      if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
+      if (!allMatches
+          .any((m) => match.start >= m.start && match.end <= m.end)) {
         allMatches.add(_MatchInfo(match.start, match.end, 'bold', match));
       }
     }
     for (final match in _headingRegex.allMatches(text, from)) {
-      if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
+      if (!allMatches
+          .any((m) => match.start >= m.start && match.end <= m.end)) {
         allMatches.add(_MatchInfo(match.start, match.end, 'heading', match));
       }
     }
     for (final match in _bulletRegex.allMatches(text, from)) {
-      if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
+      if (!allMatches
+          .any((m) => match.start >= m.start && match.end <= m.end)) {
         allMatches.add(_MatchInfo(match.start, match.end, 'bullet', match));
       }
     }
     for (final match in _hrRegex.allMatches(text, from)) {
-      if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
+      if (!allMatches
+          .any((m) => match.start >= m.start && match.end <= m.end)) {
         allMatches.add(_MatchInfo(match.start, match.end, 'hr', match));
       }
     }
     for (final match in _blockquoteRegex.allMatches(text, from)) {
-      if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
+      if (!allMatches
+          .any((m) => match.start >= m.start && match.end <= m.end)) {
         allMatches.add(_MatchInfo(match.start, match.end, 'blockquote', match));
       }
     }
     for (final match in _linkRegex.allMatches(text, from)) {
-      if (!allMatches.any((m) => match.start >= m.start && match.end <= m.end)) {
+      if (!allMatches
+          .any((m) => match.start >= m.start && match.end <= m.end)) {
         allMatches.add(_MatchInfo(match.start, match.end, 'link', match));
       }
     }
@@ -239,63 +251,29 @@ class _StreamingTextState extends State<StreamingText> {
           spans.add(const TextSpan(text: '\n'));
         case 'table':
           final tableText = info.match.group(1)!;
-          final rows = tableText.trim().split('\n')
-              .where((r) => r.trim().isNotEmpty && !RegExp(r'^\|[\s\-:|\s]+\|$').hasMatch(r))
-              .toList();
+          final parsedTable = _parseMarkdownTable(tableText);
 
-          if (rows.isNotEmpty) {
-            // Parse all rows into cell lists and compute column widths
-            final parsedRows = <List<String>>[];
-            for (final row in rows) {
-              final cells = row.split('|')
-                  .where((c) => c.isNotEmpty || parsedRows.isEmpty)
-                  .toList();
-              // Trim leading/trailing empty entries from split
-              final trimmed = <String>[];
-              for (int j = 0; j < cells.length; j++) {
-                final cell = cells[j].trim();
-                if (j == 0 && cell.isEmpty) continue;
-                if (j == cells.length - 1 && cell.isEmpty) continue;
-                trimmed.add(cell);
-              }
-              parsedRows.add(trimmed);
-            }
-
-            // Compute max width per column
-            final colCount = parsedRows.fold<int>(0, (m, r) => r.length > m ? r.length : m);
-            final colWidths = List<int>.filled(colCount, 0);
-            for (final row in parsedRows) {
-              for (int c = 0; c < row.length && c < colCount; c++) {
-                if (row[c].length > colWidths[c]) colWidths[c] = row[c].length;
-              }
-            }
-
-            final formatted = StringBuffer();
-            for (int i = 0; i < parsedRows.length; i++) {
-              final cells = parsedRows[i];
-              final paddedCells = <String>[];
-              for (int c = 0; c < colCount; c++) {
-                final val = c < cells.length ? cells[c] : '';
-                paddedCells.add(val.padRight(colWidths[c]));
-              }
-              final line = paddedCells.join('  │  ');
-              if (i == 0) {
-                formatted.writeln('┌ $line ┐');
-                final separator = colWidths.map((w) => '─' * (w + 2)).join('┼');
-                formatted.writeln('├$separator┤');
-              } else {
-                formatted.writeln('│ $line │');
-              }
-            }
-
-            spans.add(TextSpan(
-              text: formatted.toString(),
-              style: TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 13,
-                color: theme.colorScheme.onSurface,
+          if (parsedTable == null) {
+            spans.add(TextSpan(text: tableText));
+          } else {
+            spans.add(const TextSpan(text: '\n'));
+            spans.add(WidgetSpan(
+              alignment: PlaceholderAlignment.middle,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: MediaQuery.sizeOf(context).width * 0.78,
+                  ),
+                  child: MarkdownTableView(
+                    headers: parsedTable.headers,
+                    rows: parsedTable.rows,
+                    alignments: parsedTable.alignments,
+                  ),
+                ),
               ),
             ));
+            spans.add(const TextSpan(text: '\n'));
           }
         case 'inline':
           spans.add(TextSpan(
@@ -314,7 +292,11 @@ class _StreamingTextState extends State<StreamingText> {
           ));
         case 'heading':
           final level = info.match.group(1)!.length;
-          final fontSize = level == 1 ? 20.0 : level == 2 ? 17.0 : 15.0;
+          final fontSize = level == 1
+              ? 20.0
+              : level == 2
+                  ? 17.0
+                  : 15.0;
           spans.add(TextSpan(
             text: '${info.match.group(2)}\n',
             style: TextStyle(
@@ -378,6 +360,87 @@ class _StreamingTextState extends State<StreamingText> {
     _lastParseEnd = text.length;
   }
 
+  _ParsedMarkdownTable? _parseMarkdownTable(String tableText) {
+    final lines = tableText
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+
+    if (lines.length < 2) {
+      return null;
+    }
+
+    final headers = _splitMarkdownTableRow(lines[0]);
+    final delimiterCells = _splitMarkdownTableRow(lines[1]);
+
+    if (headers.isEmpty ||
+        delimiterCells.isEmpty ||
+        delimiterCells.length != headers.length) {
+      return null;
+    }
+
+    final alignments = <MarkdownTableColumnAlignment>[];
+    for (final cell in delimiterCells) {
+      final marker = cell.replaceAll(RegExp(r'\s+'), '');
+      if (!_tableDelimiterCellRegex.hasMatch(marker)) {
+        return null;
+      }
+
+      final isLeftAligned = marker.startsWith(':');
+      final isRightAligned = marker.endsWith(':');
+      if (isLeftAligned && isRightAligned) {
+        alignments.add(MarkdownTableColumnAlignment.center);
+      } else if (isRightAligned) {
+        alignments.add(MarkdownTableColumnAlignment.right);
+      } else {
+        alignments.add(MarkdownTableColumnAlignment.left);
+      }
+    }
+
+    final rows = <List<String>>[];
+    for (final line in lines.skip(2)) {
+      final cells = _splitMarkdownTableRow(line);
+      rows.add(_normalizeMarkdownTableCells(cells, headers.length));
+    }
+
+    return _ParsedMarkdownTable(
+      headers: headers,
+      rows: rows,
+      alignments: alignments,
+    );
+  }
+
+  List<String> _splitMarkdownTableRow(String row) {
+    var trimmed = row.trim();
+    if (trimmed.startsWith('|')) {
+      trimmed = trimmed.substring(1);
+    }
+    if (trimmed.endsWith('|')) {
+      trimmed = trimmed.substring(0, trimmed.length - 1);
+    }
+
+    return trimmed.split('|').map((cell) => cell.trim()).toList();
+  }
+
+  List<String> _normalizeMarkdownTableCells(
+    List<String> cells,
+    int columnCount,
+  ) {
+    if (cells.length == columnCount) {
+      return cells;
+    }
+
+    if (cells.length > columnCount) {
+      return cells.take(columnCount).toList();
+    }
+
+    return [
+      ...cells,
+      for (int i = cells.length; i < columnCount; i++) '',
+    ];
+  }
+
   @override
   void didUpdateWidget(StreamingText oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -399,4 +462,16 @@ class _MatchInfo {
   final RegExpMatch match;
 
   _MatchInfo(this.start, this.end, this.type, this.match);
+}
+
+class _ParsedMarkdownTable {
+  final List<String> headers;
+  final List<List<String>> rows;
+  final List<MarkdownTableColumnAlignment> alignments;
+
+  const _ParsedMarkdownTable({
+    required this.headers,
+    required this.rows,
+    required this.alignments,
+  });
 }
