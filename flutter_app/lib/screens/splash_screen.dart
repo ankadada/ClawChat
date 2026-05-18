@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
 import 'setup_wizard_screen.dart';
+import 'onboarding_screen.dart';
 import 'dashboard_screen.dart';
 import '../l10n/app_strings.dart';
 
@@ -67,9 +68,17 @@ class _SplashScreenState extends State<SplashScreen>
 
       if (setupComplete) {
         _prefs.setupComplete = true;
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const DashboardScreen()),
-        );
+        // If setup is done but API key missing, send to onboarding
+        final apiKey = _prefs.apiKey;
+        if (apiKey == null || apiKey.isEmpty) {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => const OnboardingScreen()),
+          );
+        } else {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => const DashboardScreen()),
+          );
+        }
       } else {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const SetupWizardScreen()),

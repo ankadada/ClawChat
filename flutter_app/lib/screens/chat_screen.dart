@@ -86,7 +86,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         if (!granted) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('请授予录音权限后重试')),
+              const SnackBar(content: Text(AppStrings.audioPermissionDenied)),
             );
           }
           return;

@@ -18,8 +18,6 @@
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.SEND_SMS" />
 
-    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
-
     <application
         android:label="ClawChat"
         android:name="${applicationName}"
@@ -46,23 +44,25 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-            <intent-filter>
-                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
-            </intent-filter>
-            <meta-data
-                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
-                android:resource="@xml/usb_device_filter" />
         </activity>
 
         <service
             android:name=".TerminalSessionService"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse" >
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Hosts the embedded Alpine Linux environment that runs user-initiated terminal sessions and AI-agent tool execution; no standard foreground service type fits a proot sandbox host." />
+        </service>
 
         <service
             android:name=".SetupService"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse" >
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Downloads and extracts the Alpine Linux rootfs during first-time setup; a long-running one-time setup task initiated by user action." />
+        </service>
 
         <meta-data
             android:name="flutterEmbedding"

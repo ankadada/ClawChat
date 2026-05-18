@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'native_bridge.dart';
 
 class SkillInfo {
@@ -17,10 +19,36 @@ class SkillInfo {
 
 class SkillService {
   static const _skillsDir = '/root/workspace/skills';
+  static const _kDisabledKey = 'disabled_skills';
+
+  /// Loads the persisted set of disabled skill names from SharedPreferences.
+  static Future<Set<String>> _loadDisabled() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kDisabledKey);
+      if (raw == null || raw.isEmpty) return {};
+      return Set<String>.from(jsonDecode(raw) as List);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// Persist the enabled state of a skill.
+  static Future<void> setSkillEnabled(String name, bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    final disabled = await _loadDisabled();
+    if (enabled) {
+      disabled.remove(name);
+    } else {
+      disabled.add(name);
+    }
+    await prefs.setString(_kDisabledKey, jsonEncode(disabled.toList()));
+  }
 
   /// Scans the skills directory for SKILL.md files and returns their metadata.
   static Future<List<SkillInfo>> scanSkills() async {
     try {
+      final disabled = await _loadDisabled();
       final output = await NativeBridge.runInProot(
         'find $_skillsDir -name "SKILL.md" -type f 2>/dev/null',
       );
@@ -33,7 +61,12 @@ class SkillService {
           final name = _extractYamlField(content, 'name') ??
               path.split('/').reversed.skip(1).first;
           final description = _extractYamlField(content, 'description') ?? '';
-          skills.add(SkillInfo(name: name, description: description, path: path));
+          skills.add(SkillInfo(
+            name: name,
+            description: description,
+            path: path,
+            enabled: !disabled.contains(name),
+          ));
         } catch (_) {}
       }
       return skills;

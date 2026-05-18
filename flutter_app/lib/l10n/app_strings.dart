@@ -225,6 +225,7 @@ class AppStrings {
   static const whisperModelLabel = '语音识别模型（STT）';
   static const ttsModelLabel = '语音合成模型（TTS）';
   static const whisperModelRequired = '请在设置 → 语音能力中填写语音识别模型名称（如 whisper-1）';
+  static const audioPermissionDenied = '请授予录音权限后重试';
 
   // ── Message actions ────────────────────────────────────────────────
   static const quoteReply = '引用回复';

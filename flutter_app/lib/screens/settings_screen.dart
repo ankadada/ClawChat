@@ -548,7 +548,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           title: Text(skill.name),
                           subtitle: Text(skill.description, maxLines: 2, overflow: TextOverflow.ellipsis),
                           value: skill.enabled,
-                          onChanged: (v) => setState(() => skill.enabled = v),
+                          onChanged: (v) async {
+                            setState(() => skill.enabled = v);
+                            await SkillService.setSkillEnabled(skill.name, v);
+                          },
                         )),
                     ],
                   ),

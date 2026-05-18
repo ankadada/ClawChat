@@ -168,7 +168,7 @@ class TtsService extends ChangeNotifier {
       }
 
       final dir = await getTemporaryDirectory();
-      final file = File('${dir.path}/tts_output.mp3');
+      final file = File('${dir.path}/tts_${DateTime.now().millisecondsSinceEpoch}.mp3');
       await file.writeAsBytes(response.bodyBytes);
 
       await _channel.invokeMethod('playAudio', {'path': file.path});

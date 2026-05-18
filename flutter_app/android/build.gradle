@@ -2,10 +2,6 @@ allprojects {
     repositories {
         google()
         mavenCentral()
-        // Fallback for plugins that still reference jcenter() (#69).
-        // usb_serial 0.5.x requires jcenter for dependency resolution.
-        //noinspection GradleDeprecated
-        jcenter()
     }
 }
 

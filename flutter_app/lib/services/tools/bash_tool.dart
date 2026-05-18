@@ -47,7 +47,6 @@ class BashTool extends Tool {
     r'eval\s*\(|'
     r'exec\s*>/dev/tcp|'
     r'base64\s+(-d|--decode).*\|\s*(sh|bash)|'  // base64 decode piped to shell
-    r'base64\s+(-d|--decode)\s.*\|\s*sh|'
     r'python[23]?\s+-c\s|'
     r'perl\s+-e\s|'
     r'ruby\s+-e\s|'

@@ -124,6 +124,13 @@ class BootstrapManager(
                                 }
 
                                 val outFile = File(rootfsDir, name)
+                                // Prevent path traversal via "../" entries
+                                val rootCanonical = File(rootfsDir).canonicalPath + File.separator
+                                if (!outFile.canonicalPath.startsWith(rootCanonical)) {
+                                    Log.w("ClawChat", "Skipping tar entry outside rootfs: $name")
+                                    entry = tis.nextEntry
+                                    continue
+                                }
 
                                 when {
                                     entry.isDirectory -> {

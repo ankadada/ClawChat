@@ -32,8 +32,7 @@ class MainActivity : FlutterActivity() {
     private lateinit var bootstrapManager: BootstrapManager
     private lateinit var processManager: ProcessManager
     private lateinit var phoneIntentManager: PhoneIntentManager
-    @Volatile
-    private var setupDone = false
+    private val setupDone = java.util.concurrent.atomic.AtomicBoolean(false)
     private var pendingSpeechResult: MethodChannel.Result? = null
     private var mediaRecorder: MediaRecorder? = null
     private var recordingPath: String? = null
@@ -56,8 +55,7 @@ class MainActivity : FlutterActivity() {
         processManager = ProcessManager(filesDir, nativeLibDir)
         phoneIntentManager = PhoneIntentManager(this)
 
-        if (!setupDone) {
-            setupDone = true
+        if (setupDone.compareAndSet(false, true)) {
             // TODO: Replace Thread{} with coroutines (requires lifecycle-runtime-ktx dependency)
             Thread {
                 try { bootstrapManager.setupDirectories() } catch (e: Exception) { Log.e("ClawChat", "setupDirectories failed", e) }
@@ -401,6 +399,8 @@ class MainActivity : FlutterActivity() {
                     val path = call.argument<String>("path")
                     if (path == null) {
                         result.error("INVALID_ARGS", "path required", null)
+                    } else if (!isAppOwnedPath(path)) {
+                        result.error("INVALID_PATH", "path must be in app cache or files dir", null)
                     } else {
                         try {
                             mediaPlayer?.release()
@@ -488,6 +488,25 @@ class MainActivity : FlutterActivity() {
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
+    }
+
+    private fun isAppOwnedPath(path: String): Boolean {
+        return try {
+            val canonical = java.io.File(path).canonicalPath
+            val cacheRoot = applicationContext.cacheDir.canonicalPath
+            val filesRoot = applicationContext.filesDir.canonicalPath
+            canonical.startsWith(cacheRoot) || canonical.startsWith(filesRoot)
+        } catch (_: Exception) { false }
+    }
+
+    override fun onDestroy() {
+        try { mediaRecorder?.stop() } catch (_: Exception) {}
+        try { mediaRecorder?.release() } catch (_: Exception) {}
+        mediaRecorder = null
+        try { mediaPlayer?.stop() } catch (_: Exception) {}
+        try { mediaPlayer?.release() } catch (_: Exception) {}
+        mediaPlayer = null
+        super.onDestroy()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

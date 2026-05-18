@@ -220,6 +220,10 @@ class ChatProvider extends ChangeNotifier {
       }
       final llm = _cachedLlm!;
 
+      // Refresh skills (and memory) to pick up any user toggle changes
+      _skills = await SkillService.scanSkills();
+      await MemoryService.getMemories();
+
       final basePrompt = session.systemPrompt ?? _prefs.systemPrompt ?? AppConstants.defaultSystemPrompt;
       final skillIndex = SkillService.buildSkillIndex(_skills);
       final memoryPrompt = MemoryService.buildMemoryPrompt();
@@ -237,10 +241,10 @@ class ChatProvider extends ChangeNotifier {
       notifyListeners();
 
       _agentCompleter = Completer<void>();
+      final apiMessages = _truncateToFit(session.toApiMessages());
+      final initialApiMsgCount = apiMessages.length;
       try {
-        _agentSubscription = _agent!.runAgentLoop(
-          _truncateToFit(session.toApiMessages()),
-        ).listen(
+        _agentSubscription = _agent!.runAgentLoop(apiMessages).listen(
           (event) {
             switch (event) {
               case AgentThinking():
@@ -271,7 +275,7 @@ class ChatProvider extends ChangeNotifier {
                 _streamBuffer = StringBuffer();
                 agentStatus = AgentStatus.idle;
                 streamingText = '';
-                _applyFinalAgentMessages(session, _agent!.messages);
+                _appendNewAgentMessages(session, _agent!.messages, initialApiMsgCount);
                 // Store token usage on the last assistant message
                 for (int i = session.messages.length - 1; i >= 0; i--) {
                   if (session.messages[i].role == 'assistant') {
@@ -283,9 +287,8 @@ class ChatProvider extends ChangeNotifier {
                 _storage.saveSession(session).then((_) {
                   if (!_disposed) notifyListeners();
                 });
-                if (_agentCompleter != null && !_agentCompleter!.isCompleted) {
-                  _agentCompleter!.complete();
-                }
+                final c = _agentCompleter;
+                if (c != null && !c.isCompleted) c.complete();
 
               case AgentError(:final message):
                 _streamThrottle?.cancel();
@@ -299,11 +302,15 @@ class ChatProvider extends ChangeNotifier {
           onError: (Object e) {
             agentStatus = AgentStatus.error;
             errorMessage = '$e';
+            _streamThrottle?.cancel();
+            _streamThrottle = null;
             notifyListeners();
-            if (!_agentCompleter!.isCompleted) _agentCompleter!.complete();
+            final c = _agentCompleter;
+            if (c != null && !c.isCompleted) c.complete();
           },
           onDone: () {
-            if (!_agentCompleter!.isCompleted) _agentCompleter!.complete();
+            final c = _agentCompleter;
+            if (c != null && !c.isCompleted) c.complete();
           },
           cancelOnError: false,
         );
@@ -371,8 +378,12 @@ class ChatProvider extends ChangeNotifier {
       }
     }
 
-    // Remove messages from the end until we hit the last user message
-    while (messages.isNotEmpty && messages.last.role != 'user') {
+    // Remove trailing messages until we find the last user message with TEXT
+    // content (not tool_result). Tool_result user messages must be removed too
+    // because their matching tool_use assistant messages will be regenerated.
+    while (messages.isNotEmpty) {
+      final last = messages.last;
+      if (last.role == 'user' && last.textContent.isNotEmpty) break;
       messages.removeLast();
     }
     if (messages.isEmpty) return;
@@ -469,9 +480,10 @@ class ChatProvider extends ChangeNotifier {
     }
 
     final session = currentSession!;
-    session.messages.add(ChatMessage.user(text));
-    session.autoTitle();
-    await _storage.saveSession(session);
+    // Don't persist the user message to session.messages in compare mode.
+    // Compare is a one-shot inspection — results live in compareResults only.
+    // If we persisted, the next real sendMessage would break role alternation
+    // (two consecutive user messages without an assistant reply between them).
     notifyListeners();
 
     final formatStr = session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
@@ -563,6 +575,7 @@ class ChatProvider extends ChangeNotifier {
           : 'https://api.openai.com'),
       maxTokens: prefs.maxTokens ?? AppConstants.defaultMaxTokens,
       thinkingBudget: prefs.thinkingBudget,
+      temperature: prefs.temperature,
     );
   }
 
@@ -625,35 +638,26 @@ class ChatProvider extends ChangeNotifier {
     return result;
   }
 
-  void _applyFinalAgentMessages(ChatSession session, List<Map<String, dynamic>> agentMessages) {
-    // Build a map of original timestamps keyed by (role, position-among-same-role).
-    // This preserves message timing when the agent loop replaces session messages.
-    final timestampMap = <String, List<DateTime>>{};
-    for (final msg in session.messages) {
-      timestampMap.putIfAbsent(msg.role, () => []).add(msg.timestamp);
-    }
-    final roleCounters = <String, int>{};
+  void _appendNewAgentMessages(
+    ChatSession session,
+    List<Map<String, dynamic>> agentMessages,
+    int initialApiMsgCount,
+  ) {
+    // Only append messages added by the agent during this turn.
+    // Preserves all prior session.messages (including alternatives, token usage,
+    // and any messages dropped by _truncateToFit).
+    if (agentMessages.length <= initialApiMsgCount) return;
+    final newMessages = agentMessages.sublist(initialApiMsgCount);
 
-    session.messages.clear();
-    for (final msg in agentMessages) {
+    for (final msg in newMessages) {
       final role = msg['role'] as String;
       final content = msg['content'];
 
-      final idx = roleCounters[role] ?? 0;
-      roleCounters[role] = idx + 1;
-      final timestamps = timestampMap[role];
-      final preservedTs = (timestamps != null && idx < timestamps.length)
-          ? timestamps[idx]
-          : null;
-
+      List<MessageContent> contentList;
       if (content is String) {
-        session.messages.add(ChatMessage(
-          role: role,
-          content: [TextContent(content)],
-          timestamp: preservedTs,
-        ));
+        contentList = [TextContent(content)];
       } else if (content is List) {
-        final contentList = content.map<MessageContent>((item) {
+        contentList = content.map<MessageContent>((item) {
           if (item is Map<String, dynamic>) {
             switch (item['type']) {
               case 'text':
@@ -685,13 +689,14 @@ class ChatProvider extends ChangeNotifier {
           }
           return TextContent(item.toString());
         }).toList();
-
-        session.messages.add(ChatMessage(
-          role: role,
-          content: contentList,
-          timestamp: preservedTs,
-        ));
+      } else {
+        continue;
       }
+
+      session.messages.add(ChatMessage(
+        role: role,
+        content: contentList,
+      ));
     }
 
     // If we have pending alternatives from a regeneration, attach them to the last assistant message

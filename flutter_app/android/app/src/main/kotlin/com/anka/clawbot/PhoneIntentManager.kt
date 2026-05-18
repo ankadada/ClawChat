@@ -138,8 +138,11 @@ class PhoneIntentManager(private val activity: Activity) {
     // ── Phone number validation ─────────────────────────────────────
 
     private fun validatePhoneNumber(number: String): String {
-        val cleaned = number.replace(Regex("[^+0-9]"), "")
-        if (cleaned.isEmpty() || cleaned.length > 15) error("Invalid phone number")
+        // Strip everything except digits, allow at most one leading +
+        val digits = number.replace(Regex("[^0-9]"), "")
+        val hasPlus = number.trimStart().startsWith("+")
+        val cleaned = if (hasPlus) "+$digits" else digits
+        if (digits.length < 3 || digits.length > 15) error("Invalid phone number length")
         return cleaned
     }
 

@@ -13,6 +13,7 @@ class LlmConfig {
   final String baseUrl;
   final int maxTokens;
   final int thinkingBudget; // 0 = disabled
+  final double? temperature;
 
   const LlmConfig({
     required this.format,
@@ -21,6 +22,7 @@ class LlmConfig {
     required this.baseUrl,
     this.maxTokens = 8192,
     this.thinkingBudget = 0,
+    this.temperature,
   });
 
   @override
@@ -404,6 +406,8 @@ class LlmService {
       if (chunk.startsWith('event:') || chunk.startsWith('id:') || chunk.startsWith('retry:')) {
         continue;
       }
+      // Flush buffer on empty line (normal SSE delimiter) OR when stream ends
+      // (handled after the loop). Some proxies omit the final blank line.
       if (chunk.trim().isEmpty && _sseDataLines.isNotEmpty) {
         final data = _sseDataLines.join('\n').trim();
         _sseDataLines.clear();
@@ -536,6 +540,9 @@ class LlmService {
       'messages': messages,
       'stream': stream,
     };
+    if (config.temperature != null) {
+      body['temperature'] = config.temperature;
+    }
     if (tools.isNotEmpty) {
       body['tools'] = tools.map((t) => t.toAnthropicJson()).toList();
     }
@@ -692,17 +699,25 @@ class LlmService {
           if (toolCalls != null) {
             for (final tc in toolCalls) {
               final index = tc['index'] as int;
-              toolCallsAccum.putIfAbsent(index, () => {'id': '', 'name': '', 'arguments': ''});
-              if (tc['id'] != null) toolCallsAccum[index]!['id'] = tc['id'];
+              final entry = toolCallsAccum.putIfAbsent(
+                index,
+                () => {'id': '', 'name': '', 'arguments': '', 'started': ''},
+              );
+              if (tc['id'] != null) entry['id'] = tc['id'];
               if (tc['function'] != null) {
                 final func = tc['function'] as Map<String, dynamic>;
                 if (func['name'] != null) {
-                  toolCallsAccum[index]!['name'] = func['name'];
-                  yield ToolUseStart(toolCallsAccum[index]!['id']!, func['name']);
+                  entry['name'] = func['name'];
+                }
+                // Only emit ToolUseStart once both id and name are known
+                if (entry['started']!.isEmpty &&
+                    entry['id']!.isNotEmpty &&
+                    entry['name']!.isNotEmpty) {
+                  entry['started'] = '1';
+                  yield ToolUseStart(entry['id']!, entry['name']!);
                 }
                 if (func['arguments'] != null) {
-                  toolCallsAccum[index]!['arguments'] =
-                      toolCallsAccum[index]!['arguments']! + func['arguments'];
+                  entry['arguments'] = entry['arguments']! + func['arguments'];
                   yield ToolInputDelta(func['arguments']);
                 }
               }
@@ -774,6 +789,9 @@ class LlmService {
       'stream': stream,
       if (stream) 'stream_options': {'include_usage': true},
     };
+    if (config.temperature != null) {
+      body['temperature'] = config.temperature;
+    }
     if (tools.isNotEmpty) {
       body['tools'] = tools.map((t) => t.toOpenAIJson()).toList();
     }
