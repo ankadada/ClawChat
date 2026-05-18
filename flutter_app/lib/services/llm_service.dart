@@ -10,6 +10,7 @@ enum ApiFormat { anthropic, openai }
 enum _OpenAICompatibleProvider {
   anthropicCompatible,
   openaiNative,
+  maxCompletionTokensProvider,
   generic,
 }
 
@@ -733,6 +734,19 @@ class LlmService {
         headers: _openaiHeaders(),
         body: jsonEncode(body),
       );
+      if (response.statusCode == 400 && _tryTokenKeyFallback(response.body)) {
+        final retryBody = _buildOpenAIBody(system, messages, tools, stream: false);
+        final retryResponse = await _client.post(
+          Uri.parse(url),
+          headers: _openaiHeaders(),
+          body: jsonEncode(retryBody),
+        );
+        if (retryResponse.statusCode != 200) {
+          throw Exception(
+              'OpenAI API error (${retryResponse.statusCode}): ${_sanitizeErrorBody(retryResponse.body)}');
+        }
+        return _parseOpenAIResponse(jsonDecode(retryResponse.body));
+      }
       if (response.statusCode != 200) {
         throw Exception(
             'OpenAI API error (${response.statusCode}): ${_sanitizeErrorBody(response.body)}');
@@ -748,7 +762,7 @@ class LlmService {
   ) async* {
     final url = _joinEndpointUrl(config.baseUrl, '/v1/chat/completions');
     _validateApiHost(url);
-    final body = _buildOpenAIBody(system, messages, tools, stream: true);
+    var body = _buildOpenAIBody(system, messages, tools, stream: true);
 
     http.StreamedResponse streamedResponse;
     try {
@@ -757,6 +771,24 @@ class LlmService {
         request.headers.addAll(_openaiHeaders());
         request.body = jsonEncode(body);
         final response = await _client.send(request);
+        if (response.statusCode == 400) {
+          final errorBody = await response.stream.bytesToString();
+          if (_tryTokenKeyFallback(errorBody)) {
+            body = _buildOpenAIBody(system, messages, tools, stream: true);
+            final retryReq = http.Request('POST', Uri.parse(url));
+            retryReq.headers.addAll(_openaiHeaders());
+            retryReq.body = jsonEncode(body);
+            final retryResp = await _client.send(retryReq);
+            if (retryResp.statusCode != 200) {
+              final retryErr = await retryResp.stream.bytesToString();
+              throw Exception(
+                  'OpenAI API error (${retryResp.statusCode}): ${_sanitizeErrorBody(retryErr)}');
+            }
+            return retryResp;
+          }
+          throw Exception(
+              'OpenAI API error (400): ${_sanitizeErrorBody(errorBody)}');
+        }
         if (response.statusCode != 200) {
           final errorBody = await response.stream.bytesToString();
           throw Exception(
@@ -965,8 +997,32 @@ class LlmService {
         m.contains('reasoning');
   }
 
+  bool _tryTokenKeyFallback(String errorBody) {
+    final lower = errorBody.toLowerCase();
+    if (!lower.contains('max_tokens') && !lower.contains('max_completion_tokens')) {
+      return false;
+    }
+    final current = _tokenKeyOverrides[config.baseUrl] ??
+        _openAITokenLimitKey(_detectOpenAICompatibleProvider());
+    final alternate = current == 'max_completion_tokens' ? 'max_tokens' : 'max_completion_tokens';
+    _tokenKeyOverrides[config.baseUrl] = alternate;
+    return true;
+  }
+
+  static final Map<String, String> _tokenKeyOverrides = {};
+
   String _openAITokenLimitKey(_OpenAICompatibleProvider provider) {
-    return 'max_completion_tokens';
+    final override = _tokenKeyOverrides[config.baseUrl];
+    if (override != null) return override;
+
+    if (_isReasoningModel(config.model)) return 'max_completion_tokens';
+
+    return switch (provider) {
+      _OpenAICompatibleProvider.openaiNative => 'max_completion_tokens',
+      _OpenAICompatibleProvider.anthropicCompatible => 'max_completion_tokens',
+      _OpenAICompatibleProvider.maxCompletionTokensProvider => 'max_completion_tokens',
+      _OpenAICompatibleProvider.generic => 'max_tokens',
+    };
   }
 
   _OpenAICompatibleProvider _detectOpenAICompatibleProvider() {
@@ -976,6 +1032,11 @@ class LlmService {
     }
     if (baseUrl.contains('openai.com')) {
       return _OpenAICompatibleProvider.openaiNative;
+    }
+    if (baseUrl.contains('openrouter') ||
+        baseUrl.contains('groq.com') ||
+        baseUrl.contains('litellm')) {
+      return _OpenAICompatibleProvider.maxCompletionTokensProvider;
     }
     return _OpenAICompatibleProvider.generic;
   }

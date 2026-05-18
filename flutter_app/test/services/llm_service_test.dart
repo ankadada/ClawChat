@@ -212,9 +212,13 @@ void main() {
       expect(body['model'], 'gpt-test');
     });
 
-    test('OpenAI-compatible requests use max_completion_tokens', () async {
+    test('generic OpenAI-compatible requests use max_tokens for non-reasoning models', () async {
       final body = await captureOpenAiBody(model: 'gpt-test');
+      expect(body['max_tokens'], 8192);
+    });
 
+    test('reasoning models use max_completion_tokens regardless of provider', () async {
+      final body = await captureOpenAiBody(model: 'gpt-5.5');
       expect(body['max_completion_tokens'], 8192);
     });
 
@@ -254,7 +258,7 @@ void main() {
         {'role': 'system', 'content': 'You are concise.'},
         {'role': 'user', 'content': 'hi'},
       ]);
-      expect(captured.body['max_completion_tokens'], 8192);
+      expect(captured.body['max_tokens'], 8192);
       expect(jsonDecode(jsonEncode(captured.body)), captured.body);
     });
   });
