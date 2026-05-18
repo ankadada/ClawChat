@@ -35,12 +35,32 @@ void main() {
     }
   });
 
+  Future<File> writeFile(String name, List<int> bytes) async {
+    final file = File('${tempDir.path}/$name');
+    await file.writeAsBytes(bytes);
+    return file;
+  }
+
+  Future<File> writeStringFile(String name, String content) async {
+    final file = File('${tempDir.path}/$name');
+    await file.writeAsString(content);
+    return file;
+  }
+
+  PlatformFile platformFile(File file, String name) {
+    return PlatformFile(
+      name: name,
+      path: file.path,
+      size: file.lengthSync(),
+    );
+  }
+
   group('FileAttachmentService.prepareForMessage', () {
     test('image file returns ImageContent', () async {
-      final file = await _writeFile('photo.png', [1, 2, 3, 4]);
+      final file = await writeFile('photo.png', [1, 2, 3, 4]);
 
       final prepared = await FileAttachmentService.prepareForMessage(
-        _platformFile(file, 'photo.png'),
+        platformFile(file, 'photo.png'),
       );
 
       expect(prepared.content, isA<ImageContent>());
@@ -51,10 +71,10 @@ void main() {
     });
 
     test('text file returns inlined code block', () async {
-      final file = await _writeStringFile('main.dart', 'void main() {}');
+      final file = await writeStringFile('main.dart', 'void main() {}');
 
       final prepared = await FileAttachmentService.prepareForMessage(
-        _platformFile(file, 'main.dart'),
+        platformFile(file, 'main.dart'),
       );
 
       expect(prepared.content, isA<TextContent>());
@@ -65,32 +85,32 @@ void main() {
     });
 
     test('oversized image throws', () async {
-      final file = await _writeFile('large.png', List<int>.filled(4 * 1024 * 1024, 1));
+      final file = await writeFile('large.png', List<int>.filled(4 * 1024 * 1024, 1));
 
       expect(
         FileAttachmentService.prepareForMessage(
-          _platformFile(file, 'large.png'),
+          platformFile(file, 'large.png'),
         ),
         throwsException,
       );
     });
 
     test('oversized text throws', () async {
-      final file = await _writeStringFile('large.txt', 'x' * (101 * 1024));
+      final file = await writeStringFile('large.txt', 'x' * (101 * 1024));
 
       expect(
         FileAttachmentService.prepareForMessage(
-          _platformFile(file, 'large.txt'),
+          platformFile(file, 'large.txt'),
         ),
         throwsException,
       );
     });
 
     test('binary file returns workspace path marker', () async {
-      final file = await _writeFile('archive.bin', [0, 1, 2, 3]);
+      final file = await writeFile('archive.bin', [0, 1, 2, 3]);
 
       final prepared = await FileAttachmentService.prepareForMessage(
-        _platformFile(file, 'archive.bin'),
+        platformFile(file, 'archive.bin'),
       );
 
       expect(prepared.content, isA<TextContent>());
@@ -98,24 +118,4 @@ void main() {
       expect(prepared.includeAsContentBlock, isFalse);
     });
   });
-
-  Future<File> _writeFile(String name, List<int> bytes) async {
-    final file = File('${tempDir.path}/$name');
-    await file.writeAsBytes(bytes);
-    return file;
-  }
-
-  Future<File> _writeStringFile(String name, String content) async {
-    final file = File('${tempDir.path}/$name');
-    await file.writeAsString(content);
-    return file;
-  }
-
-  PlatformFile _platformFile(File file, String name) {
-    return PlatformFile(
-      name: name,
-      path: file.path,
-      size: file.lengthSync(),
-    );
-  }
 }
