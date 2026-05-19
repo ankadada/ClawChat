@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
@@ -19,7 +20,7 @@ class _SplashScreenState extends State<SplashScreen>
   final _prefs = PreferencesService();
   String _status = AppStrings.splashLoading;
   late final AnimationController _fadeController;
-  late final Animation<double> _fadeAnimation;
+  late final CurvedAnimation _fadeAnimation;
 
   @override
   void initState() {
@@ -38,6 +39,7 @@ class _SplashScreenState extends State<SplashScreen>
 
   @override
   void dispose() {
+    _fadeAnimation.dispose();
     _fadeController.dispose();
     super.dispose();
   }
@@ -72,16 +74,16 @@ class _SplashScreenState extends State<SplashScreen>
         final apiKey = _prefs.apiKey;
         if (apiKey == null || apiKey.isEmpty) {
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const OnboardingScreen()),
+            CupertinoPageRoute(builder: (_) => const OnboardingScreen()),
           );
         } else {
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const ResponsiveShell()),
+            CupertinoPageRoute(builder: (_) => const ResponsiveShell()),
           );
         }
       } else {
         Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const SetupWizardScreen()),
+          CupertinoPageRoute(builder: (_) => const SetupWizardScreen()),
         );
       }
     } catch (e) {

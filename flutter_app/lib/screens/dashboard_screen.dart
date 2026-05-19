@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import '../constants.dart';
 import '../app.dart';
 import '../services/preferences_service.dart';
@@ -44,7 +45,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           IconButton(
             icon: const Icon(Icons.settings),
             onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const SettingsScreen()),
+              CupertinoPageRoute(builder: (_) => const SettingsScreen()),
             ),
           ),
         ],
@@ -74,7 +75,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       title: AppStrings.chat,
                       subtitle: AppStrings.chatSubtitle,
                       onTap: () => Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const ResponsiveShell()),
+                        CupertinoPageRoute(builder: (_) => const ResponsiveShell()),
                       ),
                     ),
                     _buildQuickAction(
@@ -84,7 +85,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       title: AppStrings.terminal,
                       subtitle: AppStrings.terminalSubtitle,
                       onTap: () => Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const TerminalScreen()),
+                        CupertinoPageRoute(builder: (_) => const TerminalScreen()),
                       ),
                     ),
                     _buildQuickAction(
@@ -94,7 +95,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       title: AppStrings.configureApiKey,
                       subtitle: AppStrings.configureApiKeySubtitle,
                       onTap: () => Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const OnboardingScreen()),
+                        CupertinoPageRoute(builder: (_) => const OnboardingScreen()),
                       ),
                     ),
                     _buildQuickAction(
@@ -104,7 +105,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       title: AppStrings.settings,
                       subtitle: AppStrings.settingsSubtitle,
                       onTap: () => Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const SettingsScreen()),
+                        CupertinoPageRoute(builder: (_) => const SettingsScreen()),
                       ),
                     ),
                   ],

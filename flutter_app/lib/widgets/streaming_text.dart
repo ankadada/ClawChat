@@ -19,17 +19,41 @@ class StreamingText extends StatefulWidget {
   State<StreamingText> createState() => _StreamingTextState();
 }
 
-class _StreamingTextState extends State<StreamingText> {
+class _StreamingTextState extends State<StreamingText>
+    with SingleTickerProviderStateMixin {
   List<InlineSpan>? _cachedSpans;
   String? _cachedText;
   double? _cachedMaxWidth;
   int _lastParseEnd = 0;
   final List<TapGestureRecognizer> _recognizers = [];
+  late final AnimationController _cursorController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 500),
+  );
+  late final Animation<double> _cursorAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _cursorAnimation =
+        Tween<double>(begin: 0.3, end: 1).animate(_cursorController);
+    _syncCursorAnimation();
+  }
 
   @override
   void dispose() {
     _disposeRecognizers();
+    _cursorController.dispose();
     super.dispose();
+  }
+
+  void _syncCursorAnimation() {
+    if (widget.isStreaming) {
+      _cursorController.repeat(reverse: true);
+    } else {
+      _cursorController.stop();
+      _cursorController.value = 1;
+    }
   }
 
   void _disposeRecognizers() {
@@ -85,10 +109,7 @@ class _StreamingTextState extends State<StreamingText> {
         result.add(TextSpan(text: trailing));
       }
       if (widget.isStreaming) {
-        result.add(TextSpan(
-          text: '▌',
-          style: TextStyle(color: theme.colorScheme.primary),
-        ));
+        result.add(_cursorSpan(theme));
       }
       return result;
     }
@@ -111,10 +132,7 @@ class _StreamingTextState extends State<StreamingText> {
         result.add(TextSpan(text: trailing));
       }
       if (widget.isStreaming) {
-        result.add(TextSpan(
-          text: '▌',
-          style: TextStyle(color: theme.colorScheme.primary),
-        ));
+        result.add(_cursorSpan(theme));
       }
       return result;
     }
@@ -129,12 +147,25 @@ class _StreamingTextState extends State<StreamingText> {
       result.add(TextSpan(text: trailing));
     }
     if (widget.isStreaming) {
-      result.add(TextSpan(
-        text: '▌',
-        style: TextStyle(color: theme.colorScheme.primary),
-      ));
+      result.add(_cursorSpan(theme));
     }
     return result;
+  }
+
+  InlineSpan _cursorSpan(ThemeData theme) {
+    return WidgetSpan(
+      alignment: PlaceholderAlignment.baseline,
+      baseline: TextBaseline.alphabetic,
+      child: FadeTransition(
+        opacity: _cursorAnimation,
+        child: Text(
+          '▌',
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.primary,
+          ),
+        ),
+      ),
+    );
   }
 
   static final _codeBlockRegex = RegExp(r'```([^\n`]*)\n([\s\S]*?)```');
@@ -481,6 +512,9 @@ class _StreamingTextState extends State<StreamingText> {
   @override
   void didUpdateWidget(StreamingText oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.isStreaming != widget.isStreaming) {
+      _syncCursorAnimation();
+    }
     // Only invalidate cache when text is completely different (not append)
     // Incremental parsing handles appends without cache invalidation
     if (oldWidget.text != widget.text &&

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import '../constants.dart';
 import '../models/setup_state.dart';
 import '../services/bootstrap_service.dart';
@@ -99,7 +100,7 @@ class _SetupWizardScreenState extends State<SetupWizardScreen> {
                   width: double.infinity,
                   child: FilledButton.icon(
                     onPressed: () => Navigator.of(context).pushReplacement(
-                      MaterialPageRoute(builder: (_) => const OnboardingScreen(isFirstRun: true)),
+                      CupertinoPageRoute(builder: (_) => const OnboardingScreen(isFirstRun: true)),
                     ),
                     icon: const Icon(Icons.arrow_forward),
                     label: const Text(AppStrings.configureApiKey),

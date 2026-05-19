@@ -16,7 +16,7 @@ class AgentStatusBar extends StatelessWidget {
     return Consumer<ChatProvider>(
       builder: (_, provider, __) {
         if (provider.agentStatus == AgentStatus.idle) {
-          return const SizedBox.shrink();
+          return _animatedStatusBar(const SizedBox.shrink(key: ValueKey('idle')));
         }
 
         final activeToolName = _activeToolName(provider);
@@ -42,7 +42,8 @@ class AgentStatusBar extends StatelessWidget {
           );
         }
 
-        return Container(
+        return _animatedStatusBar(Container(
+          key: ValueKey('status-${provider.agentStatus}-$label'),
           width: double.infinity,
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           decoration: BoxDecoration(
@@ -113,8 +114,34 @@ class AgentStatusBar extends StatelessWidget {
                 ),
             ],
           ),
+        ));
+      },
+    );
+  }
+
+  Widget _animatedStatusBar(Widget child) {
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 220),
+      reverseDuration: const Duration(milliseconds: 180),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, animation) {
+        final slide = Tween<Offset>(
+          begin: const Offset(0, -0.18),
+          end: Offset.zero,
+        ).animate(animation);
+        return ClipRect(
+          child: SizeTransition(
+            sizeFactor: animation,
+            axisAlignment: -1,
+            child: FadeTransition(
+              opacity: animation,
+              child: SlideTransition(position: slide, child: child),
+            ),
+          ),
         );
       },
+      child: child,
     );
   }
 

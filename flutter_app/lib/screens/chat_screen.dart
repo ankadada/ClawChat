@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -40,14 +41,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final WhisperService _whisper = WhisperService();
   bool _isListening = false;
   bool _isWhisperRecording = false;
+  bool _showScrollToBottom = false;
   bool _approvalDialogOpen = false;
   ToolApprovalRequest? _shownApprovalRequest;
   final List<MessageContent> _pendingAttachments = [];
+  final Set<String> _seenMessageAnimationIds = {};
+  String? _seenAnimationSessionId;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _scrollController.addListener(_handleScroll);
     _tts.addListener(_onTtsStateChanged);
     _initSpeech();
   }
@@ -277,6 +282,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _tts.removeListener(_onTtsStateChanged);
     _speech.cancel();
+    _scrollController.removeListener(_handleScroll);
     _inputController.dispose();
     _scrollController.dispose();
     _focusNode.dispose();
@@ -431,6 +437,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final text = _inputController.text.trim();
     final attachments = List<MessageContent>.from(_pendingAttachments);
     if (text.isEmpty && attachments.isEmpty) return;
+    HapticFeedback.lightImpact();
     _inputController.clear();
     _pendingAttachments.clear();
     final provider = context.read<ChatProvider>();
@@ -438,6 +445,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       provider.saveDraft(provider.currentSession!.id, '');
     }
     provider.sendMessage(text, attachments: attachments);
+  }
+
+  void _handleScroll() {
+    if (!_scrollController.hasClients) return;
+    final shouldShow = _scrollController.offset > 200;
+    if (shouldShow == _showScrollToBottom) return;
+    setState(() => _showScrollToBottom = shouldShow);
+  }
+
+  void _scrollToBottom() {
+    HapticFeedback.lightImpact();
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(
+      0,
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   @override
@@ -464,7 +488,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             : IconButton(
                 icon: const Icon(Icons.menu),
                 onPressed: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const ChatSessionsScreen()),
+                  CupertinoPageRoute(builder: (_) => const ChatSessionsScreen()),
                 ),
               ),
         actions: [
@@ -477,7 +501,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             onSelected: (value) {
               switch (value) {
                 case 'settings':
-                  Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SettingsScreen()));
+                  Navigator.of(context).push(CupertinoPageRoute(builder: (_) => const SettingsScreen()));
                 case 'system_prompt':
                   _showSystemPromptDialog();
                 case 'session_system_prompt':
@@ -536,61 +560,88 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final maxContentWidth = math.min(640.0, constraints.maxWidth * 0.86);
-                return Selector<ChatProvider, ({List<ChatMessage> messages, bool hasStreaming, String? sessionId, String modelName})>(
+                return Selector<ChatProvider, ({List<ChatMessage> messages, bool hasStreaming, AgentStatus status, String? sessionId, String modelName})>(
                   selector: (_, p) => (
                     messages: p.currentSession?.messages ?? [],
                     hasStreaming: p.agentStatus == AgentStatus.streaming || p.streamingText.isNotEmpty,
+                    status: p.agentStatus,
                     sessionId: p.currentSession?.id,
                     modelName: p.currentSession?.modelOverride ?? AppConstants.defaultModel,
                   ),
                   builder: (context, data, __) {
                     final messages = data.messages;
                     final hasStreaming = data.hasStreaming;
+                    final showTyping = data.status == AgentStatus.thinking && !hasStreaming;
 
                     // Sync draft when session changes via Selector rebuild
                     final currentId = data.sessionId;
                     if (currentId != null && currentId != _lastSessionId) {
                       _syncDraftForSession();
                     }
+                    _primeMessageAnimations(currentId, messages);
 
-                    if (messages.isEmpty && !hasStreaming) {
+                    if (messages.isEmpty && !hasStreaming && !showTyping) {
                       return _buildEmptyState(theme, data.modelName, maxContentWidth);
                     }
 
-                    final itemCount = messages.length + (hasStreaming ? 1 : 0);
-                    return ListView.builder(
-                      controller: _scrollController,
-                      reverse: true,
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                      itemCount: itemCount,
-                      itemBuilder: (context, index) {
-                        final reversedIndex = itemCount - 1 - index;
-                        if (reversedIndex == messages.length && hasStreaming) {
-                          return Consumer<ChatProvider>(
-                            builder: (_, provider, __) => _buildStreamingBubble(
-                              provider.streamingText,
-                              theme,
-                              maxContentWidth,
-                              previousRole: messages.isEmpty ? null : messages.last.role,
-                            ),
-                          );
-                        }
-                        final message = messages[reversedIndex];
-                        final previousRole = reversedIndex > 0
-                            ? messages[reversedIndex - 1].role
-                            : null;
-                        final nextRole = reversedIndex < messages.length - 1
-                            ? messages[reversedIndex + 1].role
-                            : null;
-                        return _buildMessageBubble(
-                          message,
-                          reversedIndex,
-                          theme,
-                          maxContentWidth,
-                          previousRole: previousRole,
-                          nextRole: nextRole,
-                        );
-                      },
+                    final itemCount = messages.length +
+                        (hasStreaming ? 1 : 0) +
+                        (showTyping ? 1 : 0);
+                    return Stack(
+                      children: [
+                        ListView.builder(
+                          controller: _scrollController,
+                          reverse: true,
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          itemCount: itemCount,
+                          itemBuilder: (context, index) {
+                            final reversedIndex = itemCount - 1 - index;
+                            if (reversedIndex == messages.length && hasStreaming) {
+                              return Consumer<ChatProvider>(
+                                builder: (_, provider, __) => _buildStreamingBubble(
+                                  provider.streamingText,
+                                  theme,
+                                  maxContentWidth,
+                                  previousRole: messages.isEmpty ? null : messages.last.role,
+                                ),
+                              );
+                            }
+                            if (reversedIndex == messages.length && showTyping) {
+                              return _buildTypingIndicatorBubble(
+                                theme,
+                                maxContentWidth,
+                                previousRole: messages.isEmpty ? null : messages.last.role,
+                              );
+                            }
+                            final message = messages[reversedIndex];
+                            final previousRole = reversedIndex > 0
+                                ? messages[reversedIndex - 1].role
+                                : null;
+                            final nextRole = reversedIndex < messages.length - 1
+                                ? messages[reversedIndex + 1].role
+                                : null;
+                            final animationId = _messageAnimationId(message);
+                            final animate = _seenMessageAnimationIds.add(animationId);
+                            return _AnimatedMessageEntry(
+                              key: ValueKey(animationId),
+                              animate: animate,
+                              child: _buildMessageBubble(
+                                message,
+                                reversedIndex,
+                                theme,
+                                maxContentWidth,
+                                previousRole: previousRole,
+                                nextRole: nextRole,
+                              ),
+                            );
+                          },
+                        ),
+                        Positioned(
+                          right: 16,
+                          bottom: 16,
+                          child: _buildScrollToBottomButton(theme),
+                        ),
+                      ],
                     );
                   },
                 );
@@ -619,6 +670,41 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
           _buildInputArea(theme),
         ],
+      ),
+    );
+  }
+
+  void _primeMessageAnimations(String? sessionId, List<ChatMessage> messages) {
+    if (_seenAnimationSessionId == sessionId) return;
+    _seenAnimationSessionId = sessionId;
+    _seenMessageAnimationIds
+      ..clear()
+      ..addAll(messages.map(_messageAnimationId));
+  }
+
+  String _messageAnimationId(ChatMessage message) {
+    return '${message.timestamp.microsecondsSinceEpoch}-${message.role}-${message.content.length}';
+  }
+
+  Widget _buildScrollToBottomButton(ThemeData theme) {
+    return IgnorePointer(
+      ignoring: !_showScrollToBottom,
+      child: AnimatedOpacity(
+        opacity: _showScrollToBottom ? 1 : 0,
+        duration: const Duration(milliseconds: 160),
+        child: AnimatedScale(
+          scale: _showScrollToBottom ? 1 : 0.86,
+          duration: const Duration(milliseconds: 160),
+          curve: Curves.easeOutCubic,
+          child: FloatingActionButton.small(
+            heroTag: 'chat-scroll-to-bottom',
+            tooltip: AppStrings.scrollToBottom,
+            onPressed: _scrollToBottom,
+            backgroundColor: theme.colorScheme.surfaceContainerHighest,
+            foregroundColor: theme.colorScheme.onSurface,
+            child: const Icon(Icons.keyboard_arrow_down),
+          ),
+        ),
       ),
     );
   }
@@ -708,6 +794,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   double _halfMessageGap(String? adjacentRole, String role) {
     if (adjacentRole == null) return 6;
     return adjacentRole == role ? 2 : 8;
+  }
+
+  BorderRadius _bubbleRadius(bool isUser) {
+    const tight = Radius.circular(4);
+    const regular = Radius.circular(AppRadii.m);
+    return BorderRadius.only(
+      topLeft: regular,
+      topRight: regular,
+      bottomLeft: isUser ? regular : tight,
+      bottomRight: isUser ? tight : regular,
+    );
   }
 
   Widget _buildMessageBubble(
@@ -834,6 +931,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           label: isUser ? '用户消息' : 'AI 消息',
           child: GestureDetector(
           onLongPress: () {
+            HapticFeedback.lightImpact();
             showModalBottomSheet(
               context: context,
               builder: (ctx) => SafeArea(
@@ -880,7 +978,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               color: isUser
                   ? AppColors.accent.withAlpha(45)
                   : theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(AppRadii.m),
+              borderRadius: _bubbleRadius(isUser),
               border: Border.all(
                 color: isUser
                     ? AppColors.accent.withAlpha(90)
@@ -915,7 +1013,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               color: isUser
                   ? AppColors.accent.withAlpha(45)
                   : theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(AppRadii.m),
+              borderRadius: _bubbleRadius(isUser),
               border: Border.all(
                 color: isUser
                     ? AppColors.accent.withAlpha(90)
@@ -973,12 +1071,49 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
               color: theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(AppRadii.m),
+              borderRadius: _bubbleRadius(false),
               border: Border.all(
                 color: theme.colorScheme.outline.withAlpha(50),
               ),
             ),
             child: StreamingText(text: text, isStreaming: true),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTypingIndicatorBubble(
+    ThemeData theme,
+    double maxContentWidth, {
+    String? previousRole,
+  }) {
+    return Padding(
+      padding: EdgeInsets.only(
+        top: _halfMessageGap(previousRole, 'assistant'),
+        bottom: 8,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Text(AppStrings.aiLabel,
+                style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600)),
+          ),
+          Container(
+            constraints: BoxConstraints(maxWidth: maxContentWidth),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface,
+              borderRadius: _bubbleRadius(false),
+              border: Border.all(
+                color: theme.colorScheme.outline.withAlpha(50),
+              ),
+            ),
+            child: _TypingDots(color: theme.colorScheme.primary),
           ),
         ],
       ),
@@ -1569,6 +1704,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 if (!isRunning)
                   GestureDetector(
                     onLongPressStart: (_) {
+                      HapticFeedback.lightImpact();
                       if (!_isWhisperRecording) _startListening();
                     },
                     onLongPressEnd: (_) {
@@ -1646,6 +1782,120 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ],
             ),
           ),
+        );
+      },
+    );
+  }
+}
+
+class _AnimatedMessageEntry extends StatefulWidget {
+  final Widget child;
+  final bool animate;
+
+  const _AnimatedMessageEntry({
+    super.key,
+    required this.child,
+    required this.animate,
+  });
+
+  @override
+  State<_AnimatedMessageEntry> createState() => _AnimatedMessageEntryState();
+}
+
+class _AnimatedMessageEntryState extends State<_AnimatedMessageEntry>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 200),
+    value: widget.animate ? 0 : 1,
+  );
+  late final CurvedAnimation _fadeAnimation = CurvedAnimation(
+    parent: _controller,
+    curve: Curves.easeOutCubic,
+  );
+  late final CurvedAnimation _slideAnimation = CurvedAnimation(
+    parent: _controller,
+    curve: Curves.easeOutCubic,
+  );
+  late final Animation<double> _opacity = _fadeAnimation;
+  late final Animation<Offset> _offset = Tween<Offset>(
+    begin: const Offset(0, 0.04),
+    end: Offset.zero,
+  ).animate(_slideAnimation);
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.animate) {
+      _controller.forward();
+    }
+  }
+
+  @override
+  void dispose() {
+    _slideAnimation.dispose();
+    _fadeAnimation.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _opacity,
+      child: SlideTransition(
+        position: _offset,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+class _TypingDots extends StatefulWidget {
+  final Color color;
+
+  const _TypingDots({required this.color});
+
+  @override
+  State<_TypingDots> createState() => _TypingDotsState();
+}
+
+class _TypingDotsState extends State<_TypingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(3, (index) {
+            final phase = (_controller.value + index * 0.18) % 1;
+            final lift = math.sin(phase * math.pi).clamp(0.0, 1.0);
+            return Transform.translate(
+              offset: Offset(0, -4 * lift),
+              child: Container(
+                width: 6,
+                height: 6,
+                margin: EdgeInsets.only(right: index == 2 ? 0 : 5),
+                decoration: BoxDecoration(
+                  color: widget.color.withAlpha(120 + (lift * 95).round()),
+                  shape: BoxShape.circle,
+                ),
+              ),
+            );
+          }),
         );
       },
     );

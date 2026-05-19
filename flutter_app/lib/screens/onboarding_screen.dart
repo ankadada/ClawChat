@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import '../constants.dart';
 import '../services/llm_service.dart';
 import '../services/preferences_service.dart';
@@ -482,7 +483,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const ResponsiveShell()),
+      CupertinoPageRoute(builder: (_) => const ResponsiveShell()),
     );
   }
 

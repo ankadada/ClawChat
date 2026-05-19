@@ -333,8 +333,10 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                               ),
                             );
                           },
-                          onDismissed: (_) =>
-                              provider.deleteSession(session.id),
+                          onDismissed: (_) {
+                            HapticFeedback.lightImpact();
+                            provider.deleteSession(session.id);
+                          },
                           background: Container(
                             alignment: Alignment.centerRight,
                             padding: const EdgeInsets.only(right: 16),
@@ -391,6 +393,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                                         _showMoveToFolderDialog(context, session, provider);
                                         break;
                                       case 'delete':
+                                        HapticFeedback.lightImpact();
                                         provider.deleteSession(session.id);
                                         break;
                                     }
@@ -421,7 +424,10 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                                     Navigator.of(context).pop();
                                   }
                                 },
-                                onLongPress: () => _showSessionOptions(context, session, provider),
+                              onLongPress: () {
+                                HapticFeedback.lightImpact();
+                                _showSessionOptions(context, session, provider);
+                              },
                               ),
                             ),
                         );
@@ -551,6 +557,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
               title: const Text(AppStrings.deleteChat),
               onTap: () {
                 Navigator.pop(ctx);
+                HapticFeedback.lightImpact();
                 provider.deleteSession(session.id);
               },
             ),

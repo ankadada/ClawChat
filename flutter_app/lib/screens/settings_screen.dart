@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
@@ -314,6 +315,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       subtitle: const Text(AppStrings.notifyOnCompleteSubtitle),
                       value: _notifyOnComplete,
                       onChanged: (v) {
+                        HapticFeedback.lightImpact();
                         setState(() => _notifyOnComplete = v);
                         _prefs.notifyOnComplete = v;
                       },
@@ -369,6 +371,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       subtitle: const Text(AppStrings.allowCallSubtitle),
                       value: _allowPhoneCall,
                       onChanged: (v) {
+                        HapticFeedback.lightImpact();
                         setState(() => _allowPhoneCall = v);
                         _prefs.allowPhoneCall = v;
                       },
@@ -378,6 +381,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       subtitle: const Text(AppStrings.allowSmsSubtitle),
                       value: _allowSms,
                       onChanged: (v) {
+                        HapticFeedback.lightImpact();
                         setState(() => _allowSms = v);
                         _prefs.allowSms = v;
                       },
@@ -554,6 +558,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   subtitle: const Text(AppStrings.autoCompactSubtitle),
                   value: _autoCompact,
                   onChanged: (v) {
+                    HapticFeedback.lightImpact();
                     setState(() => _autoCompact = v);
                     _prefs.autoCompact = v;  // persist immediately
                   },
@@ -617,6 +622,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         subtitle: Text(skill.description, maxLines: 2, overflow: TextOverflow.ellipsis),
                         value: skill.enabled,
                         onChanged: (v) async {
+                          HapticFeedback.lightImpact();
                           setState(() => skill.enabled = v);
                           await SkillService.setSkillEnabled(skill.name, v);
                         },
@@ -733,7 +739,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       leading: const Icon(Icons.build),
                       trailing: const Icon(Icons.chevron_right),
                       onTap: () => Navigator.of(context).pushReplacement(
-                        MaterialPageRoute(builder: (_) => const SetupWizardScreen()),
+                        CupertinoPageRoute(builder: (_) => const SetupWizardScreen()),
                       ),
                     ),
                     _settingsDivider(theme),
