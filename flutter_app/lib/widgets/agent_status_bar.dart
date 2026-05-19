@@ -43,7 +43,7 @@ class AgentStatusBar extends StatelessWidget {
         }
 
         return _animatedStatusBar(Container(
-          key: ValueKey('status-${provider.agentStatus}-$label'),
+          key: ValueKey('status-${provider.agentStatus}'),
           width: double.infinity,
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           decoration: BoxDecoration(
@@ -64,12 +64,14 @@ class AgentStatusBar extends StatelessWidget {
             children: [
               if (!isError)
                 provider.agentStatus == AgentStatus.thinking
-                    ? _PulsingStatusDot(color: color)
+                    ? RepaintBoundary(child: _PulsingStatusDot(color: color))
                     : SizedBox(
                         width: 14, height: 14,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: color,
+                        child: RepaintBoundary(
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: color,
+                          ),
                         ),
                       )
               else
@@ -121,13 +123,13 @@ class AgentStatusBar extends StatelessWidget {
 
   Widget _animatedStatusBar(Widget child) {
     return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 220),
-      reverseDuration: const Duration(milliseconds: 180),
+      duration: const Duration(milliseconds: 280),
+      reverseDuration: const Duration(milliseconds: 240),
       switchInCurve: Curves.easeOutCubic,
-      switchOutCurve: Curves.easeInCubic,
+      switchOutCurve: Curves.easeInOutCubic,
       transitionBuilder: (child, animation) {
         final slide = Tween<Offset>(
-          begin: const Offset(0, -0.18),
+          begin: const Offset(0, -0.08),
           end: Offset.zero,
         ).animate(animation);
         return ClipRect(
@@ -175,7 +177,7 @@ class _PulsingStatusDotState extends State<_PulsingStatusDot>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 850),
+    duration: const Duration(milliseconds: 1200),
   )..repeat(reverse: true);
 
   @override
@@ -192,13 +194,13 @@ class _PulsingStatusDotState extends State<_PulsingStatusDot>
       child: AnimatedBuilder(
         animation: _controller,
         builder: (context, _) {
-          final size = 7.0 + (_controller.value * 4.0);
+          final size = 7.0 + (_controller.value * 2.0);
           return Center(
             child: Container(
               width: size,
               height: size,
               decoration: BoxDecoration(
-                color: widget.color.withAlpha(145 + (_controller.value * 80).round()),
+                color: widget.color.withAlpha(150 + (_controller.value * 50).round()),
                 shape: BoxShape.circle,
               ),
             ),

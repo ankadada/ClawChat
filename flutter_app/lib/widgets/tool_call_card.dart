@@ -158,7 +158,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                     ),
                   ),
                   AnimatedCrossFade(
-                    duration: const Duration(milliseconds: 180),
+                    duration: const Duration(milliseconds: 260),
                     firstCurve: Curves.easeOutCubic,
                     secondCurve: Curves.easeOutCubic,
                     sizeCurve: Curves.easeOutCubic,
@@ -238,7 +238,7 @@ class _PulsingToolBorderState extends State<_PulsingToolBorder>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 760),
+    duration: const Duration(milliseconds: 1200),
   );
 
   @override
@@ -277,7 +277,7 @@ class _PulsingToolBorderState extends State<_PulsingToolBorder>
       animation: _controller,
       builder: (context, child) {
         final opacity = widget.pulsing
-            ? 0.48 + (_controller.value * 0.42)
+            ? 0.58 + (_controller.value * 0.22)
             : 0.9;
         return Container(
           width: 4,

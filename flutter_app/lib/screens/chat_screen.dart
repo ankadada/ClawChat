@@ -454,7 +454,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _handleScroll() {
     if (!_scrollController.hasClients) return;
-    final shouldShow = _scrollController.offset > 200;
+    final offset = _scrollController.offset;
+    final shouldShow = _showScrollToBottom ? offset > 120 : offset > 300;
     if (shouldShow == _showScrollToBottom) return;
     setState(() => _showScrollToBottom = shouldShow);
   }
@@ -603,19 +604,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             final reversedIndex = itemCount - 1 - index;
                             if (reversedIndex == messages.length && hasStreaming) {
                               return Consumer<ChatProvider>(
-                                builder: (_, provider, __) => _buildStreamingBubble(
-                                  provider.streamingText,
-                                  theme,
-                                  maxContentWidth,
-                                  previousRole: messages.isEmpty ? null : messages.last.role,
+                                builder: (_, provider, __) => RepaintBoundary(
+                                  child: _buildStreamingBubble(
+                                    provider.streamingText,
+                                    theme,
+                                    maxContentWidth,
+                                    previousRole: messages.isEmpty ? null : messages.last.role,
+                                  ),
                                 ),
                               );
                             }
                             if (reversedIndex == messages.length && showTyping) {
-                              return _buildTypingIndicatorBubble(
-                                theme,
-                                maxContentWidth,
-                                previousRole: messages.isEmpty ? null : messages.last.role,
+                              return RepaintBoundary(
+                                child: _buildTypingIndicatorBubble(
+                                  theme,
+                                  maxContentWidth,
+                                  previousRole: messages.isEmpty ? null : messages.last.role,
+                                ),
                               );
                             }
                             final message = messages[reversedIndex];
@@ -630,13 +635,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             return _AnimatedMessageEntry(
                               key: ValueKey(animationId),
                               animate: animate,
-                              child: _buildMessageBubble(
-                                message,
-                                reversedIndex,
-                                theme,
-                                maxContentWidth,
-                                previousRole: previousRole,
-                                nextRole: nextRole,
+                              child: RepaintBoundary(
+                                child: _buildMessageBubble(
+                                  message,
+                                  reversedIndex,
+                                  theme,
+                                  maxContentWidth,
+                                  previousRole: previousRole,
+                                  nextRole: nextRole,
+                                ),
                               ),
                             );
                           },
@@ -696,10 +703,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ignoring: !_showScrollToBottom,
       child: AnimatedOpacity(
         opacity: _showScrollToBottom ? 1 : 0,
-        duration: const Duration(milliseconds: 160),
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
         child: AnimatedScale(
-          scale: _showScrollToBottom ? 1 : 0.86,
-          duration: const Duration(milliseconds: 160),
+          scale: _showScrollToBottom ? 1 : 0.92,
+          duration: const Duration(milliseconds: 220),
           curve: Curves.easeOutCubic,
           child: FloatingActionButton.small(
             heroTag: 'chat-scroll-to-bottom',
@@ -1118,7 +1126,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 color: theme.colorScheme.outline.withAlpha(50),
               ),
             ),
-            child: _TypingDots(color: theme.colorScheme.primary),
+            child: RepaintBoundary(
+              child: _TypingDots(color: theme.colorScheme.primary),
+            ),
           ),
         ],
       ),
@@ -1989,7 +1999,7 @@ class _AnimatedMessageEntryState extends State<_AnimatedMessageEntry>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 200),
+    duration: const Duration(milliseconds: 300),
     value: widget.animate ? 0 : 1,
   );
   late final CurvedAnimation _fadeAnimation = CurvedAnimation(
@@ -2002,7 +2012,7 @@ class _AnimatedMessageEntryState extends State<_AnimatedMessageEntry>
   );
   late final Animation<double> _opacity = _fadeAnimation;
   late final Animation<Offset> _offset = Tween<Offset>(
-    begin: const Offset(0, 0.04),
+    begin: const Offset(0, 0.02),
     end: Offset.zero,
   ).animate(_slideAnimation);
 
@@ -2024,11 +2034,13 @@ class _AnimatedMessageEntryState extends State<_AnimatedMessageEntry>
 
   @override
   Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: _opacity,
-      child: SlideTransition(
-        position: _offset,
-        child: widget.child,
+    return RepaintBoundary(
+      child: FadeTransition(
+        opacity: _opacity,
+        child: SlideTransition(
+          position: _offset,
+          child: widget.child,
+        ),
       ),
     );
   }
@@ -2047,7 +2059,7 @@ class _TypingDotsState extends State<_TypingDots>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 900),
+    duration: const Duration(milliseconds: 1200),
   )..repeat();
 
   @override
@@ -2058,29 +2070,32 @@ class _TypingDotsState extends State<_TypingDots>
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _controller,
-      builder: (context, _) {
-        return Row(
-          mainAxisSize: MainAxisSize.min,
-          children: List.generate(3, (index) {
-            final phase = (_controller.value + index * 0.18) % 1;
-            final lift = math.sin(phase * math.pi).clamp(0.0, 1.0);
-            return Transform.translate(
-              offset: Offset(0, -4 * lift),
-              child: Container(
-                width: 6,
-                height: 6,
-                margin: EdgeInsets.only(right: index == 2 ? 0 : 5),
-                decoration: BoxDecoration(
-                  color: widget.color.withAlpha(120 + (lift * 95).round()),
-                  shape: BoxShape.circle,
+    return SizedBox(
+      height: 12,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, _) {
+          return Row(
+            mainAxisSize: MainAxisSize.min,
+            children: List.generate(3, (index) {
+              final phase = (_controller.value + index * 0.16) % 1;
+              final lift = math.sin(phase * math.pi).clamp(0.0, 1.0);
+              return Transform.translate(
+                offset: Offset(0, -2 * lift),
+                child: Container(
+                  width: 6,
+                  height: 6,
+                  margin: EdgeInsets.only(right: index == 2 ? 0 : 5),
+                  decoration: BoxDecoration(
+                    color: widget.color.withAlpha(120 + (lift * 55).round()),
+                    shape: BoxShape.circle,
+                  ),
                 ),
-              ),
-            );
-          }),
-        );
-      },
+              );
+            }),
+          );
+        },
+      ),
     );
   }
 }

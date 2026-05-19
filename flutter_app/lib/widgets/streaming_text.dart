@@ -28,15 +28,16 @@ class _StreamingTextState extends State<StreamingText>
   final List<TapGestureRecognizer> _recognizers = [];
   late final AnimationController _cursorController = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 500),
+    duration: const Duration(milliseconds: 780),
   );
   late final Animation<double> _cursorAnimation;
 
   @override
   void initState() {
     super.initState();
-    _cursorAnimation =
-        Tween<double>(begin: 0.3, end: 1).animate(_cursorController);
+    _cursorAnimation = Tween<double>(begin: 0.55, end: 1).animate(
+      CurvedAnimation(parent: _cursorController, curve: Curves.easeInOutSine),
+    );
     _syncCursorAnimation();
   }
 
@@ -156,12 +157,14 @@ class _StreamingTextState extends State<StreamingText>
     return WidgetSpan(
       alignment: PlaceholderAlignment.baseline,
       baseline: TextBaseline.alphabetic,
-      child: FadeTransition(
-        opacity: _cursorAnimation,
-        child: Text(
-          '▌',
-          style: theme.textTheme.bodyMedium?.copyWith(
-            color: theme.colorScheme.primary,
+      child: RepaintBoundary(
+        child: FadeTransition(
+          opacity: _cursorAnimation,
+          child: Text(
+            '▌',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.primary,
+            ),
           ),
         ),
       ),
