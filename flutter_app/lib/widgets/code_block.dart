@@ -176,53 +176,29 @@ class CodeBlock extends StatelessWidget {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       if (showPreview)
-                        SizedBox(
-                          height: 48,
-                          child: InkWell(
-                            onTap: () => _showPreview(context),
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 8),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(Icons.visibility, size: 14,
-                                      color: theme.colorScheme.primary),
-                                  const SizedBox(width: 4),
-                                  Text(AppStrings.preview, style: theme.textTheme.labelSmall?.copyWith(
-                                    color: theme.colorScheme.primary,
-                                  )),
-                                ],
-                              ),
-                            ),
-                          ),
+                        IconButton(
+                          tooltip: AppStrings.preview,
+                          icon: Icon(Icons.visibility, size: 18,
+                              color: theme.colorScheme.primary),
+                          onPressed: () => _showPreview(context),
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
                         ),
-                      SizedBox(
-                        height: 48,
-                        child: InkWell(
-                          onTap: () {
-                            Clipboard.setData(ClipboardData(text: code));
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text(AppStrings.copied),
-                                duration: Duration(seconds: 1),
-                              ),
-                            );
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(Icons.copy, size: 14,
-                                    color: theme.colorScheme.onSurfaceVariant),
-                                const SizedBox(width: 4),
-                                Text(AppStrings.copy, style: theme.textTheme.labelSmall?.copyWith(
-                                  color: theme.colorScheme.onSurfaceVariant,
-                                )),
-                              ],
+                      IconButton(
+                        tooltip: AppStrings.copy,
+                        icon: Icon(Icons.copy, size: 18,
+                            color: theme.colorScheme.onSurfaceVariant),
+                        onPressed: () {
+                          Clipboard.setData(ClipboardData(text: code));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(AppStrings.copied),
+                              duration: Duration(seconds: 1),
                             ),
-                          ),
-                        ),
+                          );
+                        },
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
                       ),
                     ],
                   ),

@@ -27,6 +27,12 @@ class AgentStatusBar extends StatelessWidget {
         };
 
         final isError = provider.agentStatus == AgentStatus.error;
+        void copyError() {
+          Clipboard.setData(ClipboardData(text: label));
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('已复制错误信息')),
+          );
+        }
 
         return Container(
           width: double.infinity,
@@ -56,13 +62,9 @@ class AgentStatusBar extends StatelessWidget {
               const SizedBox(width: 8),
               Expanded(
                 child: isError
-                    ? GestureDetector(
-                        onLongPress: () {
-                          Clipboard.setData(ClipboardData(text: label));
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('已复制错误信息')),
-                          );
-                        },
+                    ? InkWell(
+                        onLongPress: copyError,
+                        borderRadius: BorderRadius.circular(AppRadii.s),
                         child: Text(
                           label,
                           style: theme.textTheme.bodySmall?.copyWith(color: color),
@@ -75,7 +77,15 @@ class AgentStatusBar extends StatelessWidget {
                         overflow: TextOverflow.ellipsis,
                       ),
               ),
-              if (!isError)
+              if (isError)
+                IconButton(
+                  tooltip: AppStrings.copy,
+                  icon: Icon(Icons.copy, size: 16, color: color),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
+                  onPressed: copyError,
+                )
+              else
                 TextButton(
                   onPressed: provider.cancelAgent,
                   style: TextButton.styleFrom(

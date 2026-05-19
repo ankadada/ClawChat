@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import '../app.dart';
 import '../models/chat_models.dart';
 import '../providers/chat_provider.dart';
 import '../services/session_storage.dart';
@@ -165,7 +166,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                         )
                       : null,
                   border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(25)),
+                      borderRadius: BorderRadius.circular(AppRadii.xl)),
                   contentPadding:
                       const EdgeInsets.symmetric(horizontal: 16),
                   isDense: true,

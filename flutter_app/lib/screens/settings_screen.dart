@@ -596,9 +596,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ],
                       ),
                       if (_envVars.isEmpty)
-                        const Padding(
-                          padding: EdgeInsets.symmetric(vertical: 8),
-                          child: Text(AppStrings.noEnvVars, style: TextStyle(color: Colors.grey)),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Text(AppStrings.noEnvVars, style: TextStyle(color: theme.colorScheme.onSurfaceVariant)),
                         )
                       else
                         ..._envVars.entries.map((e) => ListTile(
@@ -664,9 +664,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           child: CircularProgressIndicator(),
                         ))
                       else if (_memories.isEmpty)
-                        const Padding(
-                          padding: EdgeInsets.symmetric(vertical: 8),
-                          child: Text(AppStrings.noMemories, style: TextStyle(color: Colors.grey)),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Text(AppStrings.noMemories, style: TextStyle(color: theme.colorScheme.onSurfaceVariant)),
                         )
                       else
                         ..._memories.asMap().entries.map((entry) => ListTile(

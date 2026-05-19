@@ -65,7 +65,7 @@ class CompareView extends StatelessWidget {
                     icon: const Icon(Icons.close, size: 18),
                     onPressed: onDismiss,
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                    constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
                   ),
               ],
             ),
@@ -145,7 +145,7 @@ class _CompareCard extends StatelessWidget {
               IconButton(
                 icon: const Icon(Icons.copy, size: 16),
                 padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
                 onPressed: () {
                   Clipboard.setData(ClipboardData(text: result.text));
                   ScaffoldMessenger.of(context).showSnackBar(

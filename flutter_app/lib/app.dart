@@ -30,10 +30,11 @@ class AppColors {
   AppColors._();
 
   static const Color accent = Color(0xFF2563EB);
-  static const Color darkBg = Color(0xFF0A0A0A);
-  static const Color darkSurface = Color(0xFF121212);
-  static const Color darkSurfaceAlt = Color(0xFF1A1A1A);
-  static const Color darkBorder = Color(0xFF2A2A2A);
+  static const Color darkBg = Color(0xFF141418);
+  static const Color darkSurface = Color(0xFF1E1E26);
+  static const Color darkSurfaceAlt = Color(0xFF252530);
+  static const Color darkBorder = Color(0xFF343442);
+  static const Color darkMutedText = Color(0xFF9CA3AF);
   static const Color lightBg = Color(0xFFFFFFFF);
   static const Color lightSurface = Color(0xFFF9F9F9);
   static const Color lightBorder = Color(0xFFE5E5E5);
@@ -42,6 +43,15 @@ class AppColors {
   static const Color statusRed = Color(0xFFEF4444);
   static const Color statusGrey = Color(0xFF6B7280);
   static const Color mutedText = Color(0xFF6B7280);
+}
+
+class AppRadii {
+  AppRadii._();
+
+  static const double s = 8.0;
+  static const double m = 12.0;
+  static const double l = 16.0;
+  static const double xl = 24.0;
 }
 
 class ClawChatApp extends StatelessWidget {
@@ -88,14 +98,19 @@ class ClawChatApp extends StatelessWidget {
     return base.copyWith(
       visualDensity: VisualDensity.adaptivePlatformDensity,
       scaffoldBackgroundColor: AppColors.darkBg,
-      colorScheme: const ColorScheme.dark(
+      colorScheme: base.colorScheme.copyWith(
         primary: AppColors.accent,
         onPrimary: Colors.white,
         secondary: AppColors.accent,
         onSecondary: Colors.white,
         surface: AppColors.darkSurface,
+        surfaceContainerHighest: AppColors.darkSurfaceAlt,
+        surfaceContainerHigh: AppColors.darkSurfaceAlt,
+        surfaceContainer: AppColors.darkSurface,
+        surfaceContainerLow: AppColors.darkBg,
+        surfaceContainerLowest: AppColors.darkBg,
         onSurface: Colors.white,
-        onSurfaceVariant: AppColors.mutedText,
+        onSurfaceVariant: AppColors.darkMutedText,
         error: AppColors.statusRed,
         onError: Colors.white,
         outline: AppColors.darkBorder,
@@ -119,7 +134,7 @@ class ClawChatApp extends StatelessWidget {
         elevation: 0,
         color: AppColors.darkSurface,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(AppRadii.m),
           side: const BorderSide(color: AppColors.darkBorder),
         ),
         margin: const EdgeInsets.symmetric(vertical: 4),
@@ -129,7 +144,7 @@ class ClawChatApp extends StatelessWidget {
           backgroundColor: AppColors.accent,
           foregroundColor: Colors.white,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: BorderRadius.circular(AppRadii.s),
           ),
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         ),
@@ -139,7 +154,7 @@ class ClawChatApp extends StatelessWidget {
           foregroundColor: Colors.white70,
           side: const BorderSide(color: AppColors.darkBorder),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: BorderRadius.circular(AppRadii.s),
           ),
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         ),
@@ -149,15 +164,15 @@ class ClawChatApp extends StatelessWidget {
       ),
       inputDecorationTheme: InputDecorationTheme(
         border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadii.s),
           borderSide: const BorderSide(color: AppColors.darkBorder),
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadii.s),
           borderSide: const BorderSide(color: AppColors.darkBorder),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadii.s),
           borderSide: const BorderSide(color: AppColors.accent, width: 2),
         ),
         filled: true,
@@ -183,7 +198,7 @@ class ClawChatApp extends StatelessWidget {
       dialogTheme: DialogTheme(
         backgroundColor: AppColors.darkSurface,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(AppRadii.l),
           side: const BorderSide(color: AppColors.darkBorder),
         ),
       ),
@@ -191,7 +206,7 @@ class ClawChatApp extends StatelessWidget {
         backgroundColor: AppColors.darkSurfaceAlt,
         contentTextStyle: GoogleFonts.inter(color: Colors.white),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadii.s),
           side: const BorderSide(color: AppColors.darkBorder),
         ),
         behavior: SnackBarBehavior.floating,
@@ -242,9 +257,9 @@ class ClawChatApp extends StatelessWidget {
       ),
       cardTheme: CardTheme(
         elevation: 0,
-        color: AppColors.lightBg,
+        color: AppColors.lightSurface,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(AppRadii.m),
           side: const BorderSide(color: AppColors.lightBorder),
         ),
         margin: const EdgeInsets.symmetric(vertical: 4),
@@ -253,7 +268,7 @@ class ClawChatApp extends StatelessWidget {
         style: FilledButton.styleFrom(
           backgroundColor: AppColors.accent,
           foregroundColor: Colors.white,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadii.s)),
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         ),
       ),
@@ -261,7 +276,7 @@ class ClawChatApp extends StatelessWidget {
         style: OutlinedButton.styleFrom(
           foregroundColor: const Color(0xFF0A0A0A),
           side: const BorderSide(color: AppColors.lightBorder),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadii.s)),
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         ),
       ),
@@ -270,15 +285,15 @@ class ClawChatApp extends StatelessWidget {
       ),
       inputDecorationTheme: InputDecorationTheme(
         border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadii.s),
           borderSide: const BorderSide(color: AppColors.lightBorder),
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadii.s),
           borderSide: const BorderSide(color: AppColors.lightBorder),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(AppRadii.s),
           borderSide: const BorderSide(color: AppColors.accent, width: 2),
         ),
         filled: true,
@@ -304,14 +319,14 @@ class ClawChatApp extends StatelessWidget {
       dialogTheme: DialogTheme(
         backgroundColor: AppColors.lightBg,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(AppRadii.l),
           side: const BorderSide(color: AppColors.lightBorder),
         ),
       ),
       snackBarTheme: SnackBarThemeData(
         backgroundColor: const Color(0xFF0A0A0A),
         contentTextStyle: GoogleFonts.inter(color: Colors.white),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadii.s)),
         behavior: SnackBarBehavior.floating,
       ),
       listTileTheme: const ListTileThemeData(iconColor: AppColors.mutedText),

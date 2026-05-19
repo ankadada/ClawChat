@@ -151,7 +151,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   padding: const EdgeInsets.all(12),
                   decoration: BoxDecoration(
                     color: theme.colorScheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(AppRadii.s),
                     border: Border.all(
                       color: theme.colorScheme.outline.withAlpha(50),
                     ),
@@ -653,11 +653,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         children: [
           if (hasText)
             SizedBox(
-              height: 28,
-              width: 28,
+              height: 44,
+              width: 44,
               child: _tts.isLoadingMessage(messageId)
-                  ? Padding(
-                      padding: const EdgeInsets.all(6),
+                  ? Center(
                       child: SizedBox(
                         width: 16,
                         height: 16,
@@ -757,12 +756,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: isUser
-                  ? AppColors.accent.withAlpha(20)
+                  ? AppColors.accent.withAlpha(45)
                   : theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(AppRadii.m),
               border: Border.all(
                 color: isUser
-                    ? AppColors.accent.withAlpha(50)
+                    ? AppColors.accent.withAlpha(90)
                     : theme.colorScheme.outline.withAlpha(50),
               ),
             ),
@@ -789,12 +788,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: isUser
-                  ? AppColors.accent.withAlpha(20)
+                  ? AppColors.accent.withAlpha(45)
                   : theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(AppRadii.m),
               border: Border.all(
                 color: isUser
-                    ? AppColors.accent.withAlpha(50)
+                    ? AppColors.accent.withAlpha(90)
                     : theme.colorScheme.outline.withAlpha(50),
               ),
             ),
@@ -841,7 +840,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: theme.colorScheme.surface,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(AppRadii.m),
               border: Border.all(
                 color: theme.colorScheme.outline.withAlpha(50),
               ),
@@ -1137,8 +1136,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         mainAxisSize: MainAxisSize.min,
         children: [
           SizedBox(
-            width: 28,
-            height: 28,
+            width: 44,
+            height: 44,
             child: IconButton(
               padding: EdgeInsets.zero,
               iconSize: 16,
@@ -1161,8 +1160,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
           ),
           SizedBox(
-            width: 28,
-            height: 28,
+            width: 44,
+            height: 44,
             child: IconButton(
               padding: EdgeInsets.zero,
               iconSize: 16,
@@ -1354,7 +1353,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     decoration: InputDecoration(
                       hintText: isRunning ? AppStrings.aiProcessing : AppStrings.inputHint,
                       border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(24),
+                        borderRadius: BorderRadius.circular(AppRadii.xl),
                       ),
                       contentPadding: const EdgeInsets.symmetric(
                         horizontal: 16, vertical: 10),
