@@ -19,6 +19,8 @@ class AppStrings {
   static const loading = '加载中...';
   static const error = '错误';
   static const retry = '重试';
+  static const more = '更多';
+  static const refresh = '刷新';
   static const open = 'Open';
   static const renderError = '渲染错误';
 
@@ -32,6 +34,11 @@ class AppStrings {
   static const leaveEmptyForDefault = '留空则使用全局设置中的模型';
   static const sendMessageToStart = '发送消息开始对话';
   static const aiAssistantCapabilities = 'AI 助手可以执行命令、读写文件、访问网页';
+  static const emptyPromptSummarizeCode = '总结一下这段代码';
+  static const emptyPromptWriteEmail = '帮我写一封邮件';
+  static const emptyPromptTranslateText = '翻译这段文字';
+  static const emptyPromptExplainConcept = '解释这个概念';
+  static String currentModelLabel(String modelName) => '当前模型  $modelName';
   static const userLabel = '你';
   static const aiLabel = 'AI';
   static const aiProcessing = 'AI 正在处理...';
@@ -54,8 +61,11 @@ class AppStrings {
   static const deleteChat = '删除对话';
   static String deleteChatConfirm(String title) => '确定删除 "$title" ?';
   static const justNow = '刚刚';
+  static const today = '今天';
+  static const yesterday = '昨天';
   static String minutesAgo(int n) => '$n 分钟前';
   static String hoursAgo(int n) => '$n 小时前';
+  static String compactDaysAgo(int n) => '$n天前';
   static String daysAgo(int n) => '$n 天前';
 
   // ── Dashboard screen ─────────────────────────────────────────────
@@ -66,6 +76,8 @@ class AppStrings {
   static const configureApiKey = '配置 API Key';
   static const configureApiKeySubtitle = '设置 AI 模型和 API 密钥';
   static const settingsSubtitle = '系统配置和信息';
+  static const dashboardConnected = '连接已配置';
+  static const dashboardWaitingApi = '等待配置 API';
 
   // ── Onboarding screen ────────────────────────────────────────────
   static const welcomeTitle = '欢迎使用 ClawChat';
@@ -84,6 +96,13 @@ class AppStrings {
   static const manualInput = '手动输入...';
   static const selectModel = '选择模型';
   static const fetchModelsButton = '获取模型列表';
+  static const apiKeyHelper = '用于连接所选 API 服务';
+  static const baseUrlHelper = '留空时使用默认地址';
+  static const testConnection = '测试连接';
+  static const manualModelHint = '也可以直接手动输入模型名称';
+  static String modelsFetched(int count) => '已获取 $count 个模型';
+  static const previousStep = '上一步';
+  static const nextStep = '下一步';
 
   // ── Settings screen ──────────────────────────────────────────────
   static const apiConfig = 'API 配置';
@@ -102,6 +121,11 @@ class AppStrings {
   static const reinitialize = '重新初始化';
   static const reinstallAlpine = '重新安装 Alpine 环境';
   static const about = '关于';
+  static const settingsAppearance = '外观';
+  static const settingsVoice = '语音';
+  static const settingsModelApi = '模型/API';
+  static const settingsAgentSkills = 'Agent/技能';
+  static const settingsData = '数据';
 
   // ── Setup wizard screen ──────────────────────────────────────────
   static const initClawChat = '初始化 ClawChat';
@@ -114,6 +138,7 @@ class AppStrings {
   static const extractRootfs = '解压根文件系统';
   static const installPackages = '安装软件包';
   static const initComplete = '初始化完成!';
+  static const currentOperation = '当前操作';
 
   // ── Splash screen ────────────────────────────────────────────────
   static const tagline = 'AI Agent for Android';
@@ -146,11 +171,13 @@ class AppStrings {
   static const statusTooling = '执行工具...';
   static const statusError = '出错';
   static const statusProcessing = '处理中...';
+  static String toolExecuting(String name) => '执行工具: $name';
 
   // ── Code block / Artifacts ────────────────────────────────────────
   // (copy/copied already defined in General)
   static const preview = '预览';
   static const artifactsPreview = '网页预览';
+  static const reloadPreview = '重新加载预览';
 
   // ── Thinking intensity ────────────────────────────────────────────
   static const thinkingIntensity = '思考强度';

@@ -342,88 +342,88 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                             child: const Icon(Icons.delete,
                                 color: Colors.white),
                           ),
-	                          child: Container(
-	                            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-	                            decoration: BoxDecoration(
-	                              color: isSelected
-	                                  ? theme.colorScheme.primaryContainer.withAlpha(170)
-	                                  : Colors.transparent,
-	                              borderRadius: BorderRadius.circular(AppRadii.l),
-	                              border: isSelected
-	                                  ? Border.all(color: theme.colorScheme.primary.withAlpha(90))
-	                                  : null,
-	                            ),
-	                            child: ListTile(
-	                              contentPadding: const EdgeInsets.only(left: 12, right: 4),
-	                              shape: RoundedRectangleBorder(
-	                                borderRadius: BorderRadius.circular(AppRadii.l),
-	                              ),
-	                              title: Text(
-	                                session.title,
-	                                maxLines: 1,
-	                                overflow: TextOverflow.ellipsis,
-	                                style: TextStyle(
-	                                  fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
-	                                ),
-	                              ),
-	                              subtitle: _SessionMeta(
-	                                session: session,
-	                                timeLabel: _formatTime(session.updatedAt),
-	                              ),
-	                              leading: Icon(
-	                                Icons.chat_bubble_outline,
-	                                color: isSelected
-	                                    ? theme.colorScheme.primary
-	                                    : theme.colorScheme.onSurfaceVariant,
-	                              ),
-	                              trailing: PopupMenuButton<String>(
-	                                tooltip: '更多',
-	                                icon: const Icon(Icons.more_vert, size: 20),
-	                                onSelected: (value) {
-	                                  switch (value) {
-	                                    case 'export':
-	                                      _exportSession(session);
-	                                      break;
-	                                    case 'rename':
-	                                      _renameSession(context, session, provider);
-	                                      break;
-	                                    case 'move':
-	                                      _showMoveToFolderDialog(context, session, provider);
-	                                      break;
-	                                    case 'delete':
-	                                      provider.deleteSession(session.id);
-	                                      break;
-	                                  }
-	                                },
-	                                itemBuilder: (context) => const [
-	                                  PopupMenuItem(
-	                                    value: 'export',
-	                                    child: Text(AppStrings.exportChat),
-	                                  ),
-	                                  PopupMenuItem(
-	                                    value: 'rename',
-	                                    child: Text(AppStrings.renameSession),
-	                                  ),
-	                                  PopupMenuItem(
-	                                    value: 'move',
-	                                    child: Text(AppStrings.moveToFolder),
-	                                  ),
-	                                  PopupMenuItem(
-	                                    value: 'delete',
-	                                    child: Text(AppStrings.deleteChat),
-	                                  ),
-	                                ],
-	                              ),
-	                              selected: isSelected,
-	                              onTap: () {
-	                                provider.selectSession(session.id);
-	                                if (!widget.embedded) {
-	                                  Navigator.of(context).pop();
-	                                }
-	                              },
-	                              onLongPress: () => _showSessionOptions(context, session, provider),
-	                            ),
-	                          ),
+                            child: Container(
+                              margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: isSelected
+                                    ? theme.colorScheme.primaryContainer.withAlpha(170)
+                                    : Colors.transparent,
+                                borderRadius: BorderRadius.circular(AppRadii.l),
+                                border: isSelected
+                                    ? Border.all(color: theme.colorScheme.primary.withAlpha(90))
+                                    : null,
+                              ),
+                              child: ListTile(
+                                contentPadding: const EdgeInsets.only(left: 12, right: 4),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(AppRadii.l),
+                                ),
+                                title: Text(
+                                  session.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
+                                  ),
+                                ),
+                                subtitle: _SessionMeta(
+                                  session: session,
+                                  timeLabel: _formatTime(session.updatedAt),
+                                ),
+                                leading: Icon(
+                                  Icons.chat_bubble_outline,
+                                  color: isSelected
+                                      ? theme.colorScheme.primary
+                                      : theme.colorScheme.onSurfaceVariant,
+                                ),
+                                trailing: PopupMenuButton<String>(
+                                  tooltip: AppStrings.more,
+                                  icon: const Icon(Icons.more_vert, size: 20),
+                                  onSelected: (value) {
+                                    switch (value) {
+                                      case 'export':
+                                        _exportSession(session);
+                                        break;
+                                      case 'rename':
+                                        _renameSession(context, session, provider);
+                                        break;
+                                      case 'move':
+                                        _showMoveToFolderDialog(context, session, provider);
+                                        break;
+                                      case 'delete':
+                                        provider.deleteSession(session.id);
+                                        break;
+                                    }
+                                  },
+                                  itemBuilder: (context) => const [
+                                    PopupMenuItem(
+                                      value: 'export',
+                                      child: Text(AppStrings.exportChat),
+                                    ),
+                                    PopupMenuItem(
+                                      value: 'rename',
+                                      child: Text(AppStrings.renameSession),
+                                    ),
+                                    PopupMenuItem(
+                                      value: 'move',
+                                      child: Text(AppStrings.moveToFolder),
+                                    ),
+                                    PopupMenuItem(
+                                      value: 'delete',
+                                      child: Text(AppStrings.deleteChat),
+                                    ),
+                                  ],
+                                ),
+                                selected: isSelected,
+                                onTap: () {
+                                  provider.selectSession(session.id);
+                                  if (!widget.embedded) {
+                                    Navigator.of(context).pop();
+                                  }
+                                },
+                                onLongPress: () => _showSessionOptions(context, session, provider),
+                              ),
+                            ),
                         );
                       },
                     );
@@ -692,12 +692,15 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
 
   String _formatTime(DateTime dt) {
     final now = DateTime.now();
+    final diff = now.difference(dt);
+    if (diff.inMinutes < 1) return AppStrings.justNow;
+    if (diff.inHours < 1) return AppStrings.minutesAgo(diff.inMinutes);
+    if (diff.inHours < 24) return AppStrings.hoursAgo(diff.inHours);
+
     final today = DateTime(now.year, now.month, now.day);
     final date = DateTime(dt.year, dt.month, dt.day);
     final days = today.difference(date).inDays;
-    if (days == 0) return '今天';
-    if (days == 1) return '昨天';
-    if (days > 1 && days < 7) return '$days天前';
+    if (days == 1) return AppStrings.yesterday;
     return '${dt.month}/${dt.day}';
   }
 }
@@ -726,6 +729,8 @@ class _SessionMeta extends StatefulWidget {
 }
 
 class _SessionMetaState extends State<_SessionMeta> {
+  static final SessionStorage _storage = SessionStorage();
+
   String? _preview;
   String? _model;
 
@@ -748,21 +753,14 @@ class _SessionMetaState extends State<_SessionMeta> {
 
   Future<void> _loadMeta() async {
     final sessionId = widget.session.id;
-    final storage = SessionStorage();
-    await storage.init();
-    final fullSession = await storage.getSession(sessionId);
-    if (!mounted || fullSession == null || widget.session.id != sessionId) return;
-
-    final preview = fullSession.messages.reversed
-        .map((message) => message.textContent.trim())
-        .where((text) => text.isNotEmpty)
-        .map(_compactPreview)
-        .cast<String?>()
-        .firstWhere((text) => text != null, orElse: () => null);
+    await _storage.init();
+    final meta = await _storage.getSessionPreview(sessionId);
+    if (!mounted || widget.session.id != sessionId) return;
 
     setState(() {
-      _preview = preview;
-      _model = fullSession.modelOverride;
+      final preview = meta?.preview;
+      _preview = preview == null ? null : _compactPreview(preview);
+      _model = meta?.modelOverride;
     });
   }
 

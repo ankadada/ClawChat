@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
-import '../app.dart' show themeNotifier, fontScaleNotifier;
+import '../app.dart' show AppRadii, themeNotifier, fontScaleNotifier;
 import '../constants.dart';
 import '../services/llm_service.dart';
 import '../services/memory_service.dart';
@@ -190,7 +190,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: DecoratedBox(
         decoration: BoxDecoration(
           color: theme.colorScheme.surfaceContainerHighest.withAlpha(120),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(AppRadii.m),
           border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
         ),
         child: Padding(
@@ -251,139 +251,139 @@ class _SettingsScreenState extends State<SettingsScreen> {
       appBar: AppBar(title: const Text(AppStrings.settings)),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
-	          : ListView(
-	              padding: const EdgeInsets.symmetric(vertical: 16),
-	              children: [
-	                _settingsGroup(theme, '外观', [
-	                  Padding(
-	                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-	                    child: Column(
-	                      crossAxisAlignment: CrossAxisAlignment.start,
-	                      children: [
-	                        Text(AppStrings.theme, style: TextStyle(
-	                          color: theme.colorScheme.onSurfaceVariant,
-	                          fontWeight: FontWeight.w600,
-	                        )),
-	                        const SizedBox(height: 8),
-	                        SingleChildScrollView(
-	                          scrollDirection: Axis.horizontal,
-	                          child: SegmentedButton<String>(
-	                            segments: const [
-	                              ButtonSegment(value: 'system', icon: Icon(Icons.settings_brightness), label: Text(AppStrings.themeSystem)),
-	                              ButtonSegment(value: 'light', icon: Icon(Icons.light_mode), label: Text(AppStrings.themeLight)),
-	                              ButtonSegment(value: 'dark', icon: Icon(Icons.dark_mode), label: Text(AppStrings.themeDark)),
-	                            ],
-	                            selected: {_themeMode},
-	                            onSelectionChanged: (v) {
-	                              setState(() => _themeMode = v.first);
-	                              _prefs.themeMode = _themeMode;
-	                              themeNotifier.value = switch (_themeMode) {
-	                                'light' => ThemeMode.light,
-	                                'dark' => ThemeMode.dark,
-	                                _ => ThemeMode.system,
-	                              };
-	                            },
-	                          ),
-	                        ),
-	                      ],
-	                    ),
-	                  ),
-	                  Padding(
-	                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-	                    child: Column(
-	                      crossAxisAlignment: CrossAxisAlignment.start,
-	                      children: [
-	                        Text('${AppStrings.fontSize}: ${(_fontScale * 100).round()}%'),
-	                        Slider(
-	                          value: _fontScale,
-	                          min: 0.8,
-	                          max: 1.4,
-	                          divisions: 6,
-	                          label: '${(_fontScale * 100).round()}%',
-	                          onChanged: (v) {
-	                            setState(() => _fontScale = v);
-	                            _prefs.fontScale = v;
-	                            fontScaleNotifier.value = v;
-	                          },
-	                        ),
-	                      ],
-	                    ),
-	                  ),
-	                  SwitchListTile(
-	                    title: const Text(AppStrings.notifyOnComplete),
-	                    subtitle: const Text(AppStrings.notifyOnCompleteSubtitle),
-	                    value: _notifyOnComplete,
-	                    onChanged: (v) {
-	                      setState(() => _notifyOnComplete = v);
-	                      _prefs.notifyOnComplete = v;
-	                    },
-	                  ),
-	                ]),
-	                _settingsGroup(theme, '语音', [
-	                  Padding(
-	                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-	                    child: Text(
-	                      AppStrings.voiceRecognitionDesc,
-	                      style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
-	                    ),
-	                  ),
-	                  Padding(
-	                    padding: const EdgeInsets.symmetric(horizontal: 16),
-	                    child: TextField(
-	                      controller: _whisperModelController,
-	                      decoration: const InputDecoration(
-	                        labelText: AppStrings.whisperModelLabel,
-	                        hintText: 'whisper-1',
-	                        border: OutlineInputBorder(),
-	                        isDense: true,
-	                      ),
-	                      onChanged: (v) => _prefs.whisperModel = v.trim(),
-	                    ),
-	                  ),
-	                  const SizedBox(height: 12),
-	                  Padding(
-	                    padding: const EdgeInsets.symmetric(horizontal: 16),
-	                    child: TextField(
-	                      controller: _ttsModelController,
-	                      decoration: const InputDecoration(
-	                        labelText: AppStrings.ttsModelLabel,
-	                        hintText: 'tts-1',
-	                        border: OutlineInputBorder(),
-	                        isDense: true,
-	                      ),
-	                      onChanged: (v) => _prefs.ttsModel = v.trim(),
-	                    ),
-	                  ),
-	                  const SizedBox(height: 12),
-	                  _settingsDivider(theme),
-	                  _subsectionHeader(theme, AppStrings.phoneIntegration),
-	                  Padding(
-	                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-	                    child: Text(
-	                      AppStrings.phoneIntegrationDesc,
-	                      style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
-	                    ),
-	                  ),
-	                  SwitchListTile(
-	                    title: const Text(AppStrings.allowCall),
-	                    subtitle: const Text(AppStrings.allowCallSubtitle),
-	                    value: _allowPhoneCall,
-	                    onChanged: (v) {
-	                      setState(() => _allowPhoneCall = v);
-	                      _prefs.allowPhoneCall = v;
-	                    },
-	                  ),
-	                  SwitchListTile(
-	                    title: const Text(AppStrings.allowSms),
-	                    subtitle: const Text(AppStrings.allowSmsSubtitle),
-	                    value: _allowSms,
-	                    onChanged: (v) {
-	                      setState(() => _allowSms = v);
-	                      _prefs.allowSms = v;
-	                    },
-	                  ),
-	                ]),
-	                _settingsGroup(theme, '模型/API', [
+            : ListView(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                children: [
+                  _settingsGroup(theme, AppStrings.settingsAppearance, [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(AppStrings.theme, style: TextStyle(
+                            color: theme.colorScheme.onSurfaceVariant,
+                            fontWeight: FontWeight.w600,
+                          )),
+                          const SizedBox(height: 8),
+                          SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: SegmentedButton<String>(
+                              segments: const [
+                                ButtonSegment(value: 'system', icon: Icon(Icons.settings_brightness), label: Text(AppStrings.themeSystem)),
+                                ButtonSegment(value: 'light', icon: Icon(Icons.light_mode), label: Text(AppStrings.themeLight)),
+                                ButtonSegment(value: 'dark', icon: Icon(Icons.dark_mode), label: Text(AppStrings.themeDark)),
+                              ],
+                              selected: {_themeMode},
+                              onSelectionChanged: (v) {
+                                setState(() => _themeMode = v.first);
+                                _prefs.themeMode = _themeMode;
+                                themeNotifier.value = switch (_themeMode) {
+                                  'light' => ThemeMode.light,
+                                  'dark' => ThemeMode.dark,
+                                  _ => ThemeMode.system,
+                                };
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('${AppStrings.fontSize}: ${(_fontScale * 100).round()}%'),
+                          Slider(
+                            value: _fontScale,
+                            min: 0.8,
+                            max: 1.4,
+                            divisions: 6,
+                            label: '${(_fontScale * 100).round()}%',
+                            onChanged: (v) {
+                              setState(() => _fontScale = v);
+                              _prefs.fontScale = v;
+                              fontScaleNotifier.value = v;
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                    SwitchListTile(
+                      title: const Text(AppStrings.notifyOnComplete),
+                      subtitle: const Text(AppStrings.notifyOnCompleteSubtitle),
+                      value: _notifyOnComplete,
+                      onChanged: (v) {
+                        setState(() => _notifyOnComplete = v);
+                        _prefs.notifyOnComplete = v;
+                      },
+                    ),
+                  ]),
+                  _settingsGroup(theme, AppStrings.settingsVoice, [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: Text(
+                        AppStrings.voiceRecognitionDesc,
+                        style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: TextField(
+                        controller: _whisperModelController,
+                        decoration: const InputDecoration(
+                          labelText: AppStrings.whisperModelLabel,
+                          hintText: 'whisper-1',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        onChanged: (v) => _prefs.whisperModel = v.trim(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: TextField(
+                        controller: _ttsModelController,
+                        decoration: const InputDecoration(
+                          labelText: AppStrings.ttsModelLabel,
+                          hintText: 'tts-1',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        onChanged: (v) => _prefs.ttsModel = v.trim(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _settingsDivider(theme),
+                    _subsectionHeader(theme, AppStrings.phoneIntegration),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: Text(
+                        AppStrings.phoneIntegrationDesc,
+                        style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                      ),
+                    ),
+                    SwitchListTile(
+                      title: const Text(AppStrings.allowCall),
+                      subtitle: const Text(AppStrings.allowCallSubtitle),
+                      value: _allowPhoneCall,
+                      onChanged: (v) {
+                        setState(() => _allowPhoneCall = v);
+                        _prefs.allowPhoneCall = v;
+                      },
+                    ),
+                    SwitchListTile(
+                      title: const Text(AppStrings.allowSms),
+                      subtitle: const Text(AppStrings.allowSmsSubtitle),
+                      value: _allowSms,
+                      onChanged: (v) {
+                        setState(() => _allowSms = v);
+                        _prefs.allowSms = v;
+                      },
+                    ),
+                  ]),
+                  _settingsGroup(theme, AppStrings.settingsModelApi, [
 
                 ListTile(
                   title: const Text(AppStrings.apiFormat),
@@ -559,214 +559,214 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   },
                 ),
 
-	                Padding(
-	                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-	                  child: FilledButton(
-	                    onPressed: _saveSettings,
-	                    child: const Text(AppStrings.saveSettings),
-	                  ),
-	                ),
-	                ]),
-	                _settingsGroup(theme, 'Agent/技能', [
-	                  Padding(
-	                    padding: const EdgeInsets.symmetric(horizontal: 8),
-	                    child: Align(
-	                      alignment: Alignment.centerRight,
-	                      child: Wrap(
-	                        spacing: 4,
-	                        runSpacing: 4,
-	                        crossAxisAlignment: WrapCrossAlignment.center,
-	                        children: [
-	                          TextButton.icon(
-	                            icon: const Icon(Icons.download, size: 18),
-	                            label: const Text(AppStrings.installPresets),
-	                            onPressed: _installPresetSkills,
-	                          ),
-	                          IconButton(
-	                            icon: const Icon(Icons.add),
-	                            tooltip: AppStrings.importSkill,
-	                            onPressed: _showImportSkillDialog,
-	                          ),
-	                          IconButton(
-	                            icon: const Icon(Icons.folder_open),
-	                            tooltip: AppStrings.importLocalSkill,
-	                            onPressed: _showLocalImportDialog,
-	                          ),
-	                          IconButton(
-	                            icon: const Icon(Icons.refresh),
-	                            tooltip: '刷新',
-	                            onPressed: _loadSkills,
-	                          ),
-	                        ],
-	                      ),
-	                    ),
-	                  ),
-	                  if (_loadingSkills)
-	                    const Center(child: Padding(
-	                      padding: EdgeInsets.all(16),
-	                      child: CircularProgressIndicator(),
-	                    ))
-	                  else if (_skills.isEmpty)
-	                    const Padding(
-	                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-	                      child: Text(AppStrings.noSkillsFound),
-	                    )
-	                  else
-	                    ..._skills.map((skill) => SwitchListTile(
-	                      title: Text(skill.name),
-	                      subtitle: Text(skill.description, maxLines: 2, overflow: TextOverflow.ellipsis),
-	                      value: skill.enabled,
-	                      onChanged: (v) async {
-	                        setState(() => skill.enabled = v);
-	                        await SkillService.setSkillEnabled(skill.name, v);
-	                      },
-	                    )),
-	                ]),
-	                _settingsGroup(theme, '数据', [
-	                  Row(
-	                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-	                    children: [
-	                      _subsectionHeader(theme, AppStrings.envVars),
-	                      Padding(
-	                        padding: const EdgeInsets.only(right: 8),
-	                        child: IconButton(
-	                          icon: const Icon(Icons.add),
-	                          onPressed: _addEnvVar,
-	                        ),
-	                      ),
-	                    ],
-	                  ),
-	                  if (_envVars.isEmpty)
-	                    Padding(
-	                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-	                      child: Text(AppStrings.noEnvVars, style: TextStyle(color: theme.colorScheme.onSurfaceVariant)),
-	                    )
-	                  else
-	                    ..._envVars.entries.map((e) => ListTile(
-	                      title: Text(e.key),
-	                      subtitle: Text('••••••'),
-	                      trailing: IconButton(
-	                        icon: const Icon(Icons.delete_outline),
-	                        onPressed: () {
-	                          setState(() { _envVars.remove(e.key); });
-	                          _prefs.envVars = _envVars;
-	                        },
-	                      ),
-	                    )),
-	                  _settingsDivider(theme),
-	                  _subsectionHeader(theme, AppStrings.dataManagement),
-	                  ListTile(
-	                    title: const Text(AppStrings.exportAll),
-	                    leading: const Icon(Icons.upload_file),
-	                    trailing: const Icon(Icons.chevron_right),
-	                    onTap: _exportAllConversations,
-	                  ),
-	                  ListTile(
-	                    title: const Text(AppStrings.importConversations),
-	                    leading: const Icon(Icons.download),
-	                    trailing: const Icon(Icons.chevron_right),
-	                    onTap: _importConversations,
-	                  ),
-	                  _settingsDivider(theme),
-	                  Row(
-	                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-	                    children: [
-	                      _subsectionHeader(theme, AppStrings.memoryManagement),
-	                      Padding(
-	                        padding: const EdgeInsets.only(right: 8),
-	                        child: IconButton(
-	                          icon: const Icon(Icons.add),
-	                          tooltip: AppStrings.addMemory,
-	                          onPressed: _addMemory,
-	                        ),
-	                      ),
-	                    ],
-	                  ),
-	                  Padding(
-	                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-	                    child: Text(
-	                      AppStrings.memoryDesc,
-	                      style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
-	                    ),
-	                  ),
-	                  if (_loadingMemories)
-	                    const Center(child: Padding(
-	                      padding: EdgeInsets.all(16),
-	                      child: CircularProgressIndicator(),
-	                    ))
-	                  else if (_memories.isEmpty)
-	                    Padding(
-	                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-	                      child: Text(AppStrings.noMemories, style: TextStyle(color: theme.colorScheme.onSurfaceVariant)),
-	                    )
-	                  else
-	                    ..._memories.asMap().entries.map((entry) => ListTile(
-	                      title: Text(entry.value),
-	                      trailing: IconButton(
-	                        icon: const Icon(Icons.delete_outline),
-	                        onPressed: () => _removeMemory(entry.key),
-	                      ),
-	                    )),
-	                ]),
-	                _settingsGroup(theme, '关于', [
-	                  _subsectionHeader(theme, AppStrings.systemInfo),
-	                  ListTile(
-	                    title: const Text(AppStrings.architecture),
-	                    subtitle: Text(_arch),
-	                    leading: const Icon(Icons.memory),
-	                  ),
-	                  ListTile(
-	                    title: const Text('Rootfs'),
-	                    subtitle: Text(_status['rootfsExists'] == true ? AppStrings.installed : AppStrings.notInstalled),
-	                    leading: const Icon(Icons.storage),
-	                  ),
-	                  ListTile(
-	                    title: const Text('Python3'),
-	                    subtitle: Text(_status['pythonInstalled'] == true ? AppStrings.installed : AppStrings.notInstalled),
-	                    leading: const Icon(Icons.code),
-	                  ),
-	                  _settingsDivider(theme),
-	                  _subsectionHeader(theme, AppStrings.maintenance),
-	                  ListTile(
-	                    title: const Text(AppStrings.reinitialize),
-	                    subtitle: const Text(AppStrings.reinstallAlpine),
-	                    leading: const Icon(Icons.build),
-	                    trailing: const Icon(Icons.chevron_right),
-	                    onTap: () => Navigator.of(context).pushReplacement(
-	                      MaterialPageRoute(builder: (_) => const SetupWizardScreen()),
-	                    ),
-	                  ),
-	                  _settingsDivider(theme),
-	                  Padding(
-	                    padding: const EdgeInsets.all(16),
-	                    child: Column(
-	                      children: [
-	                        Text(AppStrings.appName, style: theme.textTheme.titleLarge),
-	                        const SizedBox(height: 4),
-	                        Text('v${AppConstants.version}', style: theme.textTheme.bodySmall),
-	                        const SizedBox(height: 8),
-	                        Text(AppStrings.aboutDescription,
-	                            style: theme.textTheme.bodySmall,
-	                            textAlign: TextAlign.center),
-	                        const SizedBox(height: 16),
-	                        Row(
-	                          mainAxisAlignment: MainAxisAlignment.center,
-	                          children: [
-	                            TextButton.icon(
-	                              icon: const Icon(Icons.code, size: 18),
-	                              label: const Text('GitHub'),
-	                              onPressed: () => launchUrl(Uri.parse(AppConstants.githubUrl)),
-	                            ),
-	                          ],
-	                        ),
-	                        const SizedBox(height: 8),
-	                        Text('${AppStrings.license}: ${AppConstants.license}', style: theme.textTheme.bodySmall?.copyWith(
-	                          color: theme.colorScheme.onSurfaceVariant,
-	                        )),
-	                      ],
-	                    ),
-	                  ),
-	                ]),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    child: FilledButton(
+                      onPressed: _saveSettings,
+                      child: const Text(AppStrings.saveSettings),
+                    ),
+                  ),
+                  ]),
+                  _settingsGroup(theme, AppStrings.settingsAgentSkills, [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: Wrap(
+                          spacing: 4,
+                          runSpacing: 4,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            TextButton.icon(
+                              icon: const Icon(Icons.download, size: 18),
+                              label: const Text(AppStrings.installPresets),
+                              onPressed: _installPresetSkills,
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.add),
+                              tooltip: AppStrings.importSkill,
+                              onPressed: _showImportSkillDialog,
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.folder_open),
+                              tooltip: AppStrings.importLocalSkill,
+                              onPressed: _showLocalImportDialog,
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.refresh),
+                              tooltip: AppStrings.refresh,
+                              onPressed: _loadSkills,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (_loadingSkills)
+                      const Center(child: Padding(
+                        padding: EdgeInsets.all(16),
+                        child: CircularProgressIndicator(),
+                      ))
+                    else if (_skills.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                        child: Text(AppStrings.noSkillsFound),
+                      )
+                    else
+                      ..._skills.map((skill) => SwitchListTile(
+                        title: Text(skill.name),
+                        subtitle: Text(skill.description, maxLines: 2, overflow: TextOverflow.ellipsis),
+                        value: skill.enabled,
+                        onChanged: (v) async {
+                          setState(() => skill.enabled = v);
+                          await SkillService.setSkillEnabled(skill.name, v);
+                        },
+                      )),
+                  ]),
+                  _settingsGroup(theme, AppStrings.settingsData, [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        _subsectionHeader(theme, AppStrings.envVars),
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: IconButton(
+                            icon: const Icon(Icons.add),
+                            onPressed: _addEnvVar,
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_envVars.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Text(AppStrings.noEnvVars, style: TextStyle(color: theme.colorScheme.onSurfaceVariant)),
+                      )
+                    else
+                      ..._envVars.entries.map((e) => ListTile(
+                        title: Text(e.key),
+                        subtitle: Text('••••••'),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: () {
+                            setState(() { _envVars.remove(e.key); });
+                            _prefs.envVars = _envVars;
+                          },
+                        ),
+                      )),
+                    _settingsDivider(theme),
+                    _subsectionHeader(theme, AppStrings.dataManagement),
+                    ListTile(
+                      title: const Text(AppStrings.exportAll),
+                      leading: const Icon(Icons.upload_file),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: _exportAllConversations,
+                    ),
+                    ListTile(
+                      title: const Text(AppStrings.importConversations),
+                      leading: const Icon(Icons.download),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: _importConversations,
+                    ),
+                    _settingsDivider(theme),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        _subsectionHeader(theme, AppStrings.memoryManagement),
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: IconButton(
+                            icon: const Icon(Icons.add),
+                            tooltip: AppStrings.addMemory,
+                            onPressed: _addMemory,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: Text(
+                        AppStrings.memoryDesc,
+                        style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                      ),
+                    ),
+                    if (_loadingMemories)
+                      const Center(child: Padding(
+                        padding: EdgeInsets.all(16),
+                        child: CircularProgressIndicator(),
+                      ))
+                    else if (_memories.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Text(AppStrings.noMemories, style: TextStyle(color: theme.colorScheme.onSurfaceVariant)),
+                      )
+                    else
+                      ..._memories.asMap().entries.map((entry) => ListTile(
+                        title: Text(entry.value),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: () => _removeMemory(entry.key),
+                        ),
+                      )),
+                  ]),
+                  _settingsGroup(theme, AppStrings.about, [
+                    _subsectionHeader(theme, AppStrings.systemInfo),
+                    ListTile(
+                      title: const Text(AppStrings.architecture),
+                      subtitle: Text(_arch),
+                      leading: const Icon(Icons.memory),
+                    ),
+                    ListTile(
+                      title: const Text('Rootfs'),
+                      subtitle: Text(_status['rootfsExists'] == true ? AppStrings.installed : AppStrings.notInstalled),
+                      leading: const Icon(Icons.storage),
+                    ),
+                    ListTile(
+                      title: const Text('Python3'),
+                      subtitle: Text(_status['pythonInstalled'] == true ? AppStrings.installed : AppStrings.notInstalled),
+                      leading: const Icon(Icons.code),
+                    ),
+                    _settingsDivider(theme),
+                    _subsectionHeader(theme, AppStrings.maintenance),
+                    ListTile(
+                      title: const Text(AppStrings.reinitialize),
+                      subtitle: const Text(AppStrings.reinstallAlpine),
+                      leading: const Icon(Icons.build),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => Navigator.of(context).pushReplacement(
+                        MaterialPageRoute(builder: (_) => const SetupWizardScreen()),
+                      ),
+                    ),
+                    _settingsDivider(theme),
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        children: [
+                          Text(AppStrings.appName, style: theme.textTheme.titleLarge),
+                          const SizedBox(height: 4),
+                          Text('v${AppConstants.version}', style: theme.textTheme.bodySmall),
+                          const SizedBox(height: 8),
+                          Text(AppStrings.aboutDescription,
+                              style: theme.textTheme.bodySmall,
+                              textAlign: TextAlign.center),
+                          const SizedBox(height: 16),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              TextButton.icon(
+                                icon: const Icon(Icons.code, size: 18),
+                                label: const Text('GitHub'),
+                                onPressed: () => launchUrl(Uri.parse(AppConstants.githubUrl)),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text('${AppStrings.license}: ${AppConstants.license}', style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          )),
+                        ],
+                      ),
+                    ),
+                  ]),
               ],
             ),
     );

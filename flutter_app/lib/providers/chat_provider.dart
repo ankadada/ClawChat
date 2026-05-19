@@ -9,6 +9,7 @@ import '../services/llm_service.dart';
 import '../services/session_storage.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
+import '../services/tool_call_expansion_state.dart';
 import '../services/preferences_service.dart';
 import '../services/skill_service.dart';
 import '../services/memory_service.dart';
@@ -54,6 +55,11 @@ class ChatProvider extends ChangeNotifier {
   Completer<bool>? _approvalCompleter;
 
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
+
+  void _clearSessionScopedState() {
+    _sessionApprovedTools.clear();
+    ToolCallExpansionState.clear();
+  }
 
   void saveDraft(String sessionId, String text) {
     if (text.isEmpty) {
@@ -120,14 +126,14 @@ class ChatProvider extends ChangeNotifier {
       updatedAt: session.updatedAt,
     ));
     currentSession = session;
-    _sessionApprovedTools.clear();
+    _clearSessionScopedState();
     notifyListeners();
     return session;
   }
 
   Future<void> selectSession(String id) async {
     if (currentSession?.id != id) {
-      _sessionApprovedTools.clear();
+      _clearSessionScopedState();
     }
     currentSession = await _storage.getSession(id);
     notifyListeners();
@@ -138,7 +144,7 @@ class ChatProvider extends ChangeNotifier {
     sessions.removeWhere((s) => s.id == id);
     if (currentSession?.id == id) {
       currentSession = null;
-      _sessionApprovedTools.clear();
+      _clearSessionScopedState();
       if (sessions.isNotEmpty) {
         currentSession = await _storage.getSession(sessions.first.id);
       }
@@ -171,7 +177,7 @@ class ChatProvider extends ChangeNotifier {
     await _storage.clearAll();
     sessions.clear();
     currentSession = null;
-    _sessionApprovedTools.clear();
+    _clearSessionScopedState();
     notifyListeners();
   }
 

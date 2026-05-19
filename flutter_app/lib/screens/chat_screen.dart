@@ -608,7 +608,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               );
             },
           ),
-          _buildQuickPrompts(theme),
+          Consumer<ChatProvider>(
+            builder: (_, provider, __) {
+              final messages = provider.currentSession?.messages;
+              if (messages == null || messages.isEmpty) {
+                return const SizedBox.shrink();
+              }
+              return _buildQuickPrompts(theme);
+            },
+          ),
           _buildInputArea(theme),
         ],
       ),
@@ -617,10 +625,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Widget _buildEmptyState(ThemeData theme, String modelName, double maxContentWidth) {
     const prompts = [
-      '总结一下这段代码',
-      '帮我写一封邮件',
-      '翻译这段文字',
-      '解释这个概念',
+      AppStrings.emptyPromptSummarizeCode,
+      AppStrings.emptyPromptWriteEmail,
+      AppStrings.emptyPromptTranslateText,
+      AppStrings.emptyPromptExplainConcept,
     ];
 
     return Center(
@@ -661,7 +669,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   borderRadius: BorderRadius.circular(AppRadii.xl),
                   border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
                 ),
-                child: Text('当前模型  $modelName',
+                child: Text(AppStrings.currentModelLabel(modelName),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.labelSmall?.copyWith(

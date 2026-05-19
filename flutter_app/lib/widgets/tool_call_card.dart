@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../app.dart';
 import '../models/chat_models.dart';
+import '../services/tool_call_expansion_state.dart';
 import 'code_block.dart';
 import '../l10n/app_strings.dart';
 
@@ -10,18 +11,18 @@ class ToolCallCard extends StatefulWidget {
 
   const ToolCallCard({super.key, required this.toolUse});
 
+  static void clearExpansionState() => ToolCallExpansionState.clear();
+
   @override
   State<ToolCallCard> createState() => _ToolCallCardState();
 }
 
 class _ToolCallCardState extends State<ToolCallCard> {
-  static final Map<String, bool> _expandedByToolId = {};
-
-  bool get _expanded => _expandedByToolId[widget.toolUse.id] ?? false;
+  bool get _expanded => ToolCallExpansionState.isExpanded(widget.toolUse.id);
 
   void _toggleExpanded() {
     setState(() {
-      _expandedByToolId[widget.toolUse.id] = !_expanded;
+      ToolCallExpansionState.setExpanded(widget.toolUse.id, !_expanded);
     });
   }
 

@@ -2,9 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
+import '../app.dart';
 import 'setup_wizard_screen.dart';
 import 'onboarding_screen.dart';
-import 'chat_screen.dart';
 import '../l10n/app_strings.dart';
 
 class SplashScreen extends StatefulWidget {
@@ -76,7 +76,7 @@ class _SplashScreenState extends State<SplashScreen>
           );
         } else {
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => const ChatScreen()),
+            MaterialPageRoute(builder: (_) => const ResponsiveShell()),
           );
         }
       } else {

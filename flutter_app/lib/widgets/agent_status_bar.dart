@@ -27,7 +27,7 @@ class AgentStatusBar extends StatelessWidget {
               Icons.build,
               activeToolName == null
                   ? AppStrings.statusTooling
-                  : '执行工具: $activeToolName',
+                  : AppStrings.toolExecuting(activeToolName),
               AppColors.statusAmber,
             ),
           AgentStatus.error => (Icons.error_outline, provider.errorMessage ?? AppStrings.statusError, theme.colorScheme.error),

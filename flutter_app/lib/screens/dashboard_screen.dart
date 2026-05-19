@@ -171,7 +171,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      connected ? '连接已配置' : '等待配置 API',
+                      connected
+                          ? AppStrings.dashboardConnected
+                          : AppStrings.dashboardWaitingApi,
                       style: theme.textTheme.titleSmall?.copyWith(
                         fontWeight: FontWeight.w700,
                       ),

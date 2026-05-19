@@ -189,7 +189,7 @@ class _SetupWizardScreenState extends State<SetupWizardScreen> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  state.isComplete ? AppStrings.initComplete : '当前操作',
+                  state.isComplete ? AppStrings.initComplete : AppStrings.currentOperation,
                   style: theme.textTheme.titleSmall?.copyWith(
                     fontWeight: FontWeight.w700,
                   ),

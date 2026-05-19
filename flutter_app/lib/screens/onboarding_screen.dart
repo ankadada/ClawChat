@@ -320,7 +320,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           decoration: InputDecoration(
             labelText: 'API Key',
             hintText: _apiFormat == 'anthropic' ? 'sk-ant-...' : 'sk-...',
-            helperText: '用于连接所选 API 服务',
+            helperText: AppStrings.apiKeyHelper,
             errorText: _showApiKeyError && _apiKeyController.text.trim().isEmpty
                 ? AppStrings.pleaseEnterApiKey
                 : null,
@@ -335,7 +335,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
             hintText: _apiFormat == 'anthropic'
                 ? 'https://api.anthropic.com'
                 : 'https://api.openai.com',
-            helperText: '留空时使用默认地址',
+            helperText: AppStrings.baseUrlHelper,
             prefixIcon: const Icon(Icons.link),
           ),
         ),
@@ -413,13 +413,13 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   : const Icon(Icons.sync),
               label: Text(_fetchingModels
                   ? AppStrings.fetchingModels
-                  : '测试连接'),
+                  : AppStrings.testConnection),
               onPressed: _fetchingModels ? null : _fetchModels,
             ),
             Text(
               _availableModels.isEmpty
-                  ? '也可以直接手动输入模型名称'
-                  : '已获取 ${_availableModels.length} 个模型',
+                  ? AppStrings.manualModelHint
+                  : AppStrings.modelsFetched(_availableModels.length),
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
               ),
@@ -437,7 +437,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           OutlinedButton.icon(
             onPressed: () => setState(() => _currentStep--),
             icon: const Icon(Icons.arrow_back),
-            label: const Text('上一步'),
+            label: const Text(AppStrings.previousStep),
           )
         else
           const Spacer(),
@@ -445,7 +445,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         FilledButton.icon(
           onPressed: _onStepContinue,
           icon: Icon(_currentStep == 2 ? Icons.check : Icons.arrow_forward),
-          label: Text(_currentStep == 2 ? AppStrings.done : '下一步'),
+          label: Text(_currentStep == 2 ? AppStrings.done : AppStrings.nextStep),
         ),
       ],
     );

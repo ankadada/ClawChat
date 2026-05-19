@@ -20,6 +20,16 @@ class SessionSummary {
   });
 }
 
+class SessionPreview {
+  final String? preview;
+  final String? modelOverride;
+
+  const SessionPreview({
+    this.preview,
+    this.modelOverride,
+  });
+}
+
 class SessionStorage {
   static final _validSessionIdPattern = RegExp(r'^[a-zA-Z0-9_-]+$');
 
@@ -153,6 +163,57 @@ class SessionStorage {
       // Corrupted session file — treat as missing
       return null;
     }
+  }
+
+  Future<SessionPreview?> getSessionPreview(String id) async {
+    await init();
+    final file = await _sessionFile(id);
+    if (file == null) return null;
+    if (!await file.exists()) return null;
+    try {
+      final content = await file.readAsString();
+      final map = jsonDecode(content) as Map<String, dynamic>;
+      final messages = map['messages'];
+      String? preview;
+      if (messages is List) {
+        for (final message in messages.reversed) {
+          preview = _previewTextFromMessage(message);
+          if (preview != null) break;
+        }
+      }
+      return SessionPreview(
+        preview: preview,
+        modelOverride: map['modelOverride'] as String?,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _previewTextFromMessage(Object? rawMessage) {
+    if (rawMessage is! Map) return null;
+    final content = rawMessage['content'];
+    return _previewTextFromContent(content);
+  }
+
+  String? _previewTextFromContent(Object? content) {
+    if (content is String) return _nonEmptyText(content);
+    if (content is! List) return null;
+
+    final parts = <String>[];
+    for (final block in content) {
+      if (block is! Map || block['type'] != 'text') continue;
+      final text = block['text'];
+      if (text is! String) continue;
+      final compact = _nonEmptyText(text);
+      if (compact != null) parts.add(compact);
+    }
+    return parts.isEmpty ? null : parts.join('\n');
+  }
+
+  String? _nonEmptyText(String text) {
+    final trimmed = text.trim();
+    return trimmed.isEmpty ? null : trimmed;
   }
 
   Future<void> saveSession(ChatSession session) async {

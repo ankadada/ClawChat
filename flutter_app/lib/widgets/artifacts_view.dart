@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import '../l10n/app_strings.dart';
 
 class ArtifactsView extends StatefulWidget {
   final String htmlContent;
@@ -89,7 +90,7 @@ class _ArtifactsViewState extends State<ArtifactsView> {
                   ),
                   const SizedBox(width: 8),
                   Text(
-                    '预览',
+                    AppStrings.preview,
                     style: Theme.of(context).textTheme.labelLarge,
                   ),
                   const Spacer(),
@@ -104,7 +105,7 @@ class _ArtifactsViewState extends State<ArtifactsView> {
                     ),
                   IconButton(
                     icon: const Icon(Icons.refresh, size: 18),
-                    tooltip: '重新加载预览',
+                    tooltip: AppStrings.reloadPreview,
                     onPressed: _loadHtml,
                   ),
                 ],
