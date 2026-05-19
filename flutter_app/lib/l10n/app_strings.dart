@@ -15,6 +15,7 @@ class AppStrings {
   static const copy = '复制';
   static const copied = '已复制';
   static const save = '保存';
+  static const saved = '已保存';
   static const done = '完成';
   static const loading = '加载中...';
   static const error = '错误';
@@ -63,6 +64,8 @@ class AppStrings {
   static const justNow = '刚刚';
   static const today = '今天';
   static const yesterday = '昨天';
+  static const past7Days = '过去7天';
+  static const earlier = '更早';
   static String minutesAgo(int n) => '$n 分钟前';
   static String hoursAgo(int n) => '$n 小时前';
   static String compactDaysAgo(int n) => '$n天前';
@@ -251,9 +254,11 @@ class AppStrings {
 
   // ── Attach ─────────────────────────────────────────────────────────
   static const attachFile = '添加附件';
+  static const scrollToBottom = '回到底部';
   static const pickImage = '选择图片';
   static const pickFile = '选择文件';
   static const attachFailed = '附件上传失败';
+  static const removeAttachment = '移除附件';
 
   // ── Regenerate ─────────────────────────────────────────────────────
   static const regenerate = '重新生成';

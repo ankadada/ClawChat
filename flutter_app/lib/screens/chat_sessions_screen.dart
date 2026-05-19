@@ -22,7 +22,6 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
   final _searchController = TextEditingController();
   String _searchQuery = '';
   String? _selectedFolder; // null = show all
-  final Set<String> _collapsedFolders = {};
 
   @override
   void dispose() {
@@ -133,19 +132,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           }
         }
 
-        // Group by folder
-        final grouped = <String?, List<SessionSummary>>{};
-        for (final s in filteredSessions) {
-          final key = (s.folder != null && s.folder!.isNotEmpty) ? s.folder : null;
-          grouped.putIfAbsent(key, () => []).add(s);
-        }
-
-        // Build ordered keys: null (ungrouped) first, then sorted folder names
-        final groupKeys = <String?>[];
-        if (grouped.containsKey(null)) groupKeys.add(null);
-        for (final f in sortedFolders) {
-          if (grouped.containsKey(f)) groupKeys.add(f);
-        }
+        final dateGroups = _buildDateGroups(filteredSessions);
 
         return Column(
           children: [
@@ -265,175 +252,36 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                           style: theme.textTheme.bodyLarge?.copyWith(
                               color: theme.colorScheme.onSurfaceVariant)),
                     )
-                  : Builder(builder: (context) {
-                      final items = _buildListItems(groupKeys, grouped);
-                      return ListView.builder(
-                      itemCount: items.length,
-                      itemBuilder: (context, index) {
-                        final item = items[index];
-                        if (item is _FolderHeaderItem) {
-                          final isCollapsed = _collapsedFolders.contains(item.folderName);
-                          return ListTile(
-                            dense: true,
-                            leading: Icon(
-                              isCollapsed ? Icons.folder : Icons.folder_open,
-                              color: theme.colorScheme.primary,
-                              size: 20,
+                  : CustomScrollView(
+                      slivers: [
+                        for (final group in dateGroups) ...[
+                          SliverPersistentHeader(
+                            pinned: true,
+                            delegate: _DateHeaderDelegate(
+                              label: group.label,
+                              theme: theme,
                             ),
-                            title: Text(
-                              item.folderName,
-                              style: TextStyle(
-                                fontWeight: FontWeight.w600,
-                                color: theme.colorScheme.primary,
-                                fontSize: 13,
-                              ),
-                            ),
-                            trailing: Icon(
-                              isCollapsed ? Icons.expand_more : Icons.expand_less,
-                              size: 20,
-                            ),
-                            onTap: () {
-                              setState(() {
-                                if (isCollapsed) {
-                                  _collapsedFolders.remove(item.folderName);
-                                } else {
-                                  _collapsedFolders.add(item.folderName);
-                                }
-                              });
-                            },
-                          );
-                        }
-                        final sessionItem = item as _SessionItem;
-                        final session = sessionItem.session;
-                        final isSelected =
-                            session.id == provider.currentSession?.id;
-
-                        return Dismissible(
-                          key: Key(session.id),
-                          direction: DismissDirection.endToStart,
-                          confirmDismiss: (_) async {
-                            return await showDialog<bool>(
-                              context: context,
-                              builder: (ctx) => AlertDialog(
-                                title: const Text(AppStrings.deleteChat),
-                                content: Text(AppStrings.deleteChatConfirm(
-                                    session.title)),
-                                actions: [
-                                  TextButton(
-                                    onPressed: () =>
-                                        Navigator.pop(ctx, false),
-                                    child: const Text(AppStrings.cancel),
-                                  ),
-                                  FilledButton(
-                                    onPressed: () =>
-                                        Navigator.pop(ctx, true),
-                                    child: const Text(AppStrings.delete),
-                                  ),
-                                ],
-                              ),
-                            );
-                          },
-                          onDismissed: (_) {
-                            HapticFeedback.lightImpact();
-                            provider.deleteSession(session.id);
-                          },
-                          background: Container(
-                            alignment: Alignment.centerRight,
-                            padding: const EdgeInsets.only(right: 16),
-                            color: theme.colorScheme.error,
-                            child: const Icon(Icons.delete,
-                                color: Colors.white),
                           ),
-                            child: Container(
-                              margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: isSelected
-                                    ? theme.colorScheme.primaryContainer.withAlpha(170)
-                                    : Colors.transparent,
-                                borderRadius: BorderRadius.circular(AppRadii.l),
-                                border: isSelected
-                                    ? Border.all(color: theme.colorScheme.primary.withAlpha(90))
-                                    : null,
-                              ),
-                              child: ListTile(
-                                contentPadding: const EdgeInsets.only(left: 12, right: 4),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(AppRadii.l),
-                                ),
-                                title: Text(
-                                  session.title,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
-                                  ),
-                                ),
-                                subtitle: _SessionMeta(
-                                  session: session,
-                                  timeLabel: _formatTime(session.updatedAt),
-                                ),
-                                leading: Icon(
-                                  Icons.chat_bubble_outline,
-                                  color: isSelected
-                                      ? theme.colorScheme.primary
-                                      : theme.colorScheme.onSurfaceVariant,
-                                ),
-                                trailing: PopupMenuButton<String>(
-                                  tooltip: AppStrings.more,
-                                  icon: const Icon(Icons.more_vert, size: 20),
-                                  onSelected: (value) {
-                                    switch (value) {
-                                      case 'export':
-                                        _exportSession(session);
-                                        break;
-                                      case 'rename':
-                                        _renameSession(context, session, provider);
-                                        break;
-                                      case 'move':
-                                        _showMoveToFolderDialog(context, session, provider);
-                                        break;
-                                      case 'delete':
-                                        HapticFeedback.lightImpact();
-                                        provider.deleteSession(session.id);
-                                        break;
-                                    }
-                                  },
-                                  itemBuilder: (context) => const [
-                                    PopupMenuItem(
-                                      value: 'export',
-                                      child: Text(AppStrings.exportChat),
-                                    ),
-                                    PopupMenuItem(
-                                      value: 'rename',
-                                      child: Text(AppStrings.renameSession),
-                                    ),
-                                    PopupMenuItem(
-                                      value: 'move',
-                                      child: Text(AppStrings.moveToFolder),
-                                    ),
-                                    PopupMenuItem(
-                                      value: 'delete',
-                                      child: Text(AppStrings.deleteChat),
-                                    ),
-                                  ],
-                                ),
-                                selected: isSelected,
-                                onTap: () {
-                                  provider.selectSession(session.id);
-                                  if (!widget.embedded) {
-                                    Navigator.of(context).pop();
-                                  }
-                                },
-                              onLongPress: () {
-                                HapticFeedback.lightImpact();
-                                _showSessionOptions(context, session, provider);
+                          SliverList(
+                            delegate: SliverChildBuilderDelegate(
+                              (context, index) {
+                                final session = group.sessions[index];
+                                final isSelected =
+                                    session.id == provider.currentSession?.id;
+                                return _buildSessionTile(
+                                  context,
+                                  theme,
+                                  provider,
+                                  session,
+                                  isSelected,
+                                );
                               },
-                              ),
+                              childCount: group.sessions.length,
                             ),
-                        );
-                      },
-                    );
-                    }),
+                          ),
+                        ],
+                      ],
+                    ),
             ),
           ],
         );
@@ -502,23 +350,159 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     );
   }
 
-  List<Object> _buildListItems(List<String?> groupKeys, Map<String?, List<SessionSummary>> grouped) {
-    final items = <Object>[];
-    for (final key in groupKeys) {
-      if (key != null) {
-        items.add(_FolderHeaderItem(key));
-        if (!_collapsedFolders.contains(key)) {
-          for (final s in grouped[key]!) {
-            items.add(_SessionItem(s));
-          }
-        }
-      } else {
-        for (final s in grouped[key]!) {
-          items.add(_SessionItem(s));
-        }
-      }
+  List<_DateGroup> _buildDateGroups(List<SessionSummary> sessions) {
+    final grouped = <String, List<SessionSummary>>{
+      AppStrings.today: [],
+      AppStrings.yesterday: [],
+      AppStrings.past7Days: [],
+      AppStrings.earlier: [],
+    };
+    for (final session in sessions) {
+      grouped[_dateGroupLabel(session.updatedAt)]!.add(session);
     }
-    return items;
+    return grouped.entries
+        .where((entry) => entry.value.isNotEmpty)
+        .map((entry) => _DateGroup(entry.key, entry.value))
+        .toList();
+  }
+
+  String _dateGroupLabel(DateTime updatedAt) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final date = DateTime(updatedAt.year, updatedAt.month, updatedAt.day);
+    final days = today.difference(date).inDays;
+    if (days <= 0) return AppStrings.today;
+    if (days == 1) return AppStrings.yesterday;
+    if (days < 7) return AppStrings.past7Days;
+    return AppStrings.earlier;
+  }
+
+  Widget _buildSessionTile(
+    BuildContext context,
+    ThemeData theme,
+    ChatProvider provider,
+    SessionSummary session,
+    bool isSelected,
+  ) {
+    return Dismissible(
+      key: Key(session.id),
+      direction: DismissDirection.endToStart,
+      confirmDismiss: (_) async {
+        return await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text(AppStrings.deleteChat),
+            content: Text(AppStrings.deleteChatConfirm(session.title)),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text(AppStrings.cancel),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text(AppStrings.delete),
+              ),
+            ],
+          ),
+        );
+      },
+      onDismissed: (_) {
+        HapticFeedback.lightImpact();
+        provider.deleteSession(session.id);
+      },
+      background: Container(
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 16),
+        color: theme.colorScheme.error,
+        child: const Icon(Icons.delete, color: Colors.white),
+      ),
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: isSelected
+              ? theme.colorScheme.primaryContainer.withAlpha(170)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(AppRadii.l),
+          border: isSelected
+              ? Border.all(color: theme.colorScheme.primary.withAlpha(90))
+              : null,
+        ),
+        child: ListTile(
+          contentPadding: const EdgeInsets.only(left: 12, right: 4),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadii.l),
+          ),
+          title: Text(
+            session.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
+            ),
+          ),
+          subtitle: _SessionMeta(
+            session: session,
+            timeLabel: _formatTime(session.updatedAt),
+          ),
+          leading: Icon(
+            Icons.chat_bubble_outline,
+            color: isSelected
+                ? theme.colorScheme.primary
+                : theme.colorScheme.onSurfaceVariant,
+          ),
+          trailing: PopupMenuButton<String>(
+            tooltip: AppStrings.more,
+            icon: const Icon(Icons.more_vert, size: 20),
+            onSelected: (value) {
+              switch (value) {
+                case 'export':
+                  _exportSession(session);
+                  break;
+                case 'rename':
+                  _renameSession(context, session, provider);
+                  break;
+                case 'move':
+                  _showMoveToFolderDialog(context, session, provider);
+                  break;
+                case 'delete':
+                  HapticFeedback.lightImpact();
+                  provider.deleteSession(session.id);
+                  break;
+              }
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(
+                value: 'export',
+                child: Text(AppStrings.exportChat),
+              ),
+              PopupMenuItem(
+                value: 'rename',
+                child: Text(AppStrings.renameSession),
+              ),
+              PopupMenuItem(
+                value: 'move',
+                child: Text(AppStrings.moveToFolder),
+              ),
+              PopupMenuItem(
+                value: 'delete',
+                child: Text(AppStrings.deleteChat),
+              ),
+            ],
+          ),
+          selected: isSelected,
+          onTap: () {
+            provider.selectSession(session.id);
+            if (!widget.embedded) {
+              Navigator.of(context).pop();
+            }
+          },
+          onLongPress: () {
+            HapticFeedback.lightImpact();
+            _showSessionOptions(context, session, provider);
+          },
+        ),
+      ),
+    );
   }
 
   void _showSessionOptions(BuildContext context, SessionSummary session, ChatProvider provider) {
@@ -712,14 +696,61 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
   }
 }
 
-class _FolderHeaderItem {
-  final String folderName;
-  _FolderHeaderItem(this.folderName);
+class _DateGroup {
+  final String label;
+  final List<SessionSummary> sessions;
+
+  const _DateGroup(this.label, this.sessions);
 }
 
-class _SessionItem {
-  final SessionSummary session;
-  _SessionItem(this.session);
+class _DateHeaderDelegate extends SliverPersistentHeaderDelegate {
+  final String label;
+  final ThemeData theme;
+
+  const _DateHeaderDelegate({
+    required this.label,
+    required this.theme,
+  });
+
+  @override
+  double get minExtent => 34;
+
+  @override
+  double get maxExtent => 34;
+
+  @override
+  Widget build(
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.scaffoldBackgroundColor,
+        border: Border(
+          bottom: BorderSide(color: theme.colorScheme.outline.withAlpha(35)),
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 8, 18, 6),
+        child: Text(
+          label,
+          style: theme.textTheme.labelMedium?.copyWith(
+            color: theme.colorScheme.primary,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _DateHeaderDelegate oldDelegate) {
+    return label != oldDelegate.label ||
+        theme.brightness != oldDelegate.theme.brightness ||
+        theme.colorScheme.primary != oldDelegate.theme.colorScheme.primary ||
+        theme.scaffoldBackgroundColor != oldDelegate.theme.scaffoldBackgroundColor;
+  }
 }
 
 class _SessionMeta extends StatefulWidget {

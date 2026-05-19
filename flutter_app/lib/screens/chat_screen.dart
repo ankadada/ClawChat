@@ -45,6 +45,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _approvalDialogOpen = false;
   ToolApprovalRequest? _shownApprovalRequest;
   final List<MessageContent> _pendingAttachments = [];
+  final List<_PendingAttachmentPreview> _pendingAttachmentPreviews = [];
   final Set<String> _seenMessageAnimationIds = {};
   String? _seenAnimationSessionId;
 
@@ -419,6 +420,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         provider.saveDraft(_lastSessionId!, _inputController.text);
       }
       _pendingAttachments.clear();
+      _pendingAttachmentPreviews.clear();
       _lastSessionId = currentId;
       final draft = provider.getDraft(currentId);
       if (_inputController.text != draft) {
@@ -438,8 +440,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final attachments = List<MessageContent>.from(_pendingAttachments);
     if (text.isEmpty && attachments.isEmpty) return;
     HapticFeedback.lightImpact();
-    _inputController.clear();
-    _pendingAttachments.clear();
+    setState(() {
+      _inputController.clear();
+      _pendingAttachments.clear();
+      _pendingAttachmentPreviews.clear();
+    });
     final provider = context.read<ChatProvider>();
     if (provider.currentSession != null) {
       provider.saveDraft(provider.currentSession!.id, '');
@@ -1338,10 +1343,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     for (final file in files) {
       try {
         final prepared = await FileAttachmentService.prepareForMessage(file);
-        if (prepared.includeAsContentBlock) {
-          _pendingAttachments.add(prepared.content);
-        }
-        _appendAttachmentText(prepared.inputText);
+        if (!mounted) return;
+        final insertedText = _appendAttachmentText(prepared.inputText);
+        setState(() {
+          if (prepared.includeAsContentBlock) {
+            _pendingAttachments.add(prepared.content);
+          }
+          _pendingAttachmentPreviews.add(_PendingAttachmentPreview(
+            content: prepared.content,
+            inputText: prepared.inputText,
+            insertedText: insertedText,
+            includeAsContentBlock: prepared.includeAsContentBlock,
+          ));
+        });
       } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -1352,13 +1366,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _appendAttachmentText(String text) {
+  String _appendAttachmentText(String text) {
     final current = _inputController.text;
     final separator = current.isEmpty || current.endsWith('\n') ? '' : '\n';
-    _inputController.text = '$current$separator$text\n';
+    final insertedText = '$separator$text\n';
+    _inputController.text = '$current$insertedText';
     _inputController.selection = TextSelection.collapsed(
       offset: _inputController.text.length,
     );
+    return insertedText;
   }
 
   Widget _buildQuickPrompts(ThemeData theme) {
@@ -1440,6 +1456,153 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  void _removePendingAttachment(_PendingAttachmentPreview preview) {
+    setState(() {
+      _pendingAttachmentPreviews.remove(preview);
+      if (preview.includeAsContentBlock) {
+        _pendingAttachments.remove(preview.content);
+      }
+
+      final current = _inputController.text;
+      var updated = current.replaceFirst(preview.insertedText, '');
+      if (updated == current) {
+        updated = current.replaceFirst('${preview.inputText}\n', '');
+      }
+      if (updated == current) {
+        updated = current.replaceFirst(preview.inputText, '');
+      }
+      _inputController.text = updated;
+      _inputController.selection = TextSelection.collapsed(
+        offset: _inputController.text.length,
+      );
+    });
+  }
+
+  Widget _buildAttachmentPreviews(ThemeData theme) {
+    if (_pendingAttachmentPreviews.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: SizedBox(
+        height: 44,
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          itemCount: _pendingAttachmentPreviews.length,
+          separatorBuilder: (_, __) => const SizedBox(width: 8),
+          itemBuilder: (context, index) {
+            final preview = _pendingAttachmentPreviews[index];
+            return _buildAttachmentPreviewChip(theme, preview);
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAttachmentPreviewChip(
+    ThemeData theme,
+    _PendingAttachmentPreview preview,
+  ) {
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 220),
+      padding: const EdgeInsets.fromLTRB(6, 5, 2, 5),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(AppRadii.l),
+        border: Border.all(color: theme.colorScheme.outline.withAlpha(55)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _attachmentPreviewLeading(theme, preview.content),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              _attachmentPreviewLabel(preview),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: theme.colorScheme.onSurface,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 30,
+            height: 30,
+            child: IconButton(
+              tooltip: AppStrings.removeAttachment,
+              padding: EdgeInsets.zero,
+              iconSize: 16,
+              visualDensity: VisualDensity.compact,
+              onPressed: () => _removePendingAttachment(preview),
+              icon: const Icon(Icons.close),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _attachmentPreviewLeading(ThemeData theme, MessageContent content) {
+    if (content is ImageContent) {
+      try {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(AppRadii.s),
+          child: Image.memory(
+            base64Decode(content.data),
+            width: 32,
+            height: 32,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            errorBuilder: (_, __, ___) => _filePreviewIcon(theme),
+          ),
+        );
+      } catch (_) {
+        return _filePreviewIcon(theme);
+      }
+    }
+    return _filePreviewIcon(theme);
+  }
+
+  Widget _filePreviewIcon(ThemeData theme) {
+    return Container(
+      width: 32,
+      height: 32,
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(AppRadii.s),
+      ),
+      child: Icon(
+        Icons.insert_drive_file_outlined,
+        size: 18,
+        color: theme.colorScheme.onSurfaceVariant,
+      ),
+    );
+  }
+
+  String _attachmentPreviewLabel(_PendingAttachmentPreview preview) {
+    final content = preview.content;
+    if (content is ImageContent) {
+      return content.filename ?? content.mediaType;
+    }
+
+    final firstLine = preview.inputText.trim().split('\n').first;
+    if (firstLine.startsWith('File: ')) {
+      return firstLine.substring('File: '.length);
+    }
+
+    final attachedMatch = RegExp(r'^\[Attached: ([^\s\]]+)')
+        .firstMatch(firstLine);
+    if (attachedMatch != null) {
+      final path = attachedMatch.group(1)!;
+      return path.split('/').last;
+    }
+
+    return firstLine;
   }
 
   Widget _buildAlternativesNav(ChatMessage message, int messageIndex, ThemeData theme) {
@@ -1652,133 +1815,139 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
           child: SafeArea(
             top: false,
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                SizedBox(
-                  width: 44,
-                  height: 48,
-                  child: IconButton(
-                    icon: const Icon(Icons.attach_file),
-                    tooltip: AppStrings.attachFile,
-                    style: IconButton.styleFrom(
-                      backgroundColor: theme.colorScheme.surfaceContainerHighest,
-                      foregroundColor: theme.colorScheme.onSurfaceVariant,
-                    ),
-                    onPressed: isRunning ? null : _showAttachOptions,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: TextField(
-                    controller: _inputController,
-                    focusNode: _focusNode,
-                    enabled: !isRunning,
-                    maxLines: 5,
-                    minLines: 1,
-                    textInputAction: TextInputAction.send,
-                    onSubmitted: (_) => _sendMessage(),
-                    decoration: InputDecoration(
-                      hintText: isRunning ? AppStrings.aiProcessing : AppStrings.inputHint,
-                      filled: true,
-                      fillColor: theme.colorScheme.surfaceContainerHighest,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(AppRadii.xl),
-                        borderSide: BorderSide(color: theme.colorScheme.outline.withAlpha(60)),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(AppRadii.xl),
-                        borderSide: BorderSide(color: theme.colorScheme.outline.withAlpha(60)),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(AppRadii.xl),
-                        borderSide: BorderSide(color: theme.colorScheme.primary.withAlpha(180), width: 1.5),
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 12),
-                    ),
-                  ),
-                ),
-                if (!isRunning)
-                  const SizedBox(width: 6),
-                if (!isRunning)
-                  GestureDetector(
-                    onLongPressStart: (_) {
-                      HapticFeedback.lightImpact();
-                      if (!_isWhisperRecording) _startListening();
-                    },
-                    onLongPressEnd: (_) {
-                      if (_isWhisperRecording) {
-                        _stopWhisperRecording();
-                      } else {
-                        _stopListening();
-                      }
-                    },
-                    child: SizedBox(
-                      width: 48,
+                _buildAttachmentPreviews(theme),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    SizedBox(
+                      width: 44,
                       height: 48,
                       child: IconButton(
-                        icon: Icon(isRecording ? Icons.mic : Icons.mic_none),
+                        icon: const Icon(Icons.attach_file),
+                        tooltip: AppStrings.attachFile,
                         style: IconButton.styleFrom(
-                          backgroundColor: isRecording
-                              ? AppColors.statusRed.withAlpha(28)
-                              : theme.colorScheme.surfaceContainerHighest,
-                          foregroundColor: isRecording
-                              ? AppColors.statusRed
-                              : theme.colorScheme.onSurfaceVariant,
-                          side: BorderSide(
-                            color: isRecording
-                                ? AppColors.statusRed.withAlpha(120)
-                                : theme.colorScheme.outline.withAlpha(55),
-                          ),
+                          backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                          foregroundColor: theme.colorScheme.onSurfaceVariant,
                         ),
-                        onPressed: () {
+                        onPressed: isRunning ? null : _showAttachOptions,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: _inputController,
+                        focusNode: _focusNode,
+                        enabled: !isRunning,
+                        maxLines: 5,
+                        minLines: 1,
+                        textInputAction: TextInputAction.send,
+                        onSubmitted: (_) => _sendMessage(),
+                        decoration: InputDecoration(
+                          hintText: isRunning ? AppStrings.aiProcessing : AppStrings.inputHint,
+                          filled: true,
+                          fillColor: theme.colorScheme.surfaceContainerHighest,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(AppRadii.xl),
+                            borderSide: BorderSide(color: theme.colorScheme.outline.withAlpha(60)),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(AppRadii.xl),
+                            borderSide: BorderSide(color: theme.colorScheme.outline.withAlpha(60)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(AppRadii.xl),
+                            borderSide: BorderSide(color: theme.colorScheme.primary.withAlpha(180), width: 1.5),
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 12),
+                        ),
+                      ),
+                    ),
+                    if (!isRunning)
+                      const SizedBox(width: 6),
+                    if (!isRunning)
+                      GestureDetector(
+                        onLongPressStart: (_) {
+                          HapticFeedback.lightImpact();
+                          if (!_isWhisperRecording) _startListening();
+                        },
+                        onLongPressEnd: (_) {
                           if (_isWhisperRecording) {
                             _stopWhisperRecording();
-                          } else if (_isListening) {
-                            _stopListening();
                           } else {
-                            _startListening();
+                            _stopListening();
                           }
                         },
-                      ),
-                    ),
-                  ),
-                const SizedBox(width: 6),
-                if (isRunning)
-                  SizedBox(
-                    width: 52,
-                    height: 48,
-                    child: IconButton.filled(
-                      onPressed: provider.cancelAgent,
-                      icon: const Icon(Icons.stop),
-                      iconSize: 20,
-                      style: IconButton.styleFrom(
-                        backgroundColor: AppColors.statusRed,
-                        foregroundColor: Colors.white,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(AppRadii.xl),
+                        child: SizedBox(
+                          width: 48,
+                          height: 48,
+                          child: IconButton(
+                            icon: Icon(isRecording ? Icons.mic : Icons.mic_none),
+                            style: IconButton.styleFrom(
+                              backgroundColor: isRecording
+                                  ? AppColors.statusRed.withAlpha(28)
+                                  : theme.colorScheme.surfaceContainerHighest,
+                              foregroundColor: isRecording
+                                  ? AppColors.statusRed
+                                  : theme.colorScheme.onSurfaceVariant,
+                              side: BorderSide(
+                                color: isRecording
+                                    ? AppColors.statusRed.withAlpha(120)
+                                    : theme.colorScheme.outline.withAlpha(55),
+                              ),
+                            ),
+                            onPressed: () {
+                              if (_isWhisperRecording) {
+                                _stopWhisperRecording();
+                              } else if (_isListening) {
+                                _stopListening();
+                              } else {
+                                _startListening();
+                              }
+                            },
+                          ),
                         ),
                       ),
-                    ),
-                  )
-                else
-                  SizedBox(
-                    width: 52,
-                    height: 48,
-                    child: IconButton.filled(
-                      onPressed: _sendMessage,
-                      icon: const Icon(Icons.send),
-                      iconSize: 20,
-                      style: IconButton.styleFrom(
-                        backgroundColor: theme.colorScheme.primary,
-                        foregroundColor: theme.colorScheme.onPrimary,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(AppRadii.xl),
+                    const SizedBox(width: 6),
+                    if (isRunning)
+                      SizedBox(
+                        width: 52,
+                        height: 48,
+                        child: IconButton.filled(
+                          onPressed: provider.cancelAgent,
+                          icon: const Icon(Icons.stop),
+                          iconSize: 20,
+                          style: IconButton.styleFrom(
+                            backgroundColor: AppColors.statusRed,
+                            foregroundColor: Colors.white,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(AppRadii.xl),
+                            ),
+                          ),
+                        ),
+                      )
+                    else
+                      SizedBox(
+                        width: 52,
+                        height: 48,
+                        child: IconButton.filled(
+                          onPressed: _sendMessage,
+                          icon: const Icon(Icons.send),
+                          iconSize: 20,
+                          style: IconButton.styleFrom(
+                            backgroundColor: theme.colorScheme.primary,
+                            foregroundColor: theme.colorScheme.onPrimary,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(AppRadii.xl),
+                            ),
+                          ),
                         ),
                       ),
-                    ),
-                  ),
+                  ],
+                ),
               ],
             ),
           ),
@@ -1786,6 +1955,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       },
     );
   }
+}
+
+class _PendingAttachmentPreview {
+  final MessageContent content;
+  final String inputText;
+  final String insertedText;
+  final bool includeAsContentBlock;
+
+  const _PendingAttachmentPreview({
+    required this.content,
+    required this.inputText,
+    required this.insertedText,
+    required this.includeAsContentBlock,
+  });
 }
 
 class _AnimatedMessageEntry extends StatefulWidget {

@@ -6,12 +6,12 @@ import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../app.dart' show AppRadii, themeNotifier, fontScaleNotifier;
 import '../constants.dart';
-import '../services/llm_service.dart';
 import '../services/memory_service.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
 import '../services/session_storage.dart';
 import '../services/skill_service.dart';
+import 'model_api_settings_screen.dart';
 import 'setup_wizard_screen.dart';
 import '../l10n/app_strings.dart';
 
@@ -24,8 +24,6 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final _prefs = PreferencesService();
-  final _apiKeyController = TextEditingController();
-  final _baseUrlController = TextEditingController();
   final _modelController = TextEditingController();
   final _whisperModelController = TextEditingController();
   final _ttsModelController = TextEditingController();
@@ -33,13 +31,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _loading = true;
   String _arch = '';
   Map<String, dynamic> _status = {};
-  List<String> _availableModels = [];
-  bool _fetchingModels = false;
-  bool _manualModelInput = false;
-  int _thinkingLevel = 0;
-  int _contextLength = 100000;
-  double _temperature = 0.7;
-  bool _autoCompact = true;
   List<SkillInfo> _skills = [];
   bool _loadingSkills = false;
   Map<String, String> _envVars = {};
@@ -51,15 +42,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<String> _memories = [];
   bool _loadingMemories = false;
 
-  static const _thinkingBudgets = [0, 4096, 10000, 20000, 32000];
-  static const _thinkingLabels = [
-    AppStrings.thinkingOff,
-    AppStrings.thinkingLow,
-    AppStrings.thinkingMedium,
-    AppStrings.thinkingHigh,
-    AppStrings.thinkingMax,
-  ];
-
   @override
   void initState() {
     super.initState();
@@ -69,8 +51,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _loadSettings() async {
     try {
       await _prefs.init();
-      _apiKeyController.text = _prefs.apiKey ?? '';
-      _baseUrlController.text = _prefs.baseUrl ?? '';
       _modelController.text = _prefs.model ?? AppConstants.defaultModel;
       _apiFormat = _prefs.apiFormat ?? 'anthropic';
       _themeMode = _prefs.themeMode;
@@ -81,13 +61,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _whisperModelController.text = _prefs.whisperModel ?? '';
       _ttsModelController.text = _prefs.ttsModel ?? '';
 
-      final budget = _prefs.thinkingBudget;
-      _thinkingLevel = _thinkingBudgets.indexOf(budget);
-      if (_thinkingLevel < 0) _thinkingLevel = 0;
-
-      _contextLength = _prefs.contextLength;
-      _temperature = _prefs.temperature;
-      _autoCompact = _prefs.autoCompact;
       _envVars = Map.from(_prefs.envVars);
 
       try {
@@ -113,76 +86,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         SnackBar(content: Text(AppStrings.loadSettingsFailed('$e'))),
       );
     }
-  }
-
-  void _saveSettings() {
-    _prefs.apiKey = _apiKeyController.text.trim().isNotEmpty
-        ? _apiKeyController.text.trim()
-        : null;
-    _prefs.baseUrl = _baseUrlController.text.trim().isNotEmpty
-        ? _baseUrlController.text.trim()
-        : null;
-    _prefs.model = _modelController.text.trim().isNotEmpty
-        ? _modelController.text.trim()
-        : null;
-    _prefs.apiFormat = _apiFormat;
-    _prefs.thinkingBudget = _thinkingBudgets[_thinkingLevel];
-    _prefs.contextLength = _contextLength;
-    _prefs.temperature = _temperature;
-    _prefs.autoCompact = _autoCompact;
-    _prefs.envVars = _envVars;
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text(AppStrings.settingsSaved)),
-    );
-  }
-
-  Future<void> _fetchModels() async {
-    final apiKey = _apiKeyController.text.trim();
-    if (apiKey.isEmpty) return;
-
-    setState(() => _fetchingModels = true);
-    try {
-      final models = await LlmService.fetchModels(
-        apiFormat: _apiFormat,
-        apiKey: apiKey,
-        baseUrl: _baseUrlController.text.trim().isNotEmpty
-            ? _baseUrlController.text.trim()
-            : null,
-      );
-      if (!mounted) return;
-      final showingPresets = models.any(LlmService.isPresetModel);
-      setState(() {
-        _availableModels = models;
-        _fetchingModels = false;
-        _manualModelInput = models.isEmpty;
-        if (models.isNotEmpty && _modelController.text.isEmpty) {
-          _modelController.text = LlmService.modelIdFromDisplay(models.first);
-        }
-      });
-      if (showingPresets) {
-        _showModelFetchNotice(AppStrings.modelFetchPresetNotice);
-      }
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _fetchingModels = false;
-        _manualModelInput = true;
-      });
-      _showModelFetchNotice(AppStrings.modelFetchFailed(_briefError(e)));
-    }
-  }
-
-  void _showModelFetchNotice(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
-  }
-
-  String _briefError(Object error) {
-    final text = error.toString().replaceFirst('Exception: ', '');
-    return text.length > 160 ? '${text.substring(0, 160)}...' : text;
   }
 
   Widget _settingsGroup(ThemeData theme, String title, List<Widget> children) {
@@ -242,6 +145,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _loadingSkills = true);
     _skills = await SkillService.scanSkills();
     if (mounted) setState(() => _loadingSkills = false);
+  }
+
+  String _modelApiSubtitle() {
+    final format = _apiFormat == 'anthropic'
+        ? 'Anthropic'
+        : AppStrings.openaiCompatible;
+    final model = _modelController.text.trim().isEmpty
+        ? AppConstants.defaultModel
+        : _modelController.text.trim();
+    return '$format · $model';
+  }
+
+  Future<void> _reloadModelApiSummary() async {
+    await _prefs.init();
+    if (!mounted) return;
+    setState(() {
+      _apiFormat = _prefs.apiFormat ?? 'anthropic';
+      _modelController.text = _prefs.model ?? AppConstants.defaultModel;
+    });
   }
 
   @override
@@ -388,189 +310,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                   ]),
                   _settingsGroup(theme, AppStrings.settingsModelApi, [
-
-                ListTile(
-                  title: const Text(AppStrings.apiFormat),
-                  subtitle: Text(_apiFormat == 'anthropic' ? 'Anthropic' : AppStrings.openaiCompatible),
-                  trailing: DropdownButton<String>(
-                    value: _apiFormat,
-                    items: const [
-                      DropdownMenuItem(value: 'anthropic', child: Text('Anthropic')),
-                      DropdownMenuItem(value: 'openai', child: Text(AppStrings.openaiCompatible)),
-                    ],
-                    onChanged: (v) => setState(() {
-                      _apiFormat = v!;
-                      _availableModels = [];
-                      _manualModelInput = false;
-                    }),
-                  ),
-                ),
-
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: TextField(
-                    controller: _apiKeyController,
-                    obscureText: true,
-                    decoration: InputDecoration(
-                      labelText: 'API Key',
-                      hintText: _apiFormat == 'anthropic' ? 'sk-ant-...' : 'sk-...',
-                    ),
-                  ),
-                ),
-
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: TextField(
-                    controller: _baseUrlController,
-                    decoration: InputDecoration(
-                      labelText: AppStrings.baseUrlOptional,
-                      hintText: _apiFormat == 'anthropic'
-                          ? 'https://api.anthropic.com'
-                          : 'https://api.openai.com',
-                    ),
-                  ),
-                ),
-
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: _fetchingModels
-                            ? const Center(child: Padding(
-                                padding: EdgeInsets.all(16),
-                                child: CircularProgressIndicator(),
-                              ))
-                            : (_availableModels.isNotEmpty && !_manualModelInput)
-                                ? DropdownButtonFormField<String>(
-                                value: _availableModels.any((m) =>
-                                        LlmService.modelIdFromDisplay(m) ==
-                                        _modelController.text)
-                                    ? _modelController.text
-                                    : null,
-                                    decoration: const InputDecoration(
-                                      labelText: AppStrings.selectModel,
-                                    ),
-                                    items: [
-                                      ..._availableModels.map((m) => DropdownMenuItem(
-                                        value: LlmService.modelIdFromDisplay(m),
-                                        child: Text(m, overflow: TextOverflow.ellipsis),
-                                      )),
-                                      const DropdownMenuItem(
-                                        value: '__manual__',
-                                        child: Text(AppStrings.manualInput),
-                                      ),
-                                    ],
-                                    onChanged: (v) {
-                                      if (v == '__manual__') {
-                                        setState(() => _manualModelInput = true);
-                                      } else if (v != null) {
-                                        _modelController.text = v;
-                                      }
-                                    },
-                                  )
-                                : TextField(
-                                    controller: _modelController,
-                                    decoration: InputDecoration(
-                                      labelText: AppStrings.model,
-                                      hintText: AppConstants.defaultModel,
-                                    ),
-                                  ),
-                      ),
-                      const SizedBox(width: 8),
-                      IconButton(
-                        icon: const Icon(Icons.refresh),
-                        tooltip: AppStrings.fetchModelsButton,
-                        onPressed: _fetchingModels ? null : _fetchModels,
-                      ),
-                    ],
-                  ),
-                ),
-
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('${AppStrings.thinkingIntensity}: ${_thinkingLabels[_thinkingLevel]}'),
-                      Slider(
-                        value: _thinkingLevel.toDouble(),
-                        min: 0,
-                        max: 4,
-                        divisions: 4,
-                        label: _thinkingLabels[_thinkingLevel],
-                        onChanged: (v) {
-                          setState(() => _thinkingLevel = v.round());
-                          _prefs.thinkingBudget = _thinkingBudgets[_thinkingLevel];
-                        },
-                      ),
-                    ],
-                  ),
-                ),
-
-                ListTile(
-                  title: const Text(AppStrings.contextLength),
-                  trailing: DropdownButton<int>(
-                    value: _contextLength,
-                    items: const [
-                      DropdownMenuItem(value: 50000, child: Text(AppStrings.chars50k)),
-                      DropdownMenuItem(value: 100000, child: Text(AppStrings.chars100k)),
-                      DropdownMenuItem(value: 200000, child: Text(AppStrings.chars200k)),
-                    ],
-                    onChanged: (v) {
-                      setState(() => _contextLength = v!);
-                      _prefs.contextLength = _contextLength;
-                    },
-                  ),
-                ),
-
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('${AppStrings.temperature}: ${_temperature.toStringAsFixed(1)}'),
-                      Row(
-                        children: [
-                          const Text(AppStrings.temperatureLow, style: TextStyle(fontSize: 12)),
-                          Expanded(
-                            child: Slider(
-                              value: _temperature,
-                              min: 0.0,
-                              max: 1.0,
-                              divisions: 10,
-                              label: _temperature.toStringAsFixed(1),
-                              onChanged: (v) {
-                                setState(() => _temperature = v);
-                                _prefs.temperature = _temperature;
-                              },
-                            ),
+                    ListTile(
+                      leading: const Icon(Icons.tune),
+                      title: const Text(AppStrings.settingsModelApi),
+                      subtitle: Text(_modelApiSubtitle()),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () async {
+                        await Navigator.of(context).push(
+                          CupertinoPageRoute(
+                            builder: (_) => const ModelApiSettingsScreen(),
                           ),
-                          const Text(AppStrings.temperatureHigh, style: TextStyle(fontSize: 12)),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-
-                SwitchListTile(
-                  title: const Text(AppStrings.autoCompact),
-                  subtitle: const Text(AppStrings.autoCompactSubtitle),
-                  value: _autoCompact,
-                  onChanged: (v) {
-                    HapticFeedback.lightImpact();
-                    setState(() => _autoCompact = v);
-                    _prefs.autoCompact = v;  // persist immediately
-                  },
-                ),
-
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: FilledButton(
-                      onPressed: _saveSettings,
-                      child: const Text(AppStrings.saveSettings),
+                        );
+                        await _reloadModelApiSummary();
+                      },
                     ),
-                  ),
                   ]),
                   _settingsGroup(theme, AppStrings.settingsAgentSkills, [
                     Padding(
@@ -1047,8 +800,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
-    _apiKeyController.dispose();
-    _baseUrlController.dispose();
     _modelController.dispose();
     _whisperModelController.dispose();
     _ttsModelController.dispose();
