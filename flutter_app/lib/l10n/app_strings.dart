@@ -30,6 +30,7 @@ class AppStrings {
   static const retry = '重试';
   static const more = '更多';
   static const refresh = '刷新';
+  static const close = '关闭';
   static const open = 'Open';
   static const renderError = '渲染错误';
   static const searchSources = '搜索来源';
@@ -192,6 +193,12 @@ class AppStrings {
   static const preview = '预览';
   static const artifactsPreview = '网页预览';
   static const reloadPreview = '重新加载预览';
+  static const openInBrowser = '在浏览器打开';
+  static const openInBrowserFailed = '打开浏览器失败';
+  static const copyHtml = '复制 HTML';
+  static const enableJavaScript = '启用 JavaScript';
+  static const disableJavaScript = '禁用 JavaScript';
+  static const enableJavaScriptWarning = '启用 JavaScript 可能存在安全风险，确定要开启吗？';
 
   // ── Thinking intensity ────────────────────────────────────────────
   static const thinkingIntensity = '思考强度';

@@ -22,6 +22,7 @@ import '../widgets/agent_status_bar.dart';
 import '../widgets/compare_view.dart';
 import '../services/tts_service.dart';
 import '../services/whisper_service.dart';
+import 'artifact_preview_screen.dart';
 import 'settings_screen.dart';
 import 'chat_sessions_screen.dart';
 import '../l10n/app_strings.dart';
@@ -42,6 +43,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final WhisperService _whisper = WhisperService();
   bool _isListening = false;
   bool _isWhisperRecording = false;
+  bool _nativeRecognitionCancelled = false;
   bool _showScrollToBottom = false;
   bool _approvalDialogOpen = false;
   ToolApprovalRequest? _shownApprovalRequest;
@@ -354,8 +356,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Future<bool> _tryNativeSpeechRecognition() async {
     try {
+      _nativeRecognitionCancelled = false;
       if (mounted) setState(() => _isListening = true);
       final result = await NativeBridge.startSpeechRecognition(language: 'zh-CN');
+      if (_nativeRecognitionCancelled) return false;
       if (mounted) setState(() => _isListening = false);
       final text = result?.trim();
       if (text == null || text.isEmpty) {
@@ -419,6 +423,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _stopListening() {
     _speech.stop();
+    _nativeRecognitionCancelled = true;
     setState(() => _isListening = false);
   }
 
@@ -1060,6 +1065,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return null;
   }
 
+  void _openArtifactPreview(String htmlContent) {
+    Navigator.of(context).push(
+      CupertinoPageRoute(
+        builder: (_) => ArtifactPreviewScreen(
+          htmlContent: htmlContent,
+          title: AppStrings.artifactsPreview,
+        ),
+      ),
+    );
+  }
+
   Widget _buildContentBlock(
     MessageContent content,
     bool isUser,
@@ -1189,8 +1205,27 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         );
 
-      case ToolResultContent():
-        return const SizedBox.shrink();
+      case ToolResultContent(:final output):
+        if (!isPreviewableHtml(output)) return const SizedBox.shrink();
+        return Align(
+          alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: maxContentWidth),
+            child: Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: ActionChip(
+                avatar: Icon(
+                  Icons.preview_outlined,
+                  size: 16,
+                  color: theme.colorScheme.primary,
+                ),
+                label: const Text(AppStrings.preview),
+                onPressed: () => _openArtifactPreview(output),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          ),
+        );
 
       case ImageContent(:final filename, :final mediaType):
         final label = filename ?? mediaType;

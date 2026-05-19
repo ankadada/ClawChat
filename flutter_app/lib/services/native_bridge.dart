@@ -153,6 +153,11 @@ class NativeBridge {
         false;
   }
 
+  static Future<bool> openHtmlFile(String path) async {
+    return await _channel.invokeMethod<bool>('openHtmlFile', {'path': path}) ??
+        false;
+  }
+
   static Future<bool> bringToForeground() async {
     return (await _channel.invokeMethod<bool>('bringToForeground'))!;
   }

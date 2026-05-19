@@ -15,6 +15,7 @@ import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import android.app.Activity
 import android.content.Context
 import android.os.Environment
@@ -25,6 +26,7 @@ import android.speech.RecognizerIntent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.anka.clawbot/native"
@@ -420,6 +422,31 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                "openHtmlFile" -> {
+                    val path = call.argument<String>("path")
+                    if (path == null) {
+                        result.error("INVALID_ARGS", "path required", null)
+                    } else if (!isAppOwnedPath(path)) {
+                        result.error("INVALID_PATH", "path must be in app cache or files dir", null)
+                    } else {
+                        try {
+                            val file = File(path)
+                            val uri = FileProvider.getUriForFile(
+                                this,
+                                "${applicationContext.packageName}.fileprovider",
+                                file
+                            )
+                            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, "text/html")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(Intent.createChooser(viewIntent, "Open HTML"))
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("OPEN_HTML_ERROR", e.message, null)
+                        }
+                    }
+                }
                 "playAudio" -> {
                     val path = call.argument<String>("path")
                     if (path == null) {
@@ -524,10 +551,13 @@ class MainActivity : FlutterActivity() {
 
     private fun isAppOwnedPath(path: String): Boolean {
         return try {
-            val canonical = java.io.File(path).canonicalPath
+            val canonical = File(path).canonicalPath
             val cacheRoot = applicationContext.cacheDir.canonicalPath
             val filesRoot = applicationContext.filesDir.canonicalPath
-            canonical.startsWith(cacheRoot) || canonical.startsWith(filesRoot)
+            canonical == cacheRoot ||
+                canonical.startsWith(cacheRoot + File.separator) ||
+                canonical == filesRoot ||
+                canonical.startsWith(filesRoot + File.separator)
         } catch (_: Exception) { false }
     }
 

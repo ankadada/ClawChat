@@ -1,7 +1,8 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../l10n/app_strings.dart';
-import 'artifacts_view.dart';
+import '../screens/artifact_preview_screen.dart';
 
 class CodeBlock extends StatelessWidget {
   final String code;
@@ -113,46 +114,15 @@ class CodeBlock extends StatelessWidget {
   }
 
   bool get _isPreviewableHtml {
-    if (language.toLowerCase() != 'html') return false;
-    final lower = code.toLowerCase();
-    return lower.contains('<html') ||
-        lower.contains('<!doctype') ||
-        lower.contains('<body');
+    return isPreviewableHtml(code, language: language);
   }
 
   void _showPreview(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      builder: (ctx) => DraggableScrollableSheet(
-        initialChildSize: 0.85,
-        minChildSize: 0.4,
-        maxChildSize: 0.95,
-        expand: false,
-        builder: (ctx, scrollController) => Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    AppStrings.artifactsPreview,
-                    style: Theme.of(ctx).textTheme.titleMedium,
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.close),
-                    onPressed: () => Navigator.pop(ctx),
-                  ),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            Expanded(
-              child: ArtifactsView(htmlContent: code),
-            ),
-          ],
+    Navigator.of(context).push(
+      CupertinoPageRoute(
+        builder: (_) => ArtifactPreviewScreen(
+          htmlContent: code,
+          title: AppStrings.artifactsPreview,
         ),
       ),
     );
