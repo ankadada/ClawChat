@@ -14,6 +14,7 @@ import '../providers/chat_provider.dart';
 import '../services/preferences_service.dart';
 import '../services/file_attachment_service.dart';
 import '../services/llm_service.dart';
+import '../services/native_bridge.dart';
 import '../services/tools/tool_policy.dart';
 import '../widgets/streaming_text.dart';
 import '../widgets/tool_call_card.dart';
@@ -292,14 +293,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _startListening() async {
     // Check and request RECORD_AUDIO permission
-    const channel = MethodChannel('com.anka.clawbot/native');
     try {
-      final hasPermission = await channel.invokeMethod<bool>('hasAudioPermission') ?? false;
+      final hasPermission = await NativeBridge.hasAudioPermission();
       if (!hasPermission) {
-        await channel.invokeMethod('requestAudioPermission');
+        await NativeBridge.requestAudioPermission();
         // Wait for user to respond to permission dialog
         await Future.delayed(const Duration(milliseconds: 500));
-        final granted = await channel.invokeMethod<bool>('hasAudioPermission') ?? false;
+        final granted = await NativeBridge.hasAudioPermission();
         if (!granted) {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -321,10 +321,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         await _speech.listen(
           onResult: (result) {
             if (result.finalResult) {
-              _inputController.text += result.recognizedWords;
-              _inputController.selection = TextSelection.collapsed(
-                offset: _inputController.text.length,
-              );
+              _appendRecognizedText(result.recognizedWords);
             }
           },
           localeId: 'zh_CN',
@@ -333,10 +330,43 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       } catch (e) {
         debugPrint('Speech listen failed: $e');
         if (mounted) setState(() => _isListening = false);
+        final recognized = await _tryNativeSpeechRecognition();
+        if (!recognized) {
+          _startWhisperRecording();
+        }
       }
     } else {
-      // Fallback: native recording + Whisper API transcription
-      _startWhisperRecording();
+      final recognized = await _tryNativeSpeechRecognition();
+      if (!recognized) {
+        // Fallback: native recording + Whisper API transcription
+        _startWhisperRecording();
+      }
+    }
+  }
+
+  void _appendRecognizedText(String text) {
+    if (text.isEmpty) return;
+    _inputController.text += text;
+    _inputController.selection = TextSelection.collapsed(
+      offset: _inputController.text.length,
+    );
+  }
+
+  Future<bool> _tryNativeSpeechRecognition() async {
+    try {
+      if (mounted) setState(() => _isListening = true);
+      final result = await NativeBridge.startSpeechRecognition(language: 'zh-CN');
+      if (mounted) setState(() => _isListening = false);
+      final text = result?.trim();
+      if (text == null || text.isEmpty) {
+        return false;
+      }
+      _appendRecognizedText(text);
+      return true;
+    } catch (e) {
+      debugPrint('Native speech recognition failed: $e');
+      if (mounted) setState(() => _isListening = false);
+      return false;
     }
   }
 

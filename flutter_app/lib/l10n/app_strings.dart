@@ -275,6 +275,11 @@ class AppStrings {
   static const ttsModelLabel = '语音合成模型（TTS）';
   static const whisperModelRequired = '请在设置 → 语音能力中填写语音识别模型名称（如 whisper-1）';
   static const audioPermissionDenied = '请授予录音权限后重试';
+  static const testSystemVoice = '测试系统语音';
+  static const voiceDiagnosticRunning = '正在测试系统语音...';
+  static const voiceDiagnosticTitle = '系统语音诊断';
+  static const voiceDiagnosticTtsHeader = 'TTS 系统朗读';
+  static const voiceDiagnosticSttHeader = 'STT 系统识别';
 
   // ── Message actions ────────────────────────────────────────────────
   static const quoteReply = '引用回复';

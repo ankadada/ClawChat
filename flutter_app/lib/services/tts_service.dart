@@ -17,12 +17,23 @@ class TtsService extends ChangeNotifier {
   final FlutterTts _tts = FlutterTts();
   bool _initialized = false;
   bool _systemAvailable = false;
-  bool _systemFailedOnce = false;
+  int _systemFailCount = 0;
   bool isSpeaking = false;
   bool isLoading = false;
   String? _currentMessageId;
   String? _lastSpokenText;
   String? lastError;
+  static const int _maxSystemFailures = 3;
+  static const List<String> _preferredSystemLanguages = [
+    'zh-CN',
+    'zh_CN',
+    'zh',
+    'cmn-hans-cn',
+    'zh-Hans-CN',
+    'en-US',
+    'en_US',
+    'en',
+  ];
 
   bool isLoadingMessage(String messageId) =>
       isLoading && _currentMessageId == messageId;
@@ -44,21 +55,19 @@ class TtsService extends ChangeNotifier {
     });
 
     try {
-      final engines = await _tts.getEngines;
+      final engines = _stringList(await _tts.getEngines);
       debugPrint('TTS engines: $engines');
-      if (engines == null || (engines as List).isEmpty) {
+      if (engines.isEmpty) {
         debugPrint('TTS: no system engines');
         _systemAvailable = false;
         _initialized = true;
         return;
       }
 
-      bool langSet = false;
-      for (final lang in ['zh-CN', 'zh', 'zh_CN', 'en-US']) {
-        final result = await _tts.setLanguage(lang);
-        debugPrint('TTS setLanguage($lang) = $result');
-        if (result == 1) { langSet = true; break; }
-      }
+      final languages = _stringList(await _tts.getLanguages);
+      debugPrint('TTS available languages: $languages');
+      final selectedLanguage = await _selectSystemLanguage(languages);
+      final langSet = selectedLanguage != null;
 
       _systemAvailable = langSet;
       if (!_systemAvailable) {
@@ -66,6 +75,7 @@ class TtsService extends ChangeNotifier {
         _initialized = true;
         return;
       }
+      debugPrint('TTS: selected system language $selectedLanguage');
       await _tts.setSpeechRate(0.5);
       await _tts.setVolume(1.0);
       await _tts.setPitch(1.0);
@@ -75,6 +85,7 @@ class TtsService extends ChangeNotifier {
         notifyListeners();
       });
       _tts.setCompletionHandler(() {
+        _systemFailCount = 0;
         isSpeaking = false;
         _currentMessageId = null;
         notifyListeners();
@@ -86,7 +97,11 @@ class TtsService extends ChangeNotifier {
       });
       _tts.setErrorHandler((msg) {
         debugPrint('TTS error: $msg');
-        _systemFailedOnce = true;
+        _systemFailCount += 1;
+        if (_systemFailCount >= _maxSystemFailures) {
+          debugPrint('TTS: system failed $_systemFailCount times, disabling');
+          _systemAvailable = false;
+        }
         // Try API fallback if model configured and we have text + messageId
         final prefs = PreferencesService();
         final ttsModel = prefs.ttsModel;
@@ -118,6 +133,95 @@ class TtsService extends ChangeNotifier {
     _initialized = true;
   }
 
+  List<String> _stringList(dynamic value) {
+    if (value is Iterable) {
+      return value.map((item) => item.toString()).toList();
+    }
+    return const [];
+  }
+
+  bool _isTtsSuccess(dynamic result) => result == true || result == 1;
+
+  bool _isChineseLanguage(String language) {
+    final normalized = language.toLowerCase().replaceAll('_', '-');
+    return normalized.startsWith('zh') ||
+        normalized.startsWith('cmn') ||
+        normalized.contains('hans') ||
+        normalized.contains('chinese');
+  }
+
+  Future<String?> _selectSystemLanguage(List<String> availableLanguages) async {
+    for (final lang in _preferredSystemLanguages) {
+      try {
+        final available = await _tts.isLanguageAvailable(lang);
+        debugPrint('TTS isLanguageAvailable($lang) = $available');
+        if (_isTtsSuccess(available)) {
+          final result = await _tts.setLanguage(lang);
+          debugPrint('TTS setLanguage($lang) = $result');
+          if (_isTtsSuccess(result)) return lang;
+        }
+      } catch (e) {
+        debugPrint('TTS language check $lang failed: $e');
+      }
+    }
+
+    for (final lang in availableLanguages.where(_isChineseLanguage)) {
+      try {
+        final result = await _tts.setLanguage(lang);
+        debugPrint('TTS setLanguage($lang) = $result');
+        if (_isTtsSuccess(result)) return lang;
+      } catch (e) {
+        debugPrint('TTS fallback language $lang failed: $e');
+      }
+    }
+
+    return null;
+  }
+
+  String _summarizeList(List<String> values) {
+    if (values.isEmpty) return '无';
+    final sample = values.take(12).join(', ');
+    if (values.length <= 12) return sample;
+    return '$sample ... 共 ${values.length} 项';
+  }
+
+  Future<String> diagnoseSystemVoice() async {
+    final lines = <String>[];
+    try {
+      await init();
+      final engines = _stringList(await _tts.getEngines);
+      final languages = _stringList(await _tts.getLanguages);
+      lines.add('TTS 引擎: ${_summarizeList(engines)}');
+      lines.add('TTS 语言: ${_summarizeList(languages)}');
+
+      if (engines.isEmpty) {
+        lines.add('TTS 测试: 未发现系统语音引擎。请在系统设置中启用 HiVoice 或安装文本转语音引擎。');
+        return lines.join('\n');
+      }
+
+      final language = await _selectSystemLanguage(languages);
+      if (language == null) {
+        lines.add('TTS 测试: 未找到可用的中文语音包。请在系统文本转语音设置中下载中文语音数据。');
+        return lines.join('\n');
+      }
+
+      _systemAvailable = true;
+      await _tts.stop();
+      _currentMessageId = null;
+      _lastSpokenText = null;
+      await _tts.setSpeechRate(0.5);
+      await _tts.setVolume(1.0);
+      await _tts.setPitch(1.0);
+      await _tts.awaitSpeakCompletion(false);
+      final result = await _tts.speak('系统语音测试，ClawChat 正在使用手机内置语音引擎。');
+      lines.add('TTS 测试: 已调用系统引擎，语言 $language，结果 $result。');
+    } catch (e) {
+      lines.add('TTS 测试失败: $e');
+      lines.add('建议检查系统文本转语音设置，确认 HiVoice 已启用且中文语音包已安装。');
+    }
+    return lines.join('\n');
+  }
+
   Future<bool> speak(String text, String messageId) async {
     await init();
 
@@ -133,9 +237,7 @@ class TtsService extends ChangeNotifier {
     final truncated = text.length > 4000 ? text.substring(0, 4000) : text;
     _lastSpokenText = truncated;
 
-    // Skip system TTS if it failed before (e.g., missing voice data).
-    // Go straight to API if configured.
-    if (_systemAvailable && !_systemFailedOnce) {
+    if (_systemAvailable) {
       isSpeaking = true;
       notifyListeners();
       await _tts.speak(truncated);

@@ -11,6 +11,7 @@ import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
 import '../services/session_storage.dart';
 import '../services/skill_service.dart';
+import '../services/tts_service.dart';
 import 'model_api_settings_screen.dart';
 import 'setup_wizard_screen.dart';
 import '../l10n/app_strings.dart';
@@ -166,6 +167,66 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
   }
 
+  Future<void> _testSystemVoice() async {
+    HapticFeedback.lightImpact();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.voiceDiagnosticRunning)),
+      );
+    }
+
+    final lines = <String>[
+      AppStrings.voiceDiagnosticTtsHeader,
+      await TtsService().diagnoseSystemVoice(),
+      '',
+      AppStrings.voiceDiagnosticSttHeader,
+      await _testNativeSpeechRecognition(),
+    ];
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.voiceDiagnosticTitle),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
+            child: SelectableText(lines.join('\n')),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.confirm),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<String> _testNativeSpeechRecognition() async {
+    try {
+      var hasPermission = await NativeBridge.hasAudioPermission();
+      if (!hasPermission) {
+        await NativeBridge.requestAudioPermission();
+        await Future.delayed(const Duration(milliseconds: 500));
+        hasPermission = await NativeBridge.hasAudioPermission();
+      }
+      if (!hasPermission) {
+        return 'STT 测试: 未授予录音权限。请在系统权限设置中允许 ClawChat 使用麦克风。';
+      }
+
+      final text = await NativeBridge.startSpeechRecognition(language: 'zh-CN');
+      if (text == null || text.trim().isEmpty) {
+        return 'STT 测试: 未识别到文字。请确认系统语音助手或 HiVoice 可用，并已允许语音识别服务。';
+      }
+      return 'STT 测试: 识别成功，结果：${text.trim()}';
+    } catch (e) {
+      return 'STT 测试失败: $e\n建议检查系统语音助手或 HiVoice 是否启用，Android 语音识别服务是否可用。';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -276,6 +337,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           isDense: true,
                         ),
                         onChanged: (v) => _prefs.ttsModel = v.trim(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: _testSystemVoice,
+                          icon: const Icon(Icons.record_voice_over_outlined),
+                          label: const Text(AppStrings.testSystemVoice),
+                        ),
                       ),
                     ),
                     const SizedBox(height: 12),

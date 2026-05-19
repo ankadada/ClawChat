@@ -126,6 +126,22 @@ class NativeBridge {
     return Map<String, dynamic>.from(result ?? {});
   }
 
+  static Future<bool> hasAudioPermission() async {
+    return await _channel.invokeMethod<bool>('hasAudioPermission') ?? false;
+  }
+
+  static Future<bool> requestAudioPermission() async {
+    return await _channel.invokeMethod<bool>('requestAudioPermission') ?? false;
+  }
+
+  static Future<String?> startSpeechRecognition({
+    String language = 'zh-CN',
+  }) async {
+    return await _channel.invokeMethod<String>('startSpeechRecognition', {
+      'language': language,
+    });
+  }
+
   static Future<bool> bringToForeground() async {
     return (await _channel.invokeMethod<bool>('bringToForeground'))!;
   }
