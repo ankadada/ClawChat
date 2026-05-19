@@ -401,6 +401,25 @@ class MainActivity : FlutterActivity() {
                         result.error("SPEECH_ERROR", e.message, null)
                     }
                 }
+                "shareText" -> {
+                    val text = call.argument<String>("text") ?: ""
+                    val subject = call.argument<String>("subject") ?: "ClawChat"
+                    if (text.isBlank()) {
+                        result.error("INVALID_ARGS", "text required", null)
+                    } else {
+                        try {
+                            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, text)
+                                putExtra(Intent.EXTRA_SUBJECT, subject)
+                            }
+                            startActivity(Intent.createChooser(sendIntent, subject))
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("SHARE_ERROR", e.message, null)
+                        }
+                    }
+                }
                 "playAudio" -> {
                     val path = call.argument<String>("path")
                     if (path == null) {

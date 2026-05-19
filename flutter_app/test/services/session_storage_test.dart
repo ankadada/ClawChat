@@ -87,6 +87,47 @@ void main() {
       expect(files.single.uri.pathSegments.last, isNot(contains('/')));
     });
   });
+
+  group('SessionStorage search', () {
+    test('matches session message content and returns preview', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'searchable',
+        title: 'Daily notes',
+        messages: [
+          ChatMessage.user('hello'),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('The deployment checklist mentions vector search.')],
+          ),
+        ],
+      );
+
+      await storage.saveSession(session);
+
+      final results = await storage.searchSessions('vector');
+      expect(results.map((r) => r.summary.id), contains('searchable'));
+      expect(results.first.matchPreview, contains('vector'));
+    });
+  });
+
+  group('ChatSession API messages', () {
+    test('filters persisted system notices from API payload', () {
+      final session = ChatSession(
+        id: 'api_filter',
+        messages: [
+          ChatMessage.user('hello'),
+          ChatMessage.systemNotice('对话上下文已压缩'),
+          ChatMessage(role: 'assistant', content: [TextContent('hi')]),
+        ],
+      );
+
+      final apiMessages = session.toApiMessages();
+      expect(apiMessages, hasLength(2));
+      expect(apiMessages.any((m) => m['role'] == 'system'), isFalse);
+    });
+  });
 }
 
 Map<String, dynamic> _sessionJson(String id) {

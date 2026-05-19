@@ -13,7 +13,11 @@ class AppStrings {
   static const confirm = '确定';
   static const delete = '删除';
   static const copy = '复制';
+  static const copyText = '复制文本';
+  static const copyMarkdown = '复制为 Markdown';
   static const copied = '已复制';
+  static const share = '分享';
+  static const shareFailed = '分享失败';
   static const save = '保存';
   static const saved = '已保存';
   static const done = '完成';
@@ -43,6 +47,8 @@ class AppStrings {
   static const userLabel = '你';
   static const aiLabel = 'AI';
   static const aiProcessing = 'AI 正在处理...';
+  static String contextCompactedNotice(int retainedCount) =>
+      '对话上下文已压缩（保留最近 $retainedCount 条消息）';
   static const inputHint = '输入消息...';
   static const toolApprovalTitle = '工具执行确认';
   static const toolApprovalArguments = '参数';
@@ -248,9 +254,11 @@ class AppStrings {
   // ── Export ─────────────────────────────────────────────────────────
   static const exportChat = '导出对话';
   static const exportedToClipboard = '对话已复制到剪贴板';
+  static const shareSheetOpened = '已打开系统分享';
 
   // ── Search ─────────────────────────────────────────────────────────
-  static const searchConversations = '搜索对话...';
+  static const searchConversations = '搜索标题或消息内容...';
+  static const searching = '搜索中...';
 
   // ── Attach ─────────────────────────────────────────────────────────
   static const attachFile = '添加附件';

@@ -1,5 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/chat_models.dart';
@@ -28,6 +30,31 @@ class SessionPreview {
     this.preview,
     this.modelOverride,
   });
+}
+
+class SessionSearchResult {
+  final SessionSummary summary;
+  final String? matchPreview;
+
+  const SessionSearchResult({
+    required this.summary,
+    this.matchPreview,
+  });
+
+  factory SessionSearchResult.fromJson(Map<String, dynamic> json) {
+    return SessionSearchResult(
+      summary: SessionSummary(
+        id: json['id'] as String,
+        title: json['title'] as String,
+        createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ??
+            DateTime.now(),
+        updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
+            DateTime.now(),
+        folder: json['folder'] as String?,
+      ),
+      matchPreview: json['matchPreview'] as String?,
+    );
+  }
 }
 
 class SessionStorage {
@@ -151,6 +178,28 @@ class SessionStorage {
     return summaries;
   }
 
+  Future<List<SessionSearchResult>> searchSessions(String query) async {
+    await init();
+    final normalizedQuery = query.trim().toLowerCase();
+    if (normalizedQuery.isEmpty) return const [];
+
+    final payloads = <Map<String, String>>[];
+    await for (final entity in _sessionsDir!.list()) {
+      if (entity is! File || !entity.path.endsWith('.json')) continue;
+      try {
+        payloads.add({'json': await entity.readAsString()});
+      } catch (_) {
+        // Skip unreadable session files
+      }
+    }
+
+    final rawResults = await compute(_searchSessionPayloads, {
+      'query': normalizedQuery,
+      'payloads': payloads,
+    });
+    return rawResults.map(SessionSearchResult.fromJson).toList();
+  }
+
   Future<ChatSession?> getSession(String id) async {
     await init();
     final file = await _sessionFile(id);
@@ -261,4 +310,69 @@ class SessionStorage {
     }
     return count;
   }
+}
+
+List<Map<String, dynamic>> _searchSessionPayloads(Map<String, dynamic> args) {
+  final query = args['query'] as String;
+  final payloads = (args['payloads'] as List)
+      .map((item) => Map<String, String>.from(item as Map))
+      .toList();
+  final results = <Map<String, dynamic>>[];
+
+  for (final payload in payloads) {
+    try {
+      final session = ChatSession.fromJson(
+        jsonDecode(payload['json']!) as Map<String, dynamic>,
+      );
+      final titleMatch = session.title.toLowerCase().contains(query);
+      String? matchPreview;
+
+      for (final message in session.messages) {
+        if (message.isSystemNotice) continue;
+        final text = message.textContent;
+        if (text.isEmpty) continue;
+        if (text.toLowerCase().contains(query)) {
+          matchPreview = _searchSnippet(text, query);
+          break;
+        }
+      }
+
+      if (!titleMatch && matchPreview == null) continue;
+
+      results.add({
+        'id': session.id,
+        'title': session.title,
+        'createdAt': session.createdAt.toIso8601String(),
+        'updatedAt': session.updatedAt.toIso8601String(),
+        if (session.folder != null) 'folder': session.folder,
+        if (matchPreview != null) 'matchPreview': matchPreview,
+      });
+    } catch (_) {
+      // Skip corrupted session payloads
+    }
+  }
+
+  results.sort((a, b) {
+    final aUpdated = DateTime.tryParse(a['updatedAt'] as String? ?? '') ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+    final bUpdated = DateTime.tryParse(b['updatedAt'] as String? ?? '') ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+    return bUpdated.compareTo(aUpdated);
+  });
+  return results;
+}
+
+String _searchSnippet(String text, String query) {
+  final compact = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  final lower = compact.toLowerCase();
+  final index = lower.indexOf(query);
+  if (index < 0) {
+    return compact.length > 120 ? '${compact.substring(0, 120)}...' : compact;
+  }
+
+  final start = math.max(0, index - 36);
+  final end = math.min(compact.length, index + query.length + 72);
+  final prefix = start > 0 ? '...' : '';
+  final suffix = end < compact.length ? '...' : '';
+  return '$prefix${compact.substring(start, end)}$suffix';
 }

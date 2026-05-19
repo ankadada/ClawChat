@@ -858,6 +858,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     String? previousRole,
     String? nextRole,
   }) {
+    if (message.isSystemNotice) {
+      return _buildSystemNotice(message, theme);
+    }
+
     final isUser = message.role == 'user';
     final messageId = '${message.timestamp.millisecondsSinceEpoch}_$messageIndex';
 
@@ -886,11 +890,40 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               theme,
               maxContentWidth,
               messageId: messageId,
+              message: message,
             ),
           if (!isUser && message.alternatives != null && message.alternatives!.isNotEmpty)
             _buildAlternativesNav(message, messageIndex, theme),
           if (!isUser) _buildAssistantFooter(message, messageId, theme),
         ],
+      ),
+    );
+  }
+
+  Widget _buildSystemNotice(ChatMessage message, ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Center(
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.info_outline,
+              size: 14,
+              color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
+            ),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                message.textContent,
+                textAlign: TextAlign.center,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant.withAlpha(170),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -961,12 +994,38 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  String _messageToMarkdown(ChatMessage? message, {required String fallbackText}) {
+    if (message == null) return fallbackText;
+    final role = message.role == 'user' ? AppStrings.userLabel : AppStrings.aiLabel;
+    final buffer = StringBuffer('**$role**:\n');
+    for (final content in message.content) {
+      switch (content) {
+        case TextContent(:final text):
+          if (text.isNotEmpty) buffer.writeln(text);
+        case ImageContent(:final filename, :final mediaType):
+          buffer.writeln('[Image: ${filename ?? mediaType}]');
+        case ToolUseContent(:final name, :final input):
+          buffer.writeln('**Tool call**: `$name`');
+          buffer.writeln('```json');
+          buffer.writeln(const JsonEncoder.withIndent('  ').convert(input));
+          buffer.writeln('```');
+        case ToolResultContent(:final output):
+          buffer.writeln('**Tool result**:');
+          buffer.writeln('```');
+          buffer.writeln(output.length > 2000 ? '${output.substring(0, 2000)}\n\n[tool output truncated]' : output);
+          buffer.writeln('```');
+      }
+    }
+    return buffer.toString().trimRight();
+  }
+
   Widget _buildContentBlock(
     MessageContent content,
     bool isUser,
     ThemeData theme,
     double maxContentWidth, {
     String? messageId,
+    ChatMessage? message,
   }) {
     switch (content) {
       case TextContent(:final text):
@@ -983,13 +1042,44 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   children: [
                     ListTile(
                       leading: const Icon(Icons.copy),
-                      title: const Text(AppStrings.copy),
+                      title: const Text(AppStrings.copyText),
                       onTap: () {
                         Clipboard.setData(ClipboardData(text: text));
                         Navigator.pop(ctx);
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
                         );
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.article_outlined),
+                      title: const Text(AppStrings.copyMarkdown),
+                      onTap: () {
+                        Clipboard.setData(ClipboardData(
+                          text: _messageToMarkdown(message, fallbackText: text),
+                        ));
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
+                        );
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.share),
+                      title: const Text(AppStrings.share),
+                      onTap: () async {
+                        Navigator.pop(ctx);
+                        try {
+                          await NativeBridge.shareText(
+                            text: _messageToMarkdown(message, fallbackText: text),
+                            subject: AppStrings.appName,
+                          );
+                        } catch (e) {
+                          if (!mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('${AppStrings.shareFailed}: $e')),
+                          );
+                        }
                       },
                     ),
                     ListTile(

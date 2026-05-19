@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,7 @@ import 'package:provider/provider.dart';
 import '../app.dart';
 import '../models/chat_models.dart';
 import '../providers/chat_provider.dart';
+import '../services/native_bridge.dart';
 import '../services/session_storage.dart';
 import '../l10n/app_strings.dart';
 
@@ -21,10 +23,15 @@ class ChatSessionsScreen extends StatefulWidget {
 class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
   final _searchController = TextEditingController();
   String _searchQuery = '';
+  Timer? _searchDebounce;
+  int _searchGeneration = 0;
+  bool _searching = false;
+  List<SessionSearchResult> _searchResults = [];
   String? _selectedFolder; // null = show all
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -48,10 +55,18 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
       buffer.writeln('');
     }
 
-    await Clipboard.setData(ClipboardData(text: buffer.toString()));
-    if (mounted) {
+    final text = buffer.toString();
+    try {
+      await NativeBridge.shareText(text: text, subject: fullSession.title);
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text(AppStrings.exportedToClipboard)),
+        const SnackBar(content: Text(AppStrings.shareSheetOpened)),
+      );
+    } catch (e) {
+      await Clipboard.setData(ClipboardData(text: text));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${AppStrings.shareFailed}: $e')),
       );
     }
   }
@@ -82,6 +97,38 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
   String _truncateToolOutput(String output) {
     if (output.length <= 2000) return output;
     return '${output.substring(0, 2000)}\n\n[tool output truncated]';
+  }
+
+  void _setSearchQuery(String value) {
+    final query = value.trim();
+    _searchDebounce?.cancel();
+    _searchGeneration += 1;
+
+    if (query.isEmpty) {
+      setState(() {
+        _searchQuery = '';
+        _searching = false;
+        _searchResults = [];
+      });
+      return;
+    }
+
+    final generation = _searchGeneration;
+    setState(() {
+      _searchQuery = query;
+      _searching = true;
+    });
+
+    _searchDebounce = Timer(const Duration(milliseconds: 220), () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final results = await storage.searchSessions(query);
+      if (!mounted || generation != _searchGeneration) return;
+      setState(() {
+        _searchResults = results;
+        _searching = false;
+      });
+    });
   }
 
   @override
@@ -118,12 +165,12 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
         final sortedFolders = folders.toList()..sort();
 
         // Apply search and folder filter
-        var filteredSessions = sessions.toList();
-        if (_searchQuery.isNotEmpty) {
-          filteredSessions = filteredSessions
-              .where((s) => s.title.toLowerCase().contains(_searchQuery))
-              .toList();
-        }
+        final searchMatches = {
+          for (final result in _searchResults) result.summary.id: result,
+        };
+        var filteredSessions = _searchQuery.isEmpty
+            ? sessions.toList()
+            : _searchResults.map((result) => result.summary).toList();
         if (_selectedFolder != null) {
           if (_selectedFolder == '__none__') {
             filteredSessions = filteredSessions.where((s) => s.folder == null || s.folder!.isEmpty).toList();
@@ -148,7 +195,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                           icon: const Icon(Icons.clear, size: 18),
                           onPressed: () {
                             _searchController.clear();
-                            setState(() => _searchQuery = '');
+                            _setSearchQuery('');
                           },
                         )
                       : null,
@@ -157,16 +204,19 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                   contentPadding:
                       const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 ),
-                onChanged: (v) =>
-                    setState(() => _searchQuery = v.toLowerCase()),
+                onChanged: _setSearchQuery,
               ),
             ),
+            if (_searching)
+              const LinearProgressIndicator(minHeight: 2),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
               child: Row(
                 children: [
                   Text(
-                    '${filteredSessions.length}/${sessions.length}',
+                    _searching
+                        ? AppStrings.searching
+                        : '${filteredSessions.length}/${sessions.length}',
                     style: theme.textTheme.labelSmall?.copyWith(
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
@@ -246,7 +296,9 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                 ),
               ),
             Expanded(
-              child: filteredSessions.isEmpty
+              child: _searching && filteredSessions.isEmpty
+                  ? const Center(child: CircularProgressIndicator())
+                  : filteredSessions.isEmpty
                   ? Center(
                       child: Text(AppStrings.noChats,
                           style: theme.textTheme.bodyLarge?.copyWith(
@@ -274,6 +326,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                                   provider,
                                   session,
                                   isSelected,
+                                  searchMatches[session.id],
                                 );
                               },
                               childCount: group.sessions.length,
@@ -383,6 +436,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     ChatProvider provider,
     SessionSummary session,
     bool isSelected,
+    SessionSearchResult? searchResult,
   ) {
     return Dismissible(
       key: Key(session.id),
@@ -443,6 +497,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           subtitle: _SessionMeta(
             session: session,
             timeLabel: _formatTime(session.updatedAt),
+            matchPreview: searchResult?.matchPreview,
           ),
           leading: Icon(
             Icons.chat_bubble_outline,
@@ -756,10 +811,12 @@ class _DateHeaderDelegate extends SliverPersistentHeaderDelegate {
 class _SessionMeta extends StatefulWidget {
   final SessionSummary session;
   final String timeLabel;
+  final String? matchPreview;
 
   const _SessionMeta({
     required this.session,
     required this.timeLabel,
+    this.matchPreview,
   });
 
   @override
@@ -811,20 +868,38 @@ class _SessionMetaState extends State<_SessionMeta> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final folder = widget.session.folder;
+    final preview = widget.matchPreview ?? _preview;
+    final isSearchMatch = widget.matchPreview != null;
 
     return Padding(
       padding: const EdgeInsets.only(top: 3),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (_preview != null && _preview!.isNotEmpty)
-            Text(
-              _preview!,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
+          if (preview != null && preview.isNotEmpty)
+            Row(
+              children: [
+                if (isSearchMatch) ...[
+                  Icon(
+                    Icons.manage_search,
+                    size: 13,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 4),
+                ],
+                Expanded(
+                  child: Text(
+                    preview,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: isSearchMatch
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ],
             ),
           const SizedBox(height: 4),
           Wrap(

@@ -300,7 +300,13 @@ class ChatProvider extends ChangeNotifier {
       notifyListeners();
 
       _agentCompleter = Completer<void>();
-      final apiMessages = _truncateToFit(session.toApiMessages());
+      final fullApiMessages = session.toApiMessages();
+      final apiMessages = _truncateToFit(fullApiMessages);
+      if (apiMessages.length < fullApiMessages.length) {
+        _appendContextCompactionNotice(session, apiMessages.length);
+        await _storage.saveSession(session);
+        notifyListeners();
+      }
       final initialApiMsgCount = apiMessages.length;
       try {
         _agentSubscription = _agent!.runAgentLoop(apiMessages).listen(
@@ -645,6 +651,15 @@ class ChatProvider extends ChangeNotifier {
       maxChars: _prefs.contextLength,
       autoCompact: _prefs.autoCompact,
     );
+  }
+
+  void _appendContextCompactionNotice(ChatSession session, int retainedCount) {
+    final text = AppStrings.contextCompactedNotice(retainedCount);
+    if (session.messages.isNotEmpty) {
+      final last = session.messages.last;
+      if (last.isSystemNotice && last.textContent == text) return;
+    }
+    session.messages.add(ChatMessage.systemNotice(text));
   }
 
   void _appendNewAgentMessages(

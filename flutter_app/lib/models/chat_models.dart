@@ -40,7 +40,10 @@ class ChatSession {
   }
 
   List<Map<String, dynamic>> toApiMessages() {
-    return messages.map((m) => m.toApiJson()).toList();
+    return messages
+        .where((m) => !m.isSystemNotice)
+        .map((m) => m.toApiJson())
+        .toList();
   }
 
   Map<String, dynamic> toJson() => {
@@ -114,6 +117,7 @@ class ChatMessage {
   int? outputTokens;
   final List<String>? alternatives;  // previous generation texts
   int activeAlternative;  // -1 = current content, 0+ = index into alternatives
+  final bool isSystemNotice;
 
   ChatMessage({
     required this.role,
@@ -123,6 +127,7 @@ class ChatMessage {
     this.outputTokens,
     this.alternatives,
     this.activeAlternative = -1,
+    this.isSystemNotice = false,
   }) : timestamp = timestamp ?? DateTime.now();
 
   /// Total number of versions (current + alternatives).
@@ -153,6 +158,14 @@ class ChatMessage {
 
   factory ChatMessage.user(String text) {
     return ChatMessage.userContent([TextContent(text)]);
+  }
+
+  factory ChatMessage.systemNotice(String text) {
+    return ChatMessage(
+      role: 'system',
+      content: [TextContent(text)],
+      isSystemNotice: true,
+    );
   }
 
   factory ChatMessage.userContent(List<MessageContent> content) {
@@ -216,6 +229,7 @@ class ChatMessage {
     if (outputTokens != null) 'outputTokens': outputTokens,
     if (alternatives != null && alternatives!.isNotEmpty) 'alternatives': alternatives,
     if (activeAlternative != -1) 'activeAlternative': activeAlternative,
+    if (isSystemNotice) 'isSystemNotice': true,
   };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
@@ -252,6 +266,7 @@ class ChatMessage {
       outputTokens: json['outputTokens'] as int?,
       alternatives: altsList?.map((e) => e as String).toList(),
       activeAlternative: json['activeAlternative'] as int? ?? -1,
+      isSystemNotice: json['isSystemNotice'] as bool? ?? false,
     );
   }
 

@@ -142,6 +142,17 @@ class NativeBridge {
     });
   }
 
+  static Future<bool> shareText({
+    required String text,
+    String? subject,
+  }) async {
+    return await _channel.invokeMethod<bool>('shareText', {
+          'text': text,
+          if (subject != null) 'subject': subject,
+        }) ??
+        false;
+  }
+
   static Future<bool> bringToForeground() async {
     return (await _channel.invokeMethod<bool>('bringToForeground'))!;
   }
