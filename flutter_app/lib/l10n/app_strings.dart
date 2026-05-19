@@ -125,6 +125,17 @@ class AppStrings {
   static const apiFormat = 'API 格式';
   static const baseUrlOptional = 'Base URL (可选)';
   static const model = '模型';
+  static const providerProfiles = 'Provider Profiles';
+  static const addProviderProfile = '新增配置';
+  static const newProviderProfile = '新配置';
+  static const providerProfileDetails = '配置详情';
+  static const providerProfileName = '配置名称';
+  static const editProviderProfile = '编辑配置';
+  static const cannotDeleteLastProfile = '至少保留一个配置';
+  static const deleteActiveProfileTitle = '删除当前配置?';
+  static String deleteActiveProfileConfirm(String name) =>
+      '删除 "$name" 后将自动切换到其他配置。';
+  static const advancedModelSettings = '高级模型设置';
   static const saveSettings = '保存设置';
   static const settingsSaved = '设置已保存';
   static String loadSettingsFailed(String e) => '加载设置失败: $e';

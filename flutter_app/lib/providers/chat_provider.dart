@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import '../constants.dart';
 import '../models/chat_models.dart';
+import '../models/provider_profile.dart';
 import '../services/agent_service.dart';
 import '../services/chat_context_utils.dart';
 import '../services/llm_service.dart';
@@ -14,7 +15,6 @@ import '../services/preferences_service.dart';
 import '../services/skill_service.dart';
 import '../services/memory_service.dart';
 import '../l10n/app_strings.dart';
-
 
 enum AgentStatus {
   idle,
@@ -42,6 +42,28 @@ class ChatProvider extends ChangeNotifier {
     if (!_prefsInitialized) return AppConstants.defaultModel;
     return _prefs.model ?? AppConstants.defaultModel;
   }
+
+  String get configuredProfileName {
+    if (!_prefsInitialized) return '';
+    return _prefs.activeProfile.displayName;
+  }
+
+  String get configuredModelLabel {
+    if (!_prefsInitialized) return AppConstants.defaultModel;
+    final profile = _prefs.activeProfile;
+    return '${profile.displayName} · ${profile.effectiveModel}';
+  }
+
+  List<ProviderProfile> get providerProfiles {
+    if (!_prefsInitialized) return const [];
+    return _prefs.profiles;
+  }
+
+  String? get activeProfileId {
+    if (!_prefsInitialized) return null;
+    return _prefs.activeProfileId;
+  }
+
   List<SkillInfo> _skills = [];
   LlmService? _cachedLlm;
   LlmConfig? _cachedLlmConfig;
@@ -123,12 +145,14 @@ class ChatProvider extends ChangeNotifier {
   Future<ChatSession> createSession() async {
     final session = ChatSession(id: _uuid.v4());
     await _storage.saveSession(session);
-    sessions.insert(0, SessionSummary(
-      id: session.id,
-      title: session.title,
-      createdAt: session.createdAt,
-      updatedAt: session.updatedAt,
-    ));
+    sessions.insert(
+        0,
+        SessionSummary(
+          id: session.id,
+          title: session.title,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+        ));
     currentSession = session;
     _clearSessionScopedState();
     notifyListeners();
@@ -235,17 +259,20 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<ChatSession?> forkFromMessage(String sessionId, int messageIndex) async {
+  Future<ChatSession?> forkFromMessage(
+      String sessionId, int messageIndex) async {
     final fork = await _storage.forkSession(sessionId, messageIndex);
     if (fork == null) return null;
 
-    sessions.insert(0, SessionSummary(
-      id: fork.id,
-      title: fork.title,
-      createdAt: fork.createdAt,
-      updatedAt: fork.updatedAt,
-      folder: fork.folder,
-    ));
+    sessions.insert(
+        0,
+        SessionSummary(
+          id: fork.id,
+          title: fork.title,
+          createdAt: fork.createdAt,
+          updatedAt: fork.updatedAt,
+          folder: fork.folder,
+        ));
     currentSession = fork;
     _clearSessionScopedState();
     notifyListeners();
@@ -299,7 +326,9 @@ class ChatProvider extends ChangeNotifier {
       _skills = await SkillService.scanSkills();
       await MemoryService.getMemories();
 
-      final basePrompt = session.systemPrompt ?? _prefs.systemPrompt ?? AppConstants.defaultSystemPrompt;
+      final basePrompt = session.systemPrompt ??
+          _prefs.systemPrompt ??
+          AppConstants.defaultSystemPrompt;
       final skillIndex = SkillService.buildSkillIndex(_skills);
       final memoryPrompt = MemoryService.buildMemoryPrompt();
       final fullPrompt = basePrompt + skillIndex + memoryPrompt;
@@ -357,7 +386,8 @@ class ChatProvider extends ChangeNotifier {
                 _streamBuffer = StringBuffer();
                 agentStatus = AgentStatus.idle;
                 streamingText = '';
-                _appendNewAgentMessages(session, _agent!.messages, initialApiMsgCount);
+                _appendNewAgentMessages(
+                    session, _agent!.messages, initialApiMsgCount);
                 // Store token usage on the last assistant message
                 for (int i = session.messages.length - 1; i >= 0; i--) {
                   if (session.messages[i].role == 'assistant') {
@@ -454,7 +484,8 @@ class ChatProvider extends ChangeNotifier {
 
     // Save the old assistant text into _pendingAlternatives for reuse after regeneration
     if (lastAssistant != null) {
-      _pendingAlternatives = List<String>.from(lastAssistant.alternatives ?? []);
+      _pendingAlternatives =
+          List<String>.from(lastAssistant.alternatives ?? []);
       final currentText = lastAssistant.textContent;
       if (currentText.isNotEmpty) {
         _pendingAlternatives!.add(currentText);
@@ -569,8 +600,10 @@ class ChatProvider extends ChangeNotifier {
     // (two consecutive user messages without an assistant reply between them).
     notifyListeners();
 
-    final formatStr = session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
-    final format = formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
+    final formatStr =
+        session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
+    final format =
+        formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
 
     for (final model in models) {
       if (_disposed) break;
@@ -579,15 +612,19 @@ class ChatProvider extends ChangeNotifier {
           format: format,
           apiKey: apiKey,
           model: model,
-          baseUrl: session.baseUrlOverride ?? _prefs.baseUrl ?? (format == ApiFormat.anthropic
-              ? 'https://api.anthropic.com'
-              : 'https://api.openai.com'),
+          baseUrl: session.baseUrlOverride ??
+              _prefs.baseUrl ??
+              (format == ApiFormat.anthropic
+                  ? 'https://api.anthropic.com'
+                  : 'https://api.openai.com'),
           maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
           thinkingBudget: _prefs.thinkingBudget,
         );
         final llm = LlmService(config);
         try {
-          final basePrompt = session.systemPrompt ?? _prefs.systemPrompt ?? AppConstants.defaultSystemPrompt;
+          final basePrompt = session.systemPrompt ??
+              _prefs.systemPrompt ??
+              AppConstants.defaultSystemPrompt;
           final response = await llm.chat(
             system: basePrompt,
             messages: _truncateToFit(session.toApiMessages()),
@@ -636,6 +673,15 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> switchProfile(String profileId) async {
+    await _ensurePrefs();
+    _prefs.activeProfileId = profileId;
+    _cachedLlm?.dispose();
+    _cachedLlm = null;
+    _cachedLlmConfig = null;
+    notifyListeners();
+  }
+
   Future<void> updateSessionSystemPrompt(String? systemPrompt) async {
     if (currentSession == null) return;
     currentSession!.systemPrompt = systemPrompt;
@@ -646,23 +692,28 @@ class ChatProvider extends ChangeNotifier {
   LlmConfig _buildLlmConfig(PreferencesService prefs) {
     final session = currentSession;
 
-    final formatStr = session?.apiFormatOverride ?? prefs.apiFormat ?? 'anthropic';
-    final format = formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
+    final formatStr =
+        session?.apiFormatOverride ?? prefs.apiFormat ?? 'anthropic';
+    final format =
+        formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
 
     return LlmConfig(
       format: format,
       apiKey: prefs.apiKey!,
       model: session?.modelOverride ?? prefs.model ?? AppConstants.defaultModel,
-      baseUrl: session?.baseUrlOverride ?? prefs.baseUrl ?? (format == ApiFormat.anthropic
-          ? 'https://api.anthropic.com'
-          : 'https://api.openai.com'),
+      baseUrl: session?.baseUrlOverride ??
+          prefs.baseUrl ??
+          (format == ApiFormat.anthropic
+              ? 'https://api.anthropic.com'
+              : 'https://api.openai.com'),
       maxTokens: prefs.maxTokens ?? AppConstants.defaultMaxTokens,
       thinkingBudget: prefs.thinkingBudget,
       temperature: prefs.temperature,
     );
   }
 
-  List<Map<String, dynamic>> _truncateToFit(List<Map<String, dynamic>> messages) {
+  List<Map<String, dynamic>> _truncateToFit(
+      List<Map<String, dynamic>> messages) {
     return ChatContextUtils.truncateToFit(
       messages,
       maxChars: _prefs.contextLength,
@@ -705,10 +756,13 @@ class ChatProvider extends ChangeNotifier {
                 return TextContent(item['text'] as String);
               case 'image':
                 final source = item['source'];
-                final sourceMap = source is Map ? source : const <String, dynamic>{};
+                final sourceMap =
+                    source is Map ? source : const <String, dynamic>{};
                 return ImageContent(
                   data: (sourceMap['data'] ?? item['data'] ?? '') as String,
-                  mediaType: (sourceMap['media_type'] ?? item['media_type'] ?? 'image/png') as String,
+                  mediaType: (sourceMap['media_type'] ??
+                      item['media_type'] ??
+                      'image/png') as String,
                   filename: item['filename'] as String?,
                 );
               case 'tool_use':

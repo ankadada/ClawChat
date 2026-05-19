@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../models/provider_profile.dart';
 
 class PreferencesService {
   static const _keyAutoStart = 'auto_start_gateway';
@@ -26,14 +27,18 @@ class PreferencesService {
   static const _keyAllowSms = 'allow_sms';
   static const _keyWhisperModel = 'whisper_model';
   static const _keyTtsModel = 'tts_model';
+  static const _keyProviderProfiles = 'provider_profiles';
+  static const _keyActiveProfileId = 'active_provider_profile_id';
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
   );
 
   static PreferencesService? _instance;
-  static String? _cachedApiKey;
   Map<String, String> _cachedEnvVars = {};
+  List<ProviderProfile> _cachedProfiles = [];
+  String? _cachedActiveProfileId;
+  Future<void> _profileWriteChain = Future.value();
 
   late SharedPreferences _prefs;
   bool _initialized = false;
@@ -44,13 +49,19 @@ class PreferencesService {
 
   PreferencesService._();
 
+  @visibleForTesting
+  static void resetForTesting() {
+    _instance = null;
+  }
+
   Future<void> init() async {
     if (_initialized) return;
     _prefs = await SharedPreferences.getInstance();
     await _migrateApiKeyToSecureStorage();
     await _migrateEnvVarsToSecureStorage();
-    _cachedApiKey = await _secureStorage.read(key: _keyApiKey);
-    _cachedEnvVars = _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
+    await _loadProviderProfiles();
+    _cachedEnvVars =
+        _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
     _initialized = true;
   }
 
@@ -99,6 +110,175 @@ class PreferencesService {
     }
   }
 
+  Future<void> _loadProviderProfiles() async {
+    final storedProfiles = await _secureStorage.read(key: _keyProviderProfiles);
+    if (storedProfiles != null && storedProfiles.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(storedProfiles);
+        if (decoded is List) {
+          _cachedProfiles = decoded
+              .whereType<Map>()
+              .map((item) => ProviderProfile.fromJson(
+                    Map<String, dynamic>.from(item),
+                  ))
+              .toList();
+        }
+      } catch (e) {
+        debugPrint('Failed to read provider profiles: $e');
+      }
+    }
+
+    if (_cachedProfiles.isEmpty) {
+      await _migrateLegacyProviderProfile();
+    } else {
+      _cachedActiveProfileId = _prefs.getString(_keyActiveProfileId);
+      await _ensureValidActiveProfile();
+      await _deleteLegacyApiConfig();
+    }
+
+    if (_cachedProfiles.isEmpty) {
+      _cachedProfiles = [ProviderProfile.defaults()];
+      _cachedActiveProfileId = _cachedProfiles.first.id;
+      await _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+      await _persistProfilesNow();
+    }
+  }
+
+  Future<void> _migrateLegacyProviderProfile() async {
+    final legacyApiKey = await _secureStorage.read(key: _keyApiKey);
+    final legacyApiFormat = _prefs.getString(_keyApiFormat);
+    final legacyBaseUrl = _prefs.getString(_keyBaseUrl);
+    final legacyModel = _prefs.getString(_keyModel);
+    final legacyMaxTokens = _prefs.getInt(_keyMaxTokens);
+    final legacyThinkingBudget = _prefs.getInt(_keyThinkingBudget);
+    final legacyTemperature = _prefs.getDouble(_keyTemperature);
+
+    final hasLegacyConfig = [
+          legacyApiKey,
+          legacyApiFormat,
+          legacyBaseUrl,
+          legacyModel,
+        ].any((value) => value != null && value.isNotEmpty) ||
+        legacyMaxTokens != null ||
+        legacyThinkingBudget != null ||
+        legacyTemperature != null;
+
+    if (!hasLegacyConfig) return;
+
+    final profile = ProviderProfile.defaults().copyWith(
+      apiKey: legacyApiKey ?? '',
+      apiFormat: legacyApiFormat,
+      baseUrl: legacyBaseUrl ?? '',
+      model: legacyModel,
+      maxTokens: legacyMaxTokens,
+      thinkingBudget: legacyThinkingBudget,
+      temperature: legacyTemperature,
+    );
+    _cachedProfiles = [profile];
+    _cachedActiveProfileId = profile.id;
+    await _prefs.setString(_keyActiveProfileId, profile.id);
+    await _persistProfilesNow();
+    await _deleteLegacyApiConfig();
+  }
+
+  Future<void> _deleteLegacyApiConfig() async {
+    await _secureStorage.delete(key: _keyApiKey);
+    await _prefs.remove(_keyApiKey);
+    await _prefs.remove(_keyApiFormat);
+    await _prefs.remove(_keyBaseUrl);
+    await _prefs.remove(_keyModel);
+    await _prefs.remove(_keyMaxTokens);
+    await _prefs.remove(_keyThinkingBudget);
+    await _prefs.remove(_keyTemperature);
+  }
+
+  Future<void> _ensureValidActiveProfile() async {
+    if (_cachedProfiles.isEmpty) return;
+    final hasActive =
+        _cachedProfiles.any((p) => p.id == _cachedActiveProfileId);
+    if (hasActive) return;
+    _cachedActiveProfileId = _cachedProfiles.first.id;
+    await _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+  }
+
+  int _activeProfileIndex() {
+    if (_cachedProfiles.isEmpty) {
+      _cachedProfiles = [ProviderProfile.defaults()];
+      _cachedActiveProfileId = _cachedProfiles.first.id;
+      _persistProfiles();
+    }
+    final index =
+        _cachedProfiles.indexWhere((p) => p.id == _cachedActiveProfileId);
+    if (index >= 0) return index;
+    _cachedActiveProfileId = _cachedProfiles.first.id;
+    _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+    return 0;
+  }
+
+  ProviderProfile get _activeProfile => _cachedProfiles[_activeProfileIndex()];
+
+  void _replaceActiveProfile(ProviderProfile profile) {
+    _cachedProfiles[_activeProfileIndex()] = profile;
+    _persistProfiles();
+  }
+
+  Future<void> _persistProfilesNow() {
+    return _secureStorage.write(
+      key: _keyProviderProfiles,
+      value: jsonEncode(_cachedProfiles.map((p) => p.toJson()).toList()),
+    );
+  }
+
+  void _persistProfiles() {
+    final snapshot =
+        jsonEncode(_cachedProfiles.map((p) => p.toJson()).toList());
+    _profileWriteChain = _profileWriteChain.then((_) {
+      return _secureStorage.write(key: _keyProviderProfiles, value: snapshot);
+    }).catchError((e) {
+      debugPrint('Failed to persist provider profiles: $e');
+    });
+  }
+
+  List<ProviderProfile> get profiles {
+    _activeProfileIndex();
+    return _cachedProfiles.map((p) => p.copyWith()).toList();
+  }
+
+  set profiles(List<ProviderProfile> value) {
+    _cachedProfiles = value.isEmpty
+        ? [ProviderProfile.defaults()]
+        : value.map((p) => p.copyWith()).toList();
+    if (!_cachedProfiles.any((p) => p.id == _cachedActiveProfileId)) {
+      _cachedActiveProfileId = _cachedProfiles.first.id;
+      _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+    }
+    _persistProfiles();
+  }
+
+  String? get activeProfileId {
+    _activeProfileIndex();
+    return _cachedActiveProfileId;
+  }
+
+  set activeProfileId(String? value) {
+    if (value != null && _cachedProfiles.any((p) => p.id == value)) {
+      _cachedActiveProfileId = value;
+    } else if (_cachedProfiles.isNotEmpty) {
+      _cachedActiveProfileId = _cachedProfiles.first.id;
+    } else {
+      _cachedProfiles = [ProviderProfile.defaults()];
+      _cachedActiveProfileId = _cachedProfiles.first.id;
+      _persistProfiles();
+    }
+    if (_cachedActiveProfileId != null) {
+      _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+    } else {
+      _prefs.remove(_keyActiveProfileId);
+    }
+  }
+
+  ProviderProfile get activeProfile => _activeProfile.copyWith();
+
   bool get autoStartGateway => _prefs.getBool(_keyAutoStart) ?? false;
   set autoStartGateway(bool value) => _prefs.setBool(_keyAutoStart, value);
 
@@ -117,43 +297,51 @@ class PreferencesService {
     }
   }
 
-  String? get apiKey => _cachedApiKey;
-
-  set apiKey(String? v) {
-    _cachedApiKey = v;
-    if (v != null) {
-      _secureStorage.write(key: _keyApiKey, value: v).catchError((e) {
-        debugPrint('Failed to persist API key: $e');
-      });
-    } else {
-      _secureStorage.delete(key: _keyApiKey).catchError((e) {
-        debugPrint('Failed to delete API key: $e');
-      });
-    }
+  String? get apiKey {
+    final value = _activeProfile.apiKey.trim();
+    return value.isEmpty ? null : value;
   }
 
-  String? get apiFormat => _prefs.getString(_keyApiFormat);
-  set apiFormat(String? v) =>
-      v != null ? _prefs.setString(_keyApiFormat, v) : _prefs.remove(_keyApiFormat);
+  set apiKey(String? v) {
+    _replaceActiveProfile(_activeProfile.copyWith(apiKey: v ?? ''));
+  }
 
-  String? get baseUrl => _prefs.getString(_keyBaseUrl);
-  set baseUrl(String? v) =>
-      v != null ? _prefs.setString(_keyBaseUrl, v) : _prefs.remove(_keyBaseUrl);
+  String? get apiFormat => _activeProfile.apiFormat;
+  set apiFormat(String? v) => _replaceActiveProfile(
+      _activeProfile.copyWith(apiFormat: v ?? 'anthropic'));
 
-  String? get model => _prefs.getString(_keyModel);
-  set model(String? v) =>
-      v != null ? _prefs.setString(_keyModel, v) : _prefs.remove(_keyModel);
+  String? get baseUrl {
+    final value = _activeProfile.baseUrl.trim();
+    return value.isEmpty ? null : value;
+  }
 
-  int? get maxTokens => _prefs.getInt(_keyMaxTokens);
-  set maxTokens(int? v) =>
-      v != null ? _prefs.setInt(_keyMaxTokens, v) : _prefs.remove(_keyMaxTokens);
+  set baseUrl(String? v) => _replaceActiveProfile(
+        _activeProfile.copyWith(baseUrl: v ?? ''),
+      );
+
+  String? get model {
+    final value = _activeProfile.model.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  set model(String? v) => _replaceActiveProfile(
+        _activeProfile.copyWith(model: v ?? ''),
+      );
+
+  int? get maxTokens => _activeProfile.maxTokens;
+  set maxTokens(int? v) => _replaceActiveProfile(
+        _activeProfile.copyWith(maxTokens: v),
+      );
 
   String? get systemPrompt => _prefs.getString(_keySystemPrompt);
-  set systemPrompt(String? v) =>
-      v != null ? _prefs.setString(_keySystemPrompt, v) : _prefs.remove(_keySystemPrompt);
+  set systemPrompt(String? v) => v != null
+      ? _prefs.setString(_keySystemPrompt, v)
+      : _prefs.remove(_keySystemPrompt);
 
-  int get thinkingBudget => _prefs.getInt(_keyThinkingBudget) ?? 0;
-  set thinkingBudget(int v) => _prefs.setInt(_keyThinkingBudget, v);
+  int get thinkingBudget => _activeProfile.thinkingBudget;
+  set thinkingBudget(int v) => _replaceActiveProfile(
+        _activeProfile.copyWith(thinkingBudget: v),
+      );
 
   int get contextLength => _prefs.getInt(_keyContextLength) ?? 100000;
   set contextLength(int v) => _prefs.setInt(_keyContextLength, v);
@@ -161,8 +349,10 @@ class PreferencesService {
   bool get autoCompact => _prefs.getBool(_keyAutoCompact) ?? true;
   set autoCompact(bool v) => _prefs.setBool(_keyAutoCompact, v);
 
-  double get temperature => _prefs.getDouble(_keyTemperature) ?? 0.7;
-  set temperature(double v) => _prefs.setDouble(_keyTemperature, v);
+  double get temperature => _activeProfile.temperature;
+  set temperature(double v) => _replaceActiveProfile(
+        _activeProfile.copyWith(temperature: v),
+      );
 
   Map<String, String> get envVars {
     return Map<String, String>.from(_cachedEnvVars);
@@ -181,10 +371,12 @@ class PreferencesService {
         debugPrint('Failed to delete environment variables: $e');
       });
     } else {
-      _secureStorage.write(
+      _secureStorage
+          .write(
         key: _keyEnvVars,
         value: jsonEncode(_cachedEnvVars),
-      ).catchError((e) {
+      )
+          .catchError((e) {
         debugPrint('Failed to persist environment variables: $e');
       });
     }
@@ -214,13 +406,16 @@ class PreferencesService {
   bool get notifyOnComplete => _prefs.getBool(_keyNotifyOnComplete) ?? true;
   set notifyOnComplete(bool v) => _prefs.setBool(_keyNotifyOnComplete, v);
 
-  bool get allowPhoneCall => _initialized ? (_prefs.getBool(_keyAllowPhoneCall) ?? false) : false;
+  bool get allowPhoneCall =>
+      _initialized ? (_prefs.getBool(_keyAllowPhoneCall) ?? false) : false;
   set allowPhoneCall(bool v) => _prefs.setBool(_keyAllowPhoneCall, v);
 
-  bool get allowSms => _initialized ? (_prefs.getBool(_keyAllowSms) ?? false) : false;
+  bool get allowSms =>
+      _initialized ? (_prefs.getBool(_keyAllowSms) ?? false) : false;
   set allowSms(bool v) => _prefs.setBool(_keyAllowSms, v);
 
-  String? get whisperModel => _initialized ? _prefs.getString(_keyWhisperModel) : null;
+  String? get whisperModel =>
+      _initialized ? _prefs.getString(_keyWhisperModel) : null;
   set whisperModel(String? v) {
     if (v != null && v.isNotEmpty) {
       _prefs.setString(_keyWhisperModel, v);

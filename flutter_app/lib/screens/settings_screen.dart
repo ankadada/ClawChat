@@ -24,6 +24,12 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  static const _sectionAppearance = 'appearance';
+  static const _sectionVoice = 'voice';
+  static const _sectionAgentSkills = 'agent_skills';
+  static const _sectionData = 'data';
+  static const _sectionAbout = 'about';
+
   final _prefs = PreferencesService();
   final _modelController = TextEditingController();
   final _whisperModelController = TextEditingController();
@@ -42,6 +48,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _allowSms = false;
   List<String> _memories = [];
   bool _loadingMemories = false;
+  final Set<String> _expandedSections = {
+    _sectionAppearance,
+    _sectionVoice,
+    _sectionAgentSkills,
+    _sectionData,
+    _sectionAbout,
+  };
 
   @override
   void initState() {
@@ -89,7 +102,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  Widget _settingsGroup(ThemeData theme, String title, List<Widget> children) {
+  Widget _settingsGroup(
+    ThemeData theme,
+    String sectionId,
+    String title,
+    List<Widget> children, {
+    List<Widget> collapsedBadges = const [],
+  }) {
+    final expanded = _expandedSections.contains(sectionId);
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
       child: DecoratedBox(
@@ -99,23 +119,104 @@ class _SettingsScreenState extends State<SettingsScreen> {
           border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
         ),
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(4, 12, 4, 8),
+          padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Text(
-                  title,
-                  style: theme.textTheme.titleSmall?.copyWith(
-                    color: theme.colorScheme.primary,
-                    fontWeight: FontWeight.w700,
+              InkWell(
+                borderRadius: BorderRadius.circular(AppRadii.s),
+                onTap: () {
+                  setState(() {
+                    if (expanded) {
+                      _expandedSections.remove(sectionId);
+                    } else {
+                      _expandedSections.add(sectionId);
+                    }
+                  });
+                },
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          title,
+                          style: theme.textTheme.titleSmall?.copyWith(
+                            color: theme.colorScheme.primary,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      if (!expanded) ...collapsedBadges,
+                      AnimatedRotation(
+                        turns: expanded ? 0 : -0.25,
+                        duration: const Duration(milliseconds: 240),
+                        curve: Curves.easeOutCubic,
+                        child: Icon(
+                          Icons.expand_more,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-              const SizedBox(height: 8),
-              ...children,
+              AnimatedCrossFade(
+                firstChild: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const SizedBox(height: 8),
+                    ...children,
+                  ],
+                ),
+                secondChild: const SizedBox(width: double.infinity),
+                crossFadeState: expanded
+                    ? CrossFadeState.showFirst
+                    : CrossFadeState.showSecond,
+                duration: const Duration(milliseconds: 240),
+                firstCurve: Curves.easeOutCubic,
+                secondCurve: Curves.easeOutCubic,
+                sizeCurve: Curves.easeOutCubic,
+              ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _settingsNavigationGroup(ThemeData theme, List<Widget> children) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHighest.withAlpha(120),
+          borderRadius: BorderRadius.circular(AppRadii.m),
+          border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Column(children: children),
+        ),
+      ),
+    );
+  }
+
+  Widget _countBadge(ThemeData theme, String label) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.primary.withAlpha(20),
+          borderRadius: BorderRadius.circular(AppRadii.xl),
+          border: Border.all(color: theme.colorScheme.primary.withAlpha(55)),
+        ),
+        child: Text(
+          label,
+          style: theme.textTheme.labelSmall?.copyWith(
+            color: theme.colorScheme.primary,
+            fontWeight: FontWeight.w700,
           ),
         ),
       ),
@@ -149,13 +250,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   String _modelApiSubtitle() {
-    final format = _apiFormat == 'anthropic'
-        ? 'Anthropic'
-        : AppStrings.openaiCompatible;
+    final format =
+        _apiFormat == 'anthropic' ? 'Anthropic' : AppStrings.openaiCompatible;
     final model = _modelController.text.trim().isEmpty
         ? AppConstants.defaultModel
         : _modelController.text.trim();
-    return '$format · $model';
+    final profileName = _prefs.activeProfile.displayName;
+    return '$format · $profileName · $model';
   }
 
   Future<void> _reloadModelApiSummary() async {
@@ -235,27 +336,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
       appBar: AppBar(title: const Text(AppStrings.settings)),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
-            : ListView(
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                children: [
-                  _settingsGroup(theme, AppStrings.settingsAppearance, [
+          : ListView(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              children: [
+                _settingsGroup(
+                  theme,
+                  _sectionAppearance,
+                  AppStrings.settingsAppearance,
+                  [
                     Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 8),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(AppStrings.theme, style: TextStyle(
-                            color: theme.colorScheme.onSurfaceVariant,
-                            fontWeight: FontWeight.w600,
-                          )),
+                          Text(AppStrings.theme,
+                              style: TextStyle(
+                                color: theme.colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w600,
+                              )),
                           const SizedBox(height: 8),
                           SingleChildScrollView(
                             scrollDirection: Axis.horizontal,
                             child: SegmentedButton<String>(
                               segments: const [
-                                ButtonSegment(value: 'system', icon: Icon(Icons.settings_brightness), label: Text(AppStrings.themeSystem)),
-                                ButtonSegment(value: 'light', icon: Icon(Icons.light_mode), label: Text(AppStrings.themeLight)),
-                                ButtonSegment(value: 'dark', icon: Icon(Icons.dark_mode), label: Text(AppStrings.themeDark)),
+                                ButtonSegment(
+                                    value: 'system',
+                                    icon: Icon(Icons.settings_brightness),
+                                    label: Text(AppStrings.themeSystem)),
+                                ButtonSegment(
+                                    value: 'light',
+                                    icon: Icon(Icons.light_mode),
+                                    label: Text(AppStrings.themeLight)),
+                                ButtonSegment(
+                                    value: 'dark',
+                                    icon: Icon(Icons.dark_mode),
+                                    label: Text(AppStrings.themeDark)),
                               ],
                               selected: {_themeMode},
                               onSelectionChanged: (v) {
@@ -273,11 +389,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ),
                     Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 8),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('${AppStrings.fontSize}: ${(_fontScale * 100).round()}%'),
+                          Text(
+                              '${AppStrings.fontSize}: ${(_fontScale * 100).round()}%'),
                           Slider(
                             value: _fontScale,
                             min: 0.8,
@@ -303,13 +421,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         _prefs.notifyOnComplete = v;
                       },
                     ),
-                  ]),
-                  _settingsGroup(theme, AppStrings.settingsVoice, [
+                  ],
+                ),
+                _settingsGroup(
+                  theme,
+                  _sectionVoice,
+                  AppStrings.settingsVoice,
+                  [
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                       child: Text(
                         AppStrings.voiceRecognitionDesc,
-                        style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.hintColor),
                       ),
                     ),
                     Padding(
@@ -358,7 +482,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                       child: Text(
                         AppStrings.phoneIntegrationDesc,
-                        style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.hintColor),
                       ),
                     ),
                     SwitchListTile(
@@ -381,24 +506,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         _prefs.allowSms = v;
                       },
                     ),
-                  ]),
-                  _settingsGroup(theme, AppStrings.settingsModelApi, [
-                    ListTile(
-                      leading: const Icon(Icons.tune),
-                      title: const Text(AppStrings.settingsModelApi),
-                      subtitle: Text(_modelApiSubtitle()),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () async {
-                        await Navigator.of(context).push(
-                          CupertinoPageRoute(
-                            builder: (_) => const ModelApiSettingsScreen(),
-                          ),
-                        );
-                        await _reloadModelApiSummary();
-                      },
-                    ),
-                  ]),
-                  _settingsGroup(theme, AppStrings.settingsAgentSkills, [
+                  ],
+                ),
+                _settingsNavigationGroup(theme, [
+                  ListTile(
+                    leading: const Icon(Icons.tune),
+                    title: const Text(AppStrings.settingsModelApi),
+                    subtitle: Text(_modelApiSubtitle()),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () async {
+                      await Navigator.of(context).push(
+                        CupertinoPageRoute(
+                          builder: (_) => const ModelApiSettingsScreen(),
+                        ),
+                      );
+                      await _reloadModelApiSummary();
+                    },
+                  ),
+                ]),
+                _settingsGroup(
+                  theme,
+                  _sectionAgentSkills,
+                  AppStrings.settingsAgentSkills,
+                  [
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                       child: Align(
@@ -433,28 +563,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ),
                     if (_loadingSkills)
-                      const Center(child: Padding(
+                      const Center(
+                          child: Padding(
                         padding: EdgeInsets.all(16),
                         child: CircularProgressIndicator(),
                       ))
                     else if (_skills.isEmpty)
                       const Padding(
-                        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                        padding:
+                            EdgeInsets.symmetric(horizontal: 16, vertical: 16),
                         child: Text(AppStrings.noSkillsFound),
                       )
                     else
                       ..._skills.map((skill) => SwitchListTile(
-                        title: Text(skill.name),
-                        subtitle: Text(skill.description, maxLines: 2, overflow: TextOverflow.ellipsis),
-                        value: skill.enabled,
-                        onChanged: (v) async {
-                          HapticFeedback.lightImpact();
-                          setState(() => skill.enabled = v);
-                          await SkillService.setSkillEnabled(skill.name, v);
-                        },
-                      )),
-                  ]),
-                  _settingsGroup(theme, AppStrings.settingsData, [
+                            title: Text(skill.name),
+                            subtitle: Text(skill.description,
+                                maxLines: 2, overflow: TextOverflow.ellipsis),
+                            value: skill.enabled,
+                            onChanged: (v) async {
+                              HapticFeedback.lightImpact();
+                              setState(() => skill.enabled = v);
+                              await SkillService.setSkillEnabled(skill.name, v);
+                            },
+                          )),
+                  ],
+                  collapsedBadges: [
+                    _countBadge(
+                        theme, '${AppStrings.skills} ${_skills.length}'),
+                  ],
+                ),
+                _settingsGroup(
+                  theme,
+                  _sectionData,
+                  AppStrings.settingsData,
+                  [
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
@@ -471,20 +613,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     if (_envVars.isEmpty)
                       Padding(
                         padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                        child: Text(AppStrings.noEnvVars, style: TextStyle(color: theme.colorScheme.onSurfaceVariant)),
+                        child: Text(AppStrings.noEnvVars,
+                            style: TextStyle(
+                                color: theme.colorScheme.onSurfaceVariant)),
                       )
                     else
                       ..._envVars.entries.map((e) => ListTile(
-                        title: Text(e.key),
-                        subtitle: Text('••••••'),
-                        trailing: IconButton(
-                          icon: const Icon(Icons.delete_outline),
-                          onPressed: () {
-                            setState(() { _envVars.remove(e.key); });
-                            _prefs.envVars = _envVars;
-                          },
-                        ),
-                      )),
+                            title: Text(e.key),
+                            subtitle: Text('••••••'),
+                            trailing: IconButton(
+                              icon: const Icon(Icons.delete_outline),
+                              onPressed: () {
+                                setState(() {
+                                  _envVars.remove(e.key);
+                                });
+                                _prefs.envVars = _envVars;
+                              },
+                            ),
+                          )),
                     _settingsDivider(theme),
                     _subsectionHeader(theme, AppStrings.dataManagement),
                     ListTile(
@@ -518,87 +664,107 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                       child: Text(
                         AppStrings.memoryDesc,
-                        style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.hintColor),
                       ),
                     ),
                     if (_loadingMemories)
-                      const Center(child: Padding(
+                      const Center(
+                          child: Padding(
                         padding: EdgeInsets.all(16),
                         child: CircularProgressIndicator(),
                       ))
                     else if (_memories.isEmpty)
                       Padding(
                         padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                        child: Text(AppStrings.noMemories, style: TextStyle(color: theme.colorScheme.onSurfaceVariant)),
+                        child: Text(AppStrings.noMemories,
+                            style: TextStyle(
+                                color: theme.colorScheme.onSurfaceVariant)),
                       )
                     else
                       ..._memories.asMap().entries.map((entry) => ListTile(
-                        title: Text(entry.value),
-                        trailing: IconButton(
-                          icon: const Icon(Icons.delete_outline),
-                          onPressed: () => _removeMemory(entry.key),
-                        ),
-                      )),
-                  ]),
-                  _settingsGroup(theme, AppStrings.about, [
-                    _subsectionHeader(theme, AppStrings.systemInfo),
-                    ListTile(
-                      title: const Text(AppStrings.architecture),
-                      subtitle: Text(_arch),
-                      leading: const Icon(Icons.memory),
-                    ),
-                    ListTile(
-                      title: const Text('Rootfs'),
-                      subtitle: Text(_status['rootfsExists'] == true ? AppStrings.installed : AppStrings.notInstalled),
-                      leading: const Icon(Icons.storage),
-                    ),
-                    ListTile(
-                      title: const Text('Python3'),
-                      subtitle: Text(_status['pythonInstalled'] == true ? AppStrings.installed : AppStrings.notInstalled),
-                      leading: const Icon(Icons.code),
-                    ),
-                    _settingsDivider(theme),
-                    _subsectionHeader(theme, AppStrings.maintenance),
-                    ListTile(
-                      title: const Text(AppStrings.reinitialize),
-                      subtitle: const Text(AppStrings.reinstallAlpine),
-                      leading: const Icon(Icons.build),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () => Navigator.of(context).pushReplacement(
-                        CupertinoPageRoute(builder: (_) => const SetupWizardScreen()),
-                      ),
-                    ),
-                    _settingsDivider(theme),
-                    Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        children: [
-                          Text(AppStrings.appName, style: theme.textTheme.titleLarge),
-                          const SizedBox(height: 4),
-                          Text('v${AppConstants.version}', style: theme.textTheme.bodySmall),
-                          const SizedBox(height: 8),
-                          Text(AppStrings.aboutDescription,
-                              style: theme.textTheme.bodySmall,
-                              textAlign: TextAlign.center),
-                          const SizedBox(height: 16),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              TextButton.icon(
-                                icon: const Icon(Icons.code, size: 18),
-                                label: const Text('GitHub'),
-                                onPressed: () => launchUrl(Uri.parse(AppConstants.githubUrl)),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          Text('${AppStrings.license}: ${AppConstants.license}', style: theme.textTheme.bodySmall?.copyWith(
-                            color: theme.colorScheme.onSurfaceVariant,
+                            title: Text(entry.value),
+                            trailing: IconButton(
+                              icon: const Icon(Icons.delete_outline),
+                              onPressed: () => _removeMemory(entry.key),
+                            ),
                           )),
-                        ],
-                      ),
+                  ],
+                  collapsedBadges: [
+                    _countBadge(
+                        theme, '${AppStrings.envVars} ${_envVars.length}'),
+                    _countBadge(theme,
+                        '${AppStrings.memoryManagement} ${_memories.length}'),
+                  ],
+                ),
+                _settingsGroup(theme, _sectionAbout, AppStrings.about, [
+                  _subsectionHeader(theme, AppStrings.systemInfo),
+                  ListTile(
+                    title: const Text(AppStrings.architecture),
+                    subtitle: Text(_arch),
+                    leading: const Icon(Icons.memory),
+                  ),
+                  ListTile(
+                    title: const Text('Rootfs'),
+                    subtitle: Text(_status['rootfsExists'] == true
+                        ? AppStrings.installed
+                        : AppStrings.notInstalled),
+                    leading: const Icon(Icons.storage),
+                  ),
+                  ListTile(
+                    title: const Text('Python3'),
+                    subtitle: Text(_status['pythonInstalled'] == true
+                        ? AppStrings.installed
+                        : AppStrings.notInstalled),
+                    leading: const Icon(Icons.code),
+                  ),
+                  _settingsDivider(theme),
+                  _subsectionHeader(theme, AppStrings.maintenance),
+                  ListTile(
+                    title: const Text(AppStrings.reinitialize),
+                    subtitle: const Text(AppStrings.reinstallAlpine),
+                    leading: const Icon(Icons.build),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => Navigator.of(context).pushReplacement(
+                      CupertinoPageRoute(
+                          builder: (_) => const SetupWizardScreen()),
                     ),
-                  ]),
+                  ),
+                  _settingsDivider(theme),
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      children: [
+                        Text(AppStrings.appName,
+                            style: theme.textTheme.titleLarge),
+                        const SizedBox(height: 4),
+                        Text('v${AppConstants.version}',
+                            style: theme.textTheme.bodySmall),
+                        const SizedBox(height: 8),
+                        Text(AppStrings.aboutDescription,
+                            style: theme.textTheme.bodySmall,
+                            textAlign: TextAlign.center),
+                        const SizedBox(height: 16),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            TextButton.icon(
+                              icon: const Icon(Icons.code, size: 18),
+                              label: const Text('GitHub'),
+                              onPressed: () =>
+                                  launchUrl(Uri.parse(AppConstants.githubUrl)),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text('${AppStrings.license}: ${AppConstants.license}',
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            )),
+                      ],
+                    ),
+                  ),
+                ]),
               ],
             ),
     );
@@ -639,7 +805,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text(AppStrings.cancel)),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel)),
           FilledButton(
             onPressed: () => Navigator.pop(ctx, controller.text.trim()),
             child: const Text(AppStrings.importButton),
@@ -681,12 +849,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             TextField(
               controller: keyController,
-              decoration: const InputDecoration(labelText: AppStrings.envVarName),
+              decoration:
+                  const InputDecoration(labelText: AppStrings.envVarName),
             ),
             const SizedBox(height: 8),
             TextField(
               controller: valueController,
-              decoration: const InputDecoration(labelText: AppStrings.envVarValue),
+              decoration:
+                  const InputDecoration(labelText: AppStrings.envVarValue),
               obscureText: true,
             ),
           ],

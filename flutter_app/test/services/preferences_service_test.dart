@@ -1,0 +1,140 @@
+import 'dart:convert';
+
+import 'package:clawchat/constants.dart';
+import 'package:clawchat/models/provider_profile.dart';
+import 'package:clawchat/services/preferences_service.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  const secureStorageChannel =
+      MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+  late Map<String, String> secureStorage;
+
+  setUp(() {
+    secureStorage = {};
+    PreferencesService.resetForTesting();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(secureStorageChannel, (call) async {
+      final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+      final key = args['key']?.toString();
+      switch (call.method) {
+        case 'read':
+          return key == null ? null : secureStorage[key];
+        case 'write':
+          if (key != null) {
+            secureStorage[key] = args['value']?.toString() ?? '';
+          }
+          return null;
+        case 'delete':
+          if (key != null) secureStorage.remove(key);
+          return null;
+        case 'deleteAll':
+          secureStorage.clear();
+          return null;
+        case 'containsKey':
+          return key != null && secureStorage.containsKey(key);
+        case 'readAll':
+          return Map<String, String>.from(secureStorage);
+      }
+      return null;
+    });
+  });
+
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(secureStorageChannel, null);
+    PreferencesService.resetForTesting();
+  });
+
+  test('migrates legacy single API config into first provider profile',
+      () async {
+    SharedPreferences.setMockInitialValues({
+      'api_key': 'sk-legacy',
+      'api_format': ProviderProfile.openaiFormat,
+      'base_url': 'https://api.example.com',
+      'model': 'gpt-test',
+      'max_tokens': 1234,
+      'thinking_budget': 4096,
+      'temperature': 0.2,
+    });
+
+    final service = PreferencesService();
+    await service.init();
+
+    expect(service.profiles, hasLength(1));
+    final profile = service.profiles.single;
+    expect(profile.apiKey, 'sk-legacy');
+    expect(profile.apiFormat, ProviderProfile.openaiFormat);
+    expect(profile.baseUrl, 'https://api.example.com');
+    expect(profile.model, 'gpt-test');
+    expect(profile.maxTokens, 1234);
+    expect(profile.thinkingBudget, 4096);
+    expect(profile.temperature, 0.2);
+    expect(service.activeProfileId, profile.id);
+    expect(service.apiKey, 'sk-legacy');
+    expect(service.baseUrl, 'https://api.example.com');
+    expect(service.model, 'gpt-test');
+
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('api_key'), isNull);
+    expect(prefs.getString('api_format'), isNull);
+    expect(prefs.getString('base_url'), isNull);
+    expect(prefs.getString('model'), isNull);
+    expect(prefs.getInt('max_tokens'), isNull);
+    expect(prefs.getInt('thinking_budget'), isNull);
+    expect(prefs.getDouble('temperature'), isNull);
+    expect(secureStorage.containsKey('api_key'), isFalse);
+    expect(secureStorage.containsKey('provider_profiles'), isTrue);
+  });
+
+  test('delegates API getters and setters to the active profile', () async {
+    final first = ProviderProfile.defaults(name: 'First').copyWith(
+      id: 'first',
+      apiKey: 'sk-first',
+      model: 'claude-first',
+    );
+    final second = ProviderProfile.defaults(name: 'Second').copyWith(
+      id: 'second',
+      apiFormat: ProviderProfile.openaiFormat,
+      apiKey: 'sk-second',
+      baseUrl: 'https://api.second.example',
+      model: 'gpt-second',
+      maxTokens: 4096,
+      temperature: 0.4,
+    );
+    secureStorage['provider_profiles'] = jsonEncode([
+      first.toJson(),
+      second.toJson(),
+    ]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'first',
+    });
+
+    final service = PreferencesService();
+    await service.init();
+
+    expect(service.apiKey, 'sk-first');
+    expect(service.model, 'claude-first');
+
+    service.activeProfileId = 'second';
+    expect(service.apiFormat, ProviderProfile.openaiFormat);
+    expect(service.apiKey, 'sk-second');
+    expect(service.baseUrl, 'https://api.second.example');
+    expect(service.model, 'gpt-second');
+    expect(service.maxTokens, 4096);
+    expect(service.temperature, 0.4);
+
+    service.apiKey = 'sk-updated';
+    service.model = null;
+
+    final updated = service.profiles.firstWhere((p) => p.id == 'second');
+    expect(updated.apiKey, 'sk-updated');
+    expect(updated.model, isEmpty);
+    expect(service.model, isNull);
+    expect(service.activeProfile.effectiveModel, AppConstants.defaultModel);
+  });
+}

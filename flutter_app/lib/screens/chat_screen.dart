@@ -11,6 +11,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import '../app.dart';
 import '../constants.dart';
 import '../models/chat_models.dart';
+import '../models/provider_profile.dart';
 import '../providers/chat_provider.dart';
 import '../services/preferences_service.dart';
 import '../services/file_attachment_service.dart';
@@ -737,7 +738,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       bool hasStreaming,
                       AgentStatus status,
                       String? sessionId,
-                      String modelName
+                      String modelLabel
                     })>(
                   selector: (_, p) => (
                     messages: p.currentSession?.messages ?? [],
@@ -745,8 +746,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         p.streamingText.isNotEmpty,
                     status: p.agentStatus,
                     sessionId: p.currentSession?.id,
-                    modelName:
-                        p.currentSession?.modelOverride ?? p.configuredModel,
+                    modelLabel: p.currentSession?.modelOverride != null
+                        ? '${p.configuredProfileName} · '
+                            '${p.currentSession!.modelOverride}'
+                        : p.configuredModelLabel,
                   ),
                   builder: (context, data, __) {
                     final messages = data.messages;
@@ -763,7 +766,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
                     if (messages.isEmpty && !hasStreaming && !showTyping) {
                       return _buildEmptyState(
-                          theme, data.modelName, maxContentWidth);
+                          theme, data.modelLabel, maxContentWidth);
                     }
 
                     final itemCount = messages.length +
@@ -1752,6 +1755,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final provider = context.read<ChatProvider>();
     final prefs = PreferencesService();
     await prefs.init();
+    final profiles = prefs.profiles;
+    String selectedProfileId = prefs.activeProfileId ?? profiles.first.id;
 
     final controller = TextEditingController(
       text: provider.currentSession?.modelOverride ?? '',
@@ -1760,92 +1765,183 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     List<String> availableModels = [];
     bool loading = false;
 
+    ProviderProfile selectedProfile() {
+      return profiles.firstWhere(
+        (profile) => profile.id == selectedProfileId,
+        orElse: () => profiles.first,
+      );
+    }
+
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
           title: const Text(AppStrings.switchModel),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (loading)
-                const Padding(
-                  padding: EdgeInsets.all(16),
-                  child: CircularProgressIndicator(),
-                )
-              else if (availableModels.isNotEmpty)
-                DropdownButtonFormField<String>(
-                  value: availableModels.any((m) =>
-                          LlmService.modelIdFromDisplay(m) == controller.text)
-                      ? controller.text
-                      : null,
-                  decoration: InputDecoration(
-                    labelText: AppStrings.selectModel,
-                    hintText: AppStrings.useGlobalDefault,
-                  ),
-                  isExpanded: true,
-                  items: [
-                    const DropdownMenuItem(
-                        value: '', child: Text(AppStrings.useGlobalDefault)),
-                    ...availableModels.map((m) => DropdownMenuItem(
-                          value: LlmService.modelIdFromDisplay(m),
-                          child: Text(m, overflow: TextOverflow.ellipsis),
-                        )),
-                  ],
-                  onChanged: (v) => controller.text = v ?? '',
-                )
-              else
-                TextField(
-                  controller: controller,
-                  decoration: InputDecoration(
-                    labelText: AppStrings.modelName,
-                    hintText: AppStrings.useGlobalDefault,
-                    helperText: AppStrings.leaveEmptyForDefault,
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  AppStrings.providerProfiles,
+                  style: Theme.of(ctx).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 240),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      children: [
+                        for (final profile in profiles)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: profile.id == selectedProfileId
+                                    ? Theme.of(ctx)
+                                        .colorScheme
+                                        .primary
+                                        .withAlpha(18)
+                                    : Theme.of(ctx).colorScheme.surface,
+                                borderRadius: BorderRadius.circular(AppRadii.s),
+                                border: Border.all(
+                                  color: profile.id == selectedProfileId
+                                      ? Theme.of(ctx)
+                                          .colorScheme
+                                          .primary
+                                          .withAlpha(150)
+                                      : Theme.of(ctx)
+                                          .colorScheme
+                                          .outline
+                                          .withAlpha(45),
+                                ),
+                              ),
+                              child: RadioListTile<String>(
+                                value: profile.id,
+                                groupValue: selectedProfileId,
+                                onChanged: (value) {
+                                  if (value == null) return;
+                                  setDialogState(() {
+                                    selectedProfileId = value;
+                                    availableModels = [];
+                                  });
+                                },
+                                title: Text(
+                                  profile.displayName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                subtitle: Text(
+                                  '${profile.apiFormat == ProviderProfile.openaiFormat ? AppStrings.openaiCompatible : 'Anthropic'} · ${profile.effectiveModel}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                secondary: Icon(
+                                  profile.apiFormat ==
+                                          ProviderProfile.openaiFormat
+                                      ? Icons.api
+                                      : Icons.auto_awesome,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
-              const SizedBox(height: 8),
-              TextButton.icon(
-                icon: const Icon(Icons.refresh, size: 18),
-                label: const Text(AppStrings.fetchModelsButton),
-                onPressed: () async {
-                  setDialogState(() => loading = true);
-                  try {
-                    availableModels = await LlmService.fetchModels(
-                      apiFormat: prefs.apiFormat ?? 'anthropic',
-                      apiKey: prefs.apiKey ?? '',
-                      baseUrl: prefs.baseUrl,
-                    );
-                    if (availableModels.any(LlmService.isPresetModel) &&
-                        mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text(AppStrings.modelFetchPresetNotice),
-                        ),
+                const SizedBox(height: 12),
+                if (loading)
+                  const Padding(
+                    padding: EdgeInsets.all(16),
+                    child: Center(child: CircularProgressIndicator()),
+                  )
+                else if (availableModels.isNotEmpty)
+                  DropdownButtonFormField<String>(
+                    value: availableModels.any((m) =>
+                            LlmService.modelIdFromDisplay(m) == controller.text)
+                        ? controller.text
+                        : null,
+                    decoration: InputDecoration(
+                      labelText: AppStrings.selectModel,
+                      hintText: selectedProfile().effectiveModel,
+                    ),
+                    isExpanded: true,
+                    items: [
+                      const DropdownMenuItem(
+                          value: '', child: Text(AppStrings.useGlobalDefault)),
+                      ...availableModels.map((m) => DropdownMenuItem(
+                            value: LlmService.modelIdFromDisplay(m),
+                            child: Text(m, overflow: TextOverflow.ellipsis),
+                          )),
+                    ],
+                    onChanged: (v) => controller.text = v ?? '',
+                  )
+                else
+                  TextField(
+                    controller: controller,
+                    decoration: InputDecoration(
+                      labelText: AppStrings.modelName,
+                      hintText: selectedProfile().effectiveModel,
+                      helperText: AppStrings.leaveEmptyForDefault,
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: const Text(AppStrings.fetchModelsButton),
+                  onPressed: () async {
+                    final profile = selectedProfile();
+                    setDialogState(() => loading = true);
+                    try {
+                      availableModels = await LlmService.fetchModels(
+                        apiFormat: profile.apiFormat,
+                        apiKey: profile.apiKey,
+                        baseUrl: profile.baseUrl.trim().isEmpty
+                            ? null
+                            : profile.baseUrl,
                       );
-                    }
-                  } catch (e) {
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
+                      if (availableModels.any(LlmService.isPresetModel) &&
+                          mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(AppStrings.modelFetchPresetNotice),
+                          ),
+                        );
+                      }
+                    } catch (e) {
+                      if (mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
                             content: Text(
-                                AppStrings.modelFetchFailed(_briefError(e)))),
-                      );
+                              AppStrings.modelFetchFailed(_briefError(e)),
+                            ),
+                          ),
+                        );
+                      }
                     }
-                  }
-                  setDialogState(() => loading = false);
-                },
-              ),
-            ],
+                    setDialogState(() => loading = false);
+                  },
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(
                 onPressed: () => Navigator.pop(ctx),
                 child: const Text(AppStrings.cancel)),
             FilledButton(
-              onPressed: () {
-                provider.updateSessionModel(
-                    model: controller.text.isEmpty ? null : controller.text);
-                Navigator.pop(ctx);
+              onPressed: () async {
+                final selected = selectedProfile();
+                if (selected.id != prefs.activeProfileId) {
+                  await provider.switchProfile(selected.id);
+                }
+                await provider.updateSessionModel(
+                  model: controller.text.trim().isEmpty
+                      ? null
+                      : controller.text.trim(),
+                );
+                if (ctx.mounted) Navigator.pop(ctx);
               },
               child: const Text(AppStrings.confirm),
             ),

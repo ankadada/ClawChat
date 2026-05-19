@@ -2,10 +2,13 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
 
 import '../app.dart' show AppRadii;
 import '../constants.dart';
 import '../l10n/app_strings.dart';
+import '../models/provider_profile.dart';
+import '../providers/chat_provider.dart';
 import '../services/llm_service.dart';
 import '../services/preferences_service.dart';
 
@@ -18,18 +21,22 @@ class ModelApiSettingsScreen extends StatefulWidget {
 
 class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
   final _prefs = PreferencesService();
+  final _nameController = TextEditingController();
   final _apiKeyController = TextEditingController();
   final _baseUrlController = TextEditingController();
   final _modelController = TextEditingController();
 
-  String _apiFormat = 'anthropic';
+  List<ProviderProfile> _profiles = [];
+  String? _activeProfileId;
+  String? _editingProfileId;
+  String _apiFormat = ProviderProfile.anthropicFormat;
   bool _loading = true;
   List<String> _availableModels = [];
   bool _fetchingModels = false;
   bool _manualModelInput = false;
   int _thinkingLevel = 0;
-  int _contextLength = 100000;
-  double _temperature = 0.7;
+  int _contextLength = AppConstants.defaultContextLength;
+  double _temperature = AppConstants.defaultTemperature;
   bool _autoCompact = true;
   Timer? _saveDebounce;
   Timer? _savedIndicatorTimer;
@@ -55,22 +62,46 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
   Future<void> _loadSettings() async {
     await _prefs.init();
     if (!mounted) return;
-    final budget = _prefs.thinkingBudget;
-    final contextLength = _prefs.contextLength;
+    final profiles = _prefs.profiles;
+    final activeProfileId = _prefs.activeProfileId ?? profiles.first.id;
+    final editingProfile = profiles.firstWhere(
+      (profile) => profile.id == activeProfileId,
+      orElse: () => profiles.first,
+    );
     setState(() {
-      _apiKeyController.text = _prefs.apiKey ?? '';
-      _baseUrlController.text = _prefs.baseUrl ?? '';
-      _modelController.text = _prefs.model ?? AppConstants.defaultModel;
-      _apiFormat = _prefs.apiFormat ?? 'anthropic';
-      _thinkingLevel = _thinkingBudgets.indexOf(budget);
-      if (_thinkingLevel < 0) _thinkingLevel = 0;
+      _profiles = profiles;
+      _activeProfileId = activeProfileId;
+      _editingProfileId = editingProfile.id;
+      _loadProfileIntoForm(editingProfile);
+      final contextLength = _prefs.contextLength;
       _contextLength = _validContextLengths.contains(contextLength)
           ? contextLength
-          : 100000;
-      _temperature = _prefs.temperature;
+          : AppConstants.defaultContextLength;
       _autoCompact = _prefs.autoCompact;
       _loading = false;
     });
+  }
+
+  ProviderProfile? get _editingProfile {
+    final id = _editingProfileId;
+    if (id == null) return null;
+    for (final profile in _profiles) {
+      if (profile.id == id) return profile;
+    }
+    return null;
+  }
+
+  void _loadProfileIntoForm(ProviderProfile profile) {
+    _nameController.text = profile.name;
+    _apiKeyController.text = profile.apiKey;
+    _baseUrlController.text = profile.baseUrl;
+    _modelController.text = profile.effectiveModel;
+    _apiFormat = profile.apiFormat;
+    _thinkingLevel = _thinkingBudgets.indexOf(profile.thinkingBudget);
+    if (_thinkingLevel < 0) _thinkingLevel = 0;
+    _temperature = profile.temperature;
+    _availableModels = [];
+    _manualModelInput = false;
   }
 
   void _scheduleSave() {
@@ -85,19 +116,22 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     _saveDebounce = null;
     _hasPendingSave = false;
 
-    _prefs.apiKey = _apiKeyController.text.trim().isNotEmpty
-        ? _apiKeyController.text.trim()
-        : null;
-    _prefs.baseUrl = _baseUrlController.text.trim().isNotEmpty
-        ? _baseUrlController.text.trim()
-        : null;
-    _prefs.model = _modelController.text.trim().isNotEmpty
-        ? _modelController.text.trim()
-        : null;
-    _prefs.apiFormat = _apiFormat;
-    _prefs.thinkingBudget = _thinkingBudgets[_thinkingLevel];
+    final editingId = _editingProfileId;
+    final index = _profiles.indexWhere((profile) => profile.id == editingId);
+    if (index >= 0) {
+      _profiles[index] = _profiles[index].copyWith(
+        name: _nameController.text.trim(),
+        apiKey: _apiKeyController.text.trim(),
+        baseUrl: _baseUrlController.text.trim(),
+        model: _modelController.text.trim(),
+        apiFormat: _apiFormat,
+        thinkingBudget: _thinkingBudgets[_thinkingLevel],
+        temperature: _temperature,
+      );
+      _prefs.profiles = _profiles;
+      _prefs.activeProfileId = _activeProfileId;
+    }
     _prefs.contextLength = _contextLength;
-    _prefs.temperature = _temperature;
     _prefs.autoCompact = _autoCompact;
 
     if (!showIndicator || !mounted) return;
@@ -106,6 +140,94 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     _savedIndicatorTimer = Timer(const Duration(milliseconds: 1500), () {
       if (mounted) setState(() => _showSaved = false);
     });
+  }
+
+  void _editProfile(ProviderProfile profile, {bool makeActive = false}) {
+    _flushSave(showIndicator: false);
+    HapticFeedback.selectionClick();
+    setState(() {
+      if (makeActive) {
+        _activeProfileId = profile.id;
+        _prefs.activeProfileId = profile.id;
+        context.read<ChatProvider>().switchProfile(profile.id);
+      }
+      _editingProfileId = profile.id;
+      _loadProfileIntoForm(profile);
+    });
+  }
+
+  void _addProfile() {
+    _flushSave(showIndicator: false);
+    HapticFeedback.lightImpact();
+    final profile =
+        ProviderProfile.defaults(name: AppStrings.newProviderProfile);
+    setState(() {
+      _profiles = [..._profiles, profile];
+      _activeProfileId = profile.id;
+      _editingProfileId = profile.id;
+      _loadProfileIntoForm(profile);
+    });
+    _prefs.profiles = _profiles;
+    _prefs.activeProfileId = profile.id;
+    context.read<ChatProvider>().switchProfile(profile.id);
+  }
+
+  Future<bool> _confirmDeleteProfile(ProviderProfile profile) async {
+    if (_profiles.length <= 1) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text(AppStrings.cannotDeleteLastProfile)),
+        );
+      }
+      return false;
+    }
+
+    if (profile.id != _activeProfileId) return true;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.deleteActiveProfileTitle),
+        content:
+            Text(AppStrings.deleteActiveProfileConfirm(profile.displayName)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(AppStrings.delete),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
+  }
+
+  void _deleteProfile(ProviderProfile profile) {
+    _flushSave(showIndicator: false);
+    final remaining = _profiles.where((p) => p.id != profile.id).toList();
+    if (remaining.isEmpty) return;
+    final newActiveId =
+        _activeProfileId == profile.id ? remaining.first.id : _activeProfileId;
+    final newEditingId =
+        _editingProfileId == profile.id ? newActiveId : _editingProfileId;
+    final editingProfile = remaining.firstWhere(
+      (p) => p.id == newEditingId,
+      orElse: () => remaining.first,
+    );
+
+    setState(() {
+      _profiles = remaining;
+      _activeProfileId = newActiveId;
+      _editingProfileId = editingProfile.id;
+      _loadProfileIntoForm(editingProfile);
+    });
+    _prefs.profiles = _profiles;
+    _prefs.activeProfileId = _activeProfileId;
+    if (_activeProfileId != null) {
+      context.read<ChatProvider>().switchProfile(_activeProfileId!);
+    }
   }
 
   Future<void> _fetchModels() async {
@@ -177,6 +299,371 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     );
   }
 
+  Widget _groupHeader(
+    ThemeData theme,
+    String title, {
+    Widget? trailing,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 8, 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              title,
+              style: theme.textTheme.titleSmall?.copyWith(
+                color: theme.colorScheme.primary,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          if (trailing != null) trailing,
+        ],
+      ),
+    );
+  }
+
+  Widget _profileList(ThemeData theme) {
+    return _settingsGroup(theme, [
+      _groupHeader(
+        theme,
+        AppStrings.providerProfiles,
+        trailing: IconButton(
+          icon: const Icon(Icons.add),
+          tooltip: AppStrings.addProviderProfile,
+          onPressed: _addProfile,
+        ),
+      ),
+      ..._profiles.map((profile) => _profileTile(theme, profile)),
+    ]);
+  }
+
+  Widget _profileTile(ThemeData theme, ProviderProfile profile) {
+    final isActive = profile.id == _activeProfileId;
+    final isEditing = profile.id == _editingProfileId;
+    final formatLabel = profile.apiFormat == ProviderProfile.openaiFormat
+        ? AppStrings.openaiCompatible
+        : 'Anthropic';
+
+    return Dismissible(
+      key: ValueKey(profile.id),
+      direction: DismissDirection.endToStart,
+      confirmDismiss: (_) => _confirmDeleteProfile(profile),
+      onDismissed: (_) => _deleteProfile(profile),
+      background: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 20),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.error,
+          borderRadius: BorderRadius.circular(AppRadii.s),
+        ),
+        child: Icon(Icons.delete, color: theme.colorScheme.onError),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: isEditing
+                ? theme.colorScheme.primary.withAlpha(18)
+                : theme.colorScheme.surface,
+            borderRadius: BorderRadius.circular(AppRadii.s),
+            border: Border.all(
+              color: isActive
+                  ? theme.colorScheme.primary.withAlpha(160)
+                  : theme.colorScheme.outline.withAlpha(40),
+            ),
+          ),
+          child: ListTile(
+            leading: CircleAvatar(
+              backgroundColor: theme.colorScheme.primary.withAlpha(20),
+              foregroundColor: theme.colorScheme.primary,
+              child: Icon(
+                profile.apiFormat == ProviderProfile.openaiFormat
+                    ? Icons.api
+                    : Icons.auto_awesome,
+              ),
+            ),
+            title: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    profile.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+                if (isActive)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 6),
+                    child: Icon(
+                      Icons.check_circle,
+                      size: 18,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+              ],
+            ),
+            subtitle: Text(
+              '$formatLabel · ${profile.effectiveModel}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            trailing: IconButton(
+              icon: const Icon(Icons.edit_outlined),
+              tooltip: AppStrings.editProviderProfile,
+              onPressed: () => _editProfile(profile),
+            ),
+            onTap: () => _editProfile(profile, makeActive: true),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _profileForm(ThemeData theme) {
+    final profile = _editingProfile;
+    if (profile == null) return const SizedBox.shrink();
+
+    return _settingsGroup(theme, [
+      _groupHeader(theme, AppStrings.providerProfileDetails),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: TextField(
+          controller: _nameController,
+          onChanged: (_) => _scheduleSave(),
+          decoration: const InputDecoration(
+            labelText: AppStrings.providerProfileName,
+          ),
+        ),
+      ),
+      ListTile(
+        title: const Text(AppStrings.apiFormat),
+        subtitle: Text(_apiFormat == ProviderProfile.anthropicFormat
+            ? 'Anthropic'
+            : AppStrings.openaiCompatible),
+        trailing: DropdownButton<String>(
+          value: _apiFormat,
+          items: const [
+            DropdownMenuItem(
+              value: ProviderProfile.anthropicFormat,
+              child: Text('Anthropic'),
+            ),
+            DropdownMenuItem(
+              value: ProviderProfile.openaiFormat,
+              child: Text(AppStrings.openaiCompatible),
+            ),
+          ],
+          onChanged: (v) {
+            if (v == null) return;
+            setState(() {
+              _apiFormat = v;
+              _availableModels = [];
+              _manualModelInput = false;
+            });
+            _scheduleSave();
+          },
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: TextField(
+          controller: _apiKeyController,
+          obscureText: true,
+          onChanged: (_) => _scheduleSave(),
+          decoration: InputDecoration(
+            labelText: 'API Key',
+            hintText: _apiFormat == ProviderProfile.anthropicFormat
+                ? 'sk-ant-...'
+                : 'sk-...',
+          ),
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: TextField(
+          controller: _baseUrlController,
+          onChanged: (_) => _scheduleSave(),
+          decoration: InputDecoration(
+            labelText: AppStrings.baseUrlOptional,
+            hintText: _apiFormat == ProviderProfile.anthropicFormat
+                ? 'https://api.anthropic.com'
+                : 'https://api.openai.com',
+          ),
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            Expanded(
+              child: _fetchingModels
+                  ? const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(16),
+                        child: CircularProgressIndicator(),
+                      ),
+                    )
+                  : (_availableModels.isNotEmpty && !_manualModelInput)
+                      ? DropdownButtonFormField<String>(
+                          value: _availableModels.any((m) =>
+                                  LlmService.modelIdFromDisplay(m) ==
+                                  _modelController.text)
+                              ? _modelController.text
+                              : null,
+                          decoration: const InputDecoration(
+                            labelText: AppStrings.selectModel,
+                          ),
+                          items: [
+                            ..._availableModels.map(
+                              (m) => DropdownMenuItem(
+                                value: LlmService.modelIdFromDisplay(m),
+                                child: Text(
+                                  m,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                            const DropdownMenuItem(
+                              value: '__manual__',
+                              child: Text(AppStrings.manualInput),
+                            ),
+                          ],
+                          onChanged: (v) {
+                            if (v == '__manual__') {
+                              setState(() => _manualModelInput = true);
+                            } else if (v != null) {
+                              _modelController.text = v;
+                              _scheduleSave();
+                            }
+                          },
+                        )
+                      : TextField(
+                          controller: _modelController,
+                          onChanged: (_) => _scheduleSave(),
+                          decoration: InputDecoration(
+                            labelText: AppStrings.model,
+                            hintText: AppConstants.defaultModel,
+                          ),
+                        ),
+            ),
+            const SizedBox(width: 8),
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              tooltip: AppStrings.fetchModelsButton,
+              onPressed: _fetchingModels ? null : _fetchModels,
+            ),
+          ],
+        ),
+      ),
+    ]);
+  }
+
+  Widget _advancedSettings(ThemeData theme) {
+    return _settingsGroup(theme, [
+      _groupHeader(theme, AppStrings.advancedModelSettings),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('${AppStrings.thinkingIntensity}: '
+                '${_thinkingLabels[_thinkingLevel]}'),
+            Slider(
+              value: _thinkingLevel.toDouble(),
+              min: 0,
+              max: 4,
+              divisions: 4,
+              label: _thinkingLabels[_thinkingLevel],
+              onChanged: (v) {
+                setState(() => _thinkingLevel = v.round());
+                _scheduleSave();
+              },
+            ),
+          ],
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(AppStrings.contextLength),
+            const SizedBox(height: 8),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: SegmentedButton<int>(
+                segments: const [
+                  ButtonSegment(value: 50000, label: Text(AppStrings.chars50k)),
+                  ButtonSegment(
+                    value: 100000,
+                    label: Text(AppStrings.chars100k),
+                  ),
+                  ButtonSegment(
+                    value: 200000,
+                    label: Text(AppStrings.chars200k),
+                  ),
+                ],
+                selected: {_contextLength},
+                onSelectionChanged: (v) {
+                  HapticFeedback.lightImpact();
+                  setState(() => _contextLength = v.first);
+                  _scheduleSave();
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('${AppStrings.temperature}: '
+                '${_temperature.toStringAsFixed(1)}'),
+            Row(
+              children: [
+                const Text(
+                  AppStrings.temperatureLow,
+                  style: TextStyle(fontSize: 12),
+                ),
+                Expanded(
+                  child: Slider(
+                    value: _temperature,
+                    min: 0.0,
+                    max: 1.0,
+                    divisions: 10,
+                    label: _temperature.toStringAsFixed(1),
+                    onChanged: (v) {
+                      setState(() => _temperature = v);
+                      _scheduleSave();
+                    },
+                  ),
+                ),
+                const Text(
+                  AppStrings.temperatureHigh,
+                  style: TextStyle(fontSize: 12),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+      SwitchListTile(
+        title: const Text(AppStrings.autoCompact),
+        subtitle: const Text(AppStrings.autoCompactSubtitle),
+        value: _autoCompact,
+        onChanged: (v) {
+          HapticFeedback.lightImpact();
+          setState(() => _autoCompact = v);
+          _scheduleSave();
+        },
+      ),
+    ]);
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -208,198 +695,9 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
           : ListView(
               padding: const EdgeInsets.symmetric(vertical: 4),
               children: [
-                _settingsGroup(theme, [
-                  ListTile(
-                    title: const Text(AppStrings.apiFormat),
-                    subtitle: Text(_apiFormat == 'anthropic'
-                        ? 'Anthropic'
-                        : AppStrings.openaiCompatible),
-                    trailing: DropdownButton<String>(
-                      value: _apiFormat,
-                      items: const [
-                        DropdownMenuItem(value: 'anthropic', child: Text('Anthropic')),
-                        DropdownMenuItem(value: 'openai', child: Text(AppStrings.openaiCompatible)),
-                      ],
-                      onChanged: (v) {
-                        if (v == null) return;
-                        setState(() {
-                          _apiFormat = v;
-                          _availableModels = [];
-                          _manualModelInput = false;
-                        });
-                        _scheduleSave();
-                      },
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: TextField(
-                      controller: _apiKeyController,
-                      obscureText: true,
-                      onChanged: (_) => _scheduleSave(),
-                      decoration: InputDecoration(
-                        labelText: 'API Key',
-                        hintText: _apiFormat == 'anthropic' ? 'sk-ant-...' : 'sk-...',
-                      ),
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: TextField(
-                      controller: _baseUrlController,
-                      onChanged: (_) => _scheduleSave(),
-                      decoration: InputDecoration(
-                        labelText: AppStrings.baseUrlOptional,
-                        hintText: _apiFormat == 'anthropic'
-                            ? 'https://api.anthropic.com'
-                            : 'https://api.openai.com',
-                      ),
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: _fetchingModels
-                              ? const Center(child: Padding(
-                                  padding: EdgeInsets.all(16),
-                                  child: CircularProgressIndicator(),
-                                ))
-                              : (_availableModels.isNotEmpty && !_manualModelInput)
-                                  ? DropdownButtonFormField<String>(
-                                      value: _availableModels.any((m) =>
-                                              LlmService.modelIdFromDisplay(m) ==
-                                              _modelController.text)
-                                          ? _modelController.text
-                                          : null,
-                                      decoration: const InputDecoration(
-                                        labelText: AppStrings.selectModel,
-                                      ),
-                                      items: [
-                                        ..._availableModels.map((m) => DropdownMenuItem(
-                                          value: LlmService.modelIdFromDisplay(m),
-                                          child: Text(m, overflow: TextOverflow.ellipsis),
-                                        )),
-                                        const DropdownMenuItem(
-                                          value: '__manual__',
-                                          child: Text(AppStrings.manualInput),
-                                        ),
-                                      ],
-                                      onChanged: (v) {
-                                        if (v == '__manual__') {
-                                          setState(() => _manualModelInput = true);
-                                        } else if (v != null) {
-                                          _modelController.text = v;
-                                          _scheduleSave();
-                                        }
-                                      },
-                                    )
-                                  : TextField(
-                                      controller: _modelController,
-                                      onChanged: (_) => _scheduleSave(),
-                                      decoration: InputDecoration(
-                                        labelText: AppStrings.model,
-                                        hintText: AppConstants.defaultModel,
-                                      ),
-                                    ),
-                        ),
-                        const SizedBox(width: 8),
-                        IconButton(
-                          icon: const Icon(Icons.refresh),
-                          tooltip: AppStrings.fetchModelsButton,
-                          onPressed: _fetchingModels ? null : _fetchModels,
-                        ),
-                      ],
-                    ),
-                  ),
-                ]),
-                _settingsGroup(theme, [
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('${AppStrings.thinkingIntensity}: ${_thinkingLabels[_thinkingLevel]}'),
-                        Slider(
-                          value: _thinkingLevel.toDouble(),
-                          min: 0,
-                          max: 4,
-                          divisions: 4,
-                          label: _thinkingLabels[_thinkingLevel],
-                          onChanged: (v) {
-                            setState(() => _thinkingLevel = v.round());
-                            _scheduleSave();
-                          },
-                        ),
-                      ],
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(AppStrings.contextLength),
-                        const SizedBox(height: 8),
-                        SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: SegmentedButton<int>(
-                            segments: const [
-                              ButtonSegment(value: 50000, label: Text(AppStrings.chars50k)),
-                              ButtonSegment(value: 100000, label: Text(AppStrings.chars100k)),
-                              ButtonSegment(value: 200000, label: Text(AppStrings.chars200k)),
-                            ],
-                            selected: {_contextLength},
-                            onSelectionChanged: (v) {
-                              HapticFeedback.lightImpact();
-                              setState(() => _contextLength = v.first);
-                              _scheduleSave();
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('${AppStrings.temperature}: ${_temperature.toStringAsFixed(1)}'),
-                        Row(
-                          children: [
-                            const Text(AppStrings.temperatureLow, style: TextStyle(fontSize: 12)),
-                            Expanded(
-                              child: Slider(
-                                value: _temperature,
-                                min: 0.0,
-                                max: 1.0,
-                                divisions: 10,
-                                label: _temperature.toStringAsFixed(1),
-                                onChanged: (v) {
-                                  setState(() => _temperature = v);
-                                  _scheduleSave();
-                                },
-                              ),
-                            ),
-                            const Text(AppStrings.temperatureHigh, style: TextStyle(fontSize: 12)),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                  SwitchListTile(
-                    title: const Text(AppStrings.autoCompact),
-                    subtitle: const Text(AppStrings.autoCompactSubtitle),
-                    value: _autoCompact,
-                    onChanged: (v) {
-                      HapticFeedback.lightImpact();
-                      setState(() => _autoCompact = v);
-                      _scheduleSave();
-                    },
-                  ),
-                ]),
+                _profileList(theme),
+                _profileForm(theme),
+                _advancedSettings(theme),
               ],
             ),
     );
@@ -410,6 +708,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     _flushSave(showIndicator: false);
     _saveDebounce?.cancel();
     _savedIndicatorTimer?.cancel();
+    _nameController.dispose();
     _apiKeyController.dispose();
     _baseUrlController.dispose();
     _modelController.dispose();
