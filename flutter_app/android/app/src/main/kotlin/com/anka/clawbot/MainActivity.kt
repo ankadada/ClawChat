@@ -388,6 +388,10 @@ class MainActivity : FlutterActivity() {
                 }
                 "startSpeechRecognition" -> {
                     try {
+                        if (pendingSpeechResult != null) {
+                            result.error("SPEECH_BUSY", "Speech recognition already in progress", null)
+                            return@setMethodCallHandler
+                        }
                         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                             putExtra(RecognizerIntent.EXTRA_LANGUAGE, call.argument<String>("language") ?: "zh-CN")
@@ -395,12 +399,28 @@ class MainActivity : FlutterActivity() {
                         }
                         if (intent.resolveActivity(packageManager) != null) {
                             pendingSpeechResult = result
-                            startActivityForResult(intent, SPEECH_REQUEST)
+                            try {
+                                startActivityForResult(intent, SPEECH_REQUEST)
+                            } catch (e: Exception) {
+                                pendingSpeechResult = null
+                                result.error("SPEECH_ERROR", e.message, null)
+                            }
                         } else {
                             result.error("SPEECH_UNAVAILABLE", "No speech recognition available", null)
                         }
                     } catch (e: Exception) {
+                        pendingSpeechResult = null
                         result.error("SPEECH_ERROR", e.message, null)
+                    }
+                }
+                "cancelSpeechRecognition" -> {
+                    try {
+                        pendingSpeechResult?.success("")
+                        pendingSpeechResult = null
+                        result.success(true)
+                    } catch (e: Exception) {
+                        pendingSpeechResult = null
+                        result.error("SPEECH_CANCEL_ERROR", e.message, null)
                     }
                 }
                 "shareText" -> {
@@ -562,6 +582,8 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        try { pendingSpeechResult?.success("") } catch (_: Exception) {}
+        pendingSpeechResult = null
         try { mediaRecorder?.stop() } catch (_: Exception) {}
         try { mediaRecorder?.release() } catch (_: Exception) {}
         mediaRecorder = null

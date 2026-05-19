@@ -142,6 +142,11 @@ class NativeBridge {
     });
   }
 
+  static Future<bool> cancelSpeechRecognition() async {
+    return await _channel.invokeMethod<bool>('cancelSpeechRecognition') ??
+        false;
+  }
+
   static Future<bool> shareText({
     required String text,
     String? subject,

@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
+import '../l10n/app_strings.dart';
 import 'api_validator.dart';
 import 'preferences_service.dart';
 
@@ -21,6 +22,7 @@ class TtsService extends ChangeNotifier {
   bool isSpeaking = false;
   bool isLoading = false;
   String? _currentMessageId;
+  String? _currentRouteLabel;
   String? _lastSpokenText;
   String? lastError;
   static const int _maxSystemFailures = 3;
@@ -38,6 +40,9 @@ class TtsService extends ChangeNotifier {
   bool isLoadingMessage(String messageId) =>
       isLoading && _currentMessageId == messageId;
 
+  String? routeLabelForMessage(String messageId) =>
+      _currentMessageId == messageId ? _currentRouteLabel : null;
+
   bool get isAvailable {
     final ttsModel = PreferencesService().ttsModel;
     return _systemAvailable || (ttsModel != null && ttsModel.isNotEmpty);
@@ -50,6 +55,7 @@ class TtsService extends ChangeNotifier {
       if (call.method == 'onAudioComplete') {
         isSpeaking = false;
         _currentMessageId = null;
+        _currentRouteLabel = null;
         notifyListeners();
       }
     });
@@ -88,11 +94,13 @@ class TtsService extends ChangeNotifier {
         _systemFailCount = 0;
         isSpeaking = false;
         _currentMessageId = null;
+        _currentRouteLabel = null;
         notifyListeners();
       });
       _tts.setCancelHandler(() {
         isSpeaking = false;
         _currentMessageId = null;
+        _currentRouteLabel = null;
         notifyListeners();
       });
       _tts.setErrorHandler((msg) {
@@ -109,10 +117,13 @@ class TtsService extends ChangeNotifier {
         final msgId = _currentMessageId;
         if (ttsModel != null && ttsModel.isNotEmpty && text != null && msgId != null) {
           debugPrint('TTS: system failed, falling back to API');
+          _currentRouteLabel = AppStrings.ttsApiEngine(ttsModel);
+          notifyListeners();
           _speakViaApi(text, ttsModel, prefs).then((ok) {
             if (!ok) {
               isSpeaking = false;
               _currentMessageId = null;
+              _currentRouteLabel = null;
               lastError = '系统语音合成失败，API 也失败';
               notifyListeners();
             }
@@ -120,6 +131,7 @@ class TtsService extends ChangeNotifier {
         } else {
           isSpeaking = false;
           _currentMessageId = null;
+          _currentRouteLabel = null;
           lastError = ttsModel == null || ttsModel.isEmpty
               ? '系统语音合成失败（可能缺少中文语音包），请在设置 → 语音能力 中填写 TTS 模型名称启用 API 兜底'
               : '语音合成出错: $msg';
@@ -208,6 +220,7 @@ class TtsService extends ChangeNotifier {
       _systemAvailable = true;
       await _tts.stop();
       _currentMessageId = null;
+      _currentRouteLabel = null;
       _lastSpokenText = null;
       await _tts.setSpeechRate(0.5);
       await _tts.setVolume(1.0);
@@ -232,6 +245,7 @@ class TtsService extends ChangeNotifier {
 
     await stop();
     _currentMessageId = messageId;
+    _currentRouteLabel = null;
     lastError = null;
 
     final truncated = text.length > 4000 ? text.substring(0, 4000) : text;
@@ -239,6 +253,7 @@ class TtsService extends ChangeNotifier {
 
     if (_systemAvailable) {
       isSpeaking = true;
+      _currentRouteLabel = AppStrings.ttsSystemEngine;
       notifyListeners();
       await _tts.speak(truncated);
       return true;
@@ -249,17 +264,20 @@ class TtsService extends ChangeNotifier {
     final ttsModel = prefs.ttsModel;
     if (ttsModel == null || ttsModel.isEmpty) {
       lastError = '当前设备没有语音引擎，请在设置 → 语音识别 中填写 TTS 模型名称（如 tts-1）';
+      _currentRouteLabel = null;
       notifyListeners();
       return false;
     }
 
     isSpeaking = true;
+    _currentRouteLabel = AppStrings.ttsApiEngine(ttsModel);
     notifyListeners();
 
     final ok = await _speakViaApi(truncated, ttsModel, prefs);
     if (!ok) {
       isSpeaking = false;
       _currentMessageId = null;
+      _currentRouteLabel = null;
       notifyListeners();
     }
     return ok;
@@ -347,6 +365,7 @@ class TtsService extends ChangeNotifier {
     } catch (_) {}
     isSpeaking = false;
     _currentMessageId = null;
+    _currentRouteLabel = null;
     notifyListeners();
   }
 

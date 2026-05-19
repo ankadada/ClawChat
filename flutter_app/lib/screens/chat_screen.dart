@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
@@ -16,6 +17,7 @@ import '../services/file_attachment_service.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/tools/tool_policy.dart';
+import '../services/voice_input_state.dart';
 import '../widgets/streaming_text.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/agent_status_bar.dart';
@@ -26,6 +28,16 @@ import 'artifact_preview_screen.dart';
 import 'settings_screen.dart';
 import 'chat_sessions_screen.dart';
 import '../l10n/app_strings.dart';
+
+enum _NativeSpeechOutcome {
+  recognized,
+  empty,
+  unavailable,
+  busy,
+  stale,
+  timedOut,
+  failed,
+}
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -41,9 +53,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final stt.SpeechToText _speech = stt.SpeechToText();
   final TtsService _tts = TtsService();
   final WhisperService _whisper = WhisperService();
-  bool _isListening = false;
-  bool _isWhisperRecording = false;
-  bool _nativeRecognitionCancelled = false;
+  final VoiceInputStateMachine _voiceInput = VoiceInputStateMachine();
   bool _showScrollToBottom = false;
   bool _approvalDialogOpen = false;
   ToolApprovalRequest? _shownApprovalRequest;
@@ -51,6 +61,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final List<_PendingAttachmentPreview> _pendingAttachmentPreviews = [];
   final Set<String> _seenMessageAnimationIds = {};
   String? _seenAnimationSessionId;
+
+  bool get _isListening => _voiceInput.isListening;
+  bool get _isWhisperRecording => _voiceInput.isWhisperRecording;
 
   @override
   void initState() {
@@ -271,8 +284,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _initSpeech() async {
     try {
       final available = await _speech.initialize(
+        onStatus: (status) {
+          if (status == 'done' || status == 'notListening') {
+            if (mounted &&
+                _voiceInput.phase == VoiceInputPhase.pluginRecognition) {
+              setState(() => _voiceInput.cancel());
+            }
+          }
+        },
         onError: (error) {
-          if (mounted) setState(() => _isListening = false);
+          debugPrint('Speech error: ${error.errorMsg}');
+          if (mounted &&
+              _voiceInput.phase == VoiceInputPhase.pluginRecognition) {
+            setState(() => _voiceInput.cancel());
+          }
         },
       );
       debugPrint('Speech init: available=$available');
@@ -285,6 +310,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _tts.removeListener(_onTtsStateChanged);
+    unawaited(NativeBridge.cancelSpeechRecognition());
+    unawaited(_whisper.cancelRecording());
     _speech.cancel();
     _scrollController.removeListener(_handleScroll);
     _inputController.dispose();
@@ -294,36 +321,77 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _startListening() async {
-    // Check and request RECORD_AUDIO permission
+    final token = _voiceInput.beginStart();
+    if (token == null) return;
+    if (mounted) setState(() {});
+    await _startListeningImpl(token);
+  }
+
+  Future<void> _startListeningImpl(int token) async {
+    if (!await _ensureAudioPermission(token)) return;
+    if (!_voiceInput.isCurrent(token)) return;
+
+    final nativeOutcome = await _tryNativeSpeechRecognition(token);
+    switch (nativeOutcome) {
+      case _NativeSpeechOutcome.recognized:
+      case _NativeSpeechOutcome.empty:
+      case _NativeSpeechOutcome.busy:
+      case _NativeSpeechOutcome.stale:
+      case _NativeSpeechOutcome.timedOut:
+        return;
+      case _NativeSpeechOutcome.unavailable:
+      case _NativeSpeechOutcome.failed:
+        break;
+    }
+
+    await _tryPluginSpeechRecognition(token);
+  }
+
+  Future<bool> _ensureAudioPermission(int token) async {
     try {
       final hasPermission = await NativeBridge.hasAudioPermission();
       if (!hasPermission) {
         await NativeBridge.requestAudioPermission();
-        // Wait for user to respond to permission dialog
         await Future.delayed(const Duration(milliseconds: 500));
         final granted = await NativeBridge.hasAudioPermission();
         if (!granted) {
+          if (mounted && _voiceInput.isCurrent(token)) {
+            setState(() => _voiceInput.complete(token));
+          }
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text(AppStrings.audioPermissionDenied)),
             );
           }
-          return;
+          return false;
         }
       }
-    } catch (_) {}
+    } catch (_) {
+      // Native recognition will surface a better error if permission probing
+      // itself is unavailable on the current platform.
+    }
+    return _voiceInput.isCurrent(token);
+  }
 
+  Future<void> _tryPluginSpeechRecognition(int token) async {
     if (!_speech.isAvailable) {
       await _initSpeech();
     }
+    if (!_voiceInput.isCurrent(token)) return;
 
     if (_speech.isAvailable) {
-      setState(() => _isListening = true);
+      if (mounted) {
+        setState(() => _voiceInput.enterPluginRecognition(token));
+      } else {
+        _voiceInput.enterPluginRecognition(token);
+      }
       try {
         await _speech.listen(
           onResult: (result) {
+            if (!_voiceInput.isCurrent(token)) return;
             if (result.finalResult) {
               _appendRecognizedText(result.recognizedWords);
+              if (mounted) setState(() => _voiceInput.complete(token));
             }
           },
           localeId: 'zh_CN',
@@ -331,19 +399,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         );
       } catch (e) {
         debugPrint('Speech listen failed: $e');
-        if (mounted) setState(() => _isListening = false);
-        final recognized = await _tryNativeSpeechRecognition();
-        if (!recognized) {
-          _startWhisperRecording();
-        }
+        await _startWhisperRecording(token);
       }
-    } else {
-      final recognized = await _tryNativeSpeechRecognition();
-      if (!recognized) {
-        // Fallback: native recording + Whisper API transcription
-        _startWhisperRecording();
-      }
+      return;
     }
+
+    await _startWhisperRecording(token);
   }
 
   void _appendRecognizedText(String text) {
@@ -354,30 +415,60 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Future<bool> _tryNativeSpeechRecognition() async {
+  Future<_NativeSpeechOutcome> _tryNativeSpeechRecognition(int token) async {
     try {
-      _nativeRecognitionCancelled = false;
-      if (mounted) setState(() => _isListening = true);
-      final result = await NativeBridge.startSpeechRecognition(language: 'zh-CN');
-      if (_nativeRecognitionCancelled) return false;
-      if (mounted) setState(() => _isListening = false);
+      if (mounted) {
+        setState(() => _voiceInput.enterNativeRecognition(token));
+      } else {
+        _voiceInput.enterNativeRecognition(token);
+      }
+      final result = await NativeBridge.startSpeechRecognition(language: 'zh-CN')
+          .timeout(const Duration(seconds: 70));
+      if (!_voiceInput.isCurrent(token)) return _NativeSpeechOutcome.stale;
+
       final text = result?.trim();
       if (text == null || text.isEmpty) {
-        return false;
+        if (mounted) setState(() => _voiceInput.complete(token));
+        return _NativeSpeechOutcome.empty;
       }
       _appendRecognizedText(text);
-      return true;
+      if (mounted) setState(() => _voiceInput.complete(token));
+      return _NativeSpeechOutcome.recognized;
+    } on TimeoutException catch (e) {
+      debugPrint('Native speech recognition timed out: $e');
+      if (mounted && _voiceInput.isCurrent(token)) {
+        setState(() => _voiceInput.complete(token));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text(AppStrings.voiceUnavailable)),
+        );
+      }
+      return _NativeSpeechOutcome.timedOut;
+    } on PlatformException catch (e) {
+      debugPrint('Native speech recognition failed: ${e.code} ${e.message}');
+      if (e.code == 'SPEECH_BUSY') {
+        if (mounted && _voiceInput.isCurrent(token)) {
+          setState(() => _voiceInput.complete(token));
+        }
+        return _NativeSpeechOutcome.busy;
+      }
+      if (e.code == 'SPEECH_UNAVAILABLE') {
+        return _NativeSpeechOutcome.unavailable;
+      }
+      return _NativeSpeechOutcome.failed;
     } catch (e) {
       debugPrint('Native speech recognition failed: $e');
-      if (mounted) setState(() => _isListening = false);
-      return false;
+      return _NativeSpeechOutcome.failed;
     }
   }
 
-  void _startWhisperRecording() async {
+  Future<void> _startWhisperRecording(int token) async {
+    if (!_voiceInput.isCurrent(token)) return;
     final prefs = PreferencesService();
     final model = prefs.whisperModel;
     if (model == null || model.isEmpty) {
+      if (mounted && _voiceInput.isCurrent(token)) {
+        setState(() => _voiceInput.complete(token));
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text(AppStrings.whisperModelRequired)),
@@ -386,18 +477,26 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
     await _whisper.startRecording();
-    if (_whisper.isRecording && mounted) {
-      setState(() => _isWhisperRecording = true);
-    } else if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text(AppStrings.voiceUnavailable)),
-      );
+    if (!_voiceInput.isCurrent(token)) {
+      unawaited(_whisper.cancelRecording());
+      return;
+    }
+    if (_whisper.isRecording) {
+      if (mounted) setState(() => _voiceInput.enterWhisperRecording(token));
+    } else {
+      if (mounted) {
+        setState(() => _voiceInput.complete(token));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text(AppStrings.voiceUnavailable)),
+        );
+      }
     }
   }
 
   void _stopWhisperRecording() async {
     if (!_isWhisperRecording) return;
-    setState(() => _isWhisperRecording = false);
+    final token = _voiceInput.activeToken;
+    setState(() => _voiceInput.enterTranscribing(token));
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -405,9 +504,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
     }
 
-    final text = await _whisper.stopAndTranscribe();
-    if (!mounted) return;
+    String? text;
+    try {
+      text = await _whisper.stopAndTranscribe();
+    } catch (e) {
+      debugPrint('Whisper transcription failed: $e');
+    }
+    if (!mounted) {
+      if (_voiceInput.isCurrent(token)) _voiceInput.complete(token);
+      return;
+    }
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    if (_voiceInput.isCurrent(token)) {
+      setState(() => _voiceInput.complete(token));
+    }
 
     if (text != null && text.isNotEmpty) {
       _inputController.text += text;
@@ -422,9 +532,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _stopListening() {
-    _speech.stop();
-    _nativeRecognitionCancelled = true;
-    setState(() => _isListening = false);
+    unawaited(_speech.stop());
+    unawaited(NativeBridge.cancelSpeechRecognition());
+    unawaited(_whisper.cancelRecording());
+    setState(() => _voiceInput.cancel());
   }
 
   @override
@@ -941,6 +1052,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final textContent = message.textContent;
     final hasText = textContent.isNotEmpty;
     final hasTokens = message.inputTokens != null || message.outputTokens != null;
+    final ttsRouteLabel = _tts.routeLabelForMessage(messageId);
+    final showTtsRouteLabel = ttsRouteLabel != null &&
+        (_tts.isLoadingMessage(messageId) || _tts.isPlayingMessage(messageId));
 
     if (!hasText && !hasTokens) return const SizedBox.shrink();
 
@@ -985,6 +1099,26 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       },
                     ),
             ),
+          if (showTtsRouteLabel) ...[
+            const SizedBox(width: 4),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(AppRadii.s),
+                border: Border.all(
+                  color: theme.colorScheme.outline.withAlpha(45),
+                ),
+              ),
+              child: Text(
+                ttsRouteLabel,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontSize: 11,
+                ),
+              ),
+            ),
+          ],
           if (hasTokens) ...[
             const SizedBox(width: 8),
             Text(
@@ -2101,44 +2235,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       const SizedBox(width: 6),
                     if (!isRunning)
                       GestureDetector(
-                        onLongPressStart: (_) {
-                          HapticFeedback.lightImpact();
-                          if (!_isWhisperRecording) _startListening();
-                        },
-                        onLongPressEnd: (_) {
+                        onTap: () {
                           if (_isWhisperRecording) {
                             _stopWhisperRecording();
-                          } else {
+                          } else if (_isListening) {
                             _stopListening();
+                          } else {
+                            HapticFeedback.lightImpact();
+                            _startListening();
                           }
                         },
-                        child: SizedBox(
+                        child: Container(
                           width: 48,
                           height: 48,
-                          child: IconButton(
-                            icon: Icon(isRecording ? Icons.mic : Icons.mic_none),
-                            style: IconButton.styleFrom(
-                              backgroundColor: isRecording
-                                  ? AppColors.statusRed.withAlpha(28)
-                                  : theme.colorScheme.surfaceContainerHighest,
-                              foregroundColor: isRecording
-                                  ? AppColors.statusRed
-                                  : theme.colorScheme.onSurfaceVariant,
-                              side: BorderSide(
-                                color: isRecording
-                                    ? AppColors.statusRed.withAlpha(120)
-                                    : theme.colorScheme.outline.withAlpha(55),
-                              ),
+                          decoration: BoxDecoration(
+                            color: isRecording
+                                ? AppColors.statusRed.withAlpha(28)
+                                : theme.colorScheme.surfaceContainerHighest,
+                            borderRadius: BorderRadius.circular(AppRadii.s),
+                            border: Border.all(
+                              color: isRecording
+                                  ? AppColors.statusRed.withAlpha(120)
+                                  : theme.colorScheme.outline.withAlpha(55),
                             ),
-                            onPressed: () {
-                              if (_isWhisperRecording) {
-                                _stopWhisperRecording();
-                              } else if (_isListening) {
-                                _stopListening();
-                              } else {
-                                _startListening();
-                              }
-                            },
+                          ),
+                          child: Icon(
+                            isRecording ? Icons.mic : Icons.mic_none,
+                            color: isRecording
+                                ? AppColors.statusRed
+                                : theme.colorScheme.onSurfaceVariant,
                           ),
                         ),
                       ),

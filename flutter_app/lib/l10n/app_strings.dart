@@ -348,6 +348,8 @@ class AppStrings {
   // ── TTS ──────────────────────────────────────────────────────────
   static const ttsPlay = '朗读';
   static const ttsStop = '停止朗读';
+  static const ttsSystemEngine = '系统引擎';
+  static String ttsApiEngine(String model) => 'API: $model';
 
   // ── Per-session system prompt ────────────────────────────────────
   static const systemPromptTitle = '系统提示词';
