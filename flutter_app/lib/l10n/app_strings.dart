@@ -65,7 +65,8 @@ class AppStrings {
   static const riskMedium = '中风险';
   static const riskHigh = '高风险';
   static String imageAttachmentLabel(String label) => '图片附件 $label';
-  static const modelFetchPresetNotice = 'Failed to fetch models, showing presets';
+  static const modelFetchPresetNotice =
+      'Failed to fetch models, showing presets';
   static String modelFetchFailed(String e) => 'Failed to fetch models: $e';
 
   // ── Chat sessions screen ─────────────────────────────────────────
@@ -221,7 +222,8 @@ class AppStrings {
 
   // ── Skills ────────────────────────────────────────────────────────
   static const skills = '技能';
-  static const noSkillsFound = '未发现技能。将 SKILL.md 放入 /root/workspace/skills/ 目录。';
+  static const noSkillsFound =
+      '未发现技能。将 SKILL.md 放入 /root/workspace/skills/ 目录。';
   static const skillsLoaded = '已加载技能';
   static const importSkill = '导入技能';
   static const importLocalSkill = '导入本地技能';
@@ -232,7 +234,8 @@ class AppStrings {
   static const installPresets = '安装预设技能';
   static const archiveSkill = 'Archive (.zip, .tar.gz, .tgz)';
   static const directory = 'Directory';
-  static const selectSkillArchive = 'Select a .zip, .tar.gz, or .tgz skill archive';
+  static const selectSkillArchive =
+      'Select a .zip, .tar.gz, or .tgz skill archive';
 
   // ── Environment Variables ─────────────────────────────────────────
   static const envVars = '环境变量';
@@ -288,8 +291,7 @@ class AppStrings {
   static const transcribing = '正在识别语音...';
   static const transcribeFailed = '语音识别失败，请重试';
   static const voiceRecognition = '语音能力';
-  static const voiceRecognitionDesc =
-      '没有系统语音引擎的设备（如部分国产手机），通过 API 实现语音输入和朗读。'
+  static const voiceRecognitionDesc = '没有系统语音引擎的设备（如部分国产手机），通过 API 实现语音输入和朗读。'
       '填写代理支持的模型名称，留空则使用系统引擎。';
   static const whisperModelLabel = '语音识别模型（STT）';
   static const ttsModelLabel = '语音合成模型（TTS）';
@@ -336,7 +338,8 @@ class AppStrings {
   static const clearAllConfirm = '确定要删除所有会话吗？此操作不可恢复。';
 
   // ── About ─────────────────────────────────────────────────────────
-  static const aboutDescription = 'ClawChat 是一个运行在 Android 上的 AI 助手，内置 Alpine Linux 环境，支持工具调用和技能扩展。';
+  static const aboutDescription =
+      'ClawChat 是一个运行在 Android 上的 AI 助手，内置 Alpine Linux 环境，支持工具调用和技能扩展。';
   static const license = '开源协议';
 
   // ── Network ───────────────────────────────────────────────────────
@@ -348,6 +351,8 @@ class AppStrings {
   // ── TTS ──────────────────────────────────────────────────────────
   static const ttsPlay = '朗读';
   static const ttsStop = '停止朗读';
+  static const ttsPause = '暂停朗读';
+  static const ttsResume = '继续朗读';
   static const ttsSystemEngine = '系统引擎';
   static String ttsApiEngine(String model) => 'API: $model';
 

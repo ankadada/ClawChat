@@ -22,9 +22,12 @@ class TtsService extends ChangeNotifier {
   int _systemFailCount = 0;
   String? _selectedSystemLanguage;
   bool _systemQueueActive = false;
-  int _systemQueuedChunkCount = 0;
-  int _systemCompletedChunkCount = 0;
-  bool _systemFallbackInProgress = false;
+  int _playbackToken = 0;
+  int _systemPlaybackToken = 0;
+  bool _systemStopRequested = false;
+  bool _systemPaused = false;
+  String? _systemCurrentChunk;
+  Completer<bool>? _systemChunkCompleter;
   bool isSpeaking = false;
   bool isLoading = false;
   String? _currentMessageId;
@@ -32,7 +35,7 @@ class TtsService extends ChangeNotifier {
   String? _lastSpokenText;
   String? lastError;
   static const int _maxSystemFailures = 3;
-  static const int _defaultSystemChunkLimit = 1800;
+  static const int _defaultSystemChunkLimit = 220;
   static const List<String> _preferredSystemLanguages = [
     'zh-CN',
     'zh_CN',
@@ -50,6 +53,13 @@ class TtsService extends ChangeNotifier {
   String? routeLabelForMessage(String messageId) =>
       _currentMessageId == messageId ? _currentRouteLabel : null;
 
+  bool isPausedMessage(String messageId) =>
+      _systemPaused && _currentMessageId == messageId;
+
+  bool isSystemMessage(String messageId) =>
+      _currentMessageId == messageId &&
+      _currentRouteLabel == AppStrings.ttsSystemEngine;
+
   bool get isAvailable {
     final ttsModel = PreferencesService().ttsModel;
     return _systemAvailable || (ttsModel != null && ttsModel.isNotEmpty);
@@ -60,7 +70,7 @@ class TtsService extends ChangeNotifier {
 
     _channel.setMethodCallHandler((call) async {
       if (call.method == 'onAudioComplete') {
-        _systemFallbackInProgress = false;
+        if (_systemQueueActive) return;
         isSpeaking = false;
         _currentMessageId = null;
         _currentRouteLabel = null;
@@ -76,13 +86,9 @@ class TtsService extends ChangeNotifier {
         notifyListeners();
       });
       _tts.setCompletionHandler(() {
-        if (_systemFallbackInProgress) return;
         if (_systemQueueActive) {
-          _systemCompletedChunkCount += 1;
-          if (_systemCompletedChunkCount < _systemQueuedChunkCount) return;
-          _systemQueueActive = false;
-          _systemQueuedChunkCount = 0;
-          _systemCompletedChunkCount = 0;
+          _completeSystemChunk(true);
+          return;
         }
         _systemFailCount = 0;
         isSpeaking = false;
@@ -90,11 +96,26 @@ class TtsService extends ChangeNotifier {
         _currentRouteLabel = null;
         notifyListeners();
       });
+      _tts.setPauseHandler(() {
+        if (_systemQueueActive) {
+          _systemPaused = true;
+          isSpeaking = false;
+          notifyListeners();
+        }
+      });
+      _tts.setContinueHandler(() {
+        if (_systemQueueActive) {
+          _systemPaused = false;
+          isSpeaking = true;
+          notifyListeners();
+        }
+      });
       _tts.setCancelHandler(() {
-        if (_systemFallbackInProgress) return;
-        _systemQueueActive = false;
-        _systemQueuedChunkCount = 0;
-        _systemCompletedChunkCount = 0;
+        if (_systemQueueActive) {
+          _systemStopRequested = true;
+          _completeSystemChunk(false);
+          return;
+        }
         isSpeaking = false;
         _currentMessageId = null;
         _currentRouteLabel = null;
@@ -242,12 +263,23 @@ class TtsService extends ChangeNotifier {
   Future<bool> speak(String text, String messageId) async {
     await init();
 
-    if (isSpeaking && _currentMessageId == messageId) {
+    if (_currentMessageId == messageId &&
+        (_systemQueueActive || _systemPaused)) {
+      if (_systemPaused) {
+        return _resumeSystemPlayback();
+      }
+      if (isSpeaking) {
+        return _pauseSystemPlayback();
+      }
+    }
+
+    if ((isSpeaking || isLoading) && _currentMessageId == messageId) {
       await stop();
       return true;
     }
 
     await stop();
+    final playbackToken = ++_playbackToken;
     _currentMessageId = messageId;
     _currentRouteLabel = null;
     lastError = null;
@@ -260,10 +292,10 @@ class TtsService extends ChangeNotifier {
     }
     _lastSpokenText = speakableText;
 
-    if (_systemAvailable ||
-        await _prepareSystemEngine(forceLanguageProbe: true) != null) {
-      final systemStarted = await _speakViaSystem(speakableText, messageId);
-      if (systemStarted) return true;
+    final systemReady = _systemAvailable ||
+        await _prepareSystemEngine(forceLanguageProbe: true) != null;
+    if (systemReady) {
+      return _speakViaSystem(speakableText, messageId, playbackToken);
     }
 
     // Fallback: API TTS
@@ -280,17 +312,24 @@ class TtsService extends ChangeNotifier {
     _currentRouteLabel = AppStrings.ttsApiEngine(ttsModel);
     notifyListeners();
 
-    final ok = await _speakViaApi(speakableText, ttsModel, prefs);
+    final ok =
+        await _speakViaApi(speakableText, ttsModel, prefs, playbackToken);
     if (!ok) {
-      isSpeaking = false;
-      _currentMessageId = null;
-      _currentRouteLabel = null;
-      notifyListeners();
+      if (_isPlaybackCurrent(playbackToken)) {
+        isSpeaking = false;
+        _currentMessageId = null;
+        _currentRouteLabel = null;
+        notifyListeners();
+      }
     }
     return ok;
   }
 
-  Future<bool> _speakViaSystem(String text, String messageId) async {
+  Future<bool> _speakViaSystem(
+    String text,
+    String messageId,
+    int playbackToken,
+  ) async {
     try {
       final language = await _prepareSystemEngine(forceLanguageProbe: false);
       if (language == null) return false;
@@ -300,33 +339,60 @@ class TtsService extends ChangeNotifier {
       if (chunks.isEmpty) return false;
 
       _systemQueueActive = true;
-      _systemQueuedChunkCount = chunks.length;
-      _systemCompletedChunkCount = 0;
-      _systemFallbackInProgress = false;
+      _systemStopRequested = false;
+      _systemPaused = false;
+      final token = ++_systemPlaybackToken;
       isSpeaking = true;
       _currentMessageId = messageId;
       _currentRouteLabel = AppStrings.ttsSystemEngine;
       notifyListeners();
 
+      var anyChunkSucceeded = false;
       for (var i = 0; i < chunks.length; i += 1) {
-        if (Platform.isAndroid) {
-          await _tts.setQueueMode(i == 0 ? 0 : 1);
+        if (_systemStopRequested ||
+            token != _systemPlaybackToken ||
+            !_isPlaybackCurrent(playbackToken)) {
+          break;
         }
-        final result = await _tts.speak(chunks[i]);
-        debugPrint('TTS system chunk ${i + 1}/${chunks.length}: $result');
-        if (!_isTtsSuccess(result)) {
-          throw StateError('System TTS rejected chunk ${i + 1}');
+        final chunkSucceeded = await _speakSystemChunk(
+          chunks[i],
+          index: i,
+          total: chunks.length,
+          token: token,
+        );
+        if (chunkSucceeded) {
+          anyChunkSucceeded = true;
+        } else {
+          debugPrint('TTS system chunk ${i + 1} rejected, skipping');
         }
       }
+
       if (Platform.isAndroid) {
         await _tts.setQueueMode(0);
+      }
+      if (token == _systemPlaybackToken) {
+        _systemQueueActive = false;
+        _systemPaused = false;
+        _systemCurrentChunk = null;
+        _systemChunkCompleter = null;
+        _systemFailCount = 0;
+        isSpeaking = false;
+        if (_isPlaybackCurrent(playbackToken)) {
+          _currentMessageId = null;
+          _currentRouteLabel = null;
+        }
+        notifyListeners();
+      }
+      if (!anyChunkSucceeded && !_systemStopRequested) {
+        lastError = '系统语音引擎无法朗读这段文本';
       }
       return true;
     } catch (e) {
       debugPrint('TTS system speak failed before playback: $e');
       _systemQueueActive = false;
-      _systemQueuedChunkCount = 0;
-      _systemCompletedChunkCount = 0;
+      _systemPaused = false;
+      _systemCurrentChunk = null;
+      _systemChunkCompleter = null;
       _systemFailCount += 1;
       if (_systemFailCount >= _maxSystemFailures) {
         _systemAvailable = false;
@@ -338,13 +404,136 @@ class TtsService extends ChangeNotifier {
     }
   }
 
+  bool _isPlaybackCurrent(int token) => token == _playbackToken;
+
+  Future<bool> _pauseSystemPlayback() async {
+    if (!_systemQueueActive || _systemPaused) return false;
+    _systemPaused = true;
+    isSpeaking = false;
+    notifyListeners();
+    try {
+      await _tts.pause();
+      return true;
+    } catch (e) {
+      debugPrint('TTS system pause failed: $e');
+      _systemPaused = false;
+      isSpeaking = true;
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<bool> _resumeSystemPlayback() async {
+    if (!_systemQueueActive || !_systemPaused) return false;
+    final chunk = _systemCurrentChunk;
+    if (chunk == null || chunk.isEmpty) return false;
+    _systemPaused = false;
+    isSpeaking = true;
+    notifyListeners();
+    try {
+      if (Platform.isAndroid) {
+        await _tts.setQueueMode(0);
+      }
+      final result = await _tts.speak(chunk);
+      debugPrint('TTS system resume: $result');
+      if (!_isTtsSuccess(result)) {
+        _completeSystemChunk(false);
+      }
+      return _isTtsSuccess(result);
+    } catch (e) {
+      debugPrint('TTS system resume failed: $e');
+      _completeSystemChunk(false);
+      return false;
+    }
+  }
+
+  Future<bool> _speakSystemChunk(
+    String chunk, {
+    required int index,
+    required int total,
+    required int token,
+  }) async {
+    final completer = Completer<bool>();
+    _systemChunkCompleter = completer;
+    _systemCurrentChunk = chunk;
+    try {
+      if (Platform.isAndroid) {
+        await _tts.setQueueMode(0);
+      }
+      final result = await _tts.speak(chunk);
+      debugPrint(
+        'TTS system chunk ${index + 1}/$total length=${chunk.length}: $result',
+      );
+      if (!_isTtsSuccess(result)) {
+        _completeSystemChunk(false);
+      }
+      return await _waitForSystemChunk(
+        completer,
+        timeout: _systemChunkTimeout(chunk),
+        index: index,
+        total: total,
+        token: token,
+      );
+    } catch (e) {
+      debugPrint('TTS system chunk ${index + 1}/$total failed: $e');
+      _completeSystemChunk(false);
+      return false;
+    } finally {
+      if (_systemChunkCompleter == completer) {
+        _systemChunkCompleter = null;
+      }
+      if (_systemCurrentChunk == chunk && !_systemPaused) {
+        _systemCurrentChunk = null;
+      }
+    }
+  }
+
+  Future<bool> _waitForSystemChunk(
+    Completer<bool> completer, {
+    required Duration timeout,
+    required int index,
+    required int total,
+    required int token,
+  }) async {
+    var activeWait = Duration.zero;
+    while (!completer.isCompleted) {
+      final started = DateTime.now();
+      await Future.any([
+        completer.future,
+        Future<void>.delayed(const Duration(milliseconds: 250)),
+      ]);
+      if (completer.isCompleted) break;
+      if (_systemStopRequested || token != _systemPlaybackToken) return false;
+      if (!_systemPaused) {
+        activeWait += DateTime.now().difference(started);
+      }
+      if (activeWait >= timeout) {
+        debugPrint('TTS system chunk ${index + 1}/$total timed out');
+        return false;
+      }
+    }
+    return completer.future;
+  }
+
+  Duration _systemChunkTimeout(String chunk) {
+    final seconds = (chunk.length / 5).ceil().clamp(8, 75).toInt();
+    return Duration(seconds: seconds);
+  }
+
+  void _completeSystemChunk(bool success) {
+    final completer = _systemChunkCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(success);
+    }
+  }
+
   Future<int> _systemChunkLimit() async {
     if (!Platform.isAndroid) return _defaultSystemChunkLimit;
     try {
       final maxLength = await _tts.getMaxSpeechInputLength;
       if (maxLength == null || maxLength <= 0) return _defaultSystemChunkLimit;
       final safeLength = maxLength - 100;
-      return safeLength.clamp(400, _defaultSystemChunkLimit).toInt();
+      return safeLength.clamp(120, _defaultSystemChunkLimit).toInt();
     } catch (_) {
       return _defaultSystemChunkLimit;
     }
@@ -352,9 +541,21 @@ class TtsService extends ChangeNotifier {
 
   void _handleSystemTtsError(dynamic msg) {
     debugPrint('TTS error: $msg');
+    if (_systemQueueActive) {
+      _completeSystemChunk(false);
+      notifyListeners();
+      return;
+    }
+    if (_currentRouteLabel == AppStrings.ttsSystemEngine) {
+      isSpeaking = false;
+      _currentMessageId = null;
+      _currentRouteLabel = null;
+      lastError = '系统语音引擎朗读失败';
+      notifyListeners();
+      return;
+    }
+
     _systemQueueActive = false;
-    _systemQueuedChunkCount = 0;
-    _systemCompletedChunkCount = 0;
     _systemFailCount += 1;
     if (_systemFailCount >= _maxSystemFailures) {
       debugPrint('TTS: system failed $_systemFailCount times, disabling');
@@ -370,12 +571,10 @@ class TtsService extends ChangeNotifier {
         text != null &&
         msgId != null) {
       debugPrint('TTS: system failed, falling back to API');
-      _systemFallbackInProgress = true;
       isSpeaking = true;
       _currentRouteLabel = AppStrings.ttsApiEngine(ttsModel);
       notifyListeners();
-      _speakViaApi(text, ttsModel, prefs).then((ok) {
-        _systemFallbackInProgress = false;
+      _speakViaApi(text, ttsModel, prefs, _playbackToken).then((ok) {
         if (!ok) {
           isSpeaking = false;
           _currentMessageId = null;
@@ -385,7 +584,6 @@ class TtsService extends ChangeNotifier {
         }
       });
     } else {
-      _systemFallbackInProgress = false;
       isSpeaking = false;
       _currentMessageId = null;
       _currentRouteLabel = null;
@@ -426,6 +624,10 @@ class TtsService extends ChangeNotifier {
         value.replaceAll(RegExp(r'^\s*[-:| ]{3,}\s*$', multiLine: true), ' ');
     value = value.replaceAll('|', '，');
     value = value.replaceAll(RegExp(r'[*_~#\[\]()]'), ' ');
+    value = value.replaceAll(
+      RegExp('[^0-9A-Za-z\u3400-\u4DBF\u4E00-\u9FFF，。！？；：、,.!?;:\\s-]'),
+      ' ',
+    );
     value = value.replaceAll(RegExp(r'\s+'), ' ').trim();
     return value;
   }
@@ -474,7 +676,11 @@ class TtsService extends ChangeNotifier {
   }
 
   Future<bool> _speakViaApi(
-      String text, String model, PreferencesService prefs) async {
+    String text,
+    String model,
+    PreferencesService prefs,
+    int playbackToken,
+  ) async {
     final apiKey = prefs.apiKey;
     if (apiKey == null || apiKey.isEmpty) {
       lastError = '未配置 API Key';
@@ -511,6 +717,7 @@ class TtsService extends ChangeNotifier {
       // Long text + ElevenLabs can take 30-60s; allow up to 90s
       final response =
           await request.close().timeout(const Duration(seconds: 90));
+      if (!_isPlaybackCurrent(playbackToken)) return true;
       debugPrint(
           'TTS API: status=${response.statusCode} contentLength=${response.contentLength} contentType=${response.headers.contentType}');
 
@@ -520,6 +727,7 @@ class TtsService extends ChangeNotifier {
         bytesBuilder.add(chunk);
       }
       final body = bytesBuilder.toBytes();
+      if (!_isPlaybackCurrent(playbackToken)) return true;
       debugPrint('TTS API: received ${body.length} bytes');
 
       if (response.statusCode != 200) {
@@ -538,6 +746,12 @@ class TtsService extends ChangeNotifier {
           File('${dir.path}/tts_${DateTime.now().millisecondsSinceEpoch}.mp3');
       await file.writeAsBytes(body);
 
+      if (!_isPlaybackCurrent(playbackToken)) {
+        try {
+          await file.delete();
+        } catch (_) {}
+        return true;
+      }
       await _channel.invokeMethod('playAudio', {'path': file.path});
       isLoading = false;
       notifyListeners();
@@ -547,17 +761,22 @@ class TtsService extends ChangeNotifier {
       lastError = '语音合成失败: $e';
       return false;
     } finally {
-      isLoading = false;
-      notifyListeners();
+      if (_isPlaybackCurrent(playbackToken)) {
+        isLoading = false;
+        notifyListeners();
+      }
       client.close(force: true);
     }
   }
 
   Future<void> stop() async {
+    _playbackToken += 1;
+    _systemPlaybackToken += 1;
+    _systemStopRequested = true;
+    _systemPaused = false;
+    _completeSystemChunk(false);
     _systemQueueActive = false;
-    _systemQueuedChunkCount = 0;
-    _systemCompletedChunkCount = 0;
-    _systemFallbackInProgress = false;
+    _systemCurrentChunk = null;
     try {
       await _tts.stop();
       if (Platform.isAndroid) {

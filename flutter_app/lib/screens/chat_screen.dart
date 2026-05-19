@@ -422,8 +422,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       } else {
         _voiceInput.enterNativeRecognition(token);
       }
-      final result = await NativeBridge.startSpeechRecognition(language: 'zh-CN')
-          .timeout(const Duration(seconds: 70));
+      final result =
+          await NativeBridge.startSpeechRecognition(language: 'zh-CN')
+              .timeout(const Duration(seconds: 70));
       if (!_voiceInput.isCurrent(token)) return _NativeSpeechOutcome.stale;
 
       final text = result?.trim();
@@ -500,7 +501,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text(AppStrings.transcribing), duration: Duration(seconds: 10)),
+        const SnackBar(
+            content: Text(AppStrings.transcribing),
+            duration: Duration(seconds: 10)),
       );
     }
 
@@ -640,7 +643,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             : IconButton(
                 icon: const Icon(Icons.menu),
                 onPressed: () => Navigator.of(context).push(
-                  CupertinoPageRoute(builder: (_) => const ChatSessionsScreen()),
+                  CupertinoPageRoute(
+                      builder: (_) => const ChatSessionsScreen()),
                 ),
               ),
         actions: [
@@ -653,7 +657,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             onSelected: (value) {
               switch (value) {
                 case 'settings':
-                  Navigator.of(context).push(CupertinoPageRoute(builder: (_) => const SettingsScreen()));
+                  Navigator.of(context).push(CupertinoPageRoute(
+                      builder: (_) => const SettingsScreen()));
                 case 'system_prompt':
                   _showSystemPromptDialog();
                 case 'session_system_prompt':
@@ -670,36 +675,48 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               final provider = context.read<ChatProvider>();
               return [
                 if (provider.currentSession?.messages.isNotEmpty == true)
-                  const PopupMenuItem(value: 'regenerate', child: ListTile(
-                    leading: Icon(Icons.refresh),
-                    title: Text(AppStrings.regenerate),
-                    dense: true,
-                  )),
-                const PopupMenuItem(value: 'compare', child: ListTile(
-                  leading: Icon(Icons.compare_arrows),
-                  title: Text(AppStrings.compareMode),
-                  dense: true,
-                )),
-                const PopupMenuItem(value: 'switch_model', child: ListTile(
-                  leading: Icon(Icons.swap_horiz),
-                  title: Text(AppStrings.switchModel),
-                  dense: true,
-                )),
-                const PopupMenuItem(value: 'session_system_prompt', child: ListTile(
-                  leading: Icon(Icons.tune),
-                  title: Text(AppStrings.systemPromptTitle),
-                  dense: true,
-                )),
-                const PopupMenuItem(value: 'system_prompt', child: ListTile(
-                  leading: Icon(Icons.psychology),
-                  title: Text(AppStrings.editSystemPrompt),
-                  dense: true,
-                )),
-                const PopupMenuItem(value: 'settings', child: ListTile(
-                  leading: Icon(Icons.settings),
-                  title: Text(AppStrings.settings),
-                  dense: true,
-                )),
+                  const PopupMenuItem(
+                      value: 'regenerate',
+                      child: ListTile(
+                        leading: Icon(Icons.refresh),
+                        title: Text(AppStrings.regenerate),
+                        dense: true,
+                      )),
+                const PopupMenuItem(
+                    value: 'compare',
+                    child: ListTile(
+                      leading: Icon(Icons.compare_arrows),
+                      title: Text(AppStrings.compareMode),
+                      dense: true,
+                    )),
+                const PopupMenuItem(
+                    value: 'switch_model',
+                    child: ListTile(
+                      leading: Icon(Icons.swap_horiz),
+                      title: Text(AppStrings.switchModel),
+                      dense: true,
+                    )),
+                const PopupMenuItem(
+                    value: 'session_system_prompt',
+                    child: ListTile(
+                      leading: Icon(Icons.tune),
+                      title: Text(AppStrings.systemPromptTitle),
+                      dense: true,
+                    )),
+                const PopupMenuItem(
+                    value: 'system_prompt',
+                    child: ListTile(
+                      leading: Icon(Icons.psychology),
+                      title: Text(AppStrings.editSystemPrompt),
+                      dense: true,
+                    )),
+                const PopupMenuItem(
+                    value: 'settings',
+                    child: ListTile(
+                      leading: Icon(Icons.settings),
+                      title: Text(AppStrings.settings),
+                      dense: true,
+                    )),
               ];
             },
           ),
@@ -711,19 +728,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
-                final maxContentWidth = math.min(640.0, constraints.maxWidth * 0.86);
-                return Selector<ChatProvider, ({List<ChatMessage> messages, bool hasStreaming, AgentStatus status, String? sessionId, String modelName})>(
+                final maxContentWidth =
+                    math.min(640.0, constraints.maxWidth * 0.86);
+                return Selector<
+                    ChatProvider,
+                    ({
+                      List<ChatMessage> messages,
+                      bool hasStreaming,
+                      AgentStatus status,
+                      String? sessionId,
+                      String modelName
+                    })>(
                   selector: (_, p) => (
                     messages: p.currentSession?.messages ?? [],
-                    hasStreaming: p.agentStatus == AgentStatus.streaming || p.streamingText.isNotEmpty,
+                    hasStreaming: p.agentStatus == AgentStatus.streaming ||
+                        p.streamingText.isNotEmpty,
                     status: p.agentStatus,
                     sessionId: p.currentSession?.id,
-                    modelName: p.currentSession?.modelOverride ?? p.configuredModel,
+                    modelName:
+                        p.currentSession?.modelOverride ?? p.configuredModel,
                   ),
                   builder: (context, data, __) {
                     final messages = data.messages;
                     final hasStreaming = data.hasStreaming;
-                    final showTyping = data.status == AgentStatus.thinking && !hasStreaming;
+                    final showTyping =
+                        data.status == AgentStatus.thinking && !hasStreaming;
 
                     // Sync draft when session changes via Selector rebuild
                     final currentId = data.sessionId;
@@ -733,7 +762,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     _primeMessageAnimations(currentId, messages);
 
                     if (messages.isEmpty && !hasStreaming && !showTyping) {
-                      return _buildEmptyState(theme, data.modelName, maxContentWidth);
+                      return _buildEmptyState(
+                          theme, data.modelName, maxContentWidth);
                     }
 
                     final itemCount = messages.length +
@@ -744,28 +774,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         ListView.builder(
                           controller: _scrollController,
                           reverse: true,
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 16, vertical: 12),
                           itemCount: itemCount,
                           itemBuilder: (context, index) {
                             final reversedIndex = itemCount - 1 - index;
-                            if (reversedIndex == messages.length && hasStreaming) {
+                            if (reversedIndex == messages.length &&
+                                hasStreaming) {
                               return Consumer<ChatProvider>(
                                 builder: (_, provider, __) => RepaintBoundary(
                                   child: _buildStreamingBubble(
                                     provider.streamingText,
                                     theme,
                                     maxContentWidth,
-                                    previousRole: messages.isEmpty ? null : messages.last.role,
+                                    previousRole: messages.isEmpty
+                                        ? null
+                                        : messages.last.role,
                                   ),
                                 ),
                               );
                             }
-                            if (reversedIndex == messages.length && showTyping) {
+                            if (reversedIndex == messages.length &&
+                                showTyping) {
                               return RepaintBoundary(
                                 child: _buildTypingIndicatorBubble(
                                   theme,
                                   maxContentWidth,
-                                  previousRole: messages.isEmpty ? null : messages.last.role,
+                                  previousRole: messages.isEmpty
+                                      ? null
+                                      : messages.last.role,
                                 ),
                               );
                             }
@@ -777,7 +814,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                 ? messages[reversedIndex + 1].role
                                 : null;
                             final animationId = _messageAnimationId(message);
-                            final animate = _seenMessageAnimationIds.add(animationId);
+                            final animate =
+                                _seenMessageAnimationIds.add(animationId);
                             return _AnimatedMessageEntry(
                               key: ValueKey(animationId),
                               animate: animate,
@@ -810,7 +848,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           // Compare view
           Consumer<ChatProvider>(
             builder: (_, provider, __) {
-              if (provider.compareResults == null) return const SizedBox.shrink();
+              if (provider.compareResults == null)
+                return const SizedBox.shrink();
               return CompareView(
                 results: provider.compareResults!,
                 isComparing: provider.isComparing,
@@ -869,7 +908,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildEmptyState(ThemeData theme, String modelName, double maxContentWidth) {
+  Widget _buildEmptyState(
+      ThemeData theme, String modelName, double maxContentWidth) {
     const prompts = [
       AppStrings.emptyPromptSummarizeCode,
       AppStrings.emptyPromptWriteEmail,
@@ -891,10 +931,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 decoration: BoxDecoration(
                   color: theme.colorScheme.primary.withAlpha(18),
                   shape: BoxShape.circle,
-                  border: Border.all(color: theme.colorScheme.primary.withAlpha(45)),
+                  border: Border.all(
+                      color: theme.colorScheme.primary.withAlpha(45)),
                 ),
-                child: Icon(Icons.auto_awesome, size: 34,
-                    color: theme.colorScheme.primary),
+                child: Icon(Icons.auto_awesome,
+                    size: 34, color: theme.colorScheme.primary),
               ),
               const SizedBox(height: 18),
               Text(AppStrings.sendMessageToStart,
@@ -905,21 +946,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               const SizedBox(height: 8),
               Text(AppStrings.aiAssistantCapabilities,
                   textAlign: TextAlign.center,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant)),
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
               const SizedBox(height: 12),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                 decoration: BoxDecoration(
                   color: theme.colorScheme.surfaceContainerHighest,
                   borderRadius: BorderRadius.circular(AppRadii.xl),
-                  border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
+                  border: Border.all(
+                      color: theme.colorScheme.outline.withAlpha(45)),
                 ),
                 child: Text(AppStrings.currentModelLabel(modelName),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.labelSmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant)),
+                    style: theme.textTheme.labelSmall
+                        ?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
               ),
               const SizedBox(height: 18),
               Wrap(
@@ -937,10 +980,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         );
                         _focusNode.requestFocus();
                       },
-                      side: BorderSide(color: theme.colorScheme.outline.withAlpha(70)),
+                      side: BorderSide(
+                          color: theme.colorScheme.outline.withAlpha(70)),
                       backgroundColor: theme.colorScheme.surface,
                       labelStyle: theme.textTheme.labelMedium,
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 6),
                     ),
                 ],
               ),
@@ -981,7 +1026,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
 
     final isUser = message.role == 'user';
-    final messageId = '${message.timestamp.millisecondsSinceEpoch}_$messageIndex';
+    final messageId =
+        '${message.timestamp.millisecondsSinceEpoch}_$messageIndex';
 
     return Padding(
       padding: EdgeInsets.only(
@@ -989,7 +1035,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         bottom: _halfMessageGap(nextRole, message.role),
       ),
       child: Column(
-        crossAxisAlignment: isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        crossAxisAlignment:
+            isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
         children: [
           Padding(
             padding: const EdgeInsets.only(bottom: 4),
@@ -1012,7 +1059,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               messageIndex: messageIndex,
               messages: messages,
             ),
-          if (!isUser && message.alternatives != null && message.alternatives!.isNotEmpty)
+          if (!isUser &&
+              message.alternatives != null &&
+              message.alternatives!.isNotEmpty)
             _buildAlternativesNav(message, messageIndex, theme),
           if (!isUser) _buildAssistantFooter(message, messageId, theme),
         ],
@@ -1048,15 +1097,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildAssistantFooter(ChatMessage message, String messageId, ThemeData theme) {
+  Widget _buildAssistantFooter(
+      ChatMessage message, String messageId, ThemeData theme) {
     final textContent = message.textContent;
     final hasText = textContent.isNotEmpty;
-    final hasTokens = message.inputTokens != null || message.outputTokens != null;
+    final hasTokens =
+        message.inputTokens != null || message.outputTokens != null;
     final ttsRouteLabel = _tts.routeLabelForMessage(messageId);
-    final showTtsRouteLabel = ttsRouteLabel != null &&
-        (_tts.isLoadingMessage(messageId) || _tts.isPlayingMessage(messageId));
+    final isTtsLoading = _tts.isLoadingMessage(messageId);
+    final isTtsPlaying = _tts.isPlayingMessage(messageId);
+    final isTtsPaused = _tts.isPausedMessage(messageId);
+    final isSystemTts = _tts.isSystemMessage(messageId);
+    final showTtsRouteLabel =
+        ttsRouteLabel != null && (isTtsLoading || isTtsPlaying || isTtsPaused);
 
     if (!hasText && !hasTokens) return const SizedBox.shrink();
+
+    final ttsIcon = isTtsPaused
+        ? Icons.play_arrow
+        : isTtsPlaying && isSystemTts
+            ? Icons.pause
+            : isTtsPlaying
+                ? Icons.stop
+                : Icons.volume_up;
+    final ttsTooltip = isTtsPaused
+        ? AppStrings.ttsResume
+        : isTtsPlaying && isSystemTts
+            ? AppStrings.ttsPause
+            : isTtsPlaying
+                ? AppStrings.ttsStop
+                : AppStrings.ttsPlay;
 
     return Padding(
       padding: const EdgeInsets.only(top: 2),
@@ -1067,14 +1137,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             SizedBox(
               height: 44,
               width: 44,
-              child: _tts.isLoadingMessage(messageId)
+              child: isTtsLoading
                   ? Center(
                       child: SizedBox(
                         width: 16,
                         height: 16,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
+                          color:
+                              theme.colorScheme.onSurfaceVariant.withAlpha(150),
                         ),
                       ),
                     )
@@ -1082,10 +1153,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       padding: EdgeInsets.zero,
                       iconSize: 16,
                       icon: Icon(
-                        _tts.isPlayingMessage(messageId) ? Icons.stop : Icons.volume_up,
-                        color: theme.colorScheme.onSurfaceVariant.withAlpha(150),
+                        ttsIcon,
+                        color:
+                            theme.colorScheme.onSurfaceVariant.withAlpha(150),
                       ),
-                      tooltip: _tts.isPlayingMessage(messageId) ? AppStrings.ttsStop : AppStrings.ttsPlay,
+                      tooltip: ttsTooltip,
                       onPressed: () {
                         _tts.speak(textContent, messageId).then((ok) {
                           if (!mounted) return;
@@ -1137,9 +1209,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  String _messageToMarkdown(ChatMessage? message, {required String fallbackText}) {
+  String _messageToMarkdown(ChatMessage? message,
+      {required String fallbackText}) {
     if (message == null) return fallbackText;
-    final role = message.role == 'user' ? AppStrings.userLabel : AppStrings.aiLabel;
+    final role =
+        message.role == 'user' ? AppStrings.userLabel : AppStrings.aiLabel;
     final buffer = StringBuffer('**$role**:\n');
     for (final content in message.content) {
       switch (content) {
@@ -1155,7 +1229,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         case ToolResultContent(:final output):
           buffer.writeln('**Tool result**:');
           buffer.writeln('```');
-          buffer.writeln(output.length > 2000 ? '${output.substring(0, 2000)}\n\n[tool output truncated]' : output);
+          buffer.writeln(output.length > 2000
+              ? '${output.substring(0, 2000)}\n\n[tool output truncated]'
+              : output);
           buffer.writeln('```');
       }
     }
@@ -1167,9 +1243,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (session == null || messageIndex == null) return;
 
     final fork = await context.read<ChatProvider>().forkFromMessage(
-      session.id,
-      messageIndex,
-    );
+          session.id,
+          messageIndex,
+        );
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -1240,7 +1316,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           Clipboard.setData(ClipboardData(text: text));
                           Navigator.pop(ctx);
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
+                            const SnackBar(
+                                content: Text(AppStrings.copied),
+                                duration: Duration(seconds: 1)),
                           );
                         },
                       ),
@@ -1249,11 +1327,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         title: const Text(AppStrings.copyMarkdown),
                         onTap: () {
                           Clipboard.setData(ClipboardData(
-                            text: _messageToMarkdown(message, fallbackText: text),
+                            text:
+                                _messageToMarkdown(message, fallbackText: text),
                           ));
                           Navigator.pop(ctx);
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
+                            const SnackBar(
+                                content: Text(AppStrings.copied),
+                                duration: Duration(seconds: 1)),
                           );
                         },
                       ),
@@ -1264,13 +1345,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           Navigator.pop(ctx);
                           try {
                             await NativeBridge.shareText(
-                              text: _messageToMarkdown(message, fallbackText: text),
+                              text: _messageToMarkdown(message,
+                                  fallbackText: text),
                               subject: AppStrings.appName,
                             );
                           } catch (e) {
                             if (!mounted) return;
                             ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text('${AppStrings.shareFailed}: $e')),
+                              SnackBar(
+                                  content:
+                                      Text('${AppStrings.shareFailed}: $e')),
                             );
                           }
                         },
@@ -1291,7 +1375,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           final quoted = text.length > 200
                               ? '${text.substring(0, 200)}...'
                               : text;
-                          _inputController.text = '> $quoted\n\n${_inputController.text}';
+                          _inputController.text =
+                              '> $quoted\n\n${_inputController.text}';
                           _inputController.selection = TextSelection.collapsed(
                             offset: _inputController.text.length,
                           );
@@ -1493,7 +1578,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _showSystemPromptDialog() async {
     final prefs = PreferencesService();
     await prefs.init();
-    final controller = TextEditingController(text: prefs.systemPrompt ?? AppConstants.defaultSystemPrompt);
+    final controller = TextEditingController(
+        text: prefs.systemPrompt ?? AppConstants.defaultSystemPrompt);
 
     final result = await showDialog<String>(
       context: context,
@@ -1514,12 +1600,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text(AppStrings.cancel)),
           TextButton(
-            onPressed: () { controller.text = AppConstants.defaultSystemPrompt; },
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel)),
+          TextButton(
+            onPressed: () {
+              controller.text = AppConstants.defaultSystemPrompt;
+            },
             child: const Text(AppStrings.resetDefault),
           ),
-          FilledButton(onPressed: () => Navigator.pop(ctx, controller.text), child: const Text(AppStrings.save)),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, controller.text),
+              child: const Text(AppStrings.save)),
         ],
       ),
     );
@@ -1550,7 +1642,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             decoration: InputDecoration(
               border: const OutlineInputBorder(),
               hintText: AppStrings.systemPromptHint,
-              helperText: controller.text.isEmpty ? AppStrings.useGlobalDefault : null,
+              helperText:
+                  controller.text.isEmpty ? AppStrings.useGlobalDefault : null,
             ),
           ),
         ),
@@ -1615,11 +1708,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   ),
                   isExpanded: true,
                   items: [
-                    const DropdownMenuItem(value: '', child: Text(AppStrings.useGlobalDefault)),
+                    const DropdownMenuItem(
+                        value: '', child: Text(AppStrings.useGlobalDefault)),
                     ...availableModels.map((m) => DropdownMenuItem(
-                      value: LlmService.modelIdFromDisplay(m),
-                      child: Text(m, overflow: TextOverflow.ellipsis),
-                    )),
+                          value: LlmService.modelIdFromDisplay(m),
+                          child: Text(m, overflow: TextOverflow.ellipsis),
+                        )),
                   ],
                   onChanged: (v) => controller.text = v ?? '',
                 )
@@ -1644,7 +1738,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       apiKey: prefs.apiKey ?? '',
                       baseUrl: prefs.baseUrl,
                     );
-                    if (availableModels.any(LlmService.isPresetModel) && mounted) {
+                    if (availableModels.any(LlmService.isPresetModel) &&
+                        mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(
                           content: Text(AppStrings.modelFetchPresetNotice),
@@ -1654,7 +1749,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   } catch (e) {
                     if (mounted) {
                       ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(AppStrings.modelFetchFailed(_briefError(e)))),
+                        SnackBar(
+                            content: Text(
+                                AppStrings.modelFetchFailed(_briefError(e)))),
                       );
                     }
                   }
@@ -1664,10 +1761,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ],
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text(AppStrings.cancel)),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text(AppStrings.cancel)),
             FilledButton(
               onPressed: () {
-                provider.updateSessionModel(model: controller.text.isEmpty ? null : controller.text);
+                provider.updateSessionModel(
+                    model: controller.text.isEmpty ? null : controller.text);
                 Navigator.pop(ctx);
               },
               child: const Text(AppStrings.confirm),
@@ -1688,12 +1788,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ListTile(
               leading: const Icon(Icons.image),
               title: const Text(AppStrings.pickImage),
-              onTap: () { Navigator.pop(ctx); _pickAndAttach(FileType.image); },
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickAndAttach(FileType.image);
+              },
             ),
             ListTile(
               leading: const Icon(Icons.insert_drive_file),
               title: const Text(AppStrings.pickFile),
-              onTap: () { Navigator.pop(ctx); _pickAndAttach(FileType.any); },
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickAndAttach(FileType.any);
+              },
             ),
           ],
         ),
@@ -1759,28 +1865,33 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ListView(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
-            children: prompts.map((p) => Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: ActionChip(
-                label: Text(p.$1),
-                labelStyle: theme.textTheme.labelMedium?.copyWith(
-                  color: theme.colorScheme.onSurface,
-                  fontWeight: FontWeight.w600,
-                ),
-                backgroundColor: theme.colorScheme.surfaceContainerHighest,
-                side: BorderSide(color: theme.colorScheme.outline.withAlpha(65)),
-                shape: const StadiumBorder(),
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                onPressed: () {
-                  final current = _inputController.text;
-                  _inputController.text = p.$2 + current;
-                  _inputController.selection = TextSelection.collapsed(
-                    offset: _inputController.text.length,
-                  );
-                  _focusNode.requestFocus();
-                },
-              ),
-            )).toList(),
+            children: prompts
+                .map((p) => Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: ActionChip(
+                        label: Text(p.$1),
+                        labelStyle: theme.textTheme.labelMedium?.copyWith(
+                          color: theme.colorScheme.onSurface,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        backgroundColor:
+                            theme.colorScheme.surfaceContainerHighest,
+                        side: BorderSide(
+                            color: theme.colorScheme.outline.withAlpha(65)),
+                        shape: const StadiumBorder(),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 7),
+                        onPressed: () {
+                          final current = _inputController.text;
+                          _inputController.text = p.$2 + current;
+                          _inputController.selection = TextSelection.collapsed(
+                            offset: _inputController.text.length,
+                          );
+                          _focusNode.requestFocus();
+                        },
+                      ),
+                    ))
+                .toList(),
           ),
           Positioned(
             left: 0,
@@ -1960,8 +2071,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return firstLine.substring('File: '.length);
     }
 
-    final attachedMatch = RegExp(r'^\[Attached: ([^\s\]]+)')
-        .firstMatch(firstLine);
+    final attachedMatch =
+        RegExp(r'^\[Attached: ([^\s\]]+)').firstMatch(firstLine);
     if (attachedMatch != null) {
       final path = attachedMatch.group(1)!;
       return path.split('/').last;
@@ -1970,7 +2081,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return firstLine;
   }
 
-  Widget _buildAlternativesNav(ChatMessage message, int messageIndex, ThemeData theme) {
+  Widget _buildAlternativesNav(
+      ChatMessage message, int messageIndex, ThemeData theme) {
     final current = message.displayIndex;
     final total = message.totalVersions;
 
@@ -1992,7 +2104,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     : theme.colorScheme.onSurfaceVariant.withAlpha(80),
               ),
               onPressed: current > 1
-                  ? () => context.read<ChatProvider>().previousAlternative(messageIndex)
+                  ? () => context
+                      .read<ChatProvider>()
+                      .previousAlternative(messageIndex)
                   : null,
             ),
           ),
@@ -2016,7 +2130,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     : theme.colorScheme.onSurfaceVariant.withAlpha(80),
               ),
               onPressed: current < total
-                  ? () => context.read<ChatProvider>().nextAlternative(messageIndex)
+                  ? () =>
+                      context.read<ChatProvider>().nextAlternative(messageIndex)
                   : null,
             ),
           ),
@@ -2100,8 +2215,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   Text(
                     AppStrings.fetchModelsButton,
                     style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(ctx).colorScheme.onSurfaceVariant,
-                    ),
+                          color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                        ),
                   ),
                 const SizedBox(height: 8),
                 TextButton.icon(
@@ -2115,7 +2230,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         apiKey: prefs.apiKey ?? '',
                         baseUrl: prefs.baseUrl,
                       );
-                      if (availableModels.any(LlmService.isPresetModel) && mounted) {
+                      if (availableModels.any(LlmService.isPresetModel) &&
+                          mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(
                             content: Text(AppStrings.modelFetchPresetNotice),
@@ -2125,7 +2241,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     } catch (e) {
                       if (mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text(AppStrings.modelFetchFailed(_briefError(e)))),
+                          SnackBar(
+                              content: Text(
+                                  AppStrings.modelFetchFailed(_briefError(e)))),
                         );
                       }
                     }
@@ -2194,7 +2312,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         icon: const Icon(Icons.attach_file),
                         tooltip: AppStrings.attachFile,
                         style: IconButton.styleFrom(
-                          backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                          backgroundColor:
+                              theme.colorScheme.surfaceContainerHighest,
                           foregroundColor: theme.colorScheme.onSurfaceVariant,
                         ),
                         onPressed: isRunning ? null : _showAttachOptions,
@@ -2211,28 +2330,33 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         textInputAction: TextInputAction.send,
                         onSubmitted: (_) => _sendMessage(),
                         decoration: InputDecoration(
-                          hintText: isRunning ? AppStrings.aiProcessing : AppStrings.inputHint,
+                          hintText: isRunning
+                              ? AppStrings.aiProcessing
+                              : AppStrings.inputHint,
                           filled: true,
                           fillColor: theme.colorScheme.surfaceContainerHighest,
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(AppRadii.xl),
-                            borderSide: BorderSide(color: theme.colorScheme.outline.withAlpha(60)),
+                            borderSide: BorderSide(
+                                color: theme.colorScheme.outline.withAlpha(60)),
                           ),
                           enabledBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(AppRadii.xl),
-                            borderSide: BorderSide(color: theme.colorScheme.outline.withAlpha(60)),
+                            borderSide: BorderSide(
+                                color: theme.colorScheme.outline.withAlpha(60)),
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(AppRadii.xl),
-                            borderSide: BorderSide(color: theme.colorScheme.primary.withAlpha(180), width: 1.5),
+                            borderSide: BorderSide(
+                                color: theme.colorScheme.primary.withAlpha(180),
+                                width: 1.5),
                           ),
                           contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 12),
+                              horizontal: 16, vertical: 12),
                         ),
                       ),
                     ),
-                    if (!isRunning)
-                      const SizedBox(width: 6),
+                    if (!isRunning) const SizedBox(width: 6),
                     if (!isRunning)
                       GestureDetector(
                         onTap: () {
