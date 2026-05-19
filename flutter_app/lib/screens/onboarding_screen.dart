@@ -23,6 +23,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   List<String> _availableModels = [];
   bool _fetchingModels = false;
   bool _manualModelInput = false;
+  bool _showApiKeyError = false;
 
   @override
   void initState() {
@@ -78,141 +79,381 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final stepTitles = [
+      AppStrings.selectApiFormat,
+      AppStrings.enterApiKey,
+      AppStrings.selectModel,
+    ];
+
     return Scaffold(
       appBar: AppBar(
         title: const Text(AppStrings.welcomeTitle),
         automaticallyImplyLeading: !widget.isFirstRun,
       ),
-      body: Stepper(
-        currentStep: _currentStep,
-        onStepContinue: _onStepContinue,
-        onStepCancel:
-            _currentStep > 0 ? () => setState(() => _currentStep--) : null,
-        steps: [
-          Step(
-            title: const Text(AppStrings.selectApiFormat),
-            content: Column(
-              children: [
-                RadioListTile<String>(
-                  title: const Text('Anthropic (Claude)'),
-                  subtitle: const Text(AppStrings.anthropicSubtitle),
-                  value: 'anthropic',
-                  groupValue: _apiFormat,
-                  onChanged: (v) => setState(() {
-                    _apiFormat = v!;
-                    _availableModels = [];
-                    _manualModelInput = false;
-                  }),
-                ),
-                RadioListTile<String>(
-                  title: const Text(AppStrings.openaiCompatible),
-                  subtitle: const Text(AppStrings.openaiCompatibleSubtitle),
-                  value: 'openai',
-                  groupValue: _apiFormat,
-                  onChanged: (v) => setState(() {
-                    _apiFormat = v!;
-                    _availableModels = [];
-                    _manualModelInput = false;
-                  }),
-                ),
-              ],
-            ),
-          ),
-          Step(
-            title: const Text(AppStrings.enterApiKey),
-            content: Column(
-              children: [
-                TextField(
-                  controller: _apiKeyController,
-                  obscureText: true,
-                  decoration: InputDecoration(
-                    labelText: 'API Key',
-                    hintText:
-                        _apiFormat == 'anthropic' ? 'sk-ant-...' : 'sk-...',
-                  ),
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: _baseUrlController,
-                  decoration: InputDecoration(
-                    labelText: AppStrings.baseUrlDefaultHint,
-                    hintText: _apiFormat == 'anthropic'
-                        ? 'https://api.anthropic.com'
-                        : 'https://api.openai.com',
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Row(
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: constraints.maxHeight - 32),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Expanded(
-                      child: _fetchingModels
-                          ? const Center(
-                              child: Padding(
-                              padding: EdgeInsets.all(16),
-                              child: CircularProgressIndicator(),
-                            ))
-                          : (_availableModels.isNotEmpty && !_manualModelInput)
-                              ? DropdownButtonFormField<String>(
-                                  value: _availableModels.any((model) =>
-                                          LlmService.modelIdFromDisplay(
-                                              model) ==
-                                          _modelController.text)
-                                      ? _modelController.text
-                                      : null,
-                                  decoration: const InputDecoration(
-                                    labelText: AppStrings.selectModel,
-                                  ),
-                                  items: [
-                                    ..._availableModels.map((m) =>
-                                        DropdownMenuItem(
-                                          value:
-                                              LlmService.modelIdFromDisplay(m),
-                                          child: Text(m,
-                                              overflow: TextOverflow.ellipsis),
-                                        )),
-                                    const DropdownMenuItem(
-                                      value: '__manual__',
-                                      child: Text(AppStrings.manualInput),
-                                    ),
-                                  ],
-                                  onChanged: (v) {
-                                    if (v == '__manual__') {
-                                      setState(() => _manualModelInput = true);
-                                    } else if (v != null) {
-                                      _modelController.text = v;
-                                    }
-                                  },
-                                )
-                              : TextField(
-                                  controller: _modelController,
-                                  decoration: InputDecoration(
-                                    labelText: AppStrings.modelName,
-                                    hintText: AppConstants.defaultModel,
-                                  ),
-                                ),
+                    _buildHeader(theme),
+                    const SizedBox(height: 24),
+                    _buildProgress(theme, stepTitles),
+                    const SizedBox(height: 24),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 180),
+                      child: _buildStepCard(theme, key: ValueKey(_currentStep)),
                     ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      icon: const Icon(Icons.refresh),
-                      tooltip: AppStrings.fetchModelsButton,
-                      onPressed: _fetchingModels ? null : _fetchModels,
-                    ),
+                    const SizedBox(height: 20),
+                    _buildFooter(),
                   ],
                 ),
-              ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeader(ThemeData theme) {
+    return Column(
+      children: [
+        Image.asset('assets/ic_launcher.png', width: 64, height: 64),
+        const SizedBox(height: 12),
+        Text(
+          AppStrings.appName,
+          style: theme.textTheme.headlineSmall?.copyWith(
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          AppStrings.tagline,
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildProgress(ThemeData theme, List<String> stepTitles) {
+    return Row(
+      children: [
+        for (var i = 0; i < stepTitles.length; i++) ...[
+          Expanded(
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              height: 5,
+              decoration: BoxDecoration(
+                color: i <= _currentStep
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(999),
+              ),
             ),
           ),
-          Step(
-            title: const Text(AppStrings.stepComplete),
-            content: const Text(AppStrings.allReadyMessage),
+          if (i != stepTitles.length - 1) const SizedBox(width: 8),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildStepCard(ThemeData theme, {required Key key}) {
+    final title = switch (_currentStep) {
+      0 => AppStrings.selectApiFormat,
+      1 => AppStrings.enterApiKey,
+      _ => AppStrings.selectModel,
+    };
+    final icon = switch (_currentStep) {
+      0 => Icons.api,
+      1 => Icons.vpn_key,
+      _ => Icons.smart_toy,
+    };
+
+    return Container(
+      key: key,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withAlpha(130),
+        borderRadius: BorderRadius.circular(AppRadii.l),
+        border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(AppRadii.m),
+                ),
+                child: Icon(icon, color: theme.colorScheme.onPrimaryContainer),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  title,
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
           ),
+          const SizedBox(height: 16),
+          switch (_currentStep) {
+            0 => _buildProviderStep(theme),
+            1 => _buildApiKeyStep(theme),
+            _ => _buildModelStep(theme),
+          },
         ],
       ),
     );
   }
 
+  Widget _buildProviderStep(ThemeData theme) {
+    return Column(
+      children: [
+        _buildProviderCard(
+          theme,
+          value: 'anthropic',
+          icon: Icons.hexagon_outlined,
+          title: 'Anthropic (Claude)',
+          subtitle: AppStrings.anthropicSubtitle,
+        ),
+        const SizedBox(height: 12),
+        _buildProviderCard(
+          theme,
+          value: 'openai',
+          icon: Icons.bubble_chart_outlined,
+          title: AppStrings.openaiCompatible,
+          subtitle: AppStrings.openaiCompatibleSubtitle,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildProviderCard(
+    ThemeData theme, {
+    required String value,
+    required IconData icon,
+    required String title,
+    required String subtitle,
+  }) {
+    final selected = _apiFormat == value;
+    return InkWell(
+      onTap: () => setState(() {
+        _apiFormat = value;
+        _availableModels = [];
+        _manualModelInput = false;
+      }),
+      borderRadius: BorderRadius.circular(AppRadii.m),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: selected
+              ? theme.colorScheme.primaryContainer.withAlpha(120)
+              : theme.colorScheme.surface,
+          borderRadius: BorderRadius.circular(AppRadii.m),
+          border: Border.all(
+            color: selected
+                ? theme.colorScheme.primary
+                : theme.colorScheme.outline.withAlpha(55),
+            width: selected ? 1.5 : 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, color: selected
+                ? theme.colorScheme.primary
+                : theme.colorScheme.onSurfaceVariant),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  )),
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Icon(
+              selected ? Icons.check_circle : Icons.radio_button_unchecked,
+              color: selected
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.onSurfaceVariant,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildApiKeyStep(ThemeData theme) {
+    return Column(
+      children: [
+        TextField(
+          controller: _apiKeyController,
+          obscureText: true,
+          onChanged: (_) {
+            if (_showApiKeyError) setState(() => _showApiKeyError = false);
+          },
+          decoration: InputDecoration(
+            labelText: 'API Key',
+            hintText: _apiFormat == 'anthropic' ? 'sk-ant-...' : 'sk-...',
+            helperText: '用于连接所选 API 服务',
+            errorText: _showApiKeyError && _apiKeyController.text.trim().isEmpty
+                ? AppStrings.pleaseEnterApiKey
+                : null,
+            prefixIcon: const Icon(Icons.key),
+          ),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _baseUrlController,
+          decoration: InputDecoration(
+            labelText: AppStrings.baseUrlDefaultHint,
+            hintText: _apiFormat == 'anthropic'
+                ? 'https://api.anthropic.com'
+                : 'https://api.openai.com',
+            helperText: '留空时使用默认地址',
+            prefixIcon: const Icon(Icons.link),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildModelStep(ThemeData theme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _fetchingModels
+                  ? const Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(16),
+                        child: CircularProgressIndicator(),
+                      ),
+                    )
+                  : (_availableModels.isNotEmpty && !_manualModelInput)
+                      ? DropdownButtonFormField<String>(
+                          value: _availableModels.any((model) =>
+                                  LlmService.modelIdFromDisplay(model) ==
+                                  _modelController.text)
+                              ? _modelController.text
+                              : null,
+                          decoration: const InputDecoration(
+                            labelText: AppStrings.selectModel,
+                            prefixIcon: Icon(Icons.smart_toy),
+                          ),
+                          items: [
+                            ..._availableModels.map((m) => DropdownMenuItem(
+                                  value: LlmService.modelIdFromDisplay(m),
+                                  child: Text(m, overflow: TextOverflow.ellipsis),
+                                )),
+                            const DropdownMenuItem(
+                              value: '__manual__',
+                              child: Text(AppStrings.manualInput),
+                            ),
+                          ],
+                          onChanged: (v) {
+                            if (v == '__manual__') {
+                              setState(() => _manualModelInput = true);
+                            } else if (v != null) {
+                              _modelController.text = v;
+                            }
+                          },
+                        )
+                      : TextField(
+                          controller: _modelController,
+                          decoration: InputDecoration(
+                            labelText: AppStrings.modelName,
+                            hintText: AppConstants.defaultModel,
+                            prefixIcon: const Icon(Icons.smart_toy),
+                          ),
+                        ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            FilledButton.tonalIcon(
+              icon: _fetchingModels
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.sync),
+              label: Text(_fetchingModels
+                  ? AppStrings.fetchingModels
+                  : '测试连接'),
+              onPressed: _fetchingModels ? null : _fetchModels,
+            ),
+            Text(
+              _availableModels.isEmpty
+                  ? '也可以直接手动输入模型名称'
+                  : '已获取 ${_availableModels.length} 个模型',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFooter() {
+    return Row(
+      children: [
+        if (_currentStep > 0)
+          OutlinedButton.icon(
+            onPressed: () => setState(() => _currentStep--),
+            icon: const Icon(Icons.arrow_back),
+            label: const Text('上一步'),
+          )
+        else
+          const Spacer(),
+        const Spacer(),
+        FilledButton.icon(
+          onPressed: _onStepContinue,
+          icon: Icon(_currentStep == 2 ? Icons.check : Icons.arrow_forward),
+          label: Text(_currentStep == 2 ? AppStrings.done : '下一步'),
+        ),
+      ],
+    );
+  }
+
   Future<void> _onStepContinue() async {
     if (_currentStep == 1 && _apiKeyController.text.trim().isEmpty) {
+      setState(() => _showApiKeyError = true);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text(AppStrings.pleaseEnterApiKey)),

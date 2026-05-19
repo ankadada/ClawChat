@@ -23,17 +23,25 @@ class ProgressStep extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    Color circleColor;
+    Color stateColor;
+    Color backgroundColor;
+    Color borderColor;
     Widget circleChild;
 
     if (hasError) {
-      circleColor = theme.colorScheme.error;
+      stateColor = theme.colorScheme.error;
+      backgroundColor = theme.colorScheme.errorContainer.withAlpha(90);
+      borderColor = theme.colorScheme.error.withAlpha(150);
       circleChild = const Icon(Icons.close, color: Colors.white, size: 16);
     } else if (isComplete) {
-      circleColor = AppColors.statusGreen;
+      stateColor = AppColors.statusGreen;
+      backgroundColor = AppColors.statusGreen.withAlpha(24);
+      borderColor = AppColors.statusGreen.withAlpha(120);
       circleChild = const Icon(Icons.check, color: Colors.white, size: 16);
     } else if (isActive) {
-      circleColor = theme.colorScheme.primary;
+      stateColor = theme.colorScheme.primary;
+      backgroundColor = theme.colorScheme.primaryContainer.withAlpha(75);
+      borderColor = theme.colorScheme.primary.withAlpha(140);
       // Use indeterminate (spinning) when progress is 0 so the UI doesn't
       // appear frozen during long-running steps (#83).
       final effectiveProgress = (progress != null && progress! > 0.0) ? progress : null;
@@ -47,7 +55,9 @@ class ProgressStep extends StatelessWidget {
         ),
       );
     } else {
-      circleColor = theme.colorScheme.surfaceContainerHighest;
+      stateColor = theme.colorScheme.outline;
+      backgroundColor = theme.colorScheme.surfaceContainerHighest.withAlpha(80);
+      borderColor = theme.colorScheme.outline.withAlpha(45);
       circleChild = Text(
         '$stepNumber',
         style: TextStyle(
@@ -59,58 +69,90 @@ class ProgressStep extends StatelessWidget {
     }
 
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        children: [
-          Container(
-            width: 32,
-            height: 32,
-            decoration: BoxDecoration(
-              color: circleColor,
-              shape: BoxShape.circle,
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOut,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: backgroundColor,
+          borderRadius: BorderRadius.circular(AppRadii.m),
+          border: Border.all(color: borderColor),
+        ),
+        child: Row(
+          children: [
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              width: isActive ? 36 : 32,
+              height: isActive ? 36 : 32,
+              decoration: BoxDecoration(
+                color: stateColor,
+                shape: BoxShape.circle,
+                boxShadow: isActive
+                    ? [
+                        BoxShadow(
+                          color: stateColor.withAlpha(55),
+                          blurRadius: 16,
+                          spreadRadius: 1,
+                        ),
+                      ]
+                    : null,
+              ),
+              alignment: Alignment.center,
+              child: circleChild,
             ),
-            alignment: Alignment.center,
-            child: circleChild,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  label,
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
-                    color: isActive
-                        ? theme.colorScheme.onSurface
-                        : theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                if (isActive && progress != null) ...[
-                  Padding(
-                    padding: const EdgeInsets.only(top: 4),
-                    child: LinearProgressIndicator(
-                      // Show indeterminate animation when progress is 0 (#83)
-                      value: progress! > 0.0 ? progress : null,
-                      minHeight: 4,
-                      borderRadius: BorderRadius.circular(2),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      fontWeight: isActive || isComplete
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                      color: isActive
+                          ? theme.colorScheme.onSurface
+                          : theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
-                  if (progress! > 0.0)
+                  if (isActive && progress != null) ...[
                     Padding(
-                      padding: const EdgeInsets.only(top: 2),
-                      child: Text(
-                        '${(progress! * 100).toInt()}%',
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
+                      padding: const EdgeInsets.only(top: 8),
+                      child: LinearProgressIndicator(
+                        // Show indeterminate animation when progress is 0 (#83)
+                        value: progress! > 0.0 ? progress : null,
+                        minHeight: 5,
+                        borderRadius: BorderRadius.circular(999),
                       ),
                     ),
+                    if (progress! > 0.0)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          '${(progress! * 100).toInt()}%',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                  ],
                 ],
-              ],
+              ),
             ),
-          ),
-        ],
+            const SizedBox(width: 8),
+            Icon(
+              isComplete
+                  ? Icons.done_all
+                  : isActive
+                      ? Icons.more_horiz
+                      : Icons.circle_outlined,
+              size: 18,
+              color: stateColor,
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -69,6 +69,8 @@ class _SetupWizardScreenState extends State<SetupWizardScreen> {
                 ),
               ),
               const SizedBox(height: 32),
+              _buildProgressSummary(_state, theme),
+              const SizedBox(height: 16),
               Expanded(child: _buildSteps(_state, theme)),
               if (_state.hasError) ...[
                 Container(
@@ -158,5 +160,75 @@ class _SetupWizardScreenState extends State<SetupWizardScreen> {
           ),
       ],
     );
+  }
+
+  Widget _buildProgressSummary(SetupState state, ThemeData theme) {
+    final progress = _overallProgress(state);
+    final currentOperation = state.message.isNotEmpty
+        ? state.message
+        : (_started ? state.stepLabel : AppStrings.startingInit);
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withAlpha(120),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                state.isComplete ? Icons.check_circle : Icons.downloading,
+                color: state.isComplete
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  state.isComplete ? AppStrings.initComplete : '当前操作',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              Text(
+                '${(progress * 100).round()}%',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          LinearProgressIndicator(
+            value: progress,
+            minHeight: 6,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            currentOperation,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  double _overallProgress(SetupState state) {
+    if (!_started) return 0.0;
+    if (state.isComplete) return 1.0;
+    final stepBase = (state.stepNumber - 1).clamp(0, 2).toDouble();
+    final stepProgress = state.progress > 0
+        ? state.progress.clamp(0.0, 1.0).toDouble()
+        : 0.0;
+    return ((stepBase + stepProgress) / 3).clamp(0.0, 1.0).toDouble();
   }
 }

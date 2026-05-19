@@ -33,24 +33,50 @@ class CodeBlock extends StatelessWidget {
     r'^(if|else|for|while|return|import|from|class|function|def|const|let|var|async|await|try|catch|finally|throw|new|this|super|static|final|void|int|String|bool|double|true|false|null|None|self|print|extends|implements|abstract|enum|switch|case|break|continue|do|in|is|as|export|default|yield|with|required)$',
   );
 
-  List<TextSpan> _highlightCode(String code, String? language, Color defaultColor) {
+  static const _monoFamily = 'DejaVuSansMono';
+  static const _monoFallback = [
+    'monospace',
+    'Noto Sans Mono',
+    'Noto Sans Mono CJK SC',
+    'Noto Color Emoji',
+  ];
+
+  _CodePalette _paletteFor(ThemeData theme) {
+    final dark = theme.brightness == Brightness.dark;
+    return _CodePalette(
+      background: dark
+          ? theme.colorScheme.surfaceContainerLow
+          : theme.colorScheme.surfaceContainerHighest,
+      headerBackground: dark
+          ? theme.colorScheme.surfaceContainer
+          : theme.colorScheme.surfaceContainerHigh,
+      defaultColor: theme.colorScheme.onSurface,
+      comment: dark ? const Color(0xFF7DD3A8) : const Color(0xFF287348),
+      string: dark ? const Color(0xFFF2B8A2) : const Color(0xFF9A4D28),
+      number: dark ? const Color(0xFFC4DFA6) : const Color(0xFF546F2F),
+      keyword: dark ? const Color(0xFF8FC7FF) : theme.colorScheme.primary,
+      function: dark ? const Color(0xFFE5D68A) : const Color(0xFF7A5C00),
+    );
+  }
+
+  List<TextSpan> _highlightCode(String code, _CodePalette palette) {
     final spans = <TextSpan>[];
     final lines = code.split('\n');
 
     for (int i = 0; i < lines.length; i++) {
       if (i > 0) spans.add(const TextSpan(text: '\n'));
-      spans.addAll(_highlightLine(lines[i], defaultColor));
+      spans.addAll(_highlightLine(lines[i], palette));
     }
     return spans;
   }
 
-  List<TextSpan> _highlightLine(String line, Color defaultColor) {
+  List<TextSpan> _highlightLine(String line, _CodePalette palette) {
     final spans = <TextSpan>[];
 
     // Check for full-line comment
     final trimmed = line.trimLeft();
     if (trimmed.startsWith('//') || trimmed.startsWith('#')) {
-      return [TextSpan(text: line, style: const TextStyle(color: Color(0xFF6A9955)))];
+      return [TextSpan(text: line, style: TextStyle(color: palette.comment))];
     }
 
     int lastEnd = 0;
@@ -58,21 +84,21 @@ class CodeBlock extends StatelessWidget {
       if (match.start > lastEnd) {
         spans.add(TextSpan(
           text: line.substring(lastEnd, match.start),
-          style: TextStyle(color: defaultColor),
+          style: TextStyle(color: palette.defaultColor),
         ));
       }
       final text = match.group(0)!;
       TextStyle style;
       if (text.startsWith('"') || text.startsWith("'") || text.startsWith('`')) {
-        style = const TextStyle(color: Color(0xFFCE9178)); // strings: orange
+        style = TextStyle(color: palette.string);
       } else if (text.startsWith('//') || text.startsWith('#') || text.startsWith('/*')) {
-        style = const TextStyle(color: Color(0xFF6A9955)); // comments: green
+        style = TextStyle(color: palette.comment);
       } else if (RegExp(r'^\d').hasMatch(text)) {
-        style = const TextStyle(color: Color(0xFFB5CEA8)); // numbers: light green
+        style = TextStyle(color: palette.number);
       } else if (_keywordSet.hasMatch(text)) {
-        style = const TextStyle(color: Color(0xFF569CD6)); // keywords: blue
+        style = TextStyle(color: palette.keyword);
       } else {
-        style = const TextStyle(color: Color(0xFFDCDCAA)); // functions: yellow
+        style = TextStyle(color: palette.function);
       }
       spans.add(TextSpan(text: text, style: style));
       lastEnd = match.end;
@@ -80,7 +106,7 @@ class CodeBlock extends StatelessWidget {
     if (lastEnd < line.length) {
       spans.add(TextSpan(
         text: line.substring(lastEnd),
-        style: TextStyle(color: defaultColor),
+        style: TextStyle(color: palette.defaultColor),
       ));
     }
     return spans;
@@ -135,22 +161,23 @@ class CodeBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final palette = _paletteFor(theme);
 
     final lines = code.split('\n');
     final displayCode = lines.length > maxLines
         ? '${lines.take(maxLines).join('\n')}\n\n... (${lines.length - maxLines} lines omitted)'
         : code;
 
-    final defaultColor = theme.colorScheme.onSurface;
-    final highlightedSpans = _highlightCode(displayCode, language, defaultColor);
+    final highlightedSpans = _highlightCode(displayCode, palette);
 
     final showPreview = _isPreviewableHtml;
 
     return Container(
       width: double.infinity,
       decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest,
+        color: palette.background,
         borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: theme.colorScheme.outline.withAlpha(35)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -159,6 +186,7 @@ class CodeBlock extends StatelessWidget {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               decoration: BoxDecoration(
+                color: palette.headerBackground,
                 border: Border(
                   bottom: BorderSide(
                     color: theme.colorScheme.outline.withAlpha(30),
@@ -212,7 +240,8 @@ class CodeBlock extends StatelessWidget {
               TextSpan(
                 children: highlightedSpans,
                 style: TextStyle(
-                  fontFamily: 'monospace',
+                  fontFamily: _monoFamily,
+                  fontFamilyFallback: _monoFallback,
                   fontSize: 12,
                   height: 1.5,
                 ),
@@ -223,4 +252,26 @@ class CodeBlock extends StatelessWidget {
       ),
     );
   }
+}
+
+class _CodePalette {
+  final Color background;
+  final Color headerBackground;
+  final Color defaultColor;
+  final Color comment;
+  final Color string;
+  final Color number;
+  final Color keyword;
+  final Color function;
+
+  const _CodePalette({
+    required this.background,
+    required this.headerBackground,
+    required this.defaultColor,
+    required this.comment,
+    required this.string,
+    required this.number,
+    required this.keyword,
+    required this.function,
+  });
 }
