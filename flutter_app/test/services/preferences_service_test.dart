@@ -13,9 +13,11 @@ void main() {
   const secureStorageChannel =
       MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
   late Map<String, String> secureStorage;
+  late bool failWrites;
 
   setUp(() {
     secureStorage = {};
+    failWrites = false;
     PreferencesService.resetForTesting();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(secureStorageChannel, (call) async {
@@ -25,6 +27,12 @@ void main() {
         case 'read':
           return key == null ? null : secureStorage[key];
         case 'write':
+          if (failWrites) {
+            throw PlatformException(
+              code: 'write_failed',
+              message: 'secure storage write failed',
+            );
+          }
           if (key != null) {
             secureStorage[key] = args['value']?.toString() ?? '';
           }
@@ -91,6 +99,18 @@ void main() {
     expect(secureStorage.containsKey('provider_profiles'), isTrue);
   });
 
+  test('creates a default provider profile during init when none exists',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+
+    expect(service.profiles, hasLength(1));
+    expect(service.activeProfileId, service.profiles.single.id);
+    expect(secureStorage.containsKey('provider_profiles'), isTrue);
+  });
+
   test('delegates API getters and setters to the active profile', () async {
     final first = ProviderProfile.defaults(name: 'First').copyWith(
       id: 'first',
@@ -136,5 +156,39 @@ void main() {
     expect(updated.model, isEmpty);
     expect(service.model, isNull);
     expect(service.activeProfile.effectiveModel, AppConstants.defaultModel);
+  });
+
+  test('setProfiles propagates write failures and reverts in-memory state',
+      () async {
+    final first = ProviderProfile.defaults(name: 'First').copyWith(
+      id: 'first',
+      apiKey: 'sk-first',
+    );
+    final second = ProviderProfile.defaults(name: 'Second').copyWith(
+      id: 'second',
+      apiKey: 'sk-second',
+    );
+    secureStorage['provider_profiles'] = jsonEncode([
+      first.toJson(),
+      second.toJson(),
+    ]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'first',
+    });
+
+    final service = PreferencesService();
+    await service.init();
+
+    failWrites = true;
+    await expectLater(
+      service.setProfiles([
+        second.copyWith(name: 'Only second'),
+      ]),
+      throwsA(isA<PlatformException>()),
+    );
+
+    expect(service.profiles.map((p) => p.name), ['First', 'Second']);
+    expect(service.activeProfileId, 'first');
+    expect(service.apiKey, 'sk-first');
   });
 }

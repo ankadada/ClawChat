@@ -468,16 +468,24 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       return;
     }
 
-    _prefs.apiFormat = _apiFormat;
-    _prefs.apiKey = _apiKeyController.text.trim().isNotEmpty
-        ? _apiKeyController.text.trim()
-        : null;
-    _prefs.baseUrl = _baseUrlController.text.trim().isNotEmpty
-        ? _baseUrlController.text.trim()
-        : null;
-    _prefs.model = _modelController.text.trim().isNotEmpty
-        ? LlmService.modelIdFromDisplay(_modelController.text.trim())
-        : null;
+    final profile = _prefs.activeProfile.copyWith(
+      apiFormat: _apiFormat,
+      apiKey: _apiKeyController.text.trim(),
+      baseUrl: _baseUrlController.text.trim(),
+      model: _modelController.text.trim().isNotEmpty
+          ? LlmService.modelIdFromDisplay(_modelController.text.trim())
+          : '',
+    );
+    try {
+      await _prefs.updateActiveProfile(profile);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(AppStrings.providerProfileSaveFailed('$e'))),
+        );
+      }
+      return;
+    }
     _prefs.setupComplete = true;
     _prefs.isFirstRun = false;
 

@@ -107,11 +107,17 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
   void _scheduleSave() {
     _hasPendingSave = true;
     _saveDebounce?.cancel();
-    _saveDebounce = Timer(const Duration(milliseconds: 500), _flushSave);
+    _saveDebounce = Timer(
+      const Duration(milliseconds: 500),
+      () => unawaited(_flushSave()),
+    );
   }
 
-  void _flushSave({bool showIndicator = true}) {
-    if (!_hasPendingSave) return;
+  Future<bool> _flushSave({
+    bool showIndicator = true,
+    bool showErrors = true,
+  }) async {
+    if (!_hasPendingSave) return true;
     _saveDebounce?.cancel();
     _saveDebounce = null;
     _hasPendingSave = false;
@@ -128,36 +134,66 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         thinkingBudget: _thinkingBudgets[_thinkingLevel],
         temperature: _temperature,
       );
-      _prefs.profiles = _profiles;
-      _prefs.activeProfileId = _activeProfileId;
+      try {
+        await _prefs.setProfiles(_profiles);
+        await _prefs.setActiveProfileId(_activeProfileId);
+      } catch (e) {
+        if (showErrors) _showProfileSaveError(e);
+        await _loadSettings();
+        return false;
+      }
     }
     _prefs.contextLength = _contextLength;
     _prefs.autoCompact = _autoCompact;
 
-    if (!showIndicator || !mounted) return;
+    if (!showIndicator || !mounted) return true;
     setState(() => _showSaved = true);
     _savedIndicatorTimer?.cancel();
     _savedIndicatorTimer = Timer(const Duration(milliseconds: 1500), () {
       if (mounted) setState(() => _showSaved = false);
     });
+    return true;
   }
 
-  void _editProfile(ProviderProfile profile, {bool makeActive = false}) {
-    _flushSave(showIndicator: false);
+  void _showProfileSaveError(Object error) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          AppStrings.providerProfileSaveFailed(_briefError(error)),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _editProfile(
+    ProviderProfile profile, {
+    bool makeActive = false,
+  }) async {
+    final chatProvider = context.read<ChatProvider>();
+    if (!await _flushSave(showIndicator: false)) return;
     HapticFeedback.selectionClick();
+    if (makeActive) {
+      try {
+        await chatProvider.switchProfile(profile.id);
+      } catch (e) {
+        _showProfileSaveError(e);
+        return;
+      }
+      if (!mounted) return;
+    }
     setState(() {
       if (makeActive) {
         _activeProfileId = profile.id;
-        _prefs.activeProfileId = profile.id;
-        context.read<ChatProvider>().switchProfile(profile.id);
       }
       _editingProfileId = profile.id;
       _loadProfileIntoForm(profile);
     });
   }
 
-  void _addProfile() {
-    _flushSave(showIndicator: false);
+  Future<void> _addProfile() async {
+    final chatProvider = context.read<ChatProvider>();
+    if (!await _flushSave(showIndicator: false)) return;
     HapticFeedback.lightImpact();
     final profile =
         ProviderProfile.defaults(name: AppStrings.newProviderProfile);
@@ -167,9 +203,13 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
       _editingProfileId = profile.id;
       _loadProfileIntoForm(profile);
     });
-    _prefs.profiles = _profiles;
-    _prefs.activeProfileId = profile.id;
-    context.read<ChatProvider>().switchProfile(profile.id);
+    try {
+      await _prefs.setProfiles(_profiles);
+      await chatProvider.switchProfile(profile.id);
+    } catch (e) {
+      _showProfileSaveError(e);
+      await _loadSettings();
+    }
   }
 
   Future<bool> _confirmDeleteProfile(ProviderProfile profile) async {
@@ -182,13 +222,20 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
       return false;
     }
 
-    if (profile.id != _activeProfileId) return true;
+    final isActive = profile.id == _activeProfileId;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text(AppStrings.deleteActiveProfileTitle),
-        content:
-            Text(AppStrings.deleteActiveProfileConfirm(profile.displayName)),
+        title: Text(
+          isActive
+              ? AppStrings.deleteActiveProfileTitle
+              : AppStrings.deleteProviderProfileTitle,
+        ),
+        content: Text(
+          isActive
+              ? AppStrings.deleteActiveProfileConfirm(profile.displayName)
+              : AppStrings.deleteProviderProfileConfirm(profile.displayName),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -204,8 +251,9 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     return confirmed == true;
   }
 
-  void _deleteProfile(ProviderProfile profile) {
-    _flushSave(showIndicator: false);
+  Future<void> _deleteProfile(ProviderProfile profile) async {
+    final chatProvider = context.read<ChatProvider>();
+    if (!await _flushSave(showIndicator: false)) return;
     final remaining = _profiles.where((p) => p.id != profile.id).toList();
     if (remaining.isEmpty) return;
     final newActiveId =
@@ -223,10 +271,14 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
       _editingProfileId = editingProfile.id;
       _loadProfileIntoForm(editingProfile);
     });
-    _prefs.profiles = _profiles;
-    _prefs.activeProfileId = _activeProfileId;
-    if (_activeProfileId != null) {
-      context.read<ChatProvider>().switchProfile(_activeProfileId!);
+    try {
+      await _prefs.setProfiles(_profiles);
+      if (_activeProfileId != null) {
+        await chatProvider.switchProfile(_activeProfileId!);
+      }
+    } catch (e) {
+      _showProfileSaveError(e);
+      await _loadSettings();
     }
   }
 
@@ -331,7 +383,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         trailing: IconButton(
           icon: const Icon(Icons.add),
           tooltip: AppStrings.addProviderProfile,
-          onPressed: _addProfile,
+          onPressed: () => unawaited(_addProfile()),
         ),
       ),
       ..._profiles.map((profile) => _profileTile(theme, profile)),
@@ -348,8 +400,11 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     return Dismissible(
       key: ValueKey(profile.id),
       direction: DismissDirection.endToStart,
-      confirmDismiss: (_) => _confirmDeleteProfile(profile),
-      onDismissed: (_) => _deleteProfile(profile),
+      confirmDismiss: (_) async {
+        if (!await _confirmDeleteProfile(profile)) return false;
+        await _deleteProfile(profile);
+        return false;
+      },
       background: Container(
         margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         alignment: Alignment.centerRight,
@@ -413,9 +468,9 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
             trailing: IconButton(
               icon: const Icon(Icons.edit_outlined),
               tooltip: AppStrings.editProviderProfile,
-              onPressed: () => _editProfile(profile),
+              onPressed: () => unawaited(_editProfile(profile)),
             ),
-            onTap: () => _editProfile(profile, makeActive: true),
+            onTap: () => unawaited(_editProfile(profile, makeActive: true)),
           ),
         ),
       ),
@@ -705,7 +760,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
 
   @override
   void dispose() {
-    _flushSave(showIndicator: false);
+    unawaited(_flushSave(showIndicator: false, showErrors: false));
     _saveDebounce?.cancel();
     _savedIndicatorTimer?.cancel();
     _nameController.dispose();

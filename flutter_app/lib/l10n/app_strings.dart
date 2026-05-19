@@ -132,9 +132,13 @@ class AppStrings {
   static const providerProfileName = '配置名称';
   static const editProviderProfile = '编辑配置';
   static const cannotDeleteLastProfile = '至少保留一个配置';
+  static const deleteProviderProfileTitle = '删除配置?';
+  static String deleteProviderProfileConfirm(String name) =>
+      '确定删除 "$name" 吗？此操作会移除保存的 API Key。';
   static const deleteActiveProfileTitle = '删除当前配置?';
   static String deleteActiveProfileConfirm(String name) =>
       '删除 "$name" 后将自动切换到其他配置。';
+  static String providerProfileSaveFailed(String e) => '配置保存失败: $e';
   static const advancedModelSettings = '高级模型设置';
   static const saveSettings = '保存设置';
   static const settingsSaved = '设置已保存';

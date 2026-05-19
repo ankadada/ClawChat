@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -38,7 +39,6 @@ class PreferencesService {
   Map<String, String> _cachedEnvVars = {};
   List<ProviderProfile> _cachedProfiles = [];
   String? _cachedActiveProfileId;
-  Future<void> _profileWriteChain = Future.value();
 
   late SharedPreferences _prefs;
   bool _initialized = false;
@@ -60,6 +60,7 @@ class PreferencesService {
     await _migrateApiKeyToSecureStorage();
     await _migrateEnvVarsToSecureStorage();
     await _loadProviderProfiles();
+    await _ensureAtLeastOneProfile();
     _cachedEnvVars =
         _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
     _initialized = true;
@@ -136,12 +137,7 @@ class PreferencesService {
       await _deleteLegacyApiConfig();
     }
 
-    if (_cachedProfiles.isEmpty) {
-      _cachedProfiles = [ProviderProfile.defaults()];
-      _cachedActiveProfileId = _cachedProfiles.first.id;
-      await _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
-      await _persistProfilesNow();
-    }
+    await _ensureAtLeastOneProfile();
   }
 
   Future<void> _migrateLegacyProviderProfile() async {
@@ -201,25 +197,45 @@ class PreferencesService {
     await _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
   }
 
-  int _activeProfileIndex() {
+  Future<void> _ensureAtLeastOneProfile() async {
     if (_cachedProfiles.isEmpty) {
       _cachedProfiles = [ProviderProfile.defaults()];
       _cachedActiveProfileId = _cachedProfiles.first.id;
-      _persistProfiles();
+      await _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+      await _persistProfiles();
+      return;
     }
+    await _ensureValidActiveProfile();
+  }
+
+  int _activeProfileIndex() {
+    if (_cachedProfiles.isEmpty) return -1;
     final index =
         _cachedProfiles.indexWhere((p) => p.id == _cachedActiveProfileId);
     if (index >= 0) return index;
-    _cachedActiveProfileId = _cachedProfiles.first.id;
-    _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
     return 0;
   }
 
-  ProviderProfile get _activeProfile => _cachedProfiles[_activeProfileIndex()];
+  ProviderProfile get _activeProfile {
+    final index = _activeProfileIndex();
+    if (index < 0) {
+      throw StateError('PreferencesService has no provider profiles');
+    }
+    return _cachedProfiles[index];
+  }
 
   void _replaceActiveProfile(ProviderProfile profile) {
-    _cachedProfiles[_activeProfileIndex()] = profile;
-    _persistProfiles();
+    final previousProfiles = _copyProfiles(_cachedProfiles);
+    final previousActiveProfileId = _cachedActiveProfileId;
+    final index = _activeProfileIndex();
+    if (index < 0) {
+      throw StateError('PreferencesService has no provider profiles');
+    }
+    _cachedProfiles[index] = profile;
+    _persistProfilesAfterSyncMutation(
+      previousProfiles,
+      previousActiveProfileId,
+    );
   }
 
   Future<void> _persistProfilesNow() {
@@ -229,38 +245,76 @@ class PreferencesService {
     );
   }
 
-  void _persistProfiles() {
-    final snapshot =
-        jsonEncode(_cachedProfiles.map((p) => p.toJson()).toList());
-    _profileWriteChain = _profileWriteChain.then((_) {
-      return _secureStorage.write(key: _keyProviderProfiles, value: snapshot);
-    }).catchError((e) {
+  Future<void> _persistProfiles() async {
+    try {
+      await _persistProfilesNow();
+    } catch (e) {
       debugPrint('Failed to persist provider profiles: $e');
-    });
+      rethrow;
+    }
+  }
+
+  void _persistProfilesAfterSyncMutation(
+    List<ProviderProfile> previousProfiles,
+    String? previousActiveProfileId,
+  ) {
+    unawaited(_persistProfiles().catchError((Object e) {
+      _cachedProfiles = previousProfiles;
+      _cachedActiveProfileId = previousActiveProfileId;
+      debugPrint('Reverted provider profiles after persist failure: $e');
+    }));
+  }
+
+  List<ProviderProfile> _copyProfiles(List<ProviderProfile> profiles) {
+    return profiles.map((p) => p.copyWith()).toList();
   }
 
   List<ProviderProfile> get profiles {
-    _activeProfileIndex();
     return _cachedProfiles.map((p) => p.copyWith()).toList();
   }
 
   set profiles(List<ProviderProfile> value) {
+    unawaited(setProfiles(value).catchError((Object e) {
+      debugPrint('Failed to set provider profiles: $e');
+    }));
+  }
+
+  Future<void> setProfiles(List<ProviderProfile> value) async {
+    final previousProfiles = _copyProfiles(_cachedProfiles);
+    final previousActiveProfileId = _cachedActiveProfileId;
+
     _cachedProfiles = value.isEmpty
         ? [ProviderProfile.defaults()]
         : value.map((p) => p.copyWith()).toList();
     if (!_cachedProfiles.any((p) => p.id == _cachedActiveProfileId)) {
       _cachedActiveProfileId = _cachedProfiles.first.id;
-      _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
     }
-    _persistProfiles();
+
+    try {
+      await _persistProfiles();
+      await _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+    } catch (e) {
+      _cachedProfiles = previousProfiles;
+      _cachedActiveProfileId = previousActiveProfileId;
+      debugPrint('Reverted provider profiles after setProfiles failure: $e');
+      rethrow;
+    }
   }
 
   String? get activeProfileId {
-    _activeProfileIndex();
     return _cachedActiveProfileId;
   }
 
   set activeProfileId(String? value) {
+    unawaited(setActiveProfileId(value).catchError((Object e) {
+      debugPrint('Failed to set active provider profile: $e');
+    }));
+  }
+
+  Future<void> setActiveProfileId(String? value) async {
+    final previousProfiles = _copyProfiles(_cachedProfiles);
+    final previousActiveProfileId = _cachedActiveProfileId;
+
     if (value != null && _cachedProfiles.any((p) => p.id == value)) {
       _cachedActiveProfileId = value;
     } else if (_cachedProfiles.isNotEmpty) {
@@ -268,16 +322,46 @@ class PreferencesService {
     } else {
       _cachedProfiles = [ProviderProfile.defaults()];
       _cachedActiveProfileId = _cachedProfiles.first.id;
-      _persistProfiles();
     }
-    if (_cachedActiveProfileId != null) {
-      _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
-    } else {
-      _prefs.remove(_keyActiveProfileId);
+
+    try {
+      if (_cachedProfiles.length != previousProfiles.length ||
+          previousProfiles.isEmpty) {
+        await _persistProfiles();
+      }
+      if (_cachedActiveProfileId != null) {
+        await _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+      } else {
+        await _prefs.remove(_keyActiveProfileId);
+      }
+    } catch (e) {
+      _cachedProfiles = previousProfiles;
+      _cachedActiveProfileId = previousActiveProfileId;
+      debugPrint('Reverted active provider profile after persist failure: $e');
+      rethrow;
     }
   }
 
   ProviderProfile get activeProfile => _activeProfile.copyWith();
+
+  Future<void> updateActiveProfile(ProviderProfile profile) async {
+    final previousProfiles = _copyProfiles(_cachedProfiles);
+    final previousActiveProfileId = _cachedActiveProfileId;
+    final index = _activeProfileIndex();
+    if (index < 0) {
+      throw StateError('PreferencesService has no provider profiles');
+    }
+    _cachedProfiles[index] = profile.copyWith(id: _cachedProfiles[index].id);
+
+    try {
+      await _persistProfiles();
+    } catch (e) {
+      _cachedProfiles = previousProfiles;
+      _cachedActiveProfileId = previousActiveProfileId;
+      debugPrint('Reverted active provider profile after update failure: $e');
+      rethrow;
+    }
+  }
 
   bool get autoStartGateway => _prefs.getBool(_keyAutoStart) ?? false;
   set autoStartGateway(bool value) => _prefs.setBool(_keyAutoStart, value);
