@@ -235,6 +235,23 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<ChatSession?> forkFromMessage(String sessionId, int messageIndex) async {
+    final fork = await _storage.forkSession(sessionId, messageIndex);
+    if (fork == null) return null;
+
+    sessions.insert(0, SessionSummary(
+      id: fork.id,
+      title: fork.title,
+      createdAt: fork.createdAt,
+      updatedAt: fork.updatedAt,
+      folder: fork.folder,
+    ));
+    currentSession = fork;
+    _clearSessionScopedState();
+    notifyListeners();
+    return fork;
+  }
+
   Future<void> sendMessage(
     String text, {
     List<MessageContent> attachments = const [],

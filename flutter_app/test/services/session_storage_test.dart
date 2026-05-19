@@ -112,6 +112,36 @@ void main() {
     });
   });
 
+  group('SessionStorage fork', () {
+    test('copies messages through selected index and skips system notices', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final source = ChatSession(
+        id: 'source',
+        title: 'Original',
+        messages: [
+          ChatMessage.user('first'),
+          ChatMessage.systemNotice('context compacted'),
+          ChatMessage(role: 'assistant', content: [TextContent('second')]),
+          ChatMessage.user('third'),
+        ],
+      );
+      await storage.saveSession(source);
+
+      final fork = await storage.forkSession('source', 2);
+
+      expect(fork, isNotNull);
+      expect(fork!.id, isNot(source.id));
+      expect(fork.title, '分支自: Original');
+      expect(fork.messages.map((m) => m.textContent), ['first', 'second']);
+      expect(fork.messages.any((m) => m.isSystemNotice), isFalse);
+
+      fork.messages.first.content = [TextContent('changed')];
+      final reloadedSource = await storage.getSession('source');
+      expect(reloadedSource!.messages.first.textContent, 'first');
+    });
+  });
+
   group('ChatSession API messages', () {
     test('filters persisted system notices from API payload', () {
       final session = ChatSession(

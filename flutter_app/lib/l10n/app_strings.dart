@@ -18,6 +18,10 @@ class AppStrings {
   static const copied = '已复制';
   static const share = '分享';
   static const shareFailed = '分享失败';
+  static const forkConversation = '从这里分支';
+  static const forkCreated = '已创建分支对话';
+  static const forkFailed = '创建分支失败';
+  static String forkedFromTitle(String title) => '分支自: $title';
   static const save = '保存';
   static const saved = '已保存';
   static const done = '完成';
@@ -28,6 +32,7 @@ class AppStrings {
   static const refresh = '刷新';
   static const open = 'Open';
   static const renderError = '渲染错误';
+  static const searchSources = '搜索来源';
 
   // ── Chat screen ──────────────────────────────────────────────────
   static const newChat = '新对话';

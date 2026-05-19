@@ -671,6 +671,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   reversedIndex,
                                   theme,
                                   maxContentWidth,
+                                  messages: messages,
                                   previousRole: previousRole,
                                   nextRole: nextRole,
                                 ),
@@ -855,6 +856,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     int messageIndex,
     ThemeData theme,
     double maxContentWidth, {
+    required List<ChatMessage> messages,
     String? previousRole,
     String? nextRole,
   }) {
@@ -891,6 +893,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               maxContentWidth,
               messageId: messageId,
               message: message,
+              messageIndex: messageIndex,
+              messages: messages,
             ),
           if (!isUser && message.alternatives != null && message.alternatives!.isNotEmpty)
             _buildAlternativesNav(message, messageIndex, theme),
@@ -1019,6 +1023,43 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return buffer.toString().trimRight();
   }
 
+  Future<void> _forkFromMessage(int? messageIndex) async {
+    final session = context.read<ChatProvider>().currentSession;
+    if (session == null || messageIndex == null) return;
+
+    final fork = await context.read<ChatProvider>().forkFromMessage(
+      session.id,
+      messageIndex,
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          fork == null ? AppStrings.forkFailed : AppStrings.forkCreated,
+        ),
+        duration: const Duration(seconds: 1),
+      ),
+    );
+  }
+
+  String? _toolOutputFor(
+    ToolUseContent toolUse,
+    int? messageIndex,
+    List<ChatMessage>? messages,
+  ) {
+    if (messageIndex == null || messages == null) return null;
+    final resultIndex = messageIndex + 1;
+    if (resultIndex >= messages.length) return null;
+
+    final resultMessage = messages[resultIndex];
+    if (resultMessage.role != 'user') return null;
+
+    for (final result in resultMessage.toolResults) {
+      if (result.toolUseId == toolUse.id) return result.output;
+    }
+    return null;
+  }
+
   Widget _buildContentBlock(
     MessageContent content,
     bool isUser,
@@ -1026,107 +1067,126 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     double maxContentWidth, {
     String? messageId,
     ChatMessage? message,
+    int? messageIndex,
+    List<ChatMessage>? messages,
   }) {
     switch (content) {
       case TextContent(:final text):
         return Semantics(
           label: isUser ? '用户消息' : 'AI 消息',
           child: GestureDetector(
-          onLongPress: () {
-            HapticFeedback.lightImpact();
-            showModalBottomSheet(
-              context: context,
-              builder: (ctx) => SafeArea(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    ListTile(
-                      leading: const Icon(Icons.copy),
-                      title: const Text(AppStrings.copyText),
-                      onTap: () {
-                        Clipboard.setData(ClipboardData(text: text));
-                        Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
-                        );
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.article_outlined),
-                      title: const Text(AppStrings.copyMarkdown),
-                      onTap: () {
-                        Clipboard.setData(ClipboardData(
-                          text: _messageToMarkdown(message, fallbackText: text),
-                        ));
-                        Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
-                        );
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.share),
-                      title: const Text(AppStrings.share),
-                      onTap: () async {
-                        Navigator.pop(ctx);
-                        try {
-                          await NativeBridge.shareText(
-                            text: _messageToMarkdown(message, fallbackText: text),
-                            subject: AppStrings.appName,
-                          );
-                        } catch (e) {
-                          if (!mounted) return;
+            onLongPress: () {
+              HapticFeedback.lightImpact();
+              showModalBottomSheet(
+                context: context,
+                builder: (ctx) => SafeArea(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      ListTile(
+                        leading: const Icon(Icons.copy),
+                        title: const Text(AppStrings.copyText),
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(text: text));
+                          Navigator.pop(ctx);
                           ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text('${AppStrings.shareFailed}: $e')),
+                            const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
                           );
-                        }
-                      },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.format_quote),
-                      title: const Text(AppStrings.quoteReply),
-                      onTap: () {
-                        Navigator.pop(ctx);
-                        final quoted = text.length > 200
-                            ? '${text.substring(0, 200)}...'
-                            : text;
-                        _inputController.text = '> $quoted\n\n${_inputController.text}';
-                        _inputController.selection = TextSelection.collapsed(
-                          offset: _inputController.text.length,
-                        );
-                        _focusNode.requestFocus();
-                      },
-                    ),
-                  ],
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.article_outlined),
+                        title: const Text(AppStrings.copyMarkdown),
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(
+                            text: _messageToMarkdown(message, fallbackText: text),
+                          ));
+                          Navigator.pop(ctx);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
+                          );
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.share),
+                        title: const Text(AppStrings.share),
+                        onTap: () async {
+                          Navigator.pop(ctx);
+                          try {
+                            await NativeBridge.shareText(
+                              text: _messageToMarkdown(message, fallbackText: text),
+                              subject: AppStrings.appName,
+                            );
+                          } catch (e) {
+                            if (!mounted) return;
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('${AppStrings.shareFailed}: $e')),
+                            );
+                          }
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.call_split),
+                        title: const Text(AppStrings.forkConversation),
+                        onTap: () async {
+                          Navigator.pop(ctx);
+                          await _forkFromMessage(messageIndex);
+                        },
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.format_quote),
+                        title: const Text(AppStrings.quoteReply),
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          final quoted = text.length > 200
+                              ? '${text.substring(0, 200)}...'
+                              : text;
+                          _inputController.text = '> $quoted\n\n${_inputController.text}';
+                          _inputController.selection = TextSelection.collapsed(
+                            offset: _inputController.text.length,
+                          );
+                          _focusNode.requestFocus();
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+            child: Container(
+              constraints: BoxConstraints(
+                maxWidth: maxContentWidth,
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              decoration: BoxDecoration(
+                color: isUser
+                    ? AppColors.accent.withAlpha(45)
+                    : theme.colorScheme.surface,
+                borderRadius: _bubbleRadius(isUser),
+                border: Border.all(
+                  color: isUser
+                      ? AppColors.accent.withAlpha(90)
+                      : theme.colorScheme.outline.withAlpha(50),
                 ),
               ),
-            );
-          },
-          child: Container(
-            constraints: BoxConstraints(
-              maxWidth: maxContentWidth,
+              child: StreamingText(text: text),
             ),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-            decoration: BoxDecoration(
-              color: isUser
-                  ? AppColors.accent.withAlpha(45)
-                  : theme.colorScheme.surface,
-              borderRadius: _bubbleRadius(isUser),
-              border: Border.all(
-                color: isUser
-                    ? AppColors.accent.withAlpha(90)
-                    : theme.colorScheme.outline.withAlpha(50),
-              ),
-            ),
-            child: StreamingText(text: text),
           ),
-        ),
         );
 
       case ToolUseContent():
-        return ConstrainedBox(
-          constraints: BoxConstraints(maxWidth: maxContentWidth),
-          child: ToolCallCard(toolUse: content),
+        return GestureDetector(
+          onLongPress: () async {
+            HapticFeedback.lightImpact();
+            await _forkFromMessage(messageIndex);
+          },
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: maxContentWidth),
+            child: ToolCallCard(
+              toolUse: content,
+              toolOutput: _toolOutputFor(content, messageIndex, messages),
+            ),
+          ),
         );
 
       case ToolResultContent():
@@ -1136,40 +1196,46 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         final label = filename ?? mediaType;
         return Semantics(
           label: AppStrings.imageAttachmentLabel(label),
-          child: Container(
-            constraints: BoxConstraints(
-              maxWidth: maxContentWidth,
-            ),
-            margin: const EdgeInsets.only(top: 4),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-            decoration: BoxDecoration(
-              color: isUser
-                  ? AppColors.accent.withAlpha(45)
-                  : theme.colorScheme.surface,
-              borderRadius: _bubbleRadius(isUser),
-              border: Border.all(
-                color: isUser
-                    ? AppColors.accent.withAlpha(90)
-                    : theme.colorScheme.outline.withAlpha(50),
+          child: GestureDetector(
+            onLongPress: () async {
+              HapticFeedback.lightImpact();
+              await _forkFromMessage(messageIndex);
+            },
+            child: Container(
+              constraints: BoxConstraints(
+                maxWidth: maxContentWidth,
               ),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.image,
-                  color: theme.colorScheme.primary,
-                  size: 20,
+              margin: const EdgeInsets.only(top: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              decoration: BoxDecoration(
+                color: isUser
+                    ? AppColors.accent.withAlpha(45)
+                    : theme.colorScheme.surface,
+                borderRadius: _bubbleRadius(isUser),
+                border: Border.all(
+                  color: isUser
+                      ? AppColors.accent.withAlpha(90)
+                      : theme.colorScheme.outline.withAlpha(50),
                 ),
-                const SizedBox(width: 8),
-                Flexible(
-                  child: Text(
-                    label,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodyMedium,
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.image,
+                    color: theme.colorScheme.primary,
+                    size: 20,
                   ),
-                ),
-              ],
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Text(
+                      label,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         );

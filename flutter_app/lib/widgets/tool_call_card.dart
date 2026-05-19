@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../app.dart';
 import '../models/chat_models.dart';
 import '../services/tool_call_expansion_state.dart';
@@ -8,8 +9,13 @@ import '../l10n/app_strings.dart';
 
 class ToolCallCard extends StatefulWidget {
   final ToolUseContent toolUse;
+  final String? toolOutput;
 
-  const ToolCallCard({super.key, required this.toolUse});
+  const ToolCallCard({
+    super.key,
+    required this.toolUse,
+    this.toolOutput,
+  });
 
   static void clearExpansionState() => ToolCallExpansionState.clear();
 
@@ -36,6 +42,8 @@ class _ToolCallCardState extends State<ToolCallCard> {
         return Icons.edit_document;
       case 'web_fetch':
         return Icons.language;
+      case 'web_search':
+        return Icons.travel_explore;
       default:
         return Icons.build;
     }
@@ -51,6 +59,8 @@ class _ToolCallCardState extends State<ToolCallCard> {
         return widget.toolUse.input['path'] as String? ?? AppStrings.writeFile;
       case 'web_fetch':
         return widget.toolUse.input['url'] as String? ?? AppStrings.webRequest;
+      case 'web_search':
+        return widget.toolUse.input['query'] as String? ?? widget.toolUse.name;
       default:
         return widget.toolUse.name;
     }
@@ -61,7 +71,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
     final theme = Theme.of(context);
     final isExecuting = widget.toolUse.isExecuting;
     final isError = widget.toolUse.isError;
-    final hasOutput = widget.toolUse.output != null;
+    final hasOutput = widget.toolOutput != null;
     final isPending = isExecuting || (!isError && !hasOutput);
     final statusColor = isError
         ? theme.colorScheme.error
@@ -136,13 +146,13 @@ class _ToolCallCardState extends State<ToolCallCard> {
                               color: theme.colorScheme.error,
                             )
                           else if (isPending)
-                            Icon(
+                            const Icon(
                               Icons.hourglass_empty,
                               size: 16,
                               color: AppColors.statusAmber,
                             )
                           else
-                            Icon(
+                            const Icon(
                               Icons.check_circle_outline,
                               size: 16,
                               color: AppColors.statusGreen,
@@ -181,6 +191,8 @@ class _ToolCallCardState extends State<ToolCallCard> {
   }
 
   Widget _buildExpandedContent(ThemeData theme) {
+    final output = widget.toolOutput;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -200,7 +212,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                     .convert(widget.toolUse.input),
                 language: 'json',
               ),
-              if (widget.toolUse.output != null) ...[
+              if (output != null) ...[
                 const SizedBox(height: 12),
                 Text(AppStrings.outputLabel, style: theme.textTheme.labelSmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
@@ -208,10 +220,14 @@ class _ToolCallCardState extends State<ToolCallCard> {
                 )),
                 const SizedBox(height: 4),
                 CodeBlock(
-                  code: widget.toolUse.output!,
+                  code: output,
                   language: 'text',
                   maxLines: 20,
                 ),
+                if (widget.toolUse.name == 'web_search' &&
+                    output.trim().isNotEmpty) ...[
+                  _buildSearchSources(theme, output),
+                ],
               ],
             ],
           ),
@@ -219,6 +235,118 @@ class _ToolCallCardState extends State<ToolCallCard> {
       ],
     );
   }
+
+  Widget _buildSearchSources(ThemeData theme, String output) {
+    final sources = parseSearchSources(output);
+    if (sources.isEmpty) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            AppStrings.searchSources,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 6),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                for (final source in sources)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: ActionChip(
+                      avatar: Icon(
+                        Icons.public,
+                        size: 14,
+                        color: theme.colorScheme.primary,
+                      ),
+                      label: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 180),
+                        child: Text(
+                          source.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      onPressed: () => _openSource(source.uri),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openSource(Uri uri) async {
+    if (!isLaunchableSearchSource(uri)) return;
+    await launchUrl(uri, mode: LaunchMode.externalApplication);
+  }
+}
+
+@visibleForTesting
+List<SearchSource> parseSearchSources(String output) {
+  final sources = <SearchSource>[];
+  final seen = <String>{};
+  final blocks = output.split(RegExp(r'\n\s*---\s*\n'));
+  final urlPattern = RegExp(r'https?://[^\s<>)\]]+');
+
+  for (final block in blocks) {
+    final match = urlPattern.firstMatch(block);
+    if (match == null) continue;
+
+    final url = _cleanSearchSourceUrl(match.group(0)!);
+    final uri = Uri.tryParse(url);
+    if (uri == null ||
+        !isLaunchableSearchSource(uri) ||
+        !seen.add(uri.toString())) {
+      continue;
+    }
+
+    final title = block
+        .split('\n')
+        .map((line) => line.trim())
+        .firstWhere(
+          (line) => line.isNotEmpty && !urlPattern.hasMatch(line),
+          orElse: () => uri.host,
+        );
+    sources.add(SearchSource(
+      uri: uri,
+      label: title.isEmpty ? uri.host : title,
+    ));
+    if (sources.length >= 8) break;
+  }
+
+  return sources;
+}
+
+String _cleanSearchSourceUrl(String url) {
+  return url.replaceFirst(RegExp(r'[.,;:!?]+$'), '');
+}
+
+@visibleForTesting
+bool isLaunchableSearchSource(Uri uri) {
+  return (uri.scheme == 'http' || uri.scheme == 'https') &&
+      uri.host.isNotEmpty;
+}
+
+@visibleForTesting
+class SearchSource {
+  final Uri uri;
+  final String label;
+
+  const SearchSource({
+    required this.uri,
+    required this.label,
+  });
 }
 
 class _PulsingToolBorder extends StatefulWidget {

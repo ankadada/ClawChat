@@ -4,6 +4,8 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
+import '../l10n/app_strings.dart';
 import '../models/chat_models.dart';
 
 class SessionSummary {
@@ -282,6 +284,35 @@ class SessionStorage {
     if (await file.exists()) await file.delete();
   }
 
+  Future<ChatSession?> forkSession(String sessionId, int upToMessageIndex) async {
+    final source = await getSession(sessionId);
+    if (source == null ||
+        upToMessageIndex < 0 ||
+        upToMessageIndex >= source.messages.length) {
+      return null;
+    }
+
+    final copiedMessages = source.messages
+        .take(upToMessageIndex + 1)
+        .where((message) => !message.isSystemNotice)
+        .map(_deepCopyMessage)
+        .toList();
+    if (copiedMessages.isEmpty) return null;
+
+    final fork = ChatSession(
+      id: const Uuid().v4(),
+      title: AppStrings.forkedFromTitle(source.title),
+      messages: copiedMessages,
+      modelOverride: source.modelOverride,
+      baseUrlOverride: source.baseUrlOverride,
+      apiFormatOverride: source.apiFormatOverride,
+      systemPrompt: source.systemPrompt,
+      folder: source.folder,
+    );
+    await saveSession(fork);
+    return fork;
+  }
+
   Future<void> clearAll() async {
     await init();
     await for (final entity in _sessionsDir!.list()) {
@@ -310,6 +341,12 @@ class SessionStorage {
     }
     return count;
   }
+}
+
+ChatMessage _deepCopyMessage(ChatMessage message) {
+  return ChatMessage.fromJson(
+    jsonDecode(jsonEncode(message.toJson())) as Map<String, dynamic>,
+  );
 }
 
 List<Map<String, dynamic>> _searchSessionPayloads(Map<String, dynamic> args) {
