@@ -3,6 +3,7 @@ name: Build ClawChat Apps
 on:
   push:
     branches: ['*']
+    tags: ['v*']
     paths:
       - 'flutter_app/**'
       - 'scripts/fetch-proot-binaries.sh'
@@ -326,5 +327,48 @@ jobs:
             - ~300-500MB free storage after package installation
             - Internet connection for first-time setup
           files: artifacts/*
+          draft: false
+          prerelease: false
+
+  tag-release:
+    name: Create GitHub Release from tag
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+
+    permissions:
+      contents: write  # needed to create releases
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.0
+        with:
+          name: clawchat-apks
+          path: artifacts
+
+      - name: Get tag version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda  # v2.2.1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ClawChat v${{ steps.version.outputs.version }}
+          body: |
+            ## ClawChat Android v${{ steps.version.outputs.version }}
+
+            Standalone Android app — no Termux required.
+
+            Download the APK that matches your device architecture, or use the universal APK.
+          files: artifacts/*.apk
+          generate_release_notes: true
           draft: false
           prerelease: false

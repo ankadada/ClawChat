@@ -60,6 +60,19 @@
 
 ---
 
+## Screenshots
+
+Screenshots coming soon. Placeholder images are expected under `assets/screenshots/`.
+
+<p>
+  <img src="assets/screenshots/chat.png" alt="Chat screen" width="300">
+  <img src="assets/screenshots/settings.png" alt="Settings screen" width="300">
+  <img src="assets/screenshots/terminal.png" alt="Terminal screen" width="300">
+  <img src="assets/screenshots/onboarding.png" alt="Onboarding screen" width="300">
+</p>
+
+---
+
 ## Architecture
 
 ```
