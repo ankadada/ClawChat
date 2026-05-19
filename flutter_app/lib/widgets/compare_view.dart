@@ -4,7 +4,7 @@ import '../providers/chat_provider.dart';
 import '../widgets/streaming_text.dart';
 import '../l10n/app_strings.dart';
 
-class CompareView extends StatelessWidget {
+class CompareView extends StatefulWidget {
   final List<CompareResult> results;
   final bool isComparing;
   final VoidCallback? onDismiss;
@@ -17,8 +17,24 @@ class CompareView extends StatelessWidget {
   });
 
   @override
+  State<CompareView> createState() => _CompareViewState();
+}
+
+class _CompareViewState extends State<CompareView> {
+  final _pageController = PageController();
+  int _pageIndex = 0;
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final screenHeight = MediaQuery.of(context).size.height;
+    final panelHeight = screenHeight < 760 ? 420.0 : 500.0;
 
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -44,7 +60,7 @@ class CompareView extends StatelessWidget {
                     color: theme.colorScheme.primary,
                   ),
                 ),
-                if (isComparing) ...[
+                if (widget.isComparing) ...[
                   const SizedBox(width: 8),
                   const SizedBox(
                     width: 14,
@@ -60,10 +76,10 @@ class CompareView extends StatelessWidget {
                   ),
                 ],
                 const Spacer(),
-                if (onDismiss != null)
+                if (widget.onDismiss != null)
                   IconButton(
                     icon: const Icon(Icons.close, size: 18),
-                    onPressed: onDismiss,
+                    onPressed: widget.onDismiss,
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
                   ),
@@ -73,8 +89,8 @@ class CompareView extends StatelessWidget {
           const Divider(height: 1),
           // Results as horizontally scrollable pages
           SizedBox(
-            height: 350,
-            child: results.isEmpty
+            height: panelHeight,
+            child: widget.results.isEmpty
                 ? Center(
                     child: Text(
                       AppStrings.comparing,
@@ -84,13 +100,37 @@ class CompareView extends StatelessWidget {
                     ),
                   )
                 : PageView.builder(
-                    itemCount: results.length,
+                    controller: _pageController,
+                    itemCount: widget.results.length,
+                    onPageChanged: (index) => setState(() => _pageIndex = index),
                     itemBuilder: (context, index) {
-                      final r = results[index];
-                      return _CompareCard(result: r, index: index, total: results.length);
+                      final r = widget.results[index];
+                      return _CompareCard(result: r, index: index, total: widget.results.length);
                     },
                   ),
           ),
+          if (widget.results.length > 1)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(widget.results.length, (index) {
+                  final selected = index == _pageIndex;
+                  return AnimatedContainer(
+                    duration: const Duration(milliseconds: 160),
+                    margin: const EdgeInsets.symmetric(horizontal: 3),
+                    width: selected ? 18 : 6,
+                    height: 6,
+                    decoration: BoxDecoration(
+                      color: selected
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.outline.withAlpha(100),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  );
+                }),
+              ),
+            ),
         ],
       ),
     );

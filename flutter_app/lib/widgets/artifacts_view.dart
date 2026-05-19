@@ -12,6 +12,7 @@ class ArtifactsView extends StatefulWidget {
 
 class _ArtifactsViewState extends State<ArtifactsView> {
   late final WebViewController _controller;
+  bool _isLoading = true;
 
   @override
   void initState() {
@@ -19,12 +20,26 @@ class _ArtifactsViewState extends State<ArtifactsView> {
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.disabled)
       ..setNavigationDelegate(NavigationDelegate(
+        onPageStarted: (_) {
+          if (mounted) setState(() => _isLoading = true);
+        },
+        onPageFinished: (_) {
+          if (mounted) setState(() => _isLoading = false);
+        },
+        onWebResourceError: (_) {
+          if (mounted) setState(() => _isLoading = false);
+        },
         onNavigationRequest: (request) {
           if (request.url == 'about:blank') return NavigationDecision.navigate;
           return NavigationDecision.prevent;
         },
-      ))
-      ..loadHtmlString(_sandboxHtml(widget.htmlContent));
+      ));
+    _loadHtml();
+  }
+
+  Future<void> _loadHtml() async {
+    if (mounted) setState(() => _isLoading = true);
+    await _controller.loadHtmlString(_sandboxHtml(widget.htmlContent));
   }
 
   String _sandboxHtml(String html) {
@@ -40,7 +55,7 @@ class _ArtifactsViewState extends State<ArtifactsView> {
   void didUpdateWidget(covariant ArtifactsView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.htmlContent != widget.htmlContent) {
-      _controller.loadHtmlString(_sandboxHtml(widget.htmlContent));
+      _loadHtml();
     }
   }
 
@@ -54,7 +69,50 @@ class _ArtifactsViewState extends State<ArtifactsView> {
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(8),
-        child: WebViewWidget(controller: _controller),
+        child: Column(
+          children: [
+            Container(
+              height: 40,
+              padding: const EdgeInsets.only(left: 12, right: 4),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                border: Border(
+                  bottom: BorderSide(color: Theme.of(context).dividerColor),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.preview_outlined,
+                    size: 18,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    '预览',
+                    style: Theme.of(context).textTheme.labelLarge,
+                  ),
+                  const Spacer(),
+                  if (_isLoading)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 10),
+                      child: SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    ),
+                  IconButton(
+                    icon: const Icon(Icons.refresh, size: 18),
+                    tooltip: '重新加载预览',
+                    onPressed: _loadHtml,
+                  ),
+                ],
+              ),
+            ),
+            Expanded(child: WebViewWidget(controller: _controller)),
+          ],
+        ),
       ),
     );
   }

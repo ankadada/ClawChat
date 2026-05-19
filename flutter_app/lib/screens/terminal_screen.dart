@@ -438,8 +438,8 @@ class _TerminalScreenState extends State<TerminalScreen> {
               _terminal,
               controller: _controller,
               textStyle: const TerminalStyle(
-                fontSize: 11,
-                height: 1.0,
+                fontSize: 13,
+                height: 1.15,
                 fontFamily: 'DejaVuSansMono',
                 fontFamilyFallback: _fontFallback,
               ),
@@ -462,35 +462,118 @@ class _TerminalScreenState extends State<TerminalScreen> {
             top: BorderSide(color: Theme.of(context).colorScheme.outline.withAlpha(50)),
           ),
         ),
-        child: Row(
-          children: [
-            _toolbarButton('Tab', () => _pty?.write(utf8.encode('\t'))),
-            _toolbarButton('Ctrl', () { _ctrlNotifier.value = !_ctrlNotifier.value; }),
-            _toolbarButton('Esc', () => _pty?.write(utf8.encode('\x1b'))),
-            _toolbarButton('↑', () => _pty?.write(utf8.encode('\x1b[A'))),
-            _toolbarButton('↓', () => _pty?.write(utf8.encode('\x1b[B'))),
-            _toolbarButton('←', () => _pty?.write(utf8.encode('\x1b[D'))),
-            _toolbarButton('→', () => _pty?.write(utf8.encode('\x1b[C'))),
-          ],
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              _toolbarIconButton(
+                icon: Icons.keyboard_tab,
+                tooltip: 'Tab',
+                onTap: () => _pty?.write(utf8.encode('\t')),
+              ),
+              _toolbarIconButton(
+                icon: Icons.keyboard,
+                tooltip: 'Esc',
+                onTap: () => _pty?.write(utf8.encode('\x1b')),
+              ),
+              _toolbarDivider(),
+              _toolbarToggleButton(
+                label: 'Ctrl',
+                notifier: _ctrlNotifier,
+              ),
+              _toolbarToggleButton(
+                label: 'Alt',
+                notifier: _altNotifier,
+              ),
+              _toolbarDivider(),
+              _toolbarIconButton(
+                icon: Icons.keyboard_arrow_up,
+                tooltip: 'Up',
+                onTap: () => _pty?.write(utf8.encode('\x1b[A')),
+              ),
+              _toolbarIconButton(
+                icon: Icons.keyboard_arrow_down,
+                tooltip: 'Down',
+                onTap: () => _pty?.write(utf8.encode('\x1b[B')),
+              ),
+              _toolbarIconButton(
+                icon: Icons.keyboard_arrow_left,
+                tooltip: 'Left',
+                onTap: () => _pty?.write(utf8.encode('\x1b[D')),
+              ),
+              _toolbarIconButton(
+                icon: Icons.keyboard_arrow_right,
+                tooltip: 'Right',
+                onTap: () => _pty?.write(utf8.encode('\x1b[C')),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _toolbarButton(String label, VoidCallback onTap) {
+  Widget _toolbarIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+  }) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 2),
-      child: SizedBox(
-        height: 48,
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(8),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-            child: Text(label, style: const TextStyle(fontSize: 13)),
-          ),
+      child: IconButton(
+        icon: Icon(icon, size: 20),
+        tooltip: tooltip,
+        onPressed: onTap,
+        style: IconButton.styleFrom(
+          minimumSize: const Size(44, 44),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         ),
       ),
+    );
+  }
+
+  Widget _toolbarToggleButton({
+    required String label,
+    required ValueNotifier<bool> notifier,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: ValueListenableBuilder<bool>(
+        valueListenable: notifier,
+        builder: (context, active, _) {
+          return Tooltip(
+            message: label,
+            child: SizedBox(
+              height: 44,
+              child: FilledButton.tonal(
+                style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  backgroundColor: active
+                      ? Theme.of(context).colorScheme.primaryContainer
+                      : Theme.of(context).colorScheme.surfaceContainerHighest,
+                  foregroundColor: active
+                      ? Theme.of(context).colorScheme.onPrimaryContainer
+                      : Theme.of(context).colorScheme.onSurfaceVariant,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                onPressed: () => notifier.value = !notifier.value,
+                child: Text(label, style: const TextStyle(fontSize: 13)),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _toolbarDivider() {
+    return Container(
+      width: 1,
+      height: 28,
+      margin: const EdgeInsets.symmetric(horizontal: 8),
+      color: Theme.of(context).colorScheme.outline.withAlpha(80),
     );
   }
 

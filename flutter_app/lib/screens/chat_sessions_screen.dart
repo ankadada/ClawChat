@@ -150,7 +150,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
         return Column(
           children: [
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
               child: TextField(
                 controller: _searchController,
                 decoration: InputDecoration(
@@ -168,16 +168,39 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                   border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(AppRadii.xl)),
                   contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 16),
-                  isDense: true,
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 ),
                 onChanged: (v) =>
                     setState(() => _searchQuery = v.toLowerCase()),
               ),
             ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+              child: Row(
+                children: [
+                  Text(
+                    '${filteredSessions.length}/${sessions.length}',
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const Spacer(),
+                  if (_selectedFolder != null)
+                    Text(
+                      _selectedFolder == '__none__'
+                          ? AppStrings.noFolder
+                          : _selectedFolder!,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: theme.colorScheme.primary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                ],
+              ),
+            ),
             if (sortedFolders.isNotEmpty)
               SizedBox(
-                height: 40,
+                height: 48,
                 child: ListView(
                   scrollDirection: Axis.horizontal,
                   padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -187,6 +210,14 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                       child: FilterChip(
                         label: Text(AppStrings.allConversations),
                         selected: _selectedFolder == null,
+                        showCheckmark: false,
+                        selectedColor: theme.colorScheme.primaryContainer,
+                        labelStyle: TextStyle(
+                          color: _selectedFolder == null
+                              ? theme.colorScheme.onPrimaryContainer
+                              : null,
+                          fontWeight: _selectedFolder == null ? FontWeight.w700 : null,
+                        ),
                         onSelected: (_) => setState(() => _selectedFolder = null),
                       ),
                     ),
@@ -195,6 +226,14 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                       child: FilterChip(
                         label: Text(f),
                         selected: _selectedFolder == f,
+                        showCheckmark: false,
+                        selectedColor: theme.colorScheme.primaryContainer,
+                        labelStyle: TextStyle(
+                          color: _selectedFolder == f
+                              ? theme.colorScheme.onPrimaryContainer
+                              : null,
+                          fontWeight: _selectedFolder == f ? FontWeight.w700 : null,
+                        ),
                         onSelected: (_) => setState(() =>
                           _selectedFolder = _selectedFolder == f ? null : f),
                       ),
@@ -204,6 +243,14 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                       child: FilterChip(
                         label: Text(AppStrings.noFolder),
                         selected: _selectedFolder == '__none__',
+                        showCheckmark: false,
+                        selectedColor: theme.colorScheme.primaryContainer,
+                        labelStyle: TextStyle(
+                          color: _selectedFolder == '__none__'
+                              ? theme.colorScheme.onPrimaryContainer
+                              : null,
+                          fontWeight: _selectedFolder == '__none__' ? FontWeight.w700 : null,
+                        ),
                         onSelected: (_) => setState(() =>
                           _selectedFolder = _selectedFolder == '__none__' ? null : '__none__'),
                       ),
@@ -295,36 +342,88 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                             child: const Icon(Icons.delete,
                                 color: Colors.white),
                           ),
-                          child: ListTile(
-                            title: Text(
-                              session.title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            subtitle: Text(
-                              _formatTime(session.updatedAt),
-                              style: theme.textTheme.bodySmall,
-                            ),
-                            leading: Icon(
-                              Icons.chat_bubble_outline,
-                              color: isSelected
-                                  ? theme.colorScheme.primary
-                                  : theme.colorScheme.onSurfaceVariant,
-                            ),
-                            trailing: IconButton(
-                              icon: const Icon(Icons.share, size: 20),
-                              tooltip: AppStrings.exportChat,
-                              onPressed: () => _exportSession(session),
-                            ),
-                            selected: isSelected,
-                            onTap: () {
-                              provider.selectSession(session.id);
-                              if (!widget.embedded) {
-                                Navigator.of(context).pop();
-                              }
-                            },
-                            onLongPress: () => _showSessionOptions(context, session, provider),
-                          ),
+	                          child: Container(
+	                            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+	                            decoration: BoxDecoration(
+	                              color: isSelected
+	                                  ? theme.colorScheme.primaryContainer.withAlpha(170)
+	                                  : Colors.transparent,
+	                              borderRadius: BorderRadius.circular(AppRadii.l),
+	                              border: isSelected
+	                                  ? Border.all(color: theme.colorScheme.primary.withAlpha(90))
+	                                  : null,
+	                            ),
+	                            child: ListTile(
+	                              contentPadding: const EdgeInsets.only(left: 12, right: 4),
+	                              shape: RoundedRectangleBorder(
+	                                borderRadius: BorderRadius.circular(AppRadii.l),
+	                              ),
+	                              title: Text(
+	                                session.title,
+	                                maxLines: 1,
+	                                overflow: TextOverflow.ellipsis,
+	                                style: TextStyle(
+	                                  fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
+	                                ),
+	                              ),
+	                              subtitle: _SessionMeta(
+	                                session: session,
+	                                timeLabel: _formatTime(session.updatedAt),
+	                              ),
+	                              leading: Icon(
+	                                Icons.chat_bubble_outline,
+	                                color: isSelected
+	                                    ? theme.colorScheme.primary
+	                                    : theme.colorScheme.onSurfaceVariant,
+	                              ),
+	                              trailing: PopupMenuButton<String>(
+	                                tooltip: '更多',
+	                                icon: const Icon(Icons.more_vert, size: 20),
+	                                onSelected: (value) {
+	                                  switch (value) {
+	                                    case 'export':
+	                                      _exportSession(session);
+	                                      break;
+	                                    case 'rename':
+	                                      _renameSession(context, session, provider);
+	                                      break;
+	                                    case 'move':
+	                                      _showMoveToFolderDialog(context, session, provider);
+	                                      break;
+	                                    case 'delete':
+	                                      provider.deleteSession(session.id);
+	                                      break;
+	                                  }
+	                                },
+	                                itemBuilder: (context) => const [
+	                                  PopupMenuItem(
+	                                    value: 'export',
+	                                    child: Text(AppStrings.exportChat),
+	                                  ),
+	                                  PopupMenuItem(
+	                                    value: 'rename',
+	                                    child: Text(AppStrings.renameSession),
+	                                  ),
+	                                  PopupMenuItem(
+	                                    value: 'move',
+	                                    child: Text(AppStrings.moveToFolder),
+	                                  ),
+	                                  PopupMenuItem(
+	                                    value: 'delete',
+	                                    child: Text(AppStrings.deleteChat),
+	                                  ),
+	                                ],
+	                              ),
+	                              selected: isSelected,
+	                              onTap: () {
+	                                provider.selectSession(session.id);
+	                                if (!widget.embedded) {
+	                                  Navigator.of(context).pop();
+	                                }
+	                              },
+	                              onLongPress: () => _showSessionOptions(context, session, provider),
+	                            ),
+	                          ),
                         );
                       },
                     );
@@ -429,6 +528,14 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
               onTap: () {
                 Navigator.pop(ctx);
                 _renameSession(context, session, provider);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.share),
+              title: const Text(AppStrings.exportChat),
+              onTap: () {
+                Navigator.pop(ctx);
+                _exportSession(session);
               },
             ),
             ListTile(
@@ -585,11 +692,12 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
 
   String _formatTime(DateTime dt) {
     final now = DateTime.now();
-    final diff = now.difference(dt);
-    if (diff.inMinutes < 1) return AppStrings.justNow;
-    if (diff.inHours < 1) return AppStrings.minutesAgo(diff.inMinutes);
-    if (diff.inDays < 1) return AppStrings.hoursAgo(diff.inHours);
-    if (diff.inDays < 7) return AppStrings.daysAgo(diff.inDays);
+    final today = DateTime(now.year, now.month, now.day);
+    final date = DateTime(dt.year, dt.month, dt.day);
+    final days = today.difference(date).inDays;
+    if (days == 0) return '今天';
+    if (days == 1) return '昨天';
+    if (days > 1 && days < 7) return '$days天前';
     return '${dt.month}/${dt.day}';
   }
 }
@@ -602,4 +710,131 @@ class _FolderHeaderItem {
 class _SessionItem {
   final SessionSummary session;
   _SessionItem(this.session);
+}
+
+class _SessionMeta extends StatefulWidget {
+  final SessionSummary session;
+  final String timeLabel;
+
+  const _SessionMeta({
+    required this.session,
+    required this.timeLabel,
+  });
+
+  @override
+  State<_SessionMeta> createState() => _SessionMetaState();
+}
+
+class _SessionMetaState extends State<_SessionMeta> {
+  String? _preview;
+  String? _model;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadMeta();
+  }
+
+  @override
+  void didUpdateWidget(covariant _SessionMeta oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.session.id != widget.session.id ||
+        oldWidget.session.updatedAt != widget.session.updatedAt) {
+      _preview = null;
+      _model = null;
+      _loadMeta();
+    }
+  }
+
+  Future<void> _loadMeta() async {
+    final sessionId = widget.session.id;
+    final storage = SessionStorage();
+    await storage.init();
+    final fullSession = await storage.getSession(sessionId);
+    if (!mounted || fullSession == null || widget.session.id != sessionId) return;
+
+    final preview = fullSession.messages.reversed
+        .map((message) => message.textContent.trim())
+        .where((text) => text.isNotEmpty)
+        .map(_compactPreview)
+        .cast<String?>()
+        .firstWhere((text) => text != null, orElse: () => null);
+
+    setState(() {
+      _preview = preview;
+      _model = fullSession.modelOverride;
+    });
+  }
+
+  static String _compactPreview(String text) {
+    final compact = text.replaceAll(RegExp(r'\s+'), ' ');
+    return compact.length > 96 ? '${compact.substring(0, 96)}...' : compact;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final folder = widget.session.folder;
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 3),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_preview != null && _preview!.isNotEmpty)
+            Text(
+              _preview!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          const SizedBox(height: 4),
+          Wrap(
+            spacing: 6,
+            runSpacing: 4,
+            children: [
+              _metaBadge(context, widget.timeLabel),
+              if (folder != null && folder.isNotEmpty)
+                _metaBadge(context, folder, icon: Icons.folder_outlined),
+              if (_model != null && _model!.isNotEmpty)
+                _metaBadge(context, _model!, icon: Icons.smart_toy_outlined),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _metaBadge(BuildContext context, String label, {IconData? icon}) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withAlpha(170),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 12, color: theme.colorScheme.onSurfaceVariant),
+            const SizedBox(width: 3),
+          ],
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 160),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

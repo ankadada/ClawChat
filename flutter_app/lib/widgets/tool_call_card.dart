@@ -15,8 +15,15 @@ class ToolCallCard extends StatefulWidget {
 }
 
 class _ToolCallCardState extends State<ToolCallCard> {
-  // Note: _expanded state resets on parent rebuild. Consider using a key or external state.
-  bool _expanded = false;
+  static final Map<String, bool> _expandedByToolId = {};
+
+  bool get _expanded => _expandedByToolId[widget.toolUse.id] ?? false;
+
+  void _toggleExpanded() {
+    setState(() {
+      _expandedByToolId[widget.toolUse.id] = !_expanded;
+    });
+  }
 
   IconData _getToolIcon() {
     switch (widget.toolUse.name) {
@@ -69,7 +76,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           InkWell(
-            onTap: () => setState(() => _expanded = !_expanded),
+            onTap: _toggleExpanded,
             borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
             child: Padding(
               padding: const EdgeInsets.all(12),
