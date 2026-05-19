@@ -602,7 +602,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     hasStreaming: p.agentStatus == AgentStatus.streaming || p.streamingText.isNotEmpty,
                     status: p.agentStatus,
                     sessionId: p.currentSession?.id,
-                    modelName: p.currentSession?.modelOverride ?? p.configuredModel ?? AppConstants.defaultModel,
+                    modelName: p.currentSession?.modelOverride ?? p.configuredModel,
                   ),
                   builder: (context, data, __) {
                     final messages = data.messages;

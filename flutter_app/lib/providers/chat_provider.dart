@@ -38,7 +38,10 @@ class ChatProvider extends ChangeNotifier {
 
   final PreferencesService _prefs = PreferencesService();
   bool _prefsInitialized = false;
-  String? get configuredModel => _prefsInitialized ? _prefs.model : null;
+  String get configuredModel {
+    if (!_prefsInitialized) return AppConstants.defaultModel;
+    return _prefs.model ?? AppConstants.defaultModel;
+  }
   List<SkillInfo> _skills = [];
   LlmService? _cachedLlm;
   LlmConfig? _cachedLlmConfig;
