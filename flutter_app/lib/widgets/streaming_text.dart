@@ -22,6 +22,7 @@ class StreamingText extends StatefulWidget {
 class _StreamingTextState extends State<StreamingText> {
   List<InlineSpan>? _cachedSpans;
   String? _cachedText;
+  double? _cachedMaxWidth;
   int _lastParseEnd = 0;
   final List<TapGestureRecognizer> _recognizers = [];
 
@@ -41,11 +42,19 @@ class _StreamingTextState extends State<StreamingText> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final spans = _getOrParseSpans(widget.text, context, theme);
 
-    return SelectableText.rich(
-      TextSpan(children: spans),
-      style: theme.textTheme.bodyMedium,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final maxInlineWidth = constraints.hasBoundedWidth
+            ? constraints.maxWidth
+            : MediaQuery.sizeOf(context).width * 0.78;
+        final spans = _getOrParseSpans(widget.text, context, theme, maxInlineWidth);
+
+        return SelectableText.rich(
+          TextSpan(children: spans),
+          style: theme.textTheme.bodyMedium,
+        );
+      },
     );
   }
 
@@ -53,6 +62,7 @@ class _StreamingTextState extends State<StreamingText> {
     String text,
     BuildContext context,
     ThemeData theme,
+    double maxInlineWidth,
   ) {
     // During streaming, only parse up to the last newline to avoid
     // partial markdown patterns causing visual flashes.
@@ -67,7 +77,9 @@ class _StreamingTextState extends State<StreamingText> {
       }
     }
 
-    if (_cachedSpans != null && _cachedText == parseText) {
+    if (_cachedSpans != null &&
+        _cachedText == parseText &&
+        _cachedMaxWidth == maxInlineWidth) {
       final result = List<InlineSpan>.from(_cachedSpans!);
       if (trailing.isNotEmpty) {
         result.add(TextSpan(text: trailing));
@@ -84,14 +96,16 @@ class _StreamingTextState extends State<StreamingText> {
     final isNewAppend = !_tableRegex.hasMatch(parseText) &&
         !parseText.contains('```') &&
         _cachedText != null &&
+        _cachedMaxWidth == maxInlineWidth &&
         parseText.length > _cachedText!.length &&
         parseText.startsWith(_cachedText!);
 
     if (isNewAppend && _cachedSpans != null) {
       final newSpans = List<InlineSpan>.from(_cachedSpans!);
-      _appendParsedSpans(parseText, context, theme, newSpans, _lastParseEnd);
+      _appendParsedSpans(parseText, context, theme, newSpans, _lastParseEnd, maxInlineWidth);
       _cachedSpans = newSpans;
       _cachedText = parseText;
+      _cachedMaxWidth = maxInlineWidth;
       final result = List<InlineSpan>.from(newSpans);
       if (trailing.isNotEmpty) {
         result.add(TextSpan(text: trailing));
@@ -106,9 +120,10 @@ class _StreamingTextState extends State<StreamingText> {
     }
 
     _disposeRecognizers();
-    final spans = _parseFullText(parseText, context, theme);
+    final spans = _parseFullText(parseText, context, theme, maxInlineWidth);
     _cachedSpans = spans;
     _cachedText = parseText;
+    _cachedMaxWidth = maxInlineWidth;
     final result = List<InlineSpan>.from(spans);
     if (trailing.isNotEmpty) {
       result.add(TextSpan(text: trailing));
@@ -140,10 +155,11 @@ class _StreamingTextState extends State<StreamingText> {
     String text,
     BuildContext context,
     ThemeData theme,
+    double maxInlineWidth,
   ) {
     final spans = <InlineSpan>[];
     _lastParseEnd = 0;
-    _appendParsedSpans(text, context, theme, spans, 0);
+    _appendParsedSpans(text, context, theme, spans, 0, maxInlineWidth);
     return spans;
   }
 
@@ -153,6 +169,7 @@ class _StreamingTextState extends State<StreamingText> {
     ThemeData theme,
     List<InlineSpan> spans,
     int from,
+    double maxInlineWidth,
   ) {
     final allMatches = <_MatchInfo>[];
 
@@ -239,7 +256,7 @@ class _StreamingTextState extends State<StreamingText> {
               padding: const EdgeInsets.symmetric(vertical: 6),
               child: ConstrainedBox(
                 constraints: BoxConstraints(
-                  maxWidth: MediaQuery.sizeOf(context).width * 0.78,
+                  maxWidth: maxInlineWidth,
                 ),
                 child: CodeBlock(
                   code: info.match.group(2) ?? '',
@@ -263,7 +280,7 @@ class _StreamingTextState extends State<StreamingText> {
                 padding: const EdgeInsets.symmetric(vertical: 6),
                 child: ConstrainedBox(
                   constraints: BoxConstraints(
-                    maxWidth: MediaQuery.sizeOf(context).width * 0.78,
+                    maxWidth: maxInlineWidth,
                   ),
                   child: MarkdownTableView(
                     headers: parsedTable.headers,
@@ -292,24 +309,44 @@ class _StreamingTextState extends State<StreamingText> {
           ));
         case 'heading':
           final level = info.match.group(1)!.length;
-          final fontSize = level == 1
-              ? 20.0
-              : level == 2
-                  ? 17.0
-                  : 15.0;
+          final headingStyle = (level == 1
+                  ? theme.textTheme.titleMedium
+                  : level == 2
+                      ? theme.textTheme.titleSmall
+                      : theme.textTheme.bodyLarge)
+              ?.copyWith(
+                fontWeight: FontWeight.w700,
+                color: theme.colorScheme.onSurface,
+              );
           spans.add(TextSpan(
             text: '${info.match.group(2)}\n',
-            style: TextStyle(
-              fontSize: fontSize,
-              fontWeight: FontWeight.bold,
-              color: theme.colorScheme.onSurface,
-            ),
+            style: headingStyle,
           ));
         case 'bullet':
-          spans.add(TextSpan(
-            text: '  •  ${info.match.group(1)}\n',
-            style: theme.textTheme.bodyMedium,
+          spans.add(WidgetSpan(
+            alignment: PlaceholderAlignment.baseline,
+            baseline: TextBaseline.alphabetic,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: maxInlineWidth),
+              child: Padding(
+                padding: const EdgeInsets.only(left: 4, top: 2, bottom: 2),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('•', style: theme.textTheme.bodyMedium),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        info.match.group(1)!,
+                        style: theme.textTheme.bodyMedium,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ));
+          spans.add(const TextSpan(text: '\n'));
         case 'hr':
           spans.add(TextSpan(
             text: '\n━━━━━━━━━━━━━━━━━━━━\n',
@@ -451,6 +488,7 @@ class _StreamingTextState extends State<StreamingText> {
       _disposeRecognizers();
       _cachedSpans = null;
       _cachedText = null;
+      _cachedMaxWidth = null;
     }
   }
 }

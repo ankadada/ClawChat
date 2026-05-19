@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -532,41 +533,65 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         children: [
           const AgentStatusBar(),
           Expanded(
-            child: Selector<ChatProvider, ({List<ChatMessage> messages, bool hasStreaming, String? sessionId})>(
-              selector: (_, p) => (
-                messages: p.currentSession?.messages ?? [],
-                hasStreaming: p.agentStatus == AgentStatus.streaming || p.streamingText.isNotEmpty,
-                sessionId: p.currentSession?.id,
-              ),
-              builder: (context, data, __) {
-                final messages = data.messages;
-                final hasStreaming = data.hasStreaming;
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final maxContentWidth = math.min(640.0, constraints.maxWidth * 0.86);
+                return Selector<ChatProvider, ({List<ChatMessage> messages, bool hasStreaming, String? sessionId, String modelName})>(
+                  selector: (_, p) => (
+                    messages: p.currentSession?.messages ?? [],
+                    hasStreaming: p.agentStatus == AgentStatus.streaming || p.streamingText.isNotEmpty,
+                    sessionId: p.currentSession?.id,
+                    modelName: p.currentSession?.modelOverride ?? AppConstants.defaultModel,
+                  ),
+                  builder: (context, data, __) {
+                    final messages = data.messages;
+                    final hasStreaming = data.hasStreaming;
 
-                // Sync draft when session changes via Selector rebuild
-                final currentId = data.sessionId;
-                if (currentId != null && currentId != _lastSessionId) {
-                  _syncDraftForSession();
-                }
-
-                if (messages.isEmpty && !hasStreaming) {
-                  return _buildEmptyState(theme);
-                }
-
-                final itemCount = messages.length + (hasStreaming ? 1 : 0);
-                return ListView.builder(
-                  controller: _scrollController,
-                  reverse: true,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  itemCount: itemCount,
-                  itemBuilder: (context, index) {
-                    final reversedIndex = itemCount - 1 - index;
-                    if (reversedIndex == messages.length && hasStreaming) {
-                      return Consumer<ChatProvider>(
-                        builder: (_, provider, __) =>
-                            _buildStreamingBubble(provider.streamingText, theme),
-                      );
+                    // Sync draft when session changes via Selector rebuild
+                    final currentId = data.sessionId;
+                    if (currentId != null && currentId != _lastSessionId) {
+                      _syncDraftForSession();
                     }
-                    return _buildMessageBubble(messages[reversedIndex], reversedIndex, theme);
+
+                    if (messages.isEmpty && !hasStreaming) {
+                      return _buildEmptyState(theme, data.modelName, maxContentWidth);
+                    }
+
+                    final itemCount = messages.length + (hasStreaming ? 1 : 0);
+                    return ListView.builder(
+                      controller: _scrollController,
+                      reverse: true,
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      itemCount: itemCount,
+                      itemBuilder: (context, index) {
+                        final reversedIndex = itemCount - 1 - index;
+                        if (reversedIndex == messages.length && hasStreaming) {
+                          return Consumer<ChatProvider>(
+                            builder: (_, provider, __) => _buildStreamingBubble(
+                              provider.streamingText,
+                              theme,
+                              maxContentWidth,
+                              previousRole: messages.isEmpty ? null : messages.last.role,
+                            ),
+                          );
+                        }
+                        final message = messages[reversedIndex];
+                        final previousRole = reversedIndex > 0
+                            ? messages[reversedIndex - 1].role
+                            : null;
+                        final nextRole = reversedIndex < messages.length - 1
+                            ? messages[reversedIndex + 1].role
+                            : null;
+                        return _buildMessageBubble(
+                          message,
+                          reversedIndex,
+                          theme,
+                          maxContentWidth,
+                          previousRole: previousRole,
+                          nextRole: nextRole,
+                        );
+                      },
+                    );
                   },
                 );
               },
@@ -583,39 +608,116 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               );
             },
           ),
-          _buildQuickPrompts(),
+          _buildQuickPrompts(theme),
           _buildInputArea(theme),
         ],
       ),
     );
   }
 
-  Widget _buildEmptyState(ThemeData theme) {
+  Widget _buildEmptyState(ThemeData theme, String modelName, double maxContentWidth) {
+    const prompts = [
+      '总结一下这段代码',
+      '帮我写一封邮件',
+      '翻译这段文字',
+      '解释这个概念',
+    ];
+
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.chat_bubble_outline, size: 64,
-              color: theme.colorScheme.onSurfaceVariant.withAlpha(100)),
-          const SizedBox(height: 16),
-          Text(AppStrings.sendMessageToStart,
-              style: theme.textTheme.titleMedium?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant)),
-          const SizedBox(height: 8),
-          Text(AppStrings.aiAssistantCapabilities,
-              style: theme.textTheme.bodySmall?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant)),
-        ],
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: math.min(480.0, maxContentWidth)),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 72,
+                height: 72,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primary.withAlpha(18),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: theme.colorScheme.primary.withAlpha(45)),
+                ),
+                child: Icon(Icons.auto_awesome, size: 34,
+                    color: theme.colorScheme.primary),
+              ),
+              const SizedBox(height: 18),
+              Text(AppStrings.sendMessageToStart,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.titleMedium?.copyWith(
+                      color: theme.colorScheme.onSurface,
+                      fontWeight: FontWeight.w700)),
+              const SizedBox(height: 8),
+              Text(AppStrings.aiAssistantCapabilities,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant)),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(AppRadii.xl),
+                  border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
+                ),
+                child: Text('当前模型  $modelName',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant)),
+              ),
+              const SizedBox(height: 18),
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final prompt in prompts)
+                    ActionChip(
+                      label: Text(prompt),
+                      onPressed: () {
+                        _inputController.text = prompt;
+                        _inputController.selection = TextSelection.collapsed(
+                          offset: _inputController.text.length,
+                        );
+                        _focusNode.requestFocus();
+                      },
+                      side: BorderSide(color: theme.colorScheme.outline.withAlpha(70)),
+                      backgroundColor: theme.colorScheme.surface,
+                      labelStyle: theme.textTheme.labelMedium,
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
 
-  Widget _buildMessageBubble(ChatMessage message, int messageIndex, ThemeData theme) {
+  double _halfMessageGap(String? adjacentRole, String role) {
+    if (adjacentRole == null) return 6;
+    return adjacentRole == role ? 2 : 8;
+  }
+
+  Widget _buildMessageBubble(
+    ChatMessage message,
+    int messageIndex,
+    ThemeData theme,
+    double maxContentWidth, {
+    String? previousRole,
+    String? nextRole,
+  }) {
     final isUser = message.role == 'user';
     final messageId = '${message.timestamp.millisecondsSinceEpoch}_$messageIndex';
 
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: EdgeInsets.only(
+        top: _halfMessageGap(previousRole, message.role),
+        bottom: _halfMessageGap(nextRole, message.role),
+      ),
       child: Column(
         crossAxisAlignment: isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
         children: [
@@ -630,7 +732,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
           ),
           for (final content in message.content)
-            _buildContentBlock(content, isUser, theme, messageId: messageId),
+            _buildContentBlock(
+              content,
+              isUser,
+              theme,
+              maxContentWidth,
+              messageId: messageId,
+            ),
           if (!isUser && message.alternatives != null && message.alternatives!.isNotEmpty)
             _buildAlternativesNav(message, messageIndex, theme),
           if (!isUser) _buildAssistantFooter(message, messageId, theme),
@@ -705,7 +813,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildContentBlock(MessageContent content, bool isUser, ThemeData theme, {String? messageId}) {
+  Widget _buildContentBlock(
+    MessageContent content,
+    bool isUser,
+    ThemeData theme,
+    double maxContentWidth, {
+    String? messageId,
+  }) {
     switch (content) {
       case TextContent(:final text):
         return Semantics(
@@ -751,9 +865,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           },
           child: Container(
             constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.85,
+              maxWidth: maxContentWidth,
             ),
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
               color: isUser
                   ? AppColors.accent.withAlpha(45)
@@ -771,7 +885,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         );
 
       case ToolUseContent():
-        return ToolCallCard(toolUse: content);
+        return ConstrainedBox(
+          constraints: BoxConstraints(maxWidth: maxContentWidth),
+          child: ToolCallCard(toolUse: content),
+        );
 
       case ToolResultContent():
         return const SizedBox.shrink();
@@ -782,10 +899,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           label: AppStrings.imageAttachmentLabel(label),
           child: Container(
             constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.85,
+              maxWidth: maxContentWidth,
             ),
             margin: const EdgeInsets.only(top: 4),
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
               color: isUser
                   ? AppColors.accent.withAlpha(45)
@@ -820,9 +937,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  Widget _buildStreamingBubble(String text, ThemeData theme) {
+  Widget _buildStreamingBubble(
+    String text,
+    ThemeData theme,
+    double maxContentWidth, {
+    String? previousRole,
+  }) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: EdgeInsets.only(
+        top: _halfMessageGap(previousRole, 'assistant'),
+        bottom: 8,
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -835,9 +960,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
           Container(
             constraints: BoxConstraints(
-              maxWidth: MediaQuery.of(context).size.width * 0.85,
+              maxWidth: maxContentWidth,
             ),
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
               color: theme.colorScheme.surface,
               borderRadius: BorderRadius.circular(AppRadii.m),
@@ -1093,7 +1218,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildQuickPrompts() {
+  Widget _buildQuickPrompts(ThemeData theme) {
     const prompts = [
       (AppStrings.promptTranslate, AppStrings.promptTranslateTemplate),
       (AppStrings.promptSummarize, AppStrings.promptSummarizeTemplate),
@@ -1104,24 +1229,72 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     ];
 
     return SizedBox(
-      height: 40,
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        children: prompts.map((p) => Padding(
-          padding: const EdgeInsets.only(right: 8),
-          child: ActionChip(
-            label: Text(p.$1, style: const TextStyle(fontSize: 13)),
-            onPressed: () {
-              final current = _inputController.text;
-              _inputController.text = p.$2 + current;
-              _inputController.selection = TextSelection.collapsed(
-                offset: _inputController.text.length,
-              );
-              _focusNode.requestFocus();
-            },
+      height: 48,
+      child: Stack(
+        children: [
+          ListView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+            children: prompts.map((p) => Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: ActionChip(
+                label: Text(p.$1),
+                labelStyle: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurface,
+                  fontWeight: FontWeight.w600,
+                ),
+                backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                side: BorderSide(color: theme.colorScheme.outline.withAlpha(65)),
+                shape: const StadiumBorder(),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                onPressed: () {
+                  final current = _inputController.text;
+                  _inputController.text = p.$2 + current;
+                  _inputController.selection = TextSelection.collapsed(
+                    offset: _inputController.text.length,
+                  );
+                  _focusNode.requestFocus();
+                },
+              ),
+            )).toList(),
           ),
-        )).toList(),
+          Positioned(
+            left: 0,
+            top: 0,
+            bottom: 0,
+            child: IgnorePointer(
+              child: Container(
+                width: 18,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [
+                      theme.scaffoldBackgroundColor,
+                      theme.scaffoldBackgroundColor.withAlpha(0),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            right: 0,
+            top: 0,
+            bottom: 0,
+            child: IgnorePointer(
+              child: Container(
+                width: 18,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [
+                      theme.scaffoldBackgroundColor.withAlpha(0),
+                      theme.scaffoldBackgroundColor,
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1324,23 +1497,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       builder: (_, provider, __) {
         final isRunning = provider.agentStatus != AgentStatus.idle &&
             provider.agentStatus != AgentStatus.error;
+        final isRecording = _isListening || _isWhisperRecording;
 
         return Container(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+          padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
           decoration: BoxDecoration(
             color: theme.scaffoldBackgroundColor,
             border: Border(
-              top: BorderSide(color: theme.colorScheme.outline.withAlpha(50)),
+              top: BorderSide(color: theme.colorScheme.outline.withAlpha(70)),
             ),
           ),
           child: SafeArea(
+            top: false,
             child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                IconButton(
-                  icon: const Icon(Icons.attach_file),
-                  tooltip: AppStrings.attachFile,
-                  onPressed: isRunning ? null : _showAttachOptions,
+                SizedBox(
+                  width: 44,
+                  height: 48,
+                  child: IconButton(
+                    icon: const Icon(Icons.attach_file),
+                    tooltip: AppStrings.attachFile,
+                    style: IconButton.styleFrom(
+                      backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                      foregroundColor: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    onPressed: isRunning ? null : _showAttachOptions,
+                  ),
                 ),
+                const SizedBox(width: 8),
                 Expanded(
                   child: TextField(
                     controller: _inputController,
@@ -1352,14 +1537,27 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     onSubmitted: (_) => _sendMessage(),
                     decoration: InputDecoration(
                       hintText: isRunning ? AppStrings.aiProcessing : AppStrings.inputHint,
+                      filled: true,
+                      fillColor: theme.colorScheme.surfaceContainerHighest,
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(AppRadii.xl),
+                        borderSide: BorderSide(color: theme.colorScheme.outline.withAlpha(60)),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(AppRadii.xl),
+                        borderSide: BorderSide(color: theme.colorScheme.outline.withAlpha(60)),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(AppRadii.xl),
+                        borderSide: BorderSide(color: theme.colorScheme.primary.withAlpha(180), width: 1.5),
                       ),
                       contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 10),
+                        horizontal: 16, vertical: 12),
                     ),
                   ),
                 ),
+                if (!isRunning)
+                  const SizedBox(width: 6),
                 if (!isRunning)
                   GestureDetector(
                     onLongPressStart: (_) {
@@ -1372,35 +1570,70 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         _stopListening();
                       }
                     },
-                    child: IconButton(
-                      icon: Icon(
-                        (_isListening || _isWhisperRecording) ? Icons.mic : Icons.mic_none,
-                        color: (_isListening || _isWhisperRecording) ? Colors.red : null,
+                    child: SizedBox(
+                      width: 48,
+                      height: 48,
+                      child: IconButton(
+                        icon: Icon(isRecording ? Icons.mic : Icons.mic_none),
+                        style: IconButton.styleFrom(
+                          backgroundColor: isRecording
+                              ? AppColors.statusRed.withAlpha(28)
+                              : theme.colorScheme.surfaceContainerHighest,
+                          foregroundColor: isRecording
+                              ? AppColors.statusRed
+                              : theme.colorScheme.onSurfaceVariant,
+                          side: BorderSide(
+                            color: isRecording
+                                ? AppColors.statusRed.withAlpha(120)
+                                : theme.colorScheme.outline.withAlpha(55),
+                          ),
+                        ),
+                        onPressed: () {
+                          if (_isWhisperRecording) {
+                            _stopWhisperRecording();
+                          } else if (_isListening) {
+                            _stopListening();
+                          } else {
+                            _startListening();
+                          }
+                        },
                       ),
-                      onPressed: () {
-                        if (_isWhisperRecording) {
-                          _stopWhisperRecording();
-                        } else if (_isListening) {
-                          _stopListening();
-                        } else {
-                          _startListening();
-                        }
-                      },
                     ),
                   ),
-                const SizedBox(width: 4),
+                const SizedBox(width: 6),
                 if (isRunning)
-                  IconButton.filled(
-                    onPressed: provider.cancelAgent,
-                    icon: const Icon(Icons.stop),
-                    style: IconButton.styleFrom(
-                      backgroundColor: AppColors.statusRed,
+                  SizedBox(
+                    width: 52,
+                    height: 48,
+                    child: IconButton.filled(
+                      onPressed: provider.cancelAgent,
+                      icon: const Icon(Icons.stop),
+                      iconSize: 20,
+                      style: IconButton.styleFrom(
+                        backgroundColor: AppColors.statusRed,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(AppRadii.xl),
+                        ),
+                      ),
                     ),
                   )
                 else
-                  IconButton.filled(
-                    onPressed: _sendMessage,
-                    icon: const Icon(Icons.send),
+                  SizedBox(
+                    width: 52,
+                    height: 48,
+                    child: IconButton.filled(
+                      onPressed: _sendMessage,
+                      icon: const Icon(Icons.send),
+                      iconSize: 20,
+                      style: IconButton.styleFrom(
+                        backgroundColor: theme.colorScheme.primary,
+                        foregroundColor: theme.colorScheme.onPrimary,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(AppRadii.xl),
+                        ),
+                      ),
+                    ),
                   ),
               ],
             ),
