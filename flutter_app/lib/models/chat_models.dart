@@ -262,37 +262,51 @@ class ChatMessage {
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
-    final contentList = json['content'] as List;
-    final content = contentList.map((c) {
-      final type = c['type'] as String;
-      switch (type) {
-        case 'text':
-          return TextContent(
-            c['text'] as String,
-            reasoningContent: c['reasoning_content'] as String?,
-          );
-        case 'image':
-          return _imageContentFromMap(c);
-        case 'tool_use':
-          return ToolUseContent(
-            id: c['id'] as String,
-            name: c['name'] as String,
-            input: Map<String, dynamic>.from(c['input'] ?? {}),
-          );
-        case 'tool_result':
-          return ToolResultContent(
-            toolUseId: c['tool_use_id'] as String,
-            output: c['output'] as String,
-            isError: c['is_error'] as bool? ?? false,
-          );
-        default:
-          return TextContent(c.toString());
-      }
-    }).toList();
+    final rawContent = json['content'];
+    final List<MessageContent> content;
+    if (rawContent is String) {
+      content = [
+        TextContent(
+          rawContent,
+          reasoningContent: json['reasoning_content'] as String?,
+        ),
+      ];
+    } else {
+      final contentList = rawContent as List;
+      content = contentList
+          .map((c) {
+            final type = c['type'] as String;
+            switch (type) {
+              case 'text':
+                return TextContent(
+                  c['text'] as String,
+                  reasoningContent: c['reasoning_content'] as String?,
+                );
+              case 'image':
+                return _imageContentFromMap(c);
+              case 'tool_use':
+                return ToolUseContent(
+                  id: c['id'] as String,
+                  name: c['name'] as String,
+                  input: Map<String, dynamic>.from(c['input'] ?? {}),
+                );
+              case 'tool_result':
+                return ToolResultContent(
+                  toolUseId: c['tool_use_id'] as String,
+                  output: c['output'] as String,
+                  isError: c['is_error'] as bool? ?? false,
+                );
+              default:
+                return TextContent(c.toString());
+            }
+          })
+          .cast<MessageContent>()
+          .toList();
+    }
     final altsList = json['alternatives'] as List?;
     return ChatMessage(
       role: json['role'] as String,
-      content: content.cast<MessageContent>(),
+      content: content,
       timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '') ??
           DateTime.now(),
       inputTokens: json['inputTokens'] as int?,

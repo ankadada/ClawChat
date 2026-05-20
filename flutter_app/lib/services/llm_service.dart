@@ -671,7 +671,7 @@ class LlmService {
       'model': modelIdFromDisplay(config.model),
       'max_tokens': config.maxTokens,
       'system': system,
-      'messages': messages.map(_stripOpenAIReasoningContent).toList(),
+      'messages': messages.expand(_convertMessageToAnthropic).toList(),
       'stream': stream,
     };
     final thinkingEnabled = config.thinkingBudget > 0;
@@ -692,23 +692,6 @@ class LlmService {
       body['max_tokens'] = config.thinkingBudget + config.maxTokens;
     }
     return body;
-  }
-
-  Map<String, dynamic> _stripOpenAIReasoningContent(
-    Map<String, dynamic> message,
-  ) {
-    final stripped = Map<String, dynamic>.from(message)
-      ..remove('reasoning_content');
-    final content = stripped['content'];
-    if (content is List) {
-      stripped['content'] = content.map((block) {
-        if (block is Map) {
-          return Map<String, dynamic>.from(block)..remove('reasoning_content');
-        }
-        return block;
-      }).toList();
-    }
-    return stripped;
   }
 
   Map<String, String> _anthropicHeaders() {
@@ -1034,6 +1017,10 @@ class LlmService {
         m.startsWith('o3') ||
         m.startsWith('o4') ||
         m.contains('gpt-5') ||
+        m.contains('deepseek-reasoner') ||
+        m.contains('deepseek-r1') ||
+        m.contains('reasoner') ||
+        RegExp(r'(^|[/:._-])r1($|[/:._-])').hasMatch(m) ||
         m.contains('reasoning');
   }
 
@@ -1043,19 +1030,22 @@ class LlmService {
         !lower.contains('max_completion_tokens')) {
       return false;
     }
-    final current = _tokenKeyOverrides[config.baseUrl] ??
+    final current = _tokenKeyOverrides[_tokenKeyOverrideKey] ??
         _openAITokenLimitKey(_detectOpenAICompatibleProvider());
     final alternate = current == 'max_completion_tokens'
         ? 'max_tokens'
         : 'max_completion_tokens';
-    _tokenKeyOverrides[config.baseUrl] = alternate;
+    _tokenKeyOverrides[_tokenKeyOverrideKey] = alternate;
     return true;
   }
 
   static final Map<String, String> _tokenKeyOverrides = {};
 
+  String get _tokenKeyOverrideKey =>
+      '${config.baseUrl}\n${modelIdFromDisplay(config.model)}';
+
   String _openAITokenLimitKey(_OpenAICompatibleProvider provider) {
-    final override = _tokenKeyOverrides[config.baseUrl];
+    final override = _tokenKeyOverrides[_tokenKeyOverrideKey];
     if (override != null) return override;
 
     if (_isReasoningModel(config.model)) return 'max_completion_tokens';
@@ -1085,22 +1075,230 @@ class LlmService {
     return _OpenAICompatibleProvider.generic;
   }
 
+  bool _usesOpenAIReasoningContent() {
+    final model = modelIdFromDisplay(config.model).toLowerCase();
+    if (config.baseUrl.toLowerCase().contains('openai.com')) return false;
+    if (_detectOpenAICompatibleProvider() ==
+        _OpenAICompatibleProvider.anthropicCompatible) {
+      return false;
+    }
+    return model.contains('deepseek-reasoner') ||
+        model.contains('deepseek-r1') ||
+        model.contains('reasoner') ||
+        RegExp(r'(^|[/:._-])r1($|[/:._-])').hasMatch(model);
+  }
+
+  List<Map<String, dynamic>> _convertMessageToAnthropic(
+    Map<String, dynamic> msg,
+  ) {
+    final role = msg['role'] as String? ?? 'user';
+    if (role == 'tool') {
+      final toolCallId = msg['tool_call_id']?.toString() ?? '';
+      if (toolCallId.isEmpty) return const [];
+      return [
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': toolCallId,
+              'content': _stringContent(msg['content']),
+            }
+          ],
+        }
+      ];
+    }
+
+    final anthropicRole = role == 'assistant' ? 'assistant' : 'user';
+    final content = msg['content'];
+    final toolCalls = msg['tool_calls'];
+
+    if (toolCalls is List && role == 'assistant') {
+      final blocks = <Map<String, dynamic>>[];
+      blocks.addAll(_anthropicContentBlocks(content));
+      for (final toolCall in toolCalls) {
+        final block = _openAIToolCallToAnthropic(toolCall);
+        if (block != null) blocks.add(block);
+      }
+      return [
+        {
+          'role': 'assistant',
+          'content': blocks.isEmpty ? '' : blocks,
+        }
+      ];
+    }
+
+    if (content is List) {
+      final blocks = _anthropicContentBlocks(content);
+      return [
+        {
+          'role': anthropicRole,
+          'content': blocks.isEmpty ? '' : blocks,
+        }
+      ];
+    }
+
+    return [
+      {
+        'role': anthropicRole,
+        'content': _stringContent(content),
+      }
+    ];
+  }
+
+  List<Map<String, dynamic>> _anthropicContentBlocks(Object? content) {
+    if (content is String) {
+      return content.isEmpty
+          ? const []
+          : [
+              {'type': 'text', 'text': content}
+            ];
+    }
+    if (content is! List) return const [];
+
+    final blocks = <Map<String, dynamic>>[];
+    for (final block in content) {
+      final converted = _anthropicContentBlock(block);
+      if (converted != null) blocks.add(converted);
+    }
+    return blocks;
+  }
+
+  Map<String, dynamic>? _anthropicContentBlock(Object? block) {
+    if (block is! Map) return null;
+    final type = block['type'];
+    if (type == 'text') {
+      return {
+        'type': 'text',
+        'text': block['text'] as String? ?? '',
+      };
+    }
+    if (type == 'image') {
+      return _normalizeAnthropicImageBlock(block);
+    }
+    if (type == 'image_url') {
+      return _openAIImageBlockToAnthropic(block);
+    }
+    if (type == 'tool_use') {
+      return {
+        'type': 'tool_use',
+        'id': block['id'],
+        'name': block['name'],
+        'input': Map<String, dynamic>.from(block['input'] as Map? ?? {}),
+      };
+    }
+    if (type == 'tool_result') {
+      return {
+        'type': 'tool_result',
+        'tool_use_id': block['tool_use_id'],
+        'content': _stringContent(block['content'] ?? block['output']),
+        if (block['is_error'] == true) 'is_error': true,
+      };
+    }
+    return null;
+  }
+
+  Map<String, dynamic>? _normalizeAnthropicImageBlock(
+      Map<dynamic, dynamic> block) {
+    final source = block['source'];
+    if (source is Map) {
+      return {
+        'type': 'image',
+        'source': Map<String, dynamic>.from(source),
+      };
+    }
+    final data = block['data'] as String?;
+    if (data == null || data.isEmpty) return null;
+    return {
+      'type': 'image',
+      'source': {
+        'type': 'base64',
+        'media_type': block['media_type'] as String? ?? 'image/png',
+        'data': data,
+      },
+    };
+  }
+
+  Map<String, dynamic>? _openAIImageBlockToAnthropic(
+      Map<dynamic, dynamic> block) {
+    final imageUrl = block['image_url'];
+    final url = imageUrl is Map ? imageUrl['url'] as String? : null;
+    if (url == null || url.isEmpty) return null;
+
+    final dataUrl = RegExp(r'^data:([^;,]+);base64,(.*)$').firstMatch(url);
+    if (dataUrl != null) {
+      return {
+        'type': 'image',
+        'source': {
+          'type': 'base64',
+          'media_type': dataUrl.group(1)!,
+          'data': dataUrl.group(2)!,
+        },
+      };
+    }
+
+    return {
+      'type': 'image',
+      'source': {
+        'type': 'url',
+        'url': url,
+      },
+    };
+  }
+
+  Map<String, dynamic>? _openAIToolCallToAnthropic(Object? toolCall) {
+    if (toolCall is! Map) return null;
+    final function = toolCall['function'];
+    if (function is! Map) return null;
+    final id = toolCall['id']?.toString();
+    final name = function['name']?.toString();
+    if (id == null || id.isEmpty || name == null || name.isEmpty) return null;
+
+    final rawArguments = function['arguments'];
+    Map<String, dynamic> input = {};
+    if (rawArguments is Map) {
+      input = Map<String, dynamic>.from(rawArguments);
+    } else if (rawArguments is String && rawArguments.isNotEmpty) {
+      try {
+        input = jsonDecode(rawArguments) as Map<String, dynamic>;
+      } catch (_) {
+        input = {};
+      }
+    }
+
+    return {
+      'type': 'tool_use',
+      'id': id,
+      'name': name,
+      'input': input,
+    };
+  }
+
   List<Map<String, dynamic>> _convertMessageToOpenAI(Map<String, dynamic> msg) {
     final role = msg['role'] as String;
     final content = msg['content'];
     final reasoningContent =
         role == 'assistant' ? msg['reasoning_content'] as String? : null;
-    final needsReasoning = role == 'assistant' && _isReasoningModel(config.model);
+    final shouldSendReasoningContent =
+        role == 'assistant' && _usesOpenAIReasoningContent();
+    final topLevelToolCalls = msg['tool_calls'] as List?;
 
     if (content is String) {
       final result = <String, dynamic>{
         'role': role,
         'content': content,
       };
-      if (reasoningContent?.isNotEmpty == true) {
+      if (role == 'tool' && msg['tool_call_id'] != null) {
+        result['tool_call_id'] = msg['tool_call_id'];
+      }
+      if (shouldSendReasoningContent && reasoningContent?.isNotEmpty == true) {
         result['reasoning_content'] = reasoningContent!;
-      } else if (needsReasoning) {
+      } else if (shouldSendReasoningContent) {
         result['reasoning_content'] = '';
+      }
+      if (topLevelToolCalls != null) {
+        result['tool_calls'] =
+            topLevelToolCalls.map(_normalizeOpenAIToolCall).toList();
       }
       return [result];
     }
@@ -1111,13 +1309,14 @@ class LlmService {
         return content
             .where((item) => item is Map && item['type'] == 'tool_result')
             .map<Map<String, dynamic>>((item) {
-          return {
+          final result = {
             'role': 'tool',
             'tool_call_id': item['tool_use_id'],
             'content': item['content'] is String
                 ? item['content']
                 : jsonEncode(item['content']),
           };
+          return result;
         }).toList();
       }
 
@@ -1164,9 +1363,9 @@ class LlmService {
           'content': contentParts,
         };
         final combinedReasoning = reasoningParts.join('\n');
-        if (combinedReasoning.isNotEmpty) {
+        if (shouldSendReasoningContent && combinedReasoning.isNotEmpty) {
           result['reasoning_content'] = combinedReasoning;
-        } else if (needsReasoning) {
+        } else if (shouldSendReasoningContent) {
           result['reasoning_content'] = '';
         }
         return [result];
@@ -1176,18 +1375,45 @@ class LlmService {
         'content': textParts.join('\n'),
       };
       final combinedReasoning = reasoningParts.join('\n');
-      if (combinedReasoning.isNotEmpty) {
+      if (shouldSendReasoningContent && combinedReasoning.isNotEmpty) {
         result['reasoning_content'] = combinedReasoning;
-      } else if (needsReasoning) {
+      } else if (shouldSendReasoningContent) {
         result['reasoning_content'] = '';
       }
       if (toolCalls.isNotEmpty) result['tool_calls'] = toolCalls;
+      if (topLevelToolCalls != null) {
+        result['tool_calls'] =
+            topLevelToolCalls.map(_normalizeOpenAIToolCall).toList();
+      }
       return [result];
     }
 
     return [
       {'role': role, 'content': content.toString()}
     ];
+  }
+
+  Map<String, dynamic> _normalizeOpenAIToolCall(Object? toolCall) {
+    if (toolCall is! Map) return {};
+    final function = toolCall['function'];
+    final functionMap =
+        function is Map ? Map<String, dynamic>.from(function) : {};
+    return {
+      'id': toolCall['id'],
+      'type': toolCall['type'] ?? 'function',
+      'function': {
+        'name': functionMap['name'],
+        'arguments': functionMap['arguments'] is String
+            ? functionMap['arguments']
+            : jsonEncode(functionMap['arguments'] ?? {}),
+      },
+    };
+  }
+
+  static String _stringContent(Object? content) {
+    if (content == null) return '';
+    if (content is String) return content;
+    return jsonEncode(content);
   }
 
   Map<String, dynamic>? _convertImageBlockToOpenAI(

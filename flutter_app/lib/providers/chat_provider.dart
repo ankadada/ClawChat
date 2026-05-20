@@ -917,7 +917,14 @@ class ChatProvider extends ChangeNotifier {
 
       List<MessageContent> contentList;
       if (content is String) {
-        contentList = [TextContent(content)];
+        contentList = [
+          TextContent(
+            content,
+            reasoningContent: role == 'assistant'
+                ? msg['reasoning_content'] as String?
+                : null,
+          ),
+        ];
       } else if (content is List) {
         contentList = content.map<MessageContent>((item) {
           if (item is Map<String, dynamic>) {

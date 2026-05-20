@@ -237,6 +237,18 @@ void main() {
       expect(body['max_completion_tokens'], 8192);
     });
 
+    test('token key fallback is scoped per model on the same proxy', () async {
+      final bodies = await captureTokenFallbackBodiesForTwoModels();
+
+      expect(bodies[0]['model'], 'legacy-model');
+      expect(bodies[0], contains('max_tokens'));
+      expect(bodies[1]['model'], 'legacy-model');
+      expect(bodies[1], contains('max_completion_tokens'));
+      expect(bodies[2]['model'], 'gpt-test');
+      expect(bodies[2], contains('max_tokens'));
+      expect(bodies[2], isNot(contains('max_completion_tokens')));
+    });
+
     test('builds valid Anthropic simple text request body', () async {
       final captured = await captureAnthropicRequest(
         model: 'claude-sonnet-4-20250514${LlmService.presetModelSuffix}',
@@ -277,10 +289,11 @@ void main() {
       expect(jsonDecode(jsonEncode(captured.body)), captured.body);
     });
 
-    test('passes assistant reasoning_content back to OpenAI-compatible APIs',
+    test(
+        'passes assistant reasoning_content back to DeepSeek-style OpenAI-compatible APIs',
         () async {
       final captured = await captureOpenAiRequest(
-        model: 'gpt-test',
+        model: 'deepseek-reasoner',
         system: 'You are concise.',
         messages: const [
           {
@@ -302,6 +315,83 @@ void main() {
       ]);
     });
 
+    test(
+        'strips assistant reasoning_content from non-reasoning OpenAI requests',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'gpt-test',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': 'answer',
+            'reasoning_content': 'internal reasoning',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {'role': 'assistant', 'content': 'answer'},
+      ]);
+    });
+
+    test('strips reasoning_content from non-reasoning DeepSeek chat models',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'deepseek-chat',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': 'answer',
+            'reasoning_content': 'internal reasoning',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {'role': 'assistant', 'content': 'answer'},
+      ]);
+    });
+
+    test('does not send reasoning_content to official OpenAI reasoning models',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'gpt-5.5',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': 'answer',
+            'reasoning_content': 'internal reasoning',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {'role': 'assistant', 'content': 'answer'},
+      ]);
+    });
+
+    test('adds empty reasoning_content for old assistant messages on DeepSeek',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'deepseek-reasoner',
+        messages: const [
+          {'role': 'assistant', 'content': 'old answer'},
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {
+          'role': 'assistant',
+          'content': 'old answer',
+          'reasoning_content': '',
+        },
+      ]);
+    });
+
     test('strips assistant reasoning_content from Anthropic request bodies',
         () async {
       final captured = await captureAnthropicRequest(
@@ -317,6 +407,118 @@ void main() {
 
       expect(captured.body['messages'], [
         {'role': 'assistant', 'content': 'answer'},
+      ]);
+    });
+
+    test('converts raw OpenAI tool history to Anthropic tool blocks', () async {
+      final captured = await captureAnthropicRequest(
+        model: 'claude-sonnet-4-20250514',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [
+              {
+                'id': 'call_1',
+                'type': 'function',
+                'function': {
+                  'name': 'bash',
+                  'arguments': '{"command":"pwd"}',
+                },
+              },
+            ],
+          },
+          {
+            'role': 'tool',
+            'tool_call_id': 'call_1',
+            'content': '/root/workspace',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'call_1',
+              'name': 'bash',
+              'input': {'command': 'pwd'},
+            },
+          ],
+        },
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'call_1',
+              'content': '/root/workspace',
+            },
+          ],
+        },
+      ]);
+    });
+
+    test('converts OpenAI image_url blocks to Anthropic image blocks',
+        () async {
+      final captured = await captureAnthropicRequest(
+        model: 'claude-sonnet-4-20250514',
+        messages: const [
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': 'describe'},
+              {
+                'type': 'image_url',
+                'image_url': {
+                  'url': 'data:image/png;base64,abc123',
+                },
+              },
+            ],
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': 'describe'},
+            {
+              'type': 'image',
+              'source': {
+                'type': 'base64',
+                'media_type': 'image/png',
+                'data': 'abc123',
+              },
+            },
+          ],
+        },
+      ]);
+    });
+
+    test('preserves raw OpenAI tool messages when building OpenAI bodies',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'gpt-test',
+        messages: const [
+          {
+            'role': 'tool',
+            'tool_call_id': 'call_1',
+            'content': 'done',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {
+          'role': 'tool',
+          'content': 'done',
+          'tool_call_id': 'call_1',
+        },
       ]);
     });
   });
@@ -527,6 +729,59 @@ Future<int> requestCountForAlwaysStatus(int statusCode) async {
     await server.close(force: true);
   }
   fail('Expected chat request to fail');
+}
+
+Future<List<Map<String, dynamic>>>
+    captureTokenFallbackBodiesForTwoModels() async {
+  final bodies = <Map<String, dynamic>>[];
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    final body = jsonDecode(await utf8.decoder.bind(request).join())
+        as Map<String, dynamic>;
+    bodies.add(body);
+
+    if (body['model'] == 'legacy-model' && body.containsKey('max_tokens')) {
+      request.response.statusCode = 400;
+      request.response.write('use max_completion_tokens instead of max_tokens');
+    } else if (body['model'] == 'gpt-test' &&
+        body.containsKey('max_completion_tokens')) {
+      request.response.statusCode = 400;
+      request.response.write('use max_tokens instead of max_completion_tokens');
+    } else {
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode({
+        'choices': [
+          {
+            'message': {'content': 'ok'},
+            'finish_reason': 'stop',
+          }
+        ],
+      }));
+    }
+    await request.response.close();
+  });
+
+  final baseUrl = 'http://127.0.0.1:${server.port}';
+  final legacyService = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: 'legacy-model',
+    baseUrl: baseUrl,
+  ));
+  final currentService = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: 'gpt-test',
+    baseUrl: baseUrl,
+  ));
+  try {
+    await legacyService.chat(system: '', messages: const [], tools: const []);
+    await currentService.chat(system: '', messages: const [], tools: const []);
+    return bodies;
+  } finally {
+    legacyService.dispose();
+    currentService.dispose();
+    await server.close(force: true);
+  }
 }
 
 class CapturedLlmRequest {
