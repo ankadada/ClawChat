@@ -219,6 +219,15 @@ class MainActivity : FlutterActivity() {
                         result.error("INVALID_ARGS", "text required", null)
                     }
                 }
+                "showToolAutoApprovedNotification" -> {
+                    val toolName = call.argument<String>("toolName")
+                    if (toolName.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "toolName required", null)
+                    } else {
+                        showToolAutoApprovedNotification(toolName)
+                        result.success(true)
+                    }
+                }
                 "stopSetupService" -> {
                     try {
                         SetupService.stop(applicationContext)
@@ -569,6 +578,49 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun showToolAutoApprovedNotification(toolName: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+
+        val launchIntent = Intent(applicationContext, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+        }
+        val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                PendingIntent.FLAG_IMMUTABLE
+            } else {
+                0
+            }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            launchIntent,
+            pendingFlags
+        )
+        val text = "ClawChat 已自动允许 $toolName 执行"
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        val notification = builder
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("ClawChat")
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(TOOL_AUTO_APPROVED_NOTIFICATION_ID, notification)
+    }
+
     private fun isAppOwnedPath(path: String): Boolean {
         return try {
             val canonical = File(path).canonicalPath
@@ -613,5 +665,6 @@ class MainActivity : FlutterActivity() {
         const val STORAGE_PERMISSION_REQUEST = 1003
         const val AUDIO_PERMISSION_REQUEST = 1004
         const val SPEECH_REQUEST = 1005
+        const val TOOL_AUTO_APPROVED_NOTIFICATION_ID = 2001
     }
 }

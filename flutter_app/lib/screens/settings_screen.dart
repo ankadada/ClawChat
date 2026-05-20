@@ -46,6 +46,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _notifyOnComplete = true;
   bool _allowPhoneCall = false;
   bool _allowSms = false;
+  String _toolApprovalPolicy = PreferencesService.defaultToolApprovalPolicy;
   List<String> _memories = [];
   bool _loadingMemories = false;
   final Set<String> _expandedSections = {
@@ -72,6 +73,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _notifyOnComplete = _prefs.notifyOnComplete;
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
+      _toolApprovalPolicy = _prefs.toolApprovalPolicy;
       _whisperModelController.text = _prefs.whisperModel ?? '';
       _ttsModelController.text = _prefs.ttsModel ?? '';
 
@@ -529,6 +531,98 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   _sectionAgentSkills,
                   AppStrings.settingsAgentSkills,
                   [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            AppStrings.toolApprovalPolicy,
+                            style: TextStyle(
+                              color: theme.colorScheme.onSurfaceVariant,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: SegmentedButton<String>(
+                              segments: const [
+                                ButtonSegment(
+                                  value: PreferencesService.toolApprovalAlways,
+                                  icon: Icon(Icons.help_outline),
+                                  label:
+                                      Text(AppStrings.toolApprovalPolicyAlways),
+                                ),
+                                ButtonSegment(
+                                  value: PreferencesService
+                                      .toolApprovalSessionFirst,
+                                  icon: Icon(Icons.check_circle_outline),
+                                  label: Text(AppStrings
+                                      .toolApprovalPolicySessionFirst),
+                                ),
+                                ButtonSegment(
+                                  value: PreferencesService.toolApprovalAuto,
+                                  icon: Icon(Icons.flash_on_outlined),
+                                  label:
+                                      Text(AppStrings.toolApprovalPolicyAuto),
+                                ),
+                              ],
+                              selected: {_toolApprovalPolicy},
+                              onSelectionChanged: (value) {
+                                HapticFeedback.lightImpact();
+                                setState(() {
+                                  _toolApprovalPolicy = value.first;
+                                });
+                                _prefs.toolApprovalPolicy = _toolApprovalPolicy;
+                              },
+                            ),
+                          ),
+                          if (_toolApprovalPolicy ==
+                              PreferencesService.toolApprovalAuto) ...[
+                            const SizedBox(height: 8),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: theme.colorScheme.errorContainer
+                                    .withAlpha(170),
+                                borderRadius: BorderRadius.circular(AppRadii.s),
+                                border: Border.all(
+                                  color: theme.colorScheme.error.withAlpha(90),
+                                ),
+                              ),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Icon(
+                                    Icons.warning_amber_outlined,
+                                    size: 18,
+                                    color: theme.colorScheme.onErrorContainer,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      AppStrings.toolApprovalPolicyAutoWarning,
+                                      style:
+                                          theme.textTheme.bodySmall?.copyWith(
+                                        color:
+                                            theme.colorScheme.onErrorContainer,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    _settingsDivider(theme),
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                       child: Align(

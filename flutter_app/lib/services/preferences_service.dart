@@ -26,10 +26,16 @@ class PreferencesService {
   static const _keyNotifyOnComplete = 'notify_on_complete';
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
+  static const _keyToolApprovalPolicy = 'tool_approval_policy';
   static const _keyWhisperModel = 'whisper_model';
   static const _keyTtsModel = 'tts_model';
   static const _keyProviderProfiles = 'provider_profiles';
   static const _keyActiveProfileId = 'active_provider_profile_id';
+
+  static const toolApprovalAlways = 'always';
+  static const toolApprovalSessionFirst = 'session_first';
+  static const toolApprovalAuto = 'auto';
+  static const defaultToolApprovalPolicy = toolApprovalSessionFirst;
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -497,6 +503,24 @@ class PreferencesService {
   bool get allowSms =>
       _initialized ? (_prefs.getBool(_keyAllowSms) ?? false) : false;
   set allowSms(bool v) => _prefs.setBool(_keyAllowSms, v);
+
+  String get toolApprovalPolicy {
+    return normalizeToolApprovalPolicy(
+        _prefs.getString(_keyToolApprovalPolicy));
+  }
+
+  set toolApprovalPolicy(String v) {
+    _prefs.setString(_keyToolApprovalPolicy, normalizeToolApprovalPolicy(v));
+  }
+
+  static String normalizeToolApprovalPolicy(String? value) {
+    return switch (value) {
+      toolApprovalAlways => toolApprovalAlways,
+      toolApprovalAuto => toolApprovalAuto,
+      toolApprovalSessionFirst => toolApprovalSessionFirst,
+      _ => defaultToolApprovalPolicy,
+    };
+  }
 
   String? get whisperModel =>
       _initialized ? _prefs.getString(_keyWhisperModel) : null;

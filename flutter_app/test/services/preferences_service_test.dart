@@ -111,6 +111,31 @@ void main() {
     expect(secureStorage.containsKey('provider_profiles'), isTrue);
   });
 
+  test('tool approval policy defaults to session first and normalizes values',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+
+    expect(
+      service.toolApprovalPolicy,
+      PreferencesService.toolApprovalSessionFirst,
+    );
+
+    service.toolApprovalPolicy = PreferencesService.toolApprovalAlways;
+    expect(service.toolApprovalPolicy, PreferencesService.toolApprovalAlways);
+
+    service.toolApprovalPolicy = PreferencesService.toolApprovalAuto;
+    expect(service.toolApprovalPolicy, PreferencesService.toolApprovalAuto);
+
+    service.toolApprovalPolicy = 'unexpected';
+    expect(
+      service.toolApprovalPolicy,
+      PreferencesService.toolApprovalSessionFirst,
+    );
+  });
+
   test('delegates API getters and setters to the active profile', () async {
     final first = ProviderProfile.defaults(name: 'First').copyWith(
       id: 'first',

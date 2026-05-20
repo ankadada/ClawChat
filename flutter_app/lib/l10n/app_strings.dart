@@ -61,6 +61,7 @@ class AppStrings {
   static const toolApprovalDeny = '拒绝';
   static const toolApprovalAllowOnce = '允许一次';
   static const toolApprovalAllowSession = '本会话允许';
+  static const toolApprovalAllowAuto = '自动允许';
   static const riskLow = '低风险';
   static const riskMedium = '中风险';
   static const riskHigh = '高风险';
@@ -157,6 +158,13 @@ class AppStrings {
   static const settingsModelApi = '模型/API';
   static const settingsAgentSkills = 'Agent/技能';
   static const settingsData = '数据';
+  static const toolApprovalPolicy = '工具审批策略';
+  static const toolApprovalPolicyAlways = '每次询问';
+  static const toolApprovalPolicySessionFirst = '会话首次询问';
+  static const toolApprovalPolicyAuto = '自动允许';
+  static const toolApprovalPolicyAutoWarning = '所有工具将自动执行，包括命令行和文件操作';
+  static String toolAutoApprovedNotification(String name) =>
+      'ClawChat 已自动允许 $name 执行';
 
   // ── Setup wizard screen ──────────────────────────────────────────
   static const initClawChat = '初始化 ClawChat';

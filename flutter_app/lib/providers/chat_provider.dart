@@ -7,6 +7,7 @@ import '../models/provider_profile.dart';
 import '../services/agent_service.dart';
 import '../services/chat_context_utils.dart';
 import '../services/llm_service.dart';
+import '../services/native_bridge.dart';
 import '../services/session_storage.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
@@ -64,6 +65,11 @@ class ChatProvider extends ChangeNotifier {
     return _prefs.activeProfileId;
   }
 
+  String get toolApprovalPolicy {
+    if (!_prefsInitialized) return PreferencesService.defaultToolApprovalPolicy;
+    return _prefs.toolApprovalPolicy;
+  }
+
   List<SkillInfo> _skills = [];
   LlmService? _cachedLlm;
   LlmConfig? _cachedLlmConfig;
@@ -79,6 +85,10 @@ class ChatProvider extends ChangeNotifier {
   final Set<String> _sessionApprovedTools = {};
   ToolApprovalRequest? pendingApproval;
   Completer<bool>? _approvalCompleter;
+  Timer? _approvalTimeout;
+  bool _appInBackground = false;
+
+  static const _backgroundApprovalTimeout = Duration(seconds: 15);
 
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
 
@@ -211,24 +221,90 @@ class ChatProvider extends ChangeNotifier {
 
   Future<bool> _requestToolApproval(ToolApprovalRequest request) async {
     if (_disposed) return false;
-    if (_sessionApprovedTools.contains(request.toolName)) return true;
+    await _ensurePrefs();
+    if (_disposed) return false;
+
+    final policy = _prefs.toolApprovalPolicy;
+    if (policy == PreferencesService.toolApprovalAuto) return true;
+    if (policy == PreferencesService.toolApprovalSessionFirst &&
+        _sessionApprovedTools.contains(request.toolName)) {
+      return true;
+    }
 
     _completePendingApproval(false, notify: false);
     final completer = Completer<bool>();
     _approvalCompleter = completer;
     pendingApproval = request;
+    if (_appInBackground) {
+      _startBackgroundApprovalTimeout(request);
+    }
     notifyListeners();
-    return completer.future;
+    final approved = await completer.future;
+    if (approved &&
+        policy == PreferencesService.toolApprovalSessionFirst &&
+        !_disposed) {
+      _sessionApprovedTools.add(request.toolName);
+    }
+    return approved;
   }
 
   void resolveToolApproval(bool approved, {bool rememberForSession = false}) {
-    if (approved && rememberForSession && pendingApproval != null) {
-      _sessionApprovedTools.add(pendingApproval!.toolName);
+    final request = pendingApproval;
+    if (approved && request != null) {
+      _rememberToolApproval(
+        request.toolName,
+        explicitSessionApproval: rememberForSession,
+      );
     }
     _completePendingApproval(approved);
   }
 
+  void setAppInBackground(bool inBackground) {
+    if (_appInBackground == inBackground) return;
+    _appInBackground = inBackground;
+    if (!_appInBackground) {
+      _cancelApprovalTimeout();
+      if (pendingApproval != null && !_disposed) notifyListeners();
+    }
+  }
+
+  void _rememberToolApproval(
+    String toolName, {
+    bool explicitSessionApproval = false,
+  }) {
+    final policy = _prefsInitialized
+        ? _prefs.toolApprovalPolicy
+        : PreferencesService.defaultToolApprovalPolicy;
+    if (policy == PreferencesService.toolApprovalAlways) return;
+    if (explicitSessionApproval ||
+        policy == PreferencesService.toolApprovalSessionFirst) {
+      _sessionApprovedTools.add(toolName);
+    }
+  }
+
+  void _startBackgroundApprovalTimeout(ToolApprovalRequest request) {
+    _approvalTimeout?.cancel();
+    _approvalTimeout = Timer(_backgroundApprovalTimeout, () {
+      if (_disposed || !identical(pendingApproval, request)) return;
+      _rememberToolApproval(request.toolName);
+      unawaited(
+        NativeBridge.showToolAutoApprovedNotification(request.toolName)
+            .catchError((Object e) {
+          debugPrint('Tool auto-approval notification failed: $e');
+          return false;
+        }),
+      );
+      _completePendingApproval(true);
+    });
+  }
+
+  void _cancelApprovalTimeout() {
+    _approvalTimeout?.cancel();
+    _approvalTimeout = null;
+  }
+
   void _completePendingApproval(bool approved, {bool notify = true}) {
+    _cancelApprovalTimeout();
     pendingApproval = null;
     final completer = _approvalCompleter;
     _approvalCompleter = null;

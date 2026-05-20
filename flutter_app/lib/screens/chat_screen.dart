@@ -57,6 +57,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final VoiceInputStateMachine _voiceInput = VoiceInputStateMachine();
   bool _showScrollToBottom = false;
   bool _approvalDialogOpen = false;
+  bool _appInBackground = false;
   ToolApprovalRequest? _shownApprovalRequest;
   final List<MessageContent> _pendingAttachments = [];
   final List<_PendingAttachmentPreview> _pendingAttachmentPreviews = [];
@@ -85,7 +86,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _scheduleToolApprovalDialog(ToolApprovalRequest? request) {
-    if (request == null ||
+    if (request == null) {
+      _shownApprovalRequest = null;
+      return;
+    }
+    if (_appInBackground ||
         _approvalDialogOpen ||
         identical(request, _shownApprovalRequest)) {
       return;
@@ -116,6 +121,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final provider = context.read<ChatProvider>();
     final riskColor = _riskColor(request.risk);
     final arguments = _formatToolArguments(request);
+    final alwaysAsk =
+        provider.toolApprovalPolicy == PreferencesService.toolApprovalAlways;
 
     return showModalBottomSheet<void>(
       context: context,
@@ -205,20 +212,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ),
                     OutlinedButton(
                       onPressed: () {
+                        PreferencesService().toolApprovalPolicy =
+                            PreferencesService.toolApprovalAuto;
                         Navigator.pop(ctx);
                         provider.resolveToolApproval(true);
                       },
-                      child: const Text(AppStrings.toolApprovalAllowOnce),
+                      child: const Text(AppStrings.toolApprovalAllowAuto),
                     ),
                     FilledButton(
                       onPressed: () {
                         Navigator.pop(ctx);
-                        provider.resolveToolApproval(
-                          true,
-                          rememberForSession: true,
-                        );
+                        provider.resolveToolApproval(true);
                       },
-                      child: const Text(AppStrings.toolApprovalAllowSession),
+                      child: Text(
+                        alwaysAsk
+                            ? AppStrings.toolApprovalAllowOnce
+                            : AppStrings.toolApprovalAllowSession,
+                      ),
                     ),
                   ],
                 ),
@@ -552,6 +562,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _scrollController.jumpTo(0);
       }
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final inBackground = state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached;
+    _appInBackground = inBackground;
+    context.read<ChatProvider>().setAppInBackground(inBackground);
   }
 
   String? _lastSessionId;

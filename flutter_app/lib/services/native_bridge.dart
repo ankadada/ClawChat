@@ -93,6 +93,14 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('updateSetupNotification', {'text': text, 'progress': progress}))!;
   }
 
+  static Future<bool> showToolAutoApprovedNotification(String toolName) async {
+    return await _channel.invokeMethod<bool>(
+          'showToolAutoApprovedNotification',
+          {'toolName': toolName},
+        ) ??
+        false;
+  }
+
   static Future<bool> stopSetupService() async {
     return (await _channel.invokeMethod<bool>('stopSetupService'))!;
   }
