@@ -141,18 +141,23 @@ class AgentService {
         return;
       }
 
-      final toolBlocks = response.content.where((b) => b.type == 'tool_use').toList();
+      final toolBlocks =
+          response.content.where((b) => b.type == 'tool_use').toList();
       final toolResults = <Map<String, dynamic>>[];
 
       for (final block in toolBlocks) {
-        yield AgentToolStart(block.toolUseId!, block.toolName!, block.toolInput ?? {});
+        final toolUseId = block.toolUseId;
+        final toolName = block.toolName;
+        if (toolUseId == null || toolName == null) continue;
+        yield AgentToolStart(toolUseId, toolName, block.toolInput ?? {});
       }
 
       if (parallelTools && toolBlocks.length > 1) {
         final futures = toolBlocks.map((block) async {
           if (_cancelled) return null;
-          final toolUseId = block.toolUseId!;
-          final toolName = block.toolName!;
+          final toolUseId = block.toolUseId;
+          final toolName = block.toolName;
+          if (toolUseId == null || toolName == null) return null;
           final toolInput = block.toolInput ?? {};
           return _executeToolWithPolicy(toolUseId, toolName, toolInput);
         }).toList();
@@ -170,12 +175,15 @@ class AgentService {
       } else {
         for (final block in toolBlocks) {
           if (_cancelled) return;
-          final toolUseId = block.toolUseId!;
-          final toolName = block.toolName!;
+          final toolUseId = block.toolUseId;
+          final toolName = block.toolName;
+          if (toolUseId == null || toolName == null) continue;
           final toolInput = block.toolInput ?? {};
 
-          final result = await _executeToolWithPolicy(toolUseId, toolName, toolInput);
-          yield AgentToolDone(result.id, result.output, isError: result.isError);
+          final result =
+              await _executeToolWithPolicy(toolUseId, toolName, toolInput);
+          yield AgentToolDone(result.id, result.output,
+              isError: result.isError);
           toolResults.add({
             'type': 'tool_result',
             'tool_use_id': result.id,

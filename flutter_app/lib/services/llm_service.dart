@@ -290,9 +290,11 @@ class LlmService {
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
-        final models = (data['data'] as List)
-            .map((m) => (m as Map)['id'] as String)
+        final models = (data['data'] as List? ?? const [])
+            .map((m) => m is Map ? m['id']?.toString() : null)
+            .whereType<String>()
             .where((id) =>
+                id.isNotEmpty &&
                 !id.contains('embed') &&
                 !id.contains('tts') &&
                 !id.contains('dall-e') &&

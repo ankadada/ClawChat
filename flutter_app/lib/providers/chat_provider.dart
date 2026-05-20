@@ -429,16 +429,22 @@ class ChatProvider extends ChangeNotifier {
   Future<void> sendMessage(
     String text, {
     List<MessageContent> attachments = const [],
+    List<String>? pendingAlternatives,
   }) async {
     final trimmedText = text.trim();
-    if (trimmedText.isEmpty && attachments.isEmpty) return;
+    final pendingAlternativesForSend = pendingAlternatives == null
+        ? null
+        : List<String>.from(pendingAlternatives);
     // Guard against concurrent sends. In single-threaded Dart, the check-then-set
     // is safe because no other code can run between the check and the assignment
     // (no preemption between await points). The real protection is that _isSending
     // is only cleared in the finally block after all awaits complete.
     if (_isSending) return;
 
+    _pendingAlternatives = null;
+    if (trimmedText.isEmpty && attachments.isEmpty) return;
     _isSending = true;
+    _pendingAlternatives = pendingAlternativesForSend;
 
     try {
       await _ensurePrefs();
@@ -600,6 +606,7 @@ class ChatProvider extends ChangeNotifier {
         unawaited(_stopAgentService());
       }
     } finally {
+      _pendingAlternatives = null;
       _isSending = false;
     }
   }
@@ -647,13 +654,13 @@ class ChatProvider extends ChangeNotifier {
     }
     if (lastUserText == null) return;
 
-    // Save the old assistant text into _pendingAlternatives for reuse after regeneration
+    // Save the old assistant text for reuse after regeneration
+    List<String>? pendingAlternatives;
     if (lastAssistant != null) {
-      _pendingAlternatives =
-          List<String>.from(lastAssistant.alternatives ?? []);
+      pendingAlternatives = List<String>.from(lastAssistant.alternatives ?? []);
       final currentText = lastAssistant.latestTextContent;
       if (currentText.isNotEmpty) {
-        _pendingAlternatives!.add(currentText);
+        pendingAlternatives.add(currentText);
       }
     }
 
@@ -673,7 +680,7 @@ class ChatProvider extends ChangeNotifier {
     await _storage.saveSession(currentSession!);
     notifyListeners();
 
-    await sendMessage(lastUserText);
+    await sendMessage(lastUserText, pendingAlternatives: pendingAlternatives);
   }
 
   void switchAlternative(int messageIndex, int altIndex) {
@@ -733,6 +740,7 @@ class ChatProvider extends ChangeNotifier {
   Future<void> sendCompare(String text, List<String> models) async {
     if (_isSending || _isComparing || currentSession == null) return;
     if (text.trim().isEmpty || models.isEmpty) return;
+    final comparePrompt = text.trim();
 
     _isComparing = true;
     compareResults = [];
@@ -752,6 +760,10 @@ class ChatProvider extends ChangeNotifier {
     // Compare is a one-shot inspection — results live in compareResults only.
     // If we persisted, the next real sendMessage would break role alternation
     // (two consecutive user messages without an assistant reply between them).
+    final compareMessages = [
+      ..._truncateToFit(session.toApiMessages()),
+      {'role': 'user', 'content': comparePrompt},
+    ];
     notifyListeners();
 
     _skills = await SkillService.scanSkills();
@@ -788,7 +800,7 @@ class ChatProvider extends ChangeNotifier {
           final fullPrompt = basePrompt + skillIndex + memoryPrompt;
           final response = await llm.chat(
             system: fullPrompt,
-            messages: _truncateToFit(session.toApiMessages()),
+            messages: compareMessages,
             tools: [],
           );
           final responseText = response.content

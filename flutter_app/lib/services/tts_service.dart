@@ -694,6 +694,7 @@ class TtsService extends ChangeNotifier {
     notifyListeners();
 
     final client = HttpClient();
+    client.badCertificateCallback = (cert, host, port) => false;
     client.connectionTimeout = const Duration(seconds: 15);
     client.idleTimeout = const Duration(seconds: 30);
     try {

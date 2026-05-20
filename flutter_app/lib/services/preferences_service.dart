@@ -65,7 +65,6 @@ class PreferencesService {
     await _migrateApiKeyToSecureStorage();
     await _migrateEnvVarsToSecureStorage();
     await _loadProviderProfiles();
-    await _ensureAtLeastOneProfile();
     _cachedEnvVars =
         _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
     _initialized = true;
