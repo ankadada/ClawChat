@@ -8,11 +8,11 @@ class ChatSession {
   final DateTime createdAt;
   DateTime updatedAt;
   final List<ChatMessage> messages;
-  String? modelOverride;      // null = use global default
-  String? baseUrlOverride;    // null = use global default
-  String? apiFormatOverride;  // null = use global default
-  String? systemPrompt;       // null = use global default
-  String? folder;             // null = ungrouped
+  String? modelOverride; // null = use global default
+  String? baseUrlOverride; // null = use global default
+  String? apiFormatOverride; // null = use global default
+  String? systemPrompt; // null = use global default
+  String? folder; // null = ungrouped
 
   ChatSession({
     required this.id,
@@ -47,24 +47,26 @@ class ChatSession {
   }
 
   Map<String, dynamic> toJson() => {
-    'id': id,
-    'title': title,
-    'createdAt': createdAt.toIso8601String(),
-    'updatedAt': updatedAt.toIso8601String(),
-    'messages': messages.map((m) => m.toJson()).toList(),
-    if (modelOverride != null) 'modelOverride': modelOverride,
-    if (baseUrlOverride != null) 'baseUrlOverride': baseUrlOverride,
-    if (apiFormatOverride != null) 'apiFormatOverride': apiFormatOverride,
-    if (systemPrompt != null) 'systemPrompt': systemPrompt,
-    if (folder != null) 'folder': folder,
-  };
+        'id': id,
+        'title': title,
+        'createdAt': createdAt.toIso8601String(),
+        'updatedAt': updatedAt.toIso8601String(),
+        'messages': messages.map((m) => m.toJson()).toList(),
+        if (modelOverride != null) 'modelOverride': modelOverride,
+        if (baseUrlOverride != null) 'baseUrlOverride': baseUrlOverride,
+        if (apiFormatOverride != null) 'apiFormatOverride': apiFormatOverride,
+        if (systemPrompt != null) 'systemPrompt': systemPrompt,
+        if (folder != null) 'folder': folder,
+      };
 
   factory ChatSession.fromJson(Map<String, dynamic> json) {
     return ChatSession(
       id: _sanitizeId(json['id']?.toString()),
       title: json['title'] as String? ?? '新对话',
-      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ?? DateTime.now(),
-      updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ?? DateTime.now(),
+      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ??
+          DateTime.now(),
+      updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
+          DateTime.now(),
       messages: (json['messages'] as List)
           .map((m) => ChatMessage.fromJson(m))
           .toList(),
@@ -115,8 +117,8 @@ class ChatMessage {
   final DateTime timestamp;
   int? inputTokens;
   int? outputTokens;
-  final List<String>? alternatives;  // previous generation texts
-  int activeAlternative;  // -1 = current content, 0+ = index into alternatives
+  final List<String>? alternatives; // previous generation texts
+  int activeAlternative; // -1 = current content, 0+ = index into alternatives
   final bool isSystemNotice;
 
   ChatMessage({
@@ -179,7 +181,10 @@ class ChatMessage {
     final content = contentBlocks.map((block) {
       switch (block['type']) {
         case 'text':
-          return TextContent(block['text'] as String);
+          return TextContent(
+            block['text'] as String,
+            reasoningContent: block['reasoning_content'] as String?,
+          );
         case 'image':
           return _imageContentFromMap(block);
         case 'tool_use':
@@ -192,15 +197,18 @@ class ChatMessage {
           return TextContent(block.toString());
       }
     }).toList();
-    return ChatMessage(role: 'assistant', content: content.cast<MessageContent>());
+    return ChatMessage(
+        role: 'assistant', content: content.cast<MessageContent>());
   }
 
   factory ChatMessage.toolResults(List<Map<String, dynamic>> results) {
-    final content = results.map((r) => ToolResultContent(
-      toolUseId: r['tool_use_id'] as String,
-      output: r['content'] as String,
-      isError: r['is_error'] as bool? ?? false,
-    )).toList();
+    final content = results
+        .map((r) => ToolResultContent(
+              toolUseId: r['tool_use_id'] as String,
+              output: r['content'] as String,
+              isError: r['is_error'] as bool? ?? false,
+            ))
+        .toList();
     return ChatMessage(role: 'user', content: content.cast<MessageContent>());
   }
 
@@ -208,29 +216,50 @@ class ChatMessage {
     return content.whereType<TextContent>().map((c) => c.text).join('\n');
   }
 
-  List<ToolUseContent> get toolUses => content.whereType<ToolUseContent>().toList();
-  List<ToolResultContent> get toolResults => content.whereType<ToolResultContent>().toList();
+  List<ToolUseContent> get toolUses =>
+      content.whereType<ToolUseContent>().toList();
+  List<ToolResultContent> get toolResults =>
+      content.whereType<ToolResultContent>().toList();
 
   Map<String, dynamic> toApiJson() {
     if (content.length == 1 && content[0] is TextContent) {
-      return {'role': role, 'content': (content[0] as TextContent).text};
+      final textContent = content[0] as TextContent;
+      return {
+        'role': role,
+        'content': textContent.text,
+        if (role == 'assistant' &&
+            textContent.reasoningContent?.isNotEmpty == true)
+          'reasoning_content': textContent.reasoningContent,
+      };
     }
-    return {
+    final reasoningContent = role == 'assistant'
+        ? content
+            .whereType<TextContent>()
+            .map((c) => c.reasoningContent ?? '')
+            .where((reasoning) => reasoning.isNotEmpty)
+            .join('\n')
+        : '';
+    final apiJson = {
       'role': role,
       'content': content.map((c) => c.toApiJson()).toList(),
     };
+    if (reasoningContent.isNotEmpty) {
+      apiJson['reasoning_content'] = reasoningContent;
+    }
+    return apiJson;
   }
 
   Map<String, dynamic> toJson() => {
-    'role': role,
-    'timestamp': timestamp.toIso8601String(),
-    'content': content.map((c) => c.toJson()).toList(),
-    if (inputTokens != null) 'inputTokens': inputTokens,
-    if (outputTokens != null) 'outputTokens': outputTokens,
-    if (alternatives != null && alternatives!.isNotEmpty) 'alternatives': alternatives,
-    if (activeAlternative != -1) 'activeAlternative': activeAlternative,
-    if (isSystemNotice) 'isSystemNotice': true,
-  };
+        'role': role,
+        'timestamp': timestamp.toIso8601String(),
+        'content': content.map((c) => c.toJson()).toList(),
+        if (inputTokens != null) 'inputTokens': inputTokens,
+        if (outputTokens != null) 'outputTokens': outputTokens,
+        if (alternatives != null && alternatives!.isNotEmpty)
+          'alternatives': alternatives,
+        if (activeAlternative != -1) 'activeAlternative': activeAlternative,
+        if (isSystemNotice) 'isSystemNotice': true,
+      };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
     final contentList = json['content'] as List;
@@ -238,7 +267,10 @@ class ChatMessage {
       final type = c['type'] as String;
       switch (type) {
         case 'text':
-          return TextContent(c['text'] as String);
+          return TextContent(
+            c['text'] as String,
+            reasoningContent: c['reasoning_content'] as String?,
+          );
         case 'image':
           return _imageContentFromMap(c);
         case 'tool_use':
@@ -261,7 +293,8 @@ class ChatMessage {
     return ChatMessage(
       role: json['role'] as String,
       content: content.cast<MessageContent>(),
-      timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '') ?? DateTime.now(),
+      timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '') ??
+          DateTime.now(),
       inputTokens: json['inputTokens'] as int?,
       outputTokens: json['outputTokens'] as int?,
       alternatives: altsList?.map((e) => e as String).toList(),
@@ -275,7 +308,8 @@ class ChatMessage {
     final sourceMap = source is Map ? source : const <String, dynamic>{};
     return ImageContent(
       data: (sourceMap['data'] ?? block['data'] ?? '') as String,
-      mediaType: (sourceMap['media_type'] ?? block['media_type'] ?? 'image/png') as String,
+      mediaType: (sourceMap['media_type'] ?? block['media_type'] ?? 'image/png')
+          as String,
       filename: block['filename'] as String?,
     );
   }
@@ -288,13 +322,20 @@ sealed class MessageContent {
 
 class TextContent extends MessageContent {
   final String text;
-  TextContent(this.text);
+  final String? reasoningContent;
+
+  TextContent(this.text, {this.reasoningContent});
 
   @override
   Map<String, dynamic> toApiJson() => {'type': 'text', 'text': text};
 
   @override
-  Map<String, dynamic> toJson() => {'type': 'text', 'text': text};
+  Map<String, dynamic> toJson() => {
+        'type': 'text',
+        'text': text,
+        if (reasoningContent?.isNotEmpty == true)
+          'reasoning_content': reasoningContent,
+      };
 }
 
 class ImageContent extends MessageContent {
@@ -310,19 +351,19 @@ class ImageContent extends MessageContent {
 
   @override
   Map<String, dynamic> toApiJson() => {
-    'type': 'image',
-    'source': {
-      'type': 'base64',
-      'media_type': mediaType,
-      'data': data,
-    },
-  };
+        'type': 'image',
+        'source': {
+          'type': 'base64',
+          'media_type': mediaType,
+          'data': data,
+        },
+      };
 
   @override
   Map<String, dynamic> toJson() => {
-    ...toApiJson(),
-    if (filename != null) 'filename': filename,
-  };
+        ...toApiJson(),
+        if (filename != null) 'filename': filename,
+      };
 }
 
 class ToolUseContent extends MessageContent {
@@ -344,21 +385,21 @@ class ToolUseContent extends MessageContent {
 
   @override
   Map<String, dynamic> toApiJson() => {
-    'type': 'tool_use',
-    'id': id,
-    'name': name,
-    'input': input,
-  };
+        'type': 'tool_use',
+        'id': id,
+        'name': name,
+        'input': input,
+      };
 
   @override
   Map<String, dynamic> toJson() => {
-    'type': 'tool_use',
-    'id': id,
-    'name': name,
-    'input': input,
-    'output': output,
-    'is_error': isError,
-  };
+        'type': 'tool_use',
+        'id': id,
+        'name': name,
+        'input': input,
+        'output': output,
+        'is_error': isError,
+      };
 }
 
 class ToolResultContent extends MessageContent {
@@ -374,17 +415,17 @@ class ToolResultContent extends MessageContent {
 
   @override
   Map<String, dynamic> toApiJson() => {
-    'type': 'tool_result',
-    'tool_use_id': toolUseId,
-    'content': output,
-    if (isError) 'is_error': true,
-  };
+        'type': 'tool_result',
+        'tool_use_id': toolUseId,
+        'content': output,
+        if (isError) 'is_error': true,
+      };
 
   @override
   Map<String, dynamic> toJson() => {
-    'type': 'tool_result',
-    'tool_use_id': toolUseId,
-    'output': output,
-    'is_error': isError,
-  };
+        'type': 'tool_result',
+        'tool_use_id': toolUseId,
+        'output': output,
+        'is_error': isError,
+      };
 }

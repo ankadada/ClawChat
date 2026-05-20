@@ -144,6 +144,18 @@ void main() {
       expect(json['text'], 'hello');
     });
 
+    test('ContentBlock.toJson preserves reasoning_content for text blocks', () {
+      const block = ContentBlock(
+        type: 'text',
+        text: 'hello',
+        reasoningContent: 'private reasoning',
+      );
+      final json = block.toJson();
+      expect(json['type'], 'text');
+      expect(json['text'], 'hello');
+      expect(json['reasoning_content'], 'private reasoning');
+    });
+
     test('ContentBlock.toJson produces correct tool_use block', () {
       const block = ContentBlock(
         type: 'tool_use',
@@ -212,12 +224,15 @@ void main() {
       expect(body['model'], 'gpt-test');
     });
 
-    test('generic OpenAI-compatible requests use max_tokens for non-reasoning models', () async {
+    test(
+        'generic OpenAI-compatible requests use max_tokens for non-reasoning models',
+        () async {
       final body = await captureOpenAiBody(model: 'gpt-test');
       expect(body['max_tokens'], 8192);
     });
 
-    test('reasoning models use max_completion_tokens regardless of provider', () async {
+    test('reasoning models use max_completion_tokens regardless of provider',
+        () async {
       final body = await captureOpenAiBody(model: 'gpt-5.5');
       expect(body['max_completion_tokens'], 8192);
     });
@@ -260,6 +275,49 @@ void main() {
       ]);
       expect(captured.body['max_tokens'], 8192);
       expect(jsonDecode(jsonEncode(captured.body)), captured.body);
+    });
+
+    test('passes assistant reasoning_content back to OpenAI-compatible APIs',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'gpt-test',
+        system: 'You are concise.',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': 'answer',
+            'reasoning_content': 'internal reasoning',
+          },
+        ],
+        baseUrlForPort: (port) => 'http://127.0.0.1:$port/v1/chat/completions',
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': 'You are concise.'},
+        {
+          'role': 'assistant',
+          'content': 'answer',
+          'reasoning_content': 'internal reasoning',
+        },
+      ]);
+    });
+
+    test('strips assistant reasoning_content from Anthropic request bodies',
+        () async {
+      final captured = await captureAnthropicRequest(
+        model: 'claude-sonnet-4-20250514',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': 'answer',
+            'reasoning_content': 'internal reasoning',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'assistant', 'content': 'answer'},
+      ]);
     });
   });
 
@@ -328,6 +386,50 @@ void main() {
       expect(done.response.stopReason, 'end_turn');
       expect(done.response.inputTokens, 1);
       expect(done.response.outputTokens, 1);
+    });
+
+    test('captures OpenAI streaming reasoning_content without displaying it',
+        () async {
+      final events = await collectOpenAiStreamEvents([
+        sseData({
+          'choices': [
+            {
+              'delta': {'reasoning_content': 'hidden '},
+              'finish_reason': null,
+            }
+          ],
+        }),
+        sseData({
+          'choices': [
+            {
+              'delta': {'content': 'visible'},
+              'finish_reason': null,
+            }
+          ],
+        }),
+        sseData({
+          'choices': [
+            {
+              'delta': {'reasoning_content': 'state'},
+              'finish_reason': null,
+            }
+          ],
+        }),
+        sseData({
+          'choices': [
+            {
+              'delta': {},
+              'finish_reason': 'stop',
+            }
+          ],
+        }, delimiter: false),
+      ]);
+
+      expect(events.whereType<TextDelta>().map((e) => e.text), ['visible']);
+      final done = events.whereType<StreamDone>().single;
+      final textBlock = done.response.content.single;
+      expect(textBlock.text, 'visible');
+      expect(textBlock.reasoningContent, 'hidden state');
     });
   });
 }

@@ -1,13 +1,15 @@
 class ChatContextUtils {
   static int charCount(Map<String, dynamic> msg) {
+    final reasoningCount = (msg['reasoning_content'] as String?)?.length ?? 0;
     final content = msg['content'];
-    if (content is String) return content.length;
+    if (content is String) return content.length + reasoningCount;
     if (content is List) {
-      var count = 0;
+      var count = reasoningCount;
       for (final item in content) {
         if (item is Map) {
           count += (item['text'] as String?)?.length ?? 0;
           count += (item['content'] as String?)?.length ?? 0;
+          count += (item['reasoning_content'] as String?)?.length ?? 0;
           final source = item['source'];
           if (source is Map) {
             count += (source['data'] as String?)?.length ?? 0;
@@ -30,7 +32,8 @@ class ChatContextUtils {
   static bool hasToolResultContent(Map<String, dynamic> msg) {
     final content = msg['content'];
     if (content is List) {
-      return content.any((item) => item is Map && item['type'] == 'tool_result');
+      return content
+          .any((item) => item is Map && item['type'] == 'tool_result');
     }
     return false;
   }

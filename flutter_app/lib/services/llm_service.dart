@@ -100,6 +100,7 @@ class LlmResponse {
 class ContentBlock {
   final String type;
   final String? text;
+  final String? reasoningContent;
   final String? toolUseId;
   final String? toolName;
   final Map<String, dynamic>? toolInput;
@@ -107,6 +108,7 @@ class ContentBlock {
   const ContentBlock({
     required this.type,
     this.text,
+    this.reasoningContent,
     this.toolUseId,
     this.toolName,
     this.toolInput,
@@ -114,7 +116,12 @@ class ContentBlock {
 
   Map<String, dynamic> toJson() {
     if (type == 'text') {
-      return {'type': 'text', 'text': text};
+      return {
+        'type': 'text',
+        'text': text,
+        if (reasoningContent?.isNotEmpty == true)
+          'reasoning_content': reasoningContent,
+      };
     } else {
       return {
         'type': 'tool_use',
@@ -664,7 +671,7 @@ class LlmService {
       'model': modelIdFromDisplay(config.model),
       'max_tokens': config.maxTokens,
       'system': system,
-      'messages': messages,
+      'messages': messages.map(_stripOpenAIReasoningContent).toList(),
       'stream': stream,
     };
     if (config.temperature != null && !_isReasoningModel(config.model)) {
@@ -682,6 +689,23 @@ class LlmService {
       body['max_tokens'] = config.thinkingBudget + config.maxTokens;
     }
     return body;
+  }
+
+  Map<String, dynamic> _stripOpenAIReasoningContent(
+    Map<String, dynamic> message,
+  ) {
+    final stripped = Map<String, dynamic>.from(message)
+      ..remove('reasoning_content');
+    final content = stripped['content'];
+    if (content is List) {
+      stripped['content'] = content.map((block) {
+        if (block is Map) {
+          return Map<String, dynamic>.from(block)..remove('reasoning_content');
+        }
+        return block;
+      }).toList();
+    }
+    return stripped;
   }
 
   Map<String, String> _anthropicHeaders() {
@@ -735,7 +759,8 @@ class LlmService {
         body: jsonEncode(body),
       );
       if (response.statusCode == 400 && _tryTokenKeyFallback(response.body)) {
-        final retryBody = _buildOpenAIBody(system, messages, tools, stream: false);
+        final retryBody =
+            _buildOpenAIBody(system, messages, tools, stream: false);
         final retryResponse = await _client.post(
           Uri.parse(url),
           headers: _openaiHeaders(),
@@ -802,6 +827,7 @@ class LlmService {
     }
 
     String currentText = '';
+    String currentReasoningContent = '';
     final List<ContentBlock> collectedBlocks = [];
     final Map<int, Map<String, String>> toolCallsAccum = {};
     String stopReason = 'stop';
@@ -838,6 +864,10 @@ class LlmService {
         if (content != null) {
           currentText += content;
           yield TextDelta(content);
+        }
+        final reasoningContent = delta['reasoning_content'] as String?;
+        if (reasoningContent != null) {
+          currentReasoningContent += reasoningContent;
         }
 
         final toolCalls = delta['tool_calls'] as List?;
@@ -906,8 +936,13 @@ class LlmService {
       }
     }
 
-    if (currentText.isNotEmpty) {
-      collectedBlocks.add(ContentBlock(type: 'text', text: currentText));
+    if (currentText.isNotEmpty || currentReasoningContent.isNotEmpty) {
+      collectedBlocks.add(ContentBlock(
+        type: 'text',
+        text: currentText,
+        reasoningContent:
+            currentReasoningContent.isEmpty ? null : currentReasoningContent,
+      ));
     }
 
     for (final entry in toolCallsAccum.entries) {
@@ -999,12 +1034,15 @@ class LlmService {
 
   bool _tryTokenKeyFallback(String errorBody) {
     final lower = errorBody.toLowerCase();
-    if (!lower.contains('max_tokens') && !lower.contains('max_completion_tokens')) {
+    if (!lower.contains('max_tokens') &&
+        !lower.contains('max_completion_tokens')) {
       return false;
     }
     final current = _tokenKeyOverrides[config.baseUrl] ??
         _openAITokenLimitKey(_detectOpenAICompatibleProvider());
-    final alternate = current == 'max_completion_tokens' ? 'max_tokens' : 'max_completion_tokens';
+    final alternate = current == 'max_completion_tokens'
+        ? 'max_tokens'
+        : 'max_completion_tokens';
     _tokenKeyOverrides[config.baseUrl] = alternate;
     return true;
   }
@@ -1020,7 +1058,8 @@ class LlmService {
     return switch (provider) {
       _OpenAICompatibleProvider.openaiNative => 'max_completion_tokens',
       _OpenAICompatibleProvider.anthropicCompatible => 'max_completion_tokens',
-      _OpenAICompatibleProvider.maxCompletionTokensProvider => 'max_completion_tokens',
+      _OpenAICompatibleProvider.maxCompletionTokensProvider =>
+        'max_completion_tokens',
       _OpenAICompatibleProvider.generic => 'max_tokens',
     };
   }
@@ -1044,11 +1083,18 @@ class LlmService {
   List<Map<String, dynamic>> _convertMessageToOpenAI(Map<String, dynamic> msg) {
     final role = msg['role'] as String;
     final content = msg['content'];
+    final reasoningContent =
+        role == 'assistant' ? msg['reasoning_content'] as String? : null;
 
     if (content is String) {
-      return [
-        {'role': role, 'content': content}
-      ];
+      final result = <String, dynamic>{
+        'role': role,
+        'content': content,
+      };
+      if (reasoningContent?.isNotEmpty == true) {
+        result['reasoning_content'] = reasoningContent!;
+      }
+      return [result];
     }
 
     if (content is List) {
@@ -1068,6 +1114,9 @@ class LlmService {
       }
 
       final textParts = <String>[];
+      final reasoningParts = <String>[
+        if (reasoningContent?.isNotEmpty == true) reasoningContent!,
+      ];
       final contentParts = <Map<String, dynamic>>[];
       final toolCalls = <Map<String, dynamic>>[];
       var hasImage = false;
@@ -1077,6 +1126,12 @@ class LlmService {
             final text = block['text'] as String? ?? '';
             textParts.add(text);
             contentParts.add({'type': 'text', 'text': text});
+            final blockReasoning = block['reasoning_content'] as String?;
+            if (role == 'assistant' &&
+                blockReasoning != null &&
+                blockReasoning.isNotEmpty) {
+              reasoningParts.add(blockReasoning);
+            }
           } else if (block['type'] == 'image') {
             final imageContent = _convertImageBlockToOpenAI(block);
             if (imageContent != null) {
@@ -1096,17 +1151,24 @@ class LlmService {
         }
       }
       if (hasImage && toolCalls.isEmpty) {
-        return [
-          {
-            'role': role,
-            'content': contentParts,
-          }
-        ];
+        final result = <String, dynamic>{
+          'role': role,
+          'content': contentParts,
+        };
+        final combinedReasoning = reasoningParts.join('\n');
+        if (combinedReasoning.isNotEmpty) {
+          result['reasoning_content'] = combinedReasoning;
+        }
+        return [result];
       }
       final result = <String, dynamic>{
         'role': role,
         'content': textParts.join('\n'),
       };
+      final combinedReasoning = reasoningParts.join('\n');
+      if (combinedReasoning.isNotEmpty) {
+        result['reasoning_content'] = combinedReasoning;
+      }
       if (toolCalls.isNotEmpty) result['tool_calls'] = toolCalls;
       return [result];
     }
@@ -1155,8 +1217,15 @@ class LlmService {
 
     final blocks = <ContentBlock>[];
     final content = message['content'] as String?;
-    if (content != null && content.isNotEmpty) {
-      blocks.add(ContentBlock(type: 'text', text: content));
+    final reasoningContent = message['reasoning_content'] as String?;
+    if ((content != null && content.isNotEmpty) ||
+        (reasoningContent != null && reasoningContent.isNotEmpty)) {
+      blocks.add(ContentBlock(
+        type: 'text',
+        text: content ?? '',
+        reasoningContent:
+            reasoningContent?.isEmpty == true ? null : reasoningContent,
+      ));
     }
 
     final toolCalls = message['tool_calls'] as List?;

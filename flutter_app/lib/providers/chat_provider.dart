@@ -923,7 +923,10 @@ class ChatProvider extends ChangeNotifier {
           if (item is Map<String, dynamic>) {
             switch (item['type']) {
               case 'text':
-                return TextContent(item['text'] as String);
+                return TextContent(
+                  item['text'] as String,
+                  reasoningContent: item['reasoning_content'] as String?,
+                );
               case 'image':
                 final source = item['source'];
                 final sourceMap =

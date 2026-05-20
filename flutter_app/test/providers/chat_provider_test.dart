@@ -18,6 +18,17 @@ void main() {
       expect(charCount({'role': 'user', 'content': 'hello'}), 5);
     });
 
+    test('counts top-level reasoning_content with string content', () {
+      expect(
+        charCount({
+          'role': 'assistant',
+          'content': 'hello',
+          'reasoning_content': 'thinking',
+        }),
+        13,
+      );
+    });
+
     test('counts empty string as 0', () {
       expect(charCount({'role': 'user', 'content': ''}), 0);
     });
@@ -38,6 +49,22 @@ void main() {
           ],
         }),
         11,
+      );
+    });
+
+    test('counts reasoning_content in list text items', () {
+      expect(
+        charCount({
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'text',
+              'text': 'hello',
+              'reasoning_content': 'thinking',
+            },
+          ],
+        }),
+        13,
       );
     });
 
