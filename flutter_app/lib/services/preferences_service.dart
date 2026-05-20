@@ -528,14 +528,14 @@ class PreferencesService {
   double get dualPaneSidebarWidth {
     final value = _prefs.getDouble(_keyDualPaneSidebarWidth);
     if (value == null || !value.isFinite) return defaultDualPaneSidebarWidth;
-    return value.clamp(200.0, 640.0).toDouble();
+    return value.clamp(200.0, 2000.0).toDouble();
   }
 
   set dualPaneSidebarWidth(double value) {
     if (!value.isFinite) return;
     _prefs.setDouble(
       _keyDualPaneSidebarWidth,
-      value.clamp(200.0, 640.0).toDouble(),
+      value.clamp(200.0, 2000.0).toDouble(),
     );
   }
 
