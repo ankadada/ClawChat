@@ -2490,137 +2490,157 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
           child: SafeArea(
             top: false,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _buildAttachmentPreviews(theme),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 640),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    SizedBox(
-                      width: 44,
-                      height: 48,
-                      child: IconButton(
-                        icon: const Icon(Icons.attach_file),
-                        tooltip: AppStrings.attachFile,
-                        style: IconButton.styleFrom(
-                          backgroundColor:
-                              theme.colorScheme.surfaceContainerHighest,
-                          foregroundColor: theme.colorScheme.onSurfaceVariant,
-                        ),
-                        onPressed: isRunning ? null : _showAttachOptions,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextField(
-                        controller: _inputController,
-                        focusNode: _focusNode,
-                        enabled: !isRunning,
-                        maxLines: 5,
-                        minLines: 1,
-                        textInputAction: TextInputAction.send,
-                        onSubmitted: (_) => _sendMessage(),
-                        decoration: InputDecoration(
-                          hintText: isRunning
-                              ? AppStrings.aiProcessing
-                              : AppStrings.inputHint,
-                          filled: true,
-                          fillColor: theme.colorScheme.surfaceContainerHighest,
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(AppRadii.xl),
-                            borderSide: BorderSide(
-                                color: theme.colorScheme.outline.withAlpha(60)),
-                          ),
-                          enabledBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(AppRadii.xl),
-                            borderSide: BorderSide(
-                                color: theme.colorScheme.outline.withAlpha(60)),
-                          ),
-                          focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(AppRadii.xl),
-                            borderSide: BorderSide(
-                                color: theme.colorScheme.primary.withAlpha(180),
-                                width: 1.5),
-                          ),
-                          contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 12),
-                        ),
-                      ),
-                    ),
-                    if (!isRunning) const SizedBox(width: 6),
-                    if (!isRunning)
-                      GestureDetector(
-                        onTap: () {
-                          if (_isWhisperRecording) {
-                            _stopWhisperRecording();
-                          } else if (_isListening) {
-                            _stopListening();
-                          } else {
-                            HapticFeedback.lightImpact();
-                            _startListening();
-                          }
-                        },
-                        child: Container(
-                          width: 48,
+                    _buildAttachmentPreviews(theme),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        SizedBox(
+                          width: 44,
                           height: 48,
-                          decoration: BoxDecoration(
-                            color: isRecording
-                                ? AppColors.statusRed.withAlpha(28)
-                                : theme.colorScheme.surfaceContainerHighest,
-                            borderRadius: BorderRadius.circular(AppRadii.s),
-                            border: Border.all(
-                              color: isRecording
-                                  ? AppColors.statusRed.withAlpha(120)
-                                  : theme.colorScheme.outline.withAlpha(55),
+                          child: IconButton(
+                            icon: const Icon(Icons.attach_file),
+                            tooltip: AppStrings.attachFile,
+                            style: IconButton.styleFrom(
+                              backgroundColor:
+                                  theme.colorScheme.surfaceContainerHighest,
+                              foregroundColor:
+                                  theme.colorScheme.onSurfaceVariant,
                             ),
-                          ),
-                          child: Icon(
-                            isRecording ? Icons.mic : Icons.mic_none,
-                            color: isRecording
-                                ? AppColors.statusRed
-                                : theme.colorScheme.onSurfaceVariant,
+                            onPressed: isRunning ? null : _showAttachOptions,
                           ),
                         ),
-                      ),
-                    const SizedBox(width: 6),
-                    if (isRunning)
-                      SizedBox(
-                        width: 52,
-                        height: 48,
-                        child: IconButton.filled(
-                          onPressed: provider.cancelAgent,
-                          icon: const Icon(Icons.stop),
-                          iconSize: 20,
-                          style: IconButton.styleFrom(
-                            backgroundColor: AppColors.statusRed,
-                            foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(AppRadii.xl),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: TextField(
+                            controller: _inputController,
+                            focusNode: _focusNode,
+                            enabled: !isRunning,
+                            maxLines: 5,
+                            minLines: 1,
+                            textInputAction: TextInputAction.send,
+                            onSubmitted: (_) => _sendMessage(),
+                            decoration: InputDecoration(
+                              hintText: isRunning
+                                  ? AppStrings.aiProcessing
+                                  : AppStrings.inputHint,
+                              filled: true,
+                              fillColor:
+                                  theme.colorScheme.surfaceContainerHighest,
+                              border: OutlineInputBorder(
+                                borderRadius:
+                                    BorderRadius.circular(AppRadii.xl),
+                                borderSide: BorderSide(
+                                  color:
+                                      theme.colorScheme.outline.withAlpha(60),
+                                ),
+                              ),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius:
+                                    BorderRadius.circular(AppRadii.xl),
+                                borderSide: BorderSide(
+                                  color:
+                                      theme.colorScheme.outline.withAlpha(60),
+                                ),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius:
+                                    BorderRadius.circular(AppRadii.xl),
+                                borderSide: BorderSide(
+                                  color:
+                                      theme.colorScheme.primary.withAlpha(180),
+                                  width: 1.5,
+                                ),
+                              ),
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 12,
+                              ),
                             ),
                           ),
                         ),
-                      )
-                    else
-                      SizedBox(
-                        width: 52,
-                        height: 48,
-                        child: IconButton.filled(
-                          onPressed: _sendMessage,
-                          icon: const Icon(Icons.send),
-                          iconSize: 20,
-                          style: IconButton.styleFrom(
-                            backgroundColor: theme.colorScheme.primary,
-                            foregroundColor: theme.colorScheme.onPrimary,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(AppRadii.xl),
+                        if (!isRunning) const SizedBox(width: 6),
+                        if (!isRunning)
+                          GestureDetector(
+                            onTap: () {
+                              if (_isWhisperRecording) {
+                                _stopWhisperRecording();
+                              } else if (_isListening) {
+                                _stopListening();
+                              } else {
+                                HapticFeedback.lightImpact();
+                                _startListening();
+                              }
+                            },
+                            child: Container(
+                              width: 48,
+                              height: 48,
+                              decoration: BoxDecoration(
+                                color: isRecording
+                                    ? AppColors.statusRed.withAlpha(28)
+                                    : theme.colorScheme.surfaceContainerHighest,
+                                borderRadius: BorderRadius.circular(AppRadii.s),
+                                border: Border.all(
+                                  color: isRecording
+                                      ? AppColors.statusRed.withAlpha(120)
+                                      : theme.colorScheme.outline.withAlpha(55),
+                                ),
+                              ),
+                              child: Icon(
+                                isRecording ? Icons.mic : Icons.mic_none,
+                                color: isRecording
+                                    ? AppColors.statusRed
+                                    : theme.colorScheme.onSurfaceVariant,
+                              ),
                             ),
                           ),
-                        ),
-                      ),
+                        const SizedBox(width: 6),
+                        if (isRunning)
+                          SizedBox(
+                            width: 52,
+                            height: 48,
+                            child: IconButton.filled(
+                              onPressed: provider.cancelAgent,
+                              icon: const Icon(Icons.stop),
+                              iconSize: 20,
+                              style: IconButton.styleFrom(
+                                backgroundColor: AppColors.statusRed,
+                                foregroundColor: Colors.white,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius:
+                                      BorderRadius.circular(AppRadii.xl),
+                                ),
+                              ),
+                            ),
+                          )
+                        else
+                          SizedBox(
+                            width: 52,
+                            height: 48,
+                            child: IconButton.filled(
+                              onPressed: _sendMessage,
+                              icon: const Icon(Icons.send),
+                              iconSize: 20,
+                              style: IconButton.styleFrom(
+                                backgroundColor: theme.colorScheme.primary,
+                                foregroundColor: theme.colorScheme.onPrimary,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius:
+                                      BorderRadius.circular(AppRadii.xl),
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                   ],
                 ),
-              ],
+              ),
             ),
           ),
         );

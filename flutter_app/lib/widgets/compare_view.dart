@@ -51,7 +51,8 @@ class _CompareViewState extends State<CompareView> {
             padding: const EdgeInsets.fromLTRB(12, 8, 4, 4),
             child: Row(
               children: [
-                Icon(Icons.compare_arrows, size: 18, color: theme.colorScheme.primary),
+                Icon(Icons.compare_arrows,
+                    size: 18, color: theme.colorScheme.primary),
                 const SizedBox(width: 6),
                 Text(
                   AppStrings.compareMode,
@@ -81,58 +82,131 @@ class _CompareViewState extends State<CompareView> {
                     icon: const Icon(Icons.close, size: 18),
                     onPressed: widget.onDismiss,
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
+                    constraints:
+                        const BoxConstraints(minWidth: 44, minHeight: 44),
                   ),
               ],
             ),
           ),
           const Divider(height: 1),
-          // Results as horizontally scrollable pages
           SizedBox(
             height: panelHeight,
-            child: widget.results.isEmpty
-                ? Center(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                if (widget.results.isEmpty) {
+                  return Center(
                     child: Text(
                       AppStrings.comparing,
                       style: theme.textTheme.bodyMedium?.copyWith(
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
-                  )
-                : PageView.builder(
-                    controller: _pageController,
-                    itemCount: widget.results.length,
-                    onPageChanged: (index) => setState(() => _pageIndex = index),
-                    itemBuilder: (context, index) {
-                      final r = widget.results[index];
-                      return _CompareCard(result: r, index: index, total: widget.results.length);
-                    },
-                  ),
+                  );
+                }
+                if (constraints.maxWidth > 700) {
+                  return _WideCompareResults(
+                    results: widget.results,
+                    panelHeight: panelHeight,
+                  );
+                }
+                return PageView.builder(
+                  controller: _pageController,
+                  itemCount: widget.results.length,
+                  onPageChanged: (index) => setState(() => _pageIndex = index),
+                  itemBuilder: (context, index) {
+                    final r = widget.results[index];
+                    return _CompareCard(
+                      result: r,
+                      index: index,
+                      total: widget.results.length,
+                    );
+                  },
+                );
+              },
+            ),
           ),
           if (widget.results.length > 1)
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: List.generate(widget.results.length, (index) {
-                  final selected = index == _pageIndex;
-                  return AnimatedContainer(
-                    duration: const Duration(milliseconds: 160),
-                    margin: const EdgeInsets.symmetric(horizontal: 3),
-                    width: selected ? 18 : 6,
-                    height: 6,
-                    decoration: BoxDecoration(
-                      color: selected
-                          ? theme.colorScheme.primary
-                          : theme.colorScheme.outline.withAlpha(100),
-                      borderRadius: BorderRadius.circular(999),
-                    ),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  if (constraints.maxWidth > 700) {
+                    return const SizedBox(height: 6);
+                  }
+                  return Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: List.generate(widget.results.length, (index) {
+                      final selected = index == _pageIndex;
+                      return AnimatedContainer(
+                        duration: const Duration(milliseconds: 160),
+                        margin: const EdgeInsets.symmetric(horizontal: 3),
+                        width: selected ? 18 : 6,
+                        height: 6,
+                        decoration: BoxDecoration(
+                          color: selected
+                              ? theme.colorScheme.primary
+                              : theme.colorScheme.outline.withAlpha(100),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                      );
+                    }),
                   );
-                }),
+                },
               ),
             ),
         ],
       ),
+    );
+  }
+}
+
+class _WideCompareResults extends StatelessWidget {
+  final List<CompareResult> results;
+  final double panelHeight;
+
+  const _WideCompareResults({
+    required this.results,
+    required this.panelHeight,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (results.length == 1) {
+      return Row(
+        children: [
+          Expanded(
+            child: _CompareCard(
+              result: results.first,
+              index: 0,
+              total: results.length,
+            ),
+          ),
+        ],
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final tileWidth = (constraints.maxWidth - 8) / 2;
+        final aspectRatio = tileWidth / panelHeight;
+        return GridView.builder(
+          padding: EdgeInsets.zero,
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 2,
+            crossAxisSpacing: 0,
+            mainAxisSpacing: 0,
+            childAspectRatio: aspectRatio,
+          ),
+          itemCount: results.length,
+          itemBuilder: (context, index) {
+            return _CompareCard(
+              result: results[index],
+              index: index,
+              total: results.length,
+            );
+          },
+        );
+      },
     );
   }
 }
@@ -164,7 +238,8 @@ class _CompareCard extends StatelessWidget {
               Expanded(
                 child: Text(
                   result.model,
-                  style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold),
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(fontWeight: FontWeight.bold),
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -189,7 +264,9 @@ class _CompareCard extends StatelessWidget {
                 onPressed: () {
                   Clipboard.setData(ClipboardData(text: result.text));
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text(AppStrings.copied), duration: Duration(seconds: 1)),
+                    const SnackBar(
+                        content: Text(AppStrings.copied),
+                        duration: Duration(seconds: 1)),
                   );
                 },
               ),

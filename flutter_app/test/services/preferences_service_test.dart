@@ -136,6 +136,35 @@ void main() {
     );
   });
 
+  test('foldable view preferences default and clamp persisted values',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+
+    expect(
+      service.dualPaneSidebarWidth,
+      PreferencesService.defaultDualPaneSidebarWidth,
+    );
+    expect(service.terminalFontSize, isNull);
+
+    service.dualPaneSidebarWidth = 480;
+    expect(service.dualPaneSidebarWidth, 480);
+
+    service.dualPaneSidebarWidth = 120;
+    expect(service.dualPaneSidebarWidth, 200);
+
+    service.terminalFontSize = 16;
+    expect(service.terminalFontSize, 16);
+
+    service.terminalFontSize = 24;
+    expect(service.terminalFontSize, 18);
+
+    service.terminalFontSize = null;
+    expect(service.terminalFontSize, isNull);
+  });
+
   test('delegates API getters and setters to the active profile', () async {
     final first = ProviderProfile.defaults(name: 'First').copyWith(
       id: 'first',

@@ -190,6 +190,8 @@ class AppStrings {
   static const openUrl = 'Open URL';
   static const paste = 'Paste';
   static const restart = 'Restart';
+  static const terminalFontSize = '终端字号';
+  static const terminalFontAuto = '自动字号';
   static const startingTerminal = 'Starting terminal...';
   static const screenshotUnavailable = '截图功能暂不可用';
   static const copiedToClipboard = 'Copied to clipboard';

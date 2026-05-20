@@ -7,6 +7,7 @@ import 'package:xterm/xterm.dart';
 import 'package:flutter_pty/flutter_pty.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/native_bridge.dart';
+import '../services/preferences_service.dart';
 import '../services/terminal_service.dart';
 import '../l10n/app_strings.dart';
 
@@ -27,7 +28,10 @@ class _TerminalScreenState extends State<TerminalScreen> {
   final _ctrlNotifier = ValueNotifier<bool>(false);
   final _altNotifier = ValueNotifier<bool>(false);
   final _screenshotKey = GlobalKey();
+  final _prefs = PreferencesService();
+  double? _terminalFontSizeOverride;
   static final _anyUrlRegex = RegExp(r'https?://[^\s<>\[\]"' "'" r'\)]+');
+
   /// Box-drawing and other TUI characters that break URLs when copied
   static final _boxDrawing = RegExp(r'[│┤├┬┴┼╮╯╰╭─╌╴╶┌┐└┘◇◆]+');
 
@@ -48,7 +52,10 @@ class _TerminalScreenState extends State<TerminalScreen> {
     super.initState();
     _terminal = Terminal(maxLines: 10000);
     _controller = TerminalController();
-    NativeBridge.startTerminalService().catchError((_) { return false; });
+    _loadTerminalPreferences();
+    NativeBridge.startTerminalService().catchError((_) {
+      return false;
+    });
     // Defer PTY start until after the first frame so TerminalView has been
     // laid out and _terminal.viewWidth/viewHeight reflect real screen
     // dimensions instead of the 80×24 default.
@@ -57,15 +64,35 @@ class _TerminalScreenState extends State<TerminalScreen> {
     });
   }
 
+  Future<void> _loadTerminalPreferences() async {
+    await _prefs.init();
+    if (!mounted) return;
+    setState(() => _terminalFontSizeOverride = _prefs.terminalFontSize);
+  }
+
+  double _adaptiveTerminalFontSize(double width) {
+    if (width >= 920) return 16;
+    if (width >= 700) return 14.5;
+    return 13;
+  }
+
+  double _effectiveTerminalFontSize(double width) {
+    return _terminalFontSizeOverride ?? _adaptiveTerminalFontSize(width);
+  }
+
   Future<void> _startPty() async {
     _pty?.kill();
     _pty = null;
     try {
       // Ensure dirs + resolv.conf exist before proot starts (#40).
-      try { await NativeBridge.setupDirs(); } catch (_) {
+      try {
+        await NativeBridge.setupDirs();
+      } catch (_) {
         // Best-effort: dirs may already exist
       }
-      try { await NativeBridge.writeResolv(); } catch (_) {
+      try {
+        await NativeBridge.writeResolv();
+      } catch (_) {
         // Best-effort: resolv.conf may already be configured
       }
       try {
@@ -176,7 +203,8 @@ class _TerminalScreenState extends State<TerminalScreen> {
   /// chars and rejoining lines, but splitting on `http` boundaries
   /// so concatenated URLs don't merge into one.
   String? _extractUrl(String text) {
-    final clean = text.replaceAll(_boxDrawing, '').replaceAll(RegExp(r'\s+'), '');
+    final clean =
+        text.replaceAll(_boxDrawing, '').replaceAll(RegExp(r'\s+'), '');
     // Split before each http(s):// so concatenated URLs become separate
     final parts = clean.split(RegExp(r'(?=https?://)'));
     // Return the longest URL match (token URLs are longest)
@@ -264,7 +292,8 @@ class _TerminalScreenState extends State<TerminalScreen> {
   /// and strips box-drawing chars to handle wrapped URLs.
   void _handleTap(TapUpDetails details, CellOffset offset) {
     final totalLines = _terminal.buffer.lines.length;
-    final scrollbackOffset = _terminal.buffer.cursorY - _terminal.viewHeight + 1;
+    final scrollbackOffset =
+        _terminal.buffer.cursorY - _terminal.viewHeight + 1;
     final absoluteY = offset.y + scrollbackOffset;
     final startRow = (absoluteY - 2).clamp(0, totalLines - 1);
     final endRow = (absoluteY + 2).clamp(0, totalLines - 1);
@@ -429,26 +458,106 @@ class _TerminalScreenState extends State<TerminalScreen> {
       );
     }
 
-    return Column(
-      children: [
-        Expanded(
-          child: RepaintBoundary(
-            key: _screenshotKey,
-            child: TerminalView(
-              _terminal,
-              controller: _controller,
-              textStyle: const TerminalStyle(
-                fontSize: 13,
-                height: 1.15,
-                fontFamily: 'DejaVuSansMono',
-                fontFamilyFallback: _fontFallback,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final terminalFontSize =
+            _effectiveTerminalFontSize(constraints.maxWidth);
+        return Column(
+          children: [
+            Expanded(
+              child: RepaintBoundary(
+                key: _screenshotKey,
+                child: TerminalView(
+                  _terminal,
+                  controller: _controller,
+                  textStyle: TerminalStyle(
+                    fontSize: terminalFontSize,
+                    height: 1.15,
+                    fontFamily: 'DejaVuSansMono',
+                    fontFamilyFallback: _fontFallback,
+                  ),
+                  onTapUp: _handleTap,
+                ),
               ),
-              onTapUp: _handleTap,
             ),
+            _buildSimpleToolbar(),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showFontSizeSheet() async {
+    await _prefs.init();
+    if (!mounted) return;
+    final width = MediaQuery.sizeOf(context).width;
+    var selectedSize = _effectiveTerminalFontSize(width);
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        return SafeArea(
+          child: StatefulBuilder(
+            builder: (ctx, setSheetState) {
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      AppStrings.terminalFontSize,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        const Icon(Icons.format_size),
+                        Expanded(
+                          child: Slider(
+                            min: 12,
+                            max: 18,
+                            divisions: 12,
+                            value: selectedSize,
+                            label: selectedSize.toStringAsFixed(1),
+                            onChanged: (value) {
+                              setSheetState(() => selectedSize = value);
+                              setState(() => _terminalFontSizeOverride = value);
+                              _prefs.terminalFontSize = value;
+                            },
+                          ),
+                        ),
+                        SizedBox(
+                          width: 44,
+                          child: Text(
+                            selectedSize.toStringAsFixed(1),
+                            textAlign: TextAlign.end,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: () {
+                          final autoSize = _adaptiveTerminalFontSize(width);
+                          setSheetState(() => selectedSize = autoSize);
+                          setState(() => _terminalFontSizeOverride = null);
+                          _prefs.terminalFontSize = null;
+                        },
+                        child: const Text(AppStrings.terminalFontAuto),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
           ),
-        ),
-        _buildSimpleToolbar(),
-      ],
+        );
+      },
     );
   }
 
@@ -459,7 +568,8 @@ class _TerminalScreenState extends State<TerminalScreen> {
         decoration: BoxDecoration(
           color: Theme.of(context).colorScheme.surface,
           border: Border(
-            top: BorderSide(color: Theme.of(context).colorScheme.outline.withAlpha(50)),
+            top: BorderSide(
+                color: Theme.of(context).colorScheme.outline.withAlpha(50)),
           ),
         ),
         child: SingleChildScrollView(
@@ -484,6 +594,11 @@ class _TerminalScreenState extends State<TerminalScreen> {
               _toolbarToggleButton(
                 label: 'Alt',
                 notifier: _altNotifier,
+              ),
+              _toolbarIconButton(
+                icon: Icons.format_size,
+                tooltip: AppStrings.terminalFontSize,
+                onTap: _showFontSizeSheet,
               ),
               _toolbarDivider(),
               _toolbarIconButton(
@@ -576,5 +691,4 @@ class _TerminalScreenState extends State<TerminalScreen> {
       color: Theme.of(context).colorScheme.outline.withAlpha(80),
     );
   }
-
 }

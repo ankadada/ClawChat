@@ -27,6 +27,8 @@ class PreferencesService {
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
   static const _keyToolApprovalPolicy = 'tool_approval_policy';
+  static const _keyDualPaneSidebarWidth = 'dual_pane_sidebar_width';
+  static const _keyTerminalFontSize = 'terminal_font_size';
   static const _keyWhisperModel = 'whisper_model';
   static const _keyTtsModel = 'tts_model';
   static const _keyProviderProfiles = 'provider_profiles';
@@ -36,6 +38,7 @@ class PreferencesService {
   static const toolApprovalSessionFirst = 'session_first';
   static const toolApprovalAuto = 'auto';
   static const defaultToolApprovalPolicy = toolApprovalSessionFirst;
+  static const defaultDualPaneSidebarWidth = 280.0;
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -520,6 +523,37 @@ class PreferencesService {
       toolApprovalSessionFirst => toolApprovalSessionFirst,
       _ => defaultToolApprovalPolicy,
     };
+  }
+
+  double get dualPaneSidebarWidth {
+    final value = _prefs.getDouble(_keyDualPaneSidebarWidth);
+    if (value == null || !value.isFinite) return defaultDualPaneSidebarWidth;
+    return value.clamp(200.0, 640.0).toDouble();
+  }
+
+  set dualPaneSidebarWidth(double value) {
+    if (!value.isFinite) return;
+    _prefs.setDouble(
+      _keyDualPaneSidebarWidth,
+      value.clamp(200.0, 640.0).toDouble(),
+    );
+  }
+
+  double? get terminalFontSize {
+    final value = _prefs.getDouble(_keyTerminalFontSize);
+    if (value == null || !value.isFinite) return null;
+    return value.clamp(12.0, 18.0).toDouble();
+  }
+
+  set terminalFontSize(double? value) {
+    if (value == null || !value.isFinite) {
+      _prefs.remove(_keyTerminalFontSize);
+      return;
+    }
+    _prefs.setDouble(
+      _keyTerminalFontSize,
+      value.clamp(12.0, 18.0).toDouble(),
+    );
   }
 
   String? get whisperModel =>

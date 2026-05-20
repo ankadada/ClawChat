@@ -194,7 +194,8 @@ class ClawChatApp extends StatelessWidget {
         color: AppColors.accent,
         linearTrackColor: AppColors.darkBorder,
       ),
-      dividerTheme: const DividerThemeData(color: AppColors.darkBorder, space: 1),
+      dividerTheme:
+          const DividerThemeData(color: AppColors.darkBorder, space: 1),
       dialogTheme: DialogTheme(
         backgroundColor: AppColors.darkSurface,
         shape: RoundedRectangleBorder(
@@ -268,7 +269,8 @@ class ClawChatApp extends StatelessWidget {
         style: FilledButton.styleFrom(
           backgroundColor: AppColors.accent,
           foregroundColor: Colors.white,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadii.s)),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(AppRadii.s)),
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         ),
       ),
@@ -276,7 +278,8 @@ class ClawChatApp extends StatelessWidget {
         style: OutlinedButton.styleFrom(
           foregroundColor: const Color(0xFF0A0A0A),
           side: const BorderSide(color: AppColors.lightBorder),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadii.s)),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(AppRadii.s)),
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
         ),
       ),
@@ -315,7 +318,8 @@ class ClawChatApp extends StatelessWidget {
         color: AppColors.accent,
         linearTrackColor: AppColors.lightBorder,
       ),
-      dividerTheme: const DividerThemeData(color: AppColors.lightBorder, space: 1),
+      dividerTheme:
+          const DividerThemeData(color: AppColors.lightBorder, space: 1),
       dialogTheme: DialogTheme(
         backgroundColor: AppColors.lightBg,
         shape: RoundedRectangleBorder(
@@ -326,7 +330,8 @@ class ClawChatApp extends StatelessWidget {
       snackBarTheme: SnackBarThemeData(
         backgroundColor: const Color(0xFF0A0A0A),
         contentTextStyle: GoogleFonts.inter(color: Colors.white),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppRadii.s)),
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(AppRadii.s)),
         behavior: SnackBarBehavior.floating,
       ),
       listTileTheme: const ListTileThemeData(iconColor: AppColors.mutedText),
@@ -349,13 +354,14 @@ class ResponsiveShell extends StatefulWidget {
 
 class _ResponsiveShellState extends State<ResponsiveShell> {
   bool _isDualPane = false;
+  final _chatScreenKey = GlobalKey();
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final shouldBeDual = _isDualPane
-            ? constraints.maxWidth >= 680  // stay dual until drops below 680
+            ? constraints.maxWidth >= 680 // stay dual until drops below 680
             : constraints.maxWidth >= 700; // switch to dual at 700
         if (shouldBeDual != _isDualPane) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -363,29 +369,120 @@ class _ResponsiveShellState extends State<ResponsiveShell> {
           });
         }
         if (_isDualPane) {
-          return const DualPaneLayout();
+          return DualPaneLayout(chatScreenKey: _chatScreenKey);
         }
-        return const ChatScreen();
+        return ChatScreen(key: _chatScreenKey);
       },
     );
   }
 }
 
-class DualPaneLayout extends StatelessWidget {
-  const DualPaneLayout({super.key});
+class DualPaneLayout extends StatefulWidget {
+  final GlobalKey chatScreenKey;
+
+  const DualPaneLayout({
+    super.key,
+    required this.chatScreenKey,
+  });
+
+  @override
+  State<DualPaneLayout> createState() => _DualPaneLayoutState();
+}
+
+class _DualPaneLayoutState extends State<DualPaneLayout> {
+  static const _minSidebarWidth = 200.0;
+  final _prefs = PreferencesService();
+  double _sidebarWidth = PreferencesService.defaultDualPaneSidebarWidth;
+  bool _prefsReady = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _prefs.init().then((_) {
+      if (!mounted) return;
+      setState(() {
+        _sidebarWidth = _prefs.dualPaneSidebarWidth;
+        _prefsReady = true;
+      });
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Row(
-        children: [
-          SizedBox(
-            width: 280,
-            child: ChatSessionsScreen(embedded: true),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final maxSidebarWidth = constraints.maxWidth * 0.5;
+        final sidebarWidth =
+            _sidebarWidth.clamp(_minSidebarWidth, maxSidebarWidth).toDouble();
+        return Scaffold(
+          body: Row(
+            children: [
+              SizedBox(
+                width: sidebarWidth,
+                child: ChatSessionsScreen(embedded: true),
+              ),
+              _SidebarResizeDivider(
+                onDragUpdate: (delta) {
+                  final next = (sidebarWidth + delta)
+                      .clamp(_minSidebarWidth, maxSidebarWidth)
+                      .toDouble();
+                  setState(() => _sidebarWidth = next);
+                  if (_prefsReady) {
+                    _prefs.dualPaneSidebarWidth = next;
+                  }
+                },
+              ),
+              Expanded(child: ChatScreen(key: widget.chatScreenKey)),
+            ],
           ),
-          const VerticalDivider(width: 1),
-          const Expanded(child: ChatScreen()),
-        ],
+        );
+      },
+    );
+  }
+}
+
+class _SidebarResizeDivider extends StatelessWidget {
+  final ValueChanged<double> onDragUpdate;
+
+  const _SidebarResizeDivider({required this.onDragUpdate});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeLeftRight,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragUpdate: (details) => onDragUpdate(details.delta.dx),
+        child: SizedBox(
+          width: 16,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: 1,
+                color: theme.colorScheme.outline.withAlpha(80),
+              ),
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surface,
+                  borderRadius: BorderRadius.circular(AppRadii.s),
+                  border: Border.all(
+                    color: theme.colorScheme.outline.withAlpha(70),
+                  ),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Icon(
+                    Icons.drag_indicator,
+                    size: 16,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
