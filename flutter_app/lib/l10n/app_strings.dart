@@ -89,6 +89,7 @@ class AppStrings {
   static String daysAgo(int n) => '$n 天前';
 
   // ── Dashboard screen ─────────────────────────────────────────────
+  static const dashboard = '首页';
   static const chat = '聊天';
   static const chatSubtitle = '与 AI 助手对话';
   static const terminal = '终端';
@@ -135,6 +136,9 @@ class AppStrings {
   static const providerProfileDetails = '配置详情';
   static const providerProfileName = '配置名称';
   static const editProviderProfile = '编辑配置';
+  static const apiKeyRequiredToUse = '使用此配置前需要填写 API Key';
+  static String profileNeedsApiKey(String name) =>
+      '请先为 "$name" 填写 API Key，再切换到此配置。';
   static const cannotDeleteLastProfile = '至少保留一个配置';
   static const deleteProviderProfileTitle = '删除配置?';
   static String deleteProviderProfileConfirm(String name) =>
@@ -302,7 +306,7 @@ class AppStrings {
   static const allowCall = '允许直接拨打电话';
   static const allowCallSubtitle = '关闭时 AI 只能跳到拨号面板等你确认';
   static const allowSms = '允许直接发送短信';
-  static const allowSmsSubtitle = '高风险：AI 可读银行/登录验证码或乱发短信，谨慎开启';
+  static const allowSmsSubtitle = '高风险：开启后 AI 可以直接发送短信，谨慎使用';
 
   // ── Export ─────────────────────────────────────────────────────────
   static const exportChat = '导出对话';

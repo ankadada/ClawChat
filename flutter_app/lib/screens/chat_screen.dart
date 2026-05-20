@@ -26,8 +26,11 @@ import '../widgets/compare_view.dart';
 import '../services/tts_service.dart';
 import '../services/whisper_service.dart';
 import 'artifact_preview_screen.dart';
+import 'dashboard_screen.dart';
+import 'model_api_settings_screen.dart';
 import 'settings_screen.dart';
 import 'chat_sessions_screen.dart';
+import 'terminal_screen.dart';
 import '../l10n/app_strings.dart';
 
 enum _NativeSpeechOutcome {
@@ -689,6 +692,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   context.read<ChatProvider>().regenerateLastResponse();
                 case 'compare':
                   _showCompareDialog();
+                case 'terminal':
+                  Navigator.of(context).push(CupertinoPageRoute(
+                      builder: (_) => const TerminalScreen()));
+                case 'dashboard':
+                  Navigator.of(context).push(CupertinoPageRoute(
+                      builder: (_) => const DashboardScreen()));
               }
             },
             itemBuilder: (_) {
@@ -714,6 +723,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     child: ListTile(
                       leading: Icon(Icons.swap_horiz),
                       title: Text(AppStrings.switchModel),
+                      dense: true,
+                    )),
+                const PopupMenuItem(
+                    value: 'terminal',
+                    child: ListTile(
+                      leading: Icon(Icons.terminal),
+                      title: Text(AppStrings.terminal),
+                      dense: true,
+                    )),
+                const PopupMenuItem(
+                    value: 'dashboard',
+                    child: ListTile(
+                      leading: Icon(Icons.dashboard_outlined),
+                      title: Text(AppStrings.dashboard),
                       dense: true,
                     )),
                 const PopupMenuItem(
@@ -1774,6 +1797,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final provider = context.read<ChatProvider>();
     final prefs = PreferencesService();
     await prefs.init();
+    if (!mounted) return;
     final profiles = prefs.profiles;
     String selectedProfileId = prefs.activeProfileId ?? profiles.first.id;
 
@@ -1788,6 +1812,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return profiles.firstWhere(
         (profile) => profile.id == selectedProfileId,
         orElse: () => profiles.first,
+      );
+    }
+
+    Future<void> redirectToProfileSettings(
+      BuildContext dialogContext,
+      ProviderProfile profile,
+    ) async {
+      if (dialogContext.mounted) Navigator.pop(dialogContext);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(AppStrings.profileNeedsApiKey(profile.displayName)),
+        ),
+      );
+      await Navigator.of(context).push(
+        CupertinoPageRoute(
+          builder: (_) => ModelApiSettingsScreen(initialProfileId: profile.id),
+        ),
       );
     }
 
@@ -1837,6 +1879,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                 ),
                               ),
                               child: RadioListTile<String>(
+                                isThreeLine: profile.apiKey.trim().isEmpty,
                                 value: profile.id,
                                 groupValue: selectedProfileId,
                                 onChanged: (value) {
@@ -1852,15 +1895,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   overflow: TextOverflow.ellipsis,
                                 ),
                                 subtitle: Text(
-                                  '${profile.apiFormat == ProviderProfile.openaiFormat ? AppStrings.openaiCompatible : 'Anthropic'} · ${profile.effectiveModel}',
-                                  maxLines: 1,
+                                  profile.apiKey.trim().isEmpty
+                                      ? '${profile.apiFormat == ProviderProfile.openaiFormat ? AppStrings.openaiCompatible : 'Anthropic'} · ${profile.effectiveModel}\n${AppStrings.apiKeyRequiredToUse}'
+                                      : '${profile.apiFormat == ProviderProfile.openaiFormat ? AppStrings.openaiCompatible : 'Anthropic'} · ${profile.effectiveModel}',
+                                  maxLines:
+                                      profile.apiKey.trim().isEmpty ? 2 : 1,
                                   overflow: TextOverflow.ellipsis,
                                 ),
                                 secondary: Icon(
-                                  profile.apiFormat ==
-                                          ProviderProfile.openaiFormat
-                                      ? Icons.api
-                                      : Icons.auto_awesome,
+                                  profile.apiKey.trim().isEmpty
+                                      ? Icons.warning_amber_outlined
+                                      : profile.apiFormat ==
+                                              ProviderProfile.openaiFormat
+                                          ? Icons.api
+                                          : Icons.auto_awesome,
+                                  color: profile.apiKey.trim().isEmpty
+                                      ? Theme.of(ctx).colorScheme.error
+                                      : null,
                                 ),
                               ),
                             ),
@@ -1911,6 +1962,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   label: const Text(AppStrings.fetchModelsButton),
                   onPressed: () async {
                     final profile = selectedProfile();
+                    if (profile.apiKey.trim().isEmpty) {
+                      await redirectToProfileSettings(ctx, profile);
+                      return;
+                    }
                     setDialogState(() => loading = true);
                     try {
                       availableModels = await LlmService.fetchModels(
@@ -1952,6 +2007,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             FilledButton(
               onPressed: () async {
                 final selected = selectedProfile();
+                if (selected.apiKey.trim().isEmpty) {
+                  await redirectToProfileSettings(ctx, selected);
+                  return;
+                }
                 if (selected.id != prefs.activeProfileId) {
                   await provider.switchProfile(selected.id);
                 }

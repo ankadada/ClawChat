@@ -763,6 +763,11 @@ class ChatProvider extends ChangeNotifier {
     // (two consecutive user messages without an assistant reply between them).
     notifyListeners();
 
+    _skills = await SkillService.scanSkills();
+    await MemoryService.getMemories();
+    final skillIndex = SkillService.buildSkillIndex(_skills);
+    final memoryPrompt = MemoryService.buildMemoryPrompt();
+
     final formatStr =
         session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
     final format =
@@ -782,14 +787,16 @@ class ChatProvider extends ChangeNotifier {
                   : 'https://api.openai.com'),
           maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
           thinkingBudget: _prefs.thinkingBudget,
+          temperature: _prefs.temperature,
         );
         final llm = LlmService(config);
         try {
           final basePrompt = session.systemPrompt ??
               _prefs.systemPrompt ??
               AppConstants.defaultSystemPrompt;
+          final fullPrompt = basePrompt + skillIndex + memoryPrompt;
           final response = await llm.chat(
-            system: basePrompt,
+            system: fullPrompt,
             messages: _truncateToFit(session.toApiMessages()),
             tools: [],
           );

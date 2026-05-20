@@ -50,10 +50,14 @@ class _SplashScreenState extends State<SplashScreen>
     try {
       setState(() => _status = AppStrings.checkingSetupStatus);
 
-      try { await NativeBridge.setupDirs(); } catch (_) {
+      try {
+        await NativeBridge.setupDirs();
+      } catch (_) {
         // Best-effort: dirs may already exist
       }
-      try { await NativeBridge.writeResolv(); } catch (_) {
+      try {
+        await NativeBridge.writeResolv();
+      } catch (_) {
         // Best-effort: resolv.conf may already be configured
       }
 
@@ -69,7 +73,6 @@ class _SplashScreenState extends State<SplashScreen>
       if (!mounted) return;
 
       if (setupComplete) {
-        _prefs.setupComplete = true;
         // If setup is done but API key missing, send to onboarding
         final apiKey = _prefs.apiKey;
         if (apiKey == null || apiKey.isEmpty) {
@@ -122,8 +125,8 @@ class _SplashScreenState extends State<SplashScreen>
               Text(
                 AppStrings.tagline,
                 style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
               ),
               const SizedBox(height: 32),
               if (hasError) ...[
@@ -139,8 +142,8 @@ class _SplashScreenState extends State<SplashScreen>
                     _status,
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(context).colorScheme.error,
-                    ),
+                          color: Theme.of(context).colorScheme.error,
+                        ),
                   ),
                 ),
                 const SizedBox(height: 16),

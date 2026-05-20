@@ -13,7 +13,9 @@ import '../services/llm_service.dart';
 import '../services/preferences_service.dart';
 
 class ModelApiSettingsScreen extends StatefulWidget {
-  const ModelApiSettingsScreen({super.key});
+  final String? initialProfileId;
+
+  const ModelApiSettingsScreen({super.key, this.initialProfileId});
 
   @override
   State<ModelApiSettingsScreen> createState() => _ModelApiSettingsScreenState();
@@ -64,8 +66,13 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     if (!mounted) return;
     final profiles = _prefs.profiles;
     final activeProfileId = _prefs.activeProfileId ?? profiles.first.id;
+    final initialProfileId = widget.initialProfileId;
+    final editingProfileId =
+        profiles.any((profile) => profile.id == initialProfileId)
+            ? initialProfileId
+            : activeProfileId;
     final editingProfile = profiles.firstWhere(
-      (profile) => profile.id == activeProfileId,
+      (profile) => profile.id == editingProfileId,
       orElse: () => profiles.first,
     );
     setState(() {
@@ -89,6 +96,13 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
       if (profile.id == id) return profile;
     }
     return null;
+  }
+
+  ProviderProfile _profileById(String id) {
+    return _profiles.firstWhere(
+      (profile) => profile.id == id,
+      orElse: () => _profiles.first,
+    );
   }
 
   void _loadProfileIntoForm(ProviderProfile profile) {
@@ -173,9 +187,24 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     final chatProvider = context.read<ChatProvider>();
     if (!await _flushSave(showIndicator: false)) return;
     HapticFeedback.selectionClick();
+    final freshProfile = _profileById(profile.id);
     if (makeActive) {
+      if (freshProfile.apiKey.trim().isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _editingProfileId = freshProfile.id;
+          _loadProfileIntoForm(freshProfile);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content:
+                Text(AppStrings.profileNeedsApiKey(freshProfile.displayName)),
+          ),
+        );
+        return;
+      }
       try {
-        await chatProvider.switchProfile(profile.id);
+        await chatProvider.switchProfile(freshProfile.id);
       } catch (e) {
         _showProfileSaveError(e);
         return;
@@ -184,28 +213,25 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     }
     setState(() {
       if (makeActive) {
-        _activeProfileId = profile.id;
+        _activeProfileId = freshProfile.id;
       }
-      _editingProfileId = profile.id;
-      _loadProfileIntoForm(profile);
+      _editingProfileId = freshProfile.id;
+      _loadProfileIntoForm(freshProfile);
     });
   }
 
   Future<void> _addProfile() async {
-    final chatProvider = context.read<ChatProvider>();
     if (!await _flushSave(showIndicator: false)) return;
     HapticFeedback.lightImpact();
     final profile =
         ProviderProfile.defaults(name: AppStrings.newProviderProfile);
     setState(() {
       _profiles = [..._profiles, profile];
-      _activeProfileId = profile.id;
       _editingProfileId = profile.id;
       _loadProfileIntoForm(profile);
     });
     try {
       await _prefs.setProfiles(_profiles);
-      await chatProvider.switchProfile(profile.id);
     } catch (e) {
       _showProfileSaveError(e);
       await _loadSettings();
@@ -284,7 +310,10 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
 
   Future<void> _fetchModels() async {
     final apiKey = _apiKeyController.text.trim();
-    if (apiKey.isEmpty) return;
+    if (apiKey.isEmpty) {
+      _showModelFetchNotice(AppStrings.apiKeyRequiredToUse);
+      return;
+    }
 
     setState(() => _fetchingModels = true);
     try {
@@ -393,6 +422,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
   Widget _profileTile(ThemeData theme, ProviderProfile profile) {
     final isActive = profile.id == _activeProfileId;
     final isEditing = profile.id == _editingProfileId;
+    final needsApiKey = profile.apiKey.trim().isEmpty;
     final formatLabel = profile.apiFormat == ProviderProfile.openaiFormat
         ? AppStrings.openaiCompatible
         : 'Anthropic';
@@ -458,11 +488,25 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
                       color: theme.colorScheme.primary,
                     ),
                   ),
+                if (needsApiKey)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 6),
+                    child: Tooltip(
+                      message: AppStrings.apiKeyRequiredToUse,
+                      child: Icon(
+                        Icons.warning_amber_outlined,
+                        size: 18,
+                        color: theme.colorScheme.error,
+                      ),
+                    ),
+                  ),
               ],
             ),
             subtitle: Text(
-              '$formatLabel · ${profile.effectiveModel}',
-              maxLines: 1,
+              needsApiKey
+                  ? '$formatLabel · ${profile.effectiveModel}\n${AppStrings.apiKeyRequiredToUse}'
+                  : '$formatLabel · ${profile.effectiveModel}',
+              maxLines: needsApiKey ? 2 : 1,
               overflow: TextOverflow.ellipsis,
             ),
             trailing: IconButton(
@@ -526,13 +570,19 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         child: TextField(
           controller: _apiKeyController,
           obscureText: true,
-          onChanged: (_) => _scheduleSave(),
           decoration: InputDecoration(
             labelText: 'API Key',
             hintText: _apiFormat == ProviderProfile.anthropicFormat
                 ? 'sk-ant-...'
                 : 'sk-...',
+            errorText: _apiKeyController.text.trim().isEmpty
+                ? AppStrings.apiKeyRequiredToUse
+                : null,
           ),
+          onChanged: (_) {
+            setState(() {});
+            _scheduleSave();
+          },
         ),
       ),
       Padding(

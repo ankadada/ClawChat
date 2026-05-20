@@ -20,10 +20,10 @@
 - **Extended Thinking** — 思考强度可调（关闭 / 低 / 中 / 高 / 最大）
 - **流式输出** — 实时逐字显示，50ms 帧节流
 - **Markdown 渲染** — 标题、加粗、代码块（语法高亮）、表格、引用、分隔线、链接
-- **消息操作** — 长按复制、引用回复、重新生成
+- **消息操作** — 长按 / ⋯ 按钮支持复制、复制 Markdown、分享、分支、引用；菜单支持重新生成、多模型对比、切换模型、系统提示词
 
 ### 工具调用
-- **Bash** — 在 Alpine Linux 环境中执行命令，工作区限制 + 安全防护
+- **Bash** — 在 Alpine Linux 环境中执行命令，默认工作目录为 `/root/workspace`，但命令可访问整个 Alpine rootfs
 - **Read File** — 读取工作区文件
 - **Write File** — 写入工作区文件
 - **Web Fetch** — 抓取网页内容（SSRF 防护）
@@ -43,7 +43,7 @@
 ### 会话管理
 - **多会话** — 创建、切换、重命名、删除、批量清空
 - **搜索** — 按标题搜索历史会话
-- **导出** — 会话导出为 Markdown 到剪贴板
+- **导出** — 会话导出为 Markdown（通过系统分享或剪贴板）
 
 ### 设置
 - **深色模式** — 跟随系统 / 浅色 / 深色
@@ -62,14 +62,7 @@
 
 ## Screenshots
 
-Screenshots coming soon. Placeholder images are expected under `assets/screenshots/`.
-
-<p>
-  <img src="assets/screenshots/chat.png" alt="Chat screen" width="300">
-  <img src="assets/screenshots/settings.png" alt="Settings screen" width="300">
-  <img src="assets/screenshots/terminal.png" alt="Terminal screen" width="300">
-  <img src="assets/screenshots/onboarding.png" alt="Onboarding screen" width="300">
-</p>
+See the Releases page for the latest screenshots.
 
 ---
 
@@ -157,7 +150,7 @@ flutter build apk --release
 ## Security
 
 - API Key 使用 Android Keystore 加密存储
-- Shell 命令有工作区限制和敏感文件保护
+- Shell 命令默认从 `/root/workspace` 执行，并带有敏感文件保护
 - TLS 证书校验 + API Host 白名单
 - 输出自动脱敏（API Key、密码模式）
 - SharedPreferences 已从 Android 备份中排除

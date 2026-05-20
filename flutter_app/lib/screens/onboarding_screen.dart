@@ -98,7 +98,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
             return SingleChildScrollView(
               padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
               child: ConstrainedBox(
-                constraints: BoxConstraints(minHeight: constraints.maxHeight - 32),
+                constraints:
+                    BoxConstraints(minHeight: constraints.maxHeight - 32),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -276,17 +277,19 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         ),
         child: Row(
           children: [
-            Icon(icon, color: selected
-                ? theme.colorScheme.primary
-                : theme.colorScheme.onSurfaceVariant),
+            Icon(icon,
+                color: selected
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant),
             const SizedBox(width: 12),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(title, style: theme.textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  )),
+                  Text(title,
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      )),
                   const SizedBox(height: 4),
                   Text(
                     subtitle,
@@ -372,7 +375,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                           items: [
                             ..._availableModels.map((m) => DropdownMenuItem(
                                   value: LlmService.modelIdFromDisplay(m),
-                                  child: Text(m, overflow: TextOverflow.ellipsis),
+                                  child:
+                                      Text(m, overflow: TextOverflow.ellipsis),
                                 )),
                             const DropdownMenuItem(
                               value: '__manual__',
@@ -446,7 +450,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         FilledButton.icon(
           onPressed: _onStepContinue,
           icon: Icon(_currentStep == 2 ? Icons.check : Icons.arrow_forward),
-          label: Text(_currentStep == 2 ? AppStrings.done : AppStrings.nextStep),
+          label:
+              Text(_currentStep == 2 ? AppStrings.done : AppStrings.nextStep),
         ),
       ],
     );
@@ -486,9 +491,6 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       }
       return;
     }
-    _prefs.setupComplete = true;
-    _prefs.isFirstRun = false;
-
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       CupertinoPageRoute(builder: (_) => const ResponsiveShell()),

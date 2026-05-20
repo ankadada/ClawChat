@@ -67,7 +67,23 @@ class ToolRegistry {
   Future<String> executeTool(String name, Map<String, dynamic> input) async {
     final tool = _tools[name];
     if (tool == null) throw Exception('Unknown tool: $name');
-    return tool.execute(input);
+    final output = await tool.execute(input);
+    return sanitizeToolOutput(output);
+  }
+
+  static String sanitizeToolOutput(String output) {
+    var sanitized = output.replaceAllMapped(
+      RegExp(r'(sk-|key-|api-|token[=:]\s*)[a-zA-Z0-9_-]{20,}'),
+      (match) => '${match.group(1)}[REDACTED]',
+    );
+    sanitized = sanitized.replaceAllMapped(
+      RegExp(
+        r'(password|passwd|secret)[=:]\s*\S+',
+        caseSensitive: false,
+      ),
+      (match) => '${match.group(1)}=[REDACTED]',
+    );
+    return sanitized;
   }
 
   bool hasTool(String name) => _tools.containsKey(name);
