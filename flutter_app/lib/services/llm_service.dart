@@ -744,7 +744,9 @@ class LlmService {
         headers: _openaiHeaders(),
         body: jsonEncode(body),
       );
-      if (response.statusCode == 400 && _tryTokenKeyFallback(response.body)) {
+      if (response.statusCode == 400 &&
+          (_tryTokenKeyFallback(response.body) ||
+           _tryReasoningContentFallback(response.body))) {
         final retryBody =
             _buildOpenAIBody(system, messages, tools, stream: false);
         final retryResponse = await _client.post(
@@ -784,7 +786,8 @@ class LlmService {
         final response = await _client.send(request);
         if (response.statusCode == 400) {
           final errorBody = await response.stream.bytesToString();
-          if (_tryTokenKeyFallback(errorBody)) {
+          if (_tryTokenKeyFallback(errorBody) ||
+              _tryReasoningContentFallback(errorBody)) {
             body = _buildOpenAIBody(system, messages, tools, stream: true);
             final retryReq = http.Request('POST', Uri.parse(url));
             retryReq.headers.addAll(_openaiHeaders());
@@ -1037,6 +1040,20 @@ class LlmService {
         : 'max_completion_tokens';
     _tokenKeyOverrides[_tokenKeyOverrideKey] = alternate;
     _pruneTokenKeyOverrides();
+    return true;
+  }
+
+  static final Set<String> _requiresReasoningContent = {};
+
+  bool _needsReasoningContent() {
+    if (_usesOpenAIReasoningContent()) return true;
+    return _requiresReasoningContent.contains(_tokenKeyOverrideKey);
+  }
+
+  bool _tryReasoningContentFallback(String errorBody) {
+    final lower = errorBody.toLowerCase();
+    if (!lower.contains('reasoning_content')) return false;
+    _requiresReasoningContent.add(_tokenKeyOverrideKey);
     return true;
   }
 
@@ -1298,7 +1315,7 @@ class LlmService {
     final reasoningContent =
         role == 'assistant' ? msg['reasoning_content'] as String? : null;
     final shouldSendReasoningContent =
-        role == 'assistant' && _usesOpenAIReasoningContent();
+        role == 'assistant' && _needsReasoningContent();
     final topLevelToolCalls = msg['tool_calls'] as List?;
 
     if (content is String) {
