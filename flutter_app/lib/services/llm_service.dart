@@ -712,7 +712,7 @@ class LlmService {
     final stopReason = json['stop_reason'] as String? ?? 'end_turn';
     final content = (json['content'] as List)
         .where((block) => block['type'] != 'thinking')
-        .map<ContentBlock>((block) {
+        .map<ContentBlock?>((block) {
       if (block['type'] == 'text') {
         return ContentBlock(type: 'text', text: block['text']);
       } else if (block['type'] == 'tool_use') {
@@ -723,8 +723,8 @@ class LlmService {
           toolInput: Map<String, dynamic>.from(block['input']),
         );
       }
-      return ContentBlock(type: 'text', text: '');
-    }).toList();
+      return null;
+    }).whereType<ContentBlock>().toList();
     return LlmResponse(stopReason: stopReason, content: content);
   }
 
@@ -1155,20 +1155,22 @@ class LlmService {
         final block = _openAIToolCallToAnthropic(toolCall);
         if (block != null) blocks.add(block);
       }
+      if (blocks.isEmpty) return const [];
       return [
         {
           'role': 'assistant',
-          'content': blocks.isEmpty ? '' : blocks,
+          'content': blocks,
         }
       ];
     }
 
     if (content is List) {
       final blocks = _anthropicContentBlocks(content);
+      if (blocks.isEmpty) return const [];
       return [
         {
           'role': anthropicRole,
-          'content': blocks.isEmpty ? '' : blocks,
+          'content': blocks,
         }
       ];
     }
@@ -1203,9 +1205,11 @@ class LlmService {
     if (block is! Map) return null;
     final type = block['type'];
     if (type == 'text') {
+      final text = block['text'] as String? ?? '';
+      if (text.isEmpty) return null;
       return {
         'type': 'text',
-        'text': block['text'] as String? ?? '',
+        'text': text,
       };
     }
     if (type == 'image') {
