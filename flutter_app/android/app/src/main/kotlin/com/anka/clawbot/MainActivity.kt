@@ -127,6 +127,25 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "isTerminalServiceRunning" -> result.success(TerminalSessionService.isRunning)
+                "startAgentService" -> {
+                    try {
+                        AgentTaskService.start(
+                            applicationContext,
+                            call.argument<String>("text") ?: "AI 正在执行任务..."
+                        )
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "stopAgentService" -> {
+                    try {
+                        AgentTaskService.stop(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
                 "requestBatteryOptimization" -> {
                     try {
                         val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {

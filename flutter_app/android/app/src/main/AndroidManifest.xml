@@ -56,6 +56,15 @@
         </service>
 
         <service
+            android:name=".AgentTaskService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse" >
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps user-initiated AI agent tasks alive while the app streams responses or executes tools in the background." />
+        </service>
+
+        <service
             android:name=".SetupService"
             android:exported="false"
             android:foregroundServiceType="specialUse" >

@@ -87,14 +87,50 @@ class ChatProvider extends ChangeNotifier {
   Completer<bool>? _approvalCompleter;
   Timer? _approvalTimeout;
   bool _appInBackground = false;
+  bool _agentServiceActive = false;
+  String? _agentServiceText;
+  int _agentServiceGeneration = 0;
 
   static const _backgroundApprovalTimeout = Duration(seconds: 15);
+  static const _agentServiceThinkingText = 'AI 正在思考...';
+  static const _agentServiceToolingText = 'AI 正在执行命令...';
+  static const _agentServiceStreamingText = 'AI 正在生成回复...';
 
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
 
   void _clearSessionScopedState() {
     _sessionApprovedTools.clear();
     ToolCallExpansionState.clear();
+  }
+
+  Future<void> _startAgentService(String text) async {
+    if (_disposed) return;
+    if (_agentServiceActive && _agentServiceText == text) return;
+    final generation = ++_agentServiceGeneration;
+    _agentServiceActive = true;
+    _agentServiceText = text;
+    try {
+      await NativeBridge.startAgentService(text: text);
+    } catch (e) {
+      if (generation == _agentServiceGeneration) {
+        _agentServiceActive = false;
+        _agentServiceText = null;
+      }
+      debugPrint('Failed to start agent foreground service: $e');
+    }
+  }
+
+  Future<void> _stopAgentService() async {
+    _agentServiceGeneration++;
+    final shouldStop = _agentServiceActive || _agentServiceText != null;
+    _agentServiceActive = false;
+    _agentServiceText = null;
+    if (!shouldStop) return;
+    try {
+      await NativeBridge.stopAgentService();
+    } catch (e) {
+      debugPrint('Failed to stop agent foreground service: $e');
+    }
   }
 
   void saveDraft(String sessionId, String text) {
@@ -113,6 +149,7 @@ class ChatProvider extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    unawaited(_stopAgentService());
     _completePendingApproval(false);
     _streamThrottle?.cancel();
     _agentSubscription?.cancel();
@@ -420,6 +457,7 @@ class ChatProvider extends ChangeNotifier {
       streamingText = '';
       errorMessage = null;
       notifyListeners();
+      unawaited(_startAgentService(_agentServiceThinkingText));
 
       _agentCompleter = Completer<void>();
       final fullApiMessages = session.toApiMessages();
@@ -438,9 +476,11 @@ class ChatProvider extends ChangeNotifier {
                 agentStatus = AgentStatus.thinking;
                 _streamBuffer = StringBuffer();
                 notifyListeners();
+                unawaited(_startAgentService(_agentServiceThinkingText));
 
               case AgentTextDelta(:final text):
                 agentStatus = AgentStatus.streaming;
+                unawaited(_startAgentService(_agentServiceStreamingText));
                 _streamBuffer.write(text);
                 _streamThrottle ??= Timer(const Duration(milliseconds: 50), () {
                   streamingText = _streamBuffer.toString();
@@ -451,6 +491,7 @@ class ChatProvider extends ChangeNotifier {
               case AgentToolStart():
                 agentStatus = AgentStatus.tooling;
                 notifyListeners();
+                unawaited(_startAgentService(_agentServiceToolingText));
 
               case AgentToolDone():
                 notifyListeners();
@@ -477,6 +518,7 @@ class ChatProvider extends ChangeNotifier {
                 });
                 final c = _agentCompleter;
                 if (c != null && !c.isCompleted) c.complete();
+                unawaited(_stopAgentService());
 
               case AgentError(:final message):
                 _streamThrottle?.cancel();
@@ -485,6 +527,7 @@ class ChatProvider extends ChangeNotifier {
                 agentStatus = AgentStatus.error;
                 errorMessage = message;
                 notifyListeners();
+                unawaited(_stopAgentService());
             }
           },
           onError: (Object e) {
@@ -495,10 +538,12 @@ class ChatProvider extends ChangeNotifier {
             notifyListeners();
             final c = _agentCompleter;
             if (c != null && !c.isCompleted) c.complete();
+            unawaited(_stopAgentService());
           },
           onDone: () {
             final c = _agentCompleter;
             if (c != null && !c.isCompleted) c.complete();
+            unawaited(_stopAgentService());
           },
           cancelOnError: false,
         );
@@ -510,6 +555,7 @@ class ChatProvider extends ChangeNotifier {
       } finally {
         _agentSubscription = null;
         _agentCompleter = null;
+        unawaited(_stopAgentService());
       }
     } finally {
       _isSending = false;
@@ -518,6 +564,7 @@ class ChatProvider extends ChangeNotifier {
 
   void cancelAgent() {
     _agent?.cancel();
+    unawaited(_stopAgentService());
     _completePendingApproval(false);
     _agentSubscription?.cancel();
     _agentSubscription = null;

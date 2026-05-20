@@ -72,6 +72,19 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('isTerminalServiceRunning'))!;
   }
 
+  static Future<bool> startAgentService({
+    String text = 'AI 正在执行任务...',
+  }) async {
+    return (await _channel.invokeMethod<bool>(
+      'startAgentService',
+      {'text': text},
+    ))!;
+  }
+
+  static Future<bool> stopAgentService() async {
+    return (await _channel.invokeMethod<bool>('stopAgentService'))!;
+  }
+
   static Future<Map<String, dynamic>> getBatteryStatus() async {
     final result = await _channel.invokeMethod<Map>('getBatteryStatus');
     return Map<String, dynamic>.from(result!);
