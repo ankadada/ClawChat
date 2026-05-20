@@ -780,6 +780,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       bool hasStreaming,
                       AgentStatus status,
                       String? sessionId,
+                      int messageVersion,
                       String modelLabel
                     })>(
                   selector: (_, p) => (
@@ -788,6 +789,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         p.streamingText.isNotEmpty,
                     status: p.agentStatus,
                     sessionId: p.currentSession?.id,
+                    messageVersion: p.messageVersion,
                     modelLabel: p.currentSession?.modelOverride != null
                         ? '${p.configuredProfileName} · '
                             '${p.currentSession!.modelOverride}'

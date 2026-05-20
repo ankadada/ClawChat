@@ -81,6 +81,8 @@ class ChatProvider extends ChangeNotifier {
 
   bool _disposed = false;
 
+  int _messageVersion = 0;
+  int get messageVersion => _messageVersion;
   final Map<String, String> _drafts = {};
   final Set<String> _sessionApprovedTools = {};
   ToolApprovalRequest? pendingApproval;
@@ -698,6 +700,7 @@ class ChatProvider extends ChangeNotifier {
       isSystemNotice: msg.isSystemNotice,
     );
 
+    _messageVersion++;
     _storage.saveSession(currentSession!);
     notifyListeners();
   }
