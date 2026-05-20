@@ -1,6 +1,7 @@
 import '../../services/llm_service.dart';
 import '../preferences_service.dart';
 import 'bash_tool.dart';
+import 'env_var_tool.dart';
 import 'phone_intent_tool.dart';
 import 'read_file_tool.dart';
 import 'tool_policy.dart';
@@ -17,10 +18,10 @@ abstract class Tool {
   Future<String> execute(Map<String, dynamic> input);
 
   ToolDefinition toDefinition() => ToolDefinition(
-    name: name,
-    description: description,
-    inputSchema: inputSchema,
-  );
+        name: name,
+        description: description,
+        inputSchema: inputSchema,
+      );
 }
 
 class ToolRegistry {
@@ -35,6 +36,10 @@ class ToolRegistry {
     registry.register(ReadFileTool(), risk: ToolRisk.moderate);
     registry.register(WriteFileTool(), risk: ToolRisk.dangerous);
     registry.register(WebFetchTool(), risk: ToolRisk.moderate);
+    registry.register(
+      EnvVarTool(prefs ?? PreferencesService()),
+      risk: ToolRisk.moderate,
+    );
     if (prefs != null) {
       registry.register(PhoneIntentTool(prefs), risk: ToolRisk.dangerous);
     }

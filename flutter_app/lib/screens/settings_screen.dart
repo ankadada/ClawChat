@@ -717,12 +717,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             subtitle: Text('••••••'),
                             trailing: IconButton(
                               icon: const Icon(Icons.delete_outline),
-                              onPressed: () {
-                                setState(() {
-                                  _envVars.remove(e.key);
-                                });
-                                _prefs.envVars = _envVars;
-                              },
+                              onPressed: () => _deleteEnvVar(e.key),
                             ),
                           )),
                     _settingsDivider(theme),
@@ -819,10 +814,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     subtitle: const Text(AppStrings.reinstallAlpine),
                     leading: const Icon(Icons.build),
                     trailing: const Icon(Icons.chevron_right),
-                    onTap: () => Navigator.of(context).pushReplacement(
-                      CupertinoPageRoute(
-                          builder: (_) => const SetupWizardScreen()),
-                    ),
+                    onTap: _confirmReinitialize,
                   ),
                   _settingsDivider(theme),
                   Padding(
@@ -861,6 +853,54 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ]),
               ],
             ),
+    );
+  }
+
+  Future<bool> _confirmDelete(String title, String message) async {
+    final theme = Theme.of(context);
+    return await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: Text(title),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text(AppStrings.cancel),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                style: TextButton.styleFrom(
+                  foregroundColor: theme.colorScheme.error,
+                ),
+                child: const Text(AppStrings.delete),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  Future<void> _deleteEnvVar(String name) async {
+    final confirmed = await _confirmDelete(
+      AppStrings.delete,
+      AppStrings.deleteEnvVarConfirm(name),
+    );
+    if (!confirmed || !mounted) return;
+    setState(() {
+      _envVars.remove(name);
+    });
+    _prefs.envVars = _envVars;
+  }
+
+  Future<void> _confirmReinitialize() async {
+    final confirmed = await _confirmDelete(
+      AppStrings.reinitializeConfirmTitle,
+      AppStrings.reinitializeConfirmMessage,
+    );
+    if (!confirmed || !mounted) return;
+    Navigator.of(context).pushReplacement(
+      CupertinoPageRoute(builder: (_) => const SetupWizardScreen()),
     );
   }
 
@@ -1131,6 +1171,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _removeMemory(int index) async {
+    final confirmed = await _confirmDelete(
+      AppStrings.deleteMemoryTitle,
+      AppStrings.deleteMemoryConfirm,
+    );
+    if (!confirmed) return;
     await MemoryService.removeMemory(index);
     await _loadMemories();
   }

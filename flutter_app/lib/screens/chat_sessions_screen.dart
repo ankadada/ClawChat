@@ -508,7 +508,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           trailing: PopupMenuButton<String>(
             tooltip: AppStrings.more,
             icon: const Icon(Icons.more_vert, size: 20),
-            onSelected: (value) {
+            onSelected: (value) async {
               switch (value) {
                 case 'export':
                   _exportSession(session);
@@ -520,8 +520,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                   _showMoveToFolderDialog(context, session, provider);
                   break;
                 case 'delete':
-                  HapticFeedback.lightImpact();
-                  provider.deleteSession(session.id);
+                  await _confirmDeleteSession(context, session, provider);
                   break;
               }
             },
@@ -594,16 +593,45 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
             ListTile(
               leading: const Icon(Icons.delete),
               title: const Text(AppStrings.deleteChat),
-              onTap: () {
+              onTap: () async {
                 Navigator.pop(ctx);
-                HapticFeedback.lightImpact();
-                provider.deleteSession(session.id);
+                await _confirmDeleteSession(context, session, provider);
               },
             ),
           ],
         ),
       ),
     );
+  }
+
+  Future<void> _confirmDeleteSession(
+    BuildContext context,
+    SessionSummary session,
+    ChatProvider provider,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.deleteChat),
+        content: Text(AppStrings.deleteChatConfirm(session.title)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            child: const Text(AppStrings.delete),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    HapticFeedback.lightImpact();
+    await provider.deleteSession(session.id);
   }
 
   Future<void> _showMoveToFolderDialog(BuildContext context, SessionSummary session, ChatProvider provider) async {

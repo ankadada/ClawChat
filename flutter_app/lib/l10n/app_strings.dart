@@ -75,6 +75,9 @@ class AppStrings {
   static const noChats = '暂无对话';
   static const deleteChat = '删除对话';
   static String deleteChatConfirm(String title) => '确定删除 "$title" ?';
+  static String deleteEnvVarConfirm(String name) => '确定删除环境变量 $name？';
+  static const deleteMemoryTitle = '删除记忆';
+  static const deleteMemoryConfirm = '确定删除此记忆？';
   static const justNow = '刚刚';
   static const today = '今天';
   static const yesterday = '昨天';
@@ -152,6 +155,9 @@ class AppStrings {
   static const maintenance = '维护';
   static const reinitialize = '重新初始化';
   static const reinstallAlpine = '重新安装 Alpine 环境';
+  static const reinitializeConfirmTitle = '重新初始化环境？';
+  static const reinitializeConfirmMessage =
+      '将重新进入初始化流程，可能会覆盖现有 Alpine 环境。确定继续吗？';
   static const about = '关于';
   static const settingsAppearance = '外观';
   static const settingsVoice = '语音';
@@ -267,6 +273,13 @@ class AppStrings {
   static const addEnvVar = '添加环境变量';
   static const envVarName = '变量名';
   static const envVarValue = '变量值';
+  static const envVarNameRequired = 'Error: 环境变量名必填';
+  static const envVarInvalidName = 'Error: 环境变量名只能包含字母、数字和下划线，且不能以数字开头';
+  static const envVarInvalidAction = 'Error: action 必须是 set 或 delete';
+  static String envVarProtectedName(String name) =>
+      'Error: $name 是系统保留环境变量，不能通过工具修改';
+  static String envVarSet(String name) => '已设置环境变量 $name';
+  static String envVarDeleted(String name) => '已删除环境变量 $name';
 
   // ── Theme ──────────────────────────────────────────────────────────
   static const theme = '主题';
