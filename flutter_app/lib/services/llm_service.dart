@@ -1036,10 +1036,25 @@ class LlmService {
         ? 'max_tokens'
         : 'max_completion_tokens';
     _tokenKeyOverrides[_tokenKeyOverrideKey] = alternate;
+    _pruneTokenKeyOverrides();
     return true;
   }
 
+  static const int _maxTokenKeyOverrides = 50;
   static final Map<String, String> _tokenKeyOverrides = {};
+
+  static void clearTokenKeyOverrides() {
+    _tokenKeyOverrides.clear();
+  }
+
+  static void _pruneTokenKeyOverrides() {
+    if (_tokenKeyOverrides.length <= _maxTokenKeyOverrides) return;
+    final removeCount = _tokenKeyOverrides.length ~/ 2;
+    final keysToRemove = _tokenKeyOverrides.keys.take(removeCount).toList();
+    for (final key in keysToRemove) {
+      _tokenKeyOverrides.remove(key);
+    }
+  }
 
   String get _tokenKeyOverrideKey =>
       '${config.baseUrl}\n${modelIdFromDisplay(config.model)}';
@@ -1082,10 +1097,13 @@ class LlmService {
         _OpenAICompatibleProvider.anthropicCompatible) {
       return false;
     }
-    return model.contains('deepseek-reasoner') ||
-        model.contains('deepseek-r1') ||
-        model.contains('reasoner') ||
-        RegExp(r'(^|[/:._-])r1($|[/:._-])').hasMatch(model);
+    final isKnownDeepSeekReasoning =
+        model == 'deepseek-reasoner' || model == 'deepseek-r1';
+    final isDeepSeekReasoningFamily = model.contains('deepseek') &&
+        (model.contains('reasoner') ||
+            RegExp(r'(^|[/:._-])r1($|[/:._-])').hasMatch(model));
+    final isBareR1 = model == 'r1' || model.startsWith('r1-');
+    return isKnownDeepSeekReasoning || isDeepSeekReasoningFamily || isBareR1;
   }
 
   List<Map<String, dynamic>> _convertMessageToAnthropic(
@@ -1368,6 +1386,10 @@ class LlmService {
         } else if (shouldSendReasoningContent) {
           result['reasoning_content'] = '';
         }
+        if (topLevelToolCalls != null) {
+          result['tool_calls'] =
+              topLevelToolCalls.map(_normalizeOpenAIToolCall).toList();
+        }
         return [result];
       }
       final result = <String, dynamic>{
@@ -1381,7 +1403,7 @@ class LlmService {
         result['reasoning_content'] = '';
       }
       if (toolCalls.isNotEmpty) result['tool_calls'] = toolCalls;
-      if (topLevelToolCalls != null) {
+      if (toolCalls.isEmpty && topLevelToolCalls != null) {
         result['tool_calls'] =
             topLevelToolCalls.map(_normalizeOpenAIToolCall).toList();
       }

@@ -846,6 +846,7 @@ class ChatProvider extends ChangeNotifier {
   Future<void> switchProfile(String profileId) async {
     await _ensurePrefs();
     await _prefs.setActiveProfileId(profileId);
+    LlmService.clearTokenKeyOverrides();
     _cachedLlm?.dispose();
     _cachedLlm = null;
     _cachedLlmConfig = null;

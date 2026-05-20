@@ -249,6 +249,21 @@ void main() {
       expect(bodies[2], isNot(contains('max_completion_tokens')));
     });
 
+    test('token key fallback override can be cleared', () async {
+      final bodies = await captureTokenFallbackBodiesWithManualClear();
+
+      expect(bodies.map((body) => body['model']), [
+        'legacy-model',
+        'legacy-model',
+        'legacy-model',
+        'legacy-model',
+      ]);
+      expect(bodies[0], contains('max_tokens'));
+      expect(bodies[1], contains('max_completion_tokens'));
+      expect(bodies[2], contains('max_tokens'));
+      expect(bodies[3], contains('max_completion_tokens'));
+    });
+
     test('builds valid Anthropic simple text request body', () async {
       final captured = await captureAnthropicRequest(
         model: 'claude-sonnet-4-20250514${LlmService.presetModelSuffix}',
@@ -351,6 +366,47 @@ void main() {
       expect(captured.body['messages'], [
         {'role': 'system', 'content': ''},
         {'role': 'assistant', 'content': 'answer'},
+      ]);
+    });
+
+    test('strips reasoning_content from non-DeepSeek reasoner models',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'other-reasoner',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': 'answer',
+            'reasoning_content': 'internal reasoning',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {'role': 'assistant', 'content': 'answer'},
+      ]);
+    });
+
+    test('allows bare r1 OpenAI-compatible reasoning_content', () async {
+      final captured = await captureOpenAiRequest(
+        model: 'r1',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': 'answer',
+            'reasoning_content': 'internal reasoning',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {
+          'role': 'assistant',
+          'content': 'answer',
+          'reasoning_content': 'internal reasoning',
+        },
       ]);
     });
 
@@ -518,6 +574,53 @@ void main() {
           'role': 'tool',
           'content': 'done',
           'tool_call_id': 'call_1',
+        },
+      ]);
+    });
+
+    test('prefers content-block tool_use over top-level tool_calls', () async {
+      final captured = await captureOpenAiRequest(
+        model: 'gpt-test',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': [
+              {
+                'type': 'tool_use',
+                'id': 'call_content',
+                'name': 'bash',
+                'input': {'command': 'pwd'},
+              },
+            ],
+            'tool_calls': [
+              {
+                'id': 'call_top',
+                'type': 'function',
+                'function': {
+                  'name': 'bash',
+                  'arguments': '{"command":"ignored"}',
+                },
+              },
+            ],
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {
+          'role': 'assistant',
+          'content': '',
+          'tool_calls': [
+            {
+              'id': 'call_content',
+              'type': 'function',
+              'function': {
+                'name': 'bash',
+                'arguments': '{"command":"pwd"}',
+              },
+            },
+          ],
         },
       ]);
     });
@@ -733,6 +836,7 @@ Future<int> requestCountForAlwaysStatus(int statusCode) async {
 
 Future<List<Map<String, dynamic>>>
     captureTokenFallbackBodiesForTwoModels() async {
+  LlmService.clearTokenKeyOverrides();
   final bodies = <Map<String, dynamic>>[];
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.listen((request) async {
@@ -781,6 +885,59 @@ Future<List<Map<String, dynamic>>>
     legacyService.dispose();
     currentService.dispose();
     await server.close(force: true);
+    LlmService.clearTokenKeyOverrides();
+  }
+}
+
+Future<List<Map<String, dynamic>>>
+    captureTokenFallbackBodiesWithManualClear() async {
+  LlmService.clearTokenKeyOverrides();
+  final bodies = <Map<String, dynamic>>[];
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    final body = jsonDecode(await utf8.decoder.bind(request).join())
+        as Map<String, dynamic>;
+    bodies.add(body);
+
+    if (body.containsKey('max_tokens')) {
+      request.response.statusCode = 400;
+      request.response.write('use max_completion_tokens instead of max_tokens');
+    } else {
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode({
+        'choices': [
+          {
+            'message': {'content': 'ok'},
+            'finish_reason': 'stop',
+          }
+        ],
+      }));
+    }
+    await request.response.close();
+  });
+
+  Future<void> sendLegacyRequest() async {
+    final service = LlmService(LlmConfig.openai(
+      apiKey: 'sk-test',
+      model: 'legacy-model',
+      baseUrl: 'http://127.0.0.1:${server.port}',
+    ));
+    try {
+      await service.chat(system: '', messages: const [], tools: const []);
+    } finally {
+      service.dispose();
+    }
+  }
+
+  try {
+    await sendLegacyRequest();
+    LlmService.clearTokenKeyOverrides();
+    await sendLegacyRequest();
+    return bodies;
+  } finally {
+    await server.close(force: true);
+    LlmService.clearTokenKeyOverrides();
   }
 }
 
