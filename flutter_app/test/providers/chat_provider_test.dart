@@ -1,5 +1,13 @@
+import 'dart:io';
+
+import 'package:clawchat/constants.dart';
+import 'package:clawchat/models/chat_models.dart';
+import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
+import 'package:clawchat/services/preferences_service.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 const int _maxContextChars = 100000; // ~25k tokens
 
@@ -13,6 +21,126 @@ List<Map<String, dynamic>> truncateToFit(List<Map<String, dynamic>> messages) {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('alternative navigation', () {
+    const pathProviderChannel =
+        MethodChannel('plugins.flutter.io/path_provider');
+    const secureStorageChannel =
+        MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+    const nativeChannel = MethodChannel(AppConstants.channelName);
+
+    late Directory tempDir;
+    late Map<String, String> secureStorage;
+
+    setUp(() async {
+      SharedPreferences.setMockInitialValues({});
+      PreferencesService.resetForTesting();
+      secureStorage = {};
+      tempDir = await Directory.systemTemp.createTemp('clawchat_alt_nav_test_');
+
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(pathProviderChannel, (call) async {
+        if (call.method == 'getApplicationDocumentsDirectory') {
+          return tempDir.path;
+        }
+        return null;
+      });
+      messenger.setMockMethodCallHandler(secureStorageChannel, (call) async {
+        final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+        final key = args['key']?.toString();
+        switch (call.method) {
+          case 'read':
+            return key == null ? null : secureStorage[key];
+          case 'write':
+            if (key != null) {
+              secureStorage[key] = args['value']?.toString() ?? '';
+            }
+            return null;
+          case 'delete':
+            if (key != null) secureStorage.remove(key);
+            return null;
+          case 'deleteAll':
+            secureStorage.clear();
+            return null;
+          case 'containsKey':
+            return key != null && secureStorage.containsKey(key);
+          case 'readAll':
+            return Map<String, String>.from(secureStorage);
+        }
+        return null;
+      });
+      messenger.setMockMethodCallHandler(nativeChannel, (call) async {
+        switch (call.method) {
+          case 'runInProot':
+            return '';
+          case 'readRootfsFile':
+            return null;
+          case 'writeRootfsFile':
+            return true;
+        }
+        return true;
+      });
+    });
+
+    tearDown(() async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(pathProviderChannel, null);
+      messenger.setMockMethodCallHandler(secureStorageChannel, null);
+      messenger.setMockMethodCallHandler(nativeChannel, null);
+      PreferencesService.resetForTesting();
+      if (await tempDir.exists()) {
+        await tempDir.delete(recursive: true);
+      }
+    });
+
+    test('switches 2 to 1 to 2 to 1 without reordering versions', () async {
+      final provider = ChatProvider();
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      provider.currentSession = ChatSession(
+        id: 'alt_nav',
+        messages: [
+          ChatMessage.user('prompt'),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('v2')],
+            alternatives: ['v1'],
+          ),
+        ],
+      );
+
+      provider.switchAlternative(1, 0);
+      var message = provider.currentSession!.messages[1];
+      expect(message.textContent, 'v1');
+      expect(message.displayIndex, 1);
+      expect((message.content.single as TextContent).text, 'v2');
+      expect(message.alternatives, ['v1']);
+
+      provider.switchAlternative(1, 1);
+      message = provider.currentSession!.messages[1];
+      expect(message.textContent, 'v2');
+      expect(message.displayIndex, 2);
+      expect((message.content.single as TextContent).text, 'v2');
+      expect(message.alternatives, ['v1']);
+
+      provider.switchAlternative(1, 0);
+      message = provider.currentSession!.messages[1];
+      expect(message.textContent, 'v1');
+      expect(message.displayIndex, 1);
+      expect((message.content.single as TextContent).text, 'v2');
+      expect(message.alternatives, ['v1']);
+
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    });
+  });
+
   group('charCount - string content', () {
     test('counts simple string content', () {
       expect(charCount({'role': 'user', 'content': 'hello'}), 5);

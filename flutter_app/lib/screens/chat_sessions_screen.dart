@@ -73,6 +73,11 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
 
   String _messageContentToMarkdown(ChatMessage message) {
     final buffer = StringBuffer();
+    if (message.isViewingAlternative) {
+      final text = message.textContent;
+      if (text.isNotEmpty) buffer.writeln(text);
+      return buffer.toString();
+    }
     for (final content in message.content) {
       switch (content) {
         case TextContent(:final text):

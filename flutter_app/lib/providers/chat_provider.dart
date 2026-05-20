@@ -649,7 +649,7 @@ class ChatProvider extends ChangeNotifier {
     if (lastAssistant != null) {
       _pendingAlternatives =
           List<String>.from(lastAssistant.alternatives ?? []);
-      final currentText = lastAssistant.textContent;
+      final currentText = lastAssistant.latestTextContent;
       if (currentText.isNotEmpty) {
         _pendingAlternatives!.add(currentText);
       }
@@ -682,32 +682,20 @@ class ChatProvider extends ChangeNotifier {
     final msg = messages[messageIndex];
     if (msg.alternatives == null || msg.alternatives!.isEmpty) return;
 
-    // Build a list of all versions: alternatives (older) + current content (newest)
-    final allTexts = [...msg.alternatives!, msg.textContent];
-    final totalVersions = allTexts.length;
+    final totalVersions = msg.totalVersions;
     if (altIndex < 0 || altIndex >= totalVersions) return;
-
-    // The target text to display
-    final targetText = allTexts[altIndex];
-    final currentText = msg.textContent;
-
-    // Rebuild the alternatives list with the current content placed where the target was
-    final newAlts = List<String>.from(msg.alternatives!);
-    if (altIndex < newAlts.length) {
-      // Swapping with an alternative
-      newAlts[altIndex] = currentText;
-    }
-    // else altIndex == totalVersions-1, meaning "show current" -- no swap needed
+    final activeAlternative = altIndex == totalVersions - 1 ? -1 : altIndex;
 
     // Replace the message in the session
     messages[messageIndex] = ChatMessage(
       role: msg.role,
-      content: [TextContent(targetText)],
+      content: msg.content,
       timestamp: msg.timestamp,
       inputTokens: msg.inputTokens,
       outputTokens: msg.outputTokens,
-      alternatives: altIndex == totalVersions - 1 ? msg.alternatives : newAlts,
-      activeAlternative: altIndex == totalVersions - 1 ? -1 : altIndex,
+      alternatives: msg.alternatives,
+      activeAlternative: activeAlternative,
+      isSystemNotice: msg.isSystemNotice,
     );
 
     _storage.saveSession(currentSession!);

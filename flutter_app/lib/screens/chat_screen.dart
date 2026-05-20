@@ -1073,6 +1073,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final isUser = message.role == 'user';
     final messageId =
         '${message.timestamp.millisecondsSinceEpoch}_$messageIndex';
+    final visibleContent = !isUser && message.isViewingAlternative
+        ? <MessageContent>[TextContent(message.textContent)]
+        : message.content;
 
     return Padding(
       padding: EdgeInsets.only(
@@ -1093,7 +1096,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ),
             ),
           ),
-          for (final content in message.content)
+          for (final content in visibleContent)
             _buildContentBlock(
               content,
               isUser,
@@ -1260,6 +1263,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final role =
         message.role == 'user' ? AppStrings.userLabel : AppStrings.aiLabel;
     final buffer = StringBuffer('**$role**:\n');
+    if (message.isViewingAlternative) {
+      final text = message.textContent;
+      if (text.isNotEmpty) buffer.writeln(text);
+      return buffer.toString().trimRight();
+    }
     for (final content in message.content) {
       switch (content) {
         case TextContent(:final text):

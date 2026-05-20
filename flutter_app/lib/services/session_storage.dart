@@ -243,6 +243,15 @@ class SessionStorage {
 
   String? _previewTextFromMessage(Object? rawMessage) {
     if (rawMessage is! Map) return null;
+    final activeAlternative = rawMessage['activeAlternative'];
+    final alternatives = rawMessage['alternatives'];
+    if (activeAlternative is int &&
+        activeAlternative >= 0 &&
+        alternatives is List &&
+        activeAlternative < alternatives.length) {
+      final alternative = alternatives[activeAlternative];
+      if (alternative is String) return _nonEmptyText(alternative);
+    }
     final content = rawMessage['content'];
     return _previewTextFromContent(content);
   }

@@ -112,6 +112,30 @@ void main() {
     });
   });
 
+  group('SessionStorage preview', () {
+    test('uses the active alternative text for message preview', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'preview_alt',
+        title: 'Preview',
+        messages: [
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('latest')],
+            alternatives: ['first'],
+            activeAlternative: 0,
+          ),
+        ],
+      );
+
+      await storage.saveSession(session);
+
+      final preview = await storage.getSessionPreview('preview_alt');
+      expect(preview?.preview, 'first');
+    });
+  });
+
   group('SessionStorage fork', () {
     test('copies messages through selected index and skips system notices', () async {
       final storage = SessionStorage();

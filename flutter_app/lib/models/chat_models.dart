@@ -145,8 +145,8 @@ class ChatMessage {
   /// Create a copy with current text pushed into alternatives and new content set.
   ChatMessage withNewAlternative(List<MessageContent> newContent) {
     final alts = List<String>.from(alternatives ?? []);
-    // Push current text content into alternatives
-    alts.add(textContent);
+    // Push the canonical latest text into alternatives.
+    alts.add(latestTextContent);
     return ChatMessage(
       role: role,
       content: newContent,
@@ -213,6 +213,22 @@ class ChatMessage {
   }
 
   String get textContent {
+    if (isViewingAlternative) {
+      return alternatives![activeAlternative];
+    }
+    return latestTextContent;
+  }
+
+  String get latestTextContent => _contentText;
+
+  bool get isViewingAlternative {
+    final alts = alternatives;
+    return alts != null &&
+        activeAlternative >= 0 &&
+        activeAlternative < alts.length;
+  }
+
+  String get _contentText {
     return content.whereType<TextContent>().map((c) => c.text).join('\n');
   }
 
@@ -222,6 +238,12 @@ class ChatMessage {
       content.whereType<ToolResultContent>().toList();
 
   Map<String, dynamic> toApiJson() {
+    if (isViewingAlternative) {
+      return {
+        'role': role,
+        'content': textContent,
+      };
+    }
     if (content.length == 1 && content[0] is TextContent) {
       final textContent = content[0] as TextContent;
       return {
