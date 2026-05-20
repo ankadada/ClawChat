@@ -1090,6 +1090,7 @@ class LlmService {
     final content = msg['content'];
     final reasoningContent =
         role == 'assistant' ? msg['reasoning_content'] as String? : null;
+    final needsReasoning = role == 'assistant' && _isReasoningModel(config.model);
 
     if (content is String) {
       final result = <String, dynamic>{
@@ -1098,6 +1099,8 @@ class LlmService {
       };
       if (reasoningContent?.isNotEmpty == true) {
         result['reasoning_content'] = reasoningContent!;
+      } else if (needsReasoning) {
+        result['reasoning_content'] = '';
       }
       return [result];
     }
@@ -1163,6 +1166,8 @@ class LlmService {
         final combinedReasoning = reasoningParts.join('\n');
         if (combinedReasoning.isNotEmpty) {
           result['reasoning_content'] = combinedReasoning;
+        } else if (needsReasoning) {
+          result['reasoning_content'] = '';
         }
         return [result];
       }
@@ -1173,6 +1178,8 @@ class LlmService {
       final combinedReasoning = reasoningParts.join('\n');
       if (combinedReasoning.isNotEmpty) {
         result['reasoning_content'] = combinedReasoning;
+      } else if (needsReasoning) {
+        result['reasoning_content'] = '';
       }
       if (toolCalls.isNotEmpty) result['tool_calls'] = toolCalls;
       return [result];
