@@ -90,6 +90,7 @@ class ChatProvider extends ChangeNotifier {
   bool _agentServiceActive = false;
   String? _agentServiceText;
   int _agentServiceGeneration = 0;
+  bool _agentCompletionFinalizing = false;
 
   static const _backgroundApprovalTimeout = Duration(seconds: 15);
   static const _agentServiceThinkingText = 'AI 正在思考...';
@@ -130,6 +131,37 @@ class ChatProvider extends ChangeNotifier {
       await NativeBridge.stopAgentService();
     } catch (e) {
       debugPrint('Failed to stop agent foreground service: $e');
+    }
+  }
+
+  String _completionNotificationPreview(String text) {
+    final normalized = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return String.fromCharCodes(normalized.runes.take(50));
+  }
+
+  Future<void> _showCompletionNotificationIfNeeded(String finalText) async {
+    if (!_appInBackground || !_prefs.notifyOnComplete) return;
+    try {
+      await NativeBridge.showAgentCompleteNotification(
+        _completionNotificationPreview(finalText),
+      );
+    } catch (e) {
+      debugPrint('Failed to show agent completion notification: $e');
+    }
+  }
+
+  Future<void> _finishAgentComplete(
+    String finalText,
+    Completer<void>? completer,
+  ) async {
+    try {
+      await _showCompletionNotificationIfNeeded(finalText);
+    } finally {
+      await _stopAgentService();
+      if (completer != null && !completer.isCompleted) {
+        completer.complete();
+      }
+      _agentCompletionFinalizing = false;
     }
   }
 
@@ -496,7 +528,11 @@ class ChatProvider extends ChangeNotifier {
               case AgentToolDone():
                 notifyListeners();
 
-              case AgentComplete(:final inputTokens, :final outputTokens):
+              case AgentComplete(
+                  :final finalText,
+                  :final inputTokens,
+                  :final outputTokens,
+                ):
                 _streamThrottle?.cancel();
                 _streamThrottle = null;
                 streamingText = _streamBuffer.toString();
@@ -517,8 +553,8 @@ class ChatProvider extends ChangeNotifier {
                   if (!_disposed) notifyListeners();
                 });
                 final c = _agentCompleter;
-                if (c != null && !c.isCompleted) c.complete();
-                unawaited(_stopAgentService());
+                _agentCompletionFinalizing = true;
+                unawaited(_finishAgentComplete(finalText, c));
 
               case AgentError(:final message):
                 _streamThrottle?.cancel();
@@ -536,14 +572,18 @@ class ChatProvider extends ChangeNotifier {
             _streamThrottle?.cancel();
             _streamThrottle = null;
             notifyListeners();
-            final c = _agentCompleter;
-            if (c != null && !c.isCompleted) c.complete();
-            unawaited(_stopAgentService());
+            if (!_agentCompletionFinalizing) {
+              final c = _agentCompleter;
+              if (c != null && !c.isCompleted) c.complete();
+              unawaited(_stopAgentService());
+            }
           },
           onDone: () {
-            final c = _agentCompleter;
-            if (c != null && !c.isCompleted) c.complete();
-            unawaited(_stopAgentService());
+            if (!_agentCompletionFinalizing) {
+              final c = _agentCompleter;
+              if (c != null && !c.isCompleted) c.complete();
+              unawaited(_stopAgentService());
+            }
           },
           cancelOnError: false,
         );

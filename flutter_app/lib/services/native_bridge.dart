@@ -114,6 +114,13 @@ class NativeBridge {
         false;
   }
 
+  static Future<void> showAgentCompleteNotification(String preview) async {
+    await _channel.invokeMethod<void>(
+      'showAgentCompleteNotification',
+      {'preview': preview},
+    );
+  }
+
   static Future<bool> stopSetupService() async {
     return (await _channel.invokeMethod<bool>('stopSetupService'))!;
   }

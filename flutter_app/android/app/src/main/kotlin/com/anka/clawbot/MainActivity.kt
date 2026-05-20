@@ -247,6 +247,11 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
                 }
+                "showAgentCompleteNotification" -> {
+                    val preview = call.argument<String>("preview") ?: ""
+                    showAgentCompleteNotification(preview)
+                    result.success(true)
+                }
                 "stopSetupService" -> {
                     try {
                         SetupService.stop(applicationContext)
@@ -570,6 +575,7 @@ class MainActivity : FlutterActivity() {
         }
 
         createNotificationChannel()
+        createAgentCompleteNotificationChannel()
         requestNotificationPermission()
     }
 
@@ -592,6 +598,21 @@ class MainActivity : FlutterActivity() {
             val channel = NotificationChannel(
                 CHANNEL_ID, "ClawChat", NotificationManager.IMPORTANCE_LOW
             ).apply { description = "ClawChat notifications" }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun createAgentCompleteNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                AGENT_COMPLETE_CHANNEL_ID,
+                "ClawChat Agent",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "AI task completion notifications"
+                enableVibration(true)
+            }
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
@@ -640,6 +661,51 @@ class MainActivity : FlutterActivity() {
         manager.notify(TOOL_AUTO_APPROVED_NOTIFICATION_ID, notification)
     }
 
+    @Suppress("DEPRECATION")
+    private fun showAgentCompleteNotification(preview: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+
+        val launchIntent = Intent(applicationContext, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+        }
+        val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                PendingIntent.FLAG_IMMUTABLE
+            } else {
+                0
+            }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            launchIntent,
+            pendingFlags
+        )
+        val text = preview.ifBlank { "点击查看回复" }
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, AGENT_COMPLETE_CHANNEL_ID)
+        } else {
+            Notification.Builder(this)
+        }
+        val notification = builder
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("AI 回复完成")
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(Notification.PRIORITY_DEFAULT)
+            .setDefaults(Notification.DEFAULT_ALL)
+            .build()
+
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(AGENT_COMPLETE_NOTIFICATION_ID, notification)
+    }
+
     private fun isAppOwnedPath(path: String): Boolean {
         return try {
             val canonical = File(path).canonicalPath
@@ -680,10 +746,12 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         const val CHANNEL_ID = "clawchat_main"
+        const val AGENT_COMPLETE_CHANNEL_ID = "clawchat_agent_complete"
         const val NOTIFICATION_PERMISSION_REQUEST = 1001
         const val STORAGE_PERMISSION_REQUEST = 1003
         const val AUDIO_PERMISSION_REQUEST = 1004
         const val SPEECH_REQUEST = 1005
         const val TOOL_AUTO_APPROVED_NOTIFICATION_ID = 2001
+        const val AGENT_COMPLETE_NOTIFICATION_ID = 2002
     }
 }
