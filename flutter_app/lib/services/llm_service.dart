@@ -674,13 +674,16 @@ class LlmService {
       'messages': messages.map(_stripOpenAIReasoningContent).toList(),
       'stream': stream,
     };
-    if (config.temperature != null && !_isReasoningModel(config.model)) {
+    final thinkingEnabled = config.thinkingBudget > 0;
+    if (config.temperature != null &&
+        !_isReasoningModel(config.model) &&
+        !thinkingEnabled) {
       body['temperature'] = config.temperature;
     }
     if (tools.isNotEmpty) {
       body['tools'] = tools.map((t) => t.toAnthropicJson()).toList();
     }
-    if (config.thinkingBudget > 0) {
+    if (thinkingEnabled) {
       body['thinking'] = {
         'type': 'enabled',
         'budget_tokens': config.thinkingBudget,
@@ -1008,7 +1011,9 @@ class LlmService {
       'stream': stream,
       if (stream) 'stream_options': {'include_usage': true},
     };
-    if (config.temperature != null && !_isReasoningModel(config.model)) {
+    if (config.temperature != null &&
+        !_isReasoningModel(config.model) &&
+        !thinkingEnabled) {
       body['temperature'] = config.temperature;
     }
     if (tools.isNotEmpty) {
