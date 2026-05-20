@@ -413,16 +413,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ],
                       ),
                     ),
-                    SwitchListTile(
-                      title: const Text(AppStrings.notifyOnComplete),
-                      subtitle: const Text(AppStrings.notifyOnCompleteSubtitle),
-                      value: _notifyOnComplete,
-                      onChanged: (v) {
-                        HapticFeedback.lightImpact();
-                        setState(() => _notifyOnComplete = v);
-                        _prefs.notifyOnComplete = v;
-                      },
-                    ),
                   ],
                 ),
                 _settingsGroup(
@@ -680,6 +670,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               await SkillService.setSkillEnabled(skill.name, v);
                             },
                           )),
+                    _settingsDivider(theme),
+                    SwitchListTile(
+                      title: const Text(AppStrings.notifyOnComplete),
+                      subtitle: const Text(AppStrings.notifyOnCompleteSubtitle),
+                      value: _notifyOnComplete,
+                      onChanged: (v) {
+                        HapticFeedback.lightImpact();
+                        setState(() => _notifyOnComplete = v);
+                        _prefs.notifyOnComplete = v;
+                      },
+                    ),
                   ],
                   collapsedBadges: [
                     _countBadge(
