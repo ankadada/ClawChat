@@ -889,15 +889,12 @@ class ChatProvider extends ChangeNotifier {
     debugPrint(
       '[COMPARE] Guards: _isSending=$_isSending, _isComparing=$_isComparing, session=${currentSession != null}',
     );
-    if (_isSending || _isComparing || currentSession == null) {
-      errorMessage = _isSending
-          ? '正在发送中，请等待完成'
-          : _isComparing
-              ? '正在对比中，请等待完成'
-              : '请先创建或选择一个会话';
+    if (_isSending || _isComparing) {
+      errorMessage = _isSending ? '正在发送中，请等待完成' : '正在对比中，请等待完成';
       notifyListeners();
       return;
     }
+    if (currentSession == null) await createSession();
     final compareModels =
         models.where((model) => model.trim().isNotEmpty).toList();
     debugPrint(
