@@ -2524,14 +2524,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   ? () {
                       Navigator.pop(ctx);
                       final text = textController.text.trim();
-                      if (text.isNotEmpty) {
-                        _inputController.clear();
-                        final provider = context.read<ChatProvider>();
-                        if (provider.currentSession != null) {
-                          provider.saveDraft(provider.currentSession!.id, '');
-                        }
-                        provider.sendCompare(text, selectedModels.toList());
+                      if (text.isEmpty) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('请输入对比内容')),
+                        );
+                        return;
                       }
+                      debugPrint(
+                        'Starting model compare with ${selectedModels.length} models',
+                      );
+                      _inputController.clear();
+                      final provider = context.read<ChatProvider>();
+                      if (provider.currentSession != null) {
+                        provider.saveDraft(provider.currentSession!.id, '');
+                      }
+                      unawaited(
+                        provider.sendCompare(text, selectedModels.toList()),
+                      );
                     }
                   : null,
               child: const Text(AppStrings.compareStart),

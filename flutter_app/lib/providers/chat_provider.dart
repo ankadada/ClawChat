@@ -882,91 +882,118 @@ class ChatProvider extends ChangeNotifier {
   bool get isComparing => _isComparing;
 
   Future<void> sendCompare(String text, List<String> models) async {
-    if (_isSending || _isComparing || currentSession == null) return;
-    if (text.trim().isEmpty || models.isEmpty) return;
+    if (_isSending || _isComparing || currentSession == null) {
+      errorMessage = _isSending
+          ? '正在发送中，请等待完成'
+          : _isComparing
+              ? '正在对比中，请等待完成'
+              : '请先创建或选择一个会话';
+      notifyListeners();
+      return;
+    }
+    if (text.trim().isEmpty || models.isEmpty) {
+      errorMessage = text.trim().isEmpty ? '请输入对比内容' : '请选择至少一个模型';
+      notifyListeners();
+      return;
+    }
     final comparePrompt = text.trim();
 
     _isComparing = true;
     compareResults = [];
+    errorMessage = null;
     notifyListeners();
 
-    await _ensurePrefs();
-    final apiKey = _prefs.apiKey;
-    if (apiKey == null || apiKey.isEmpty) {
-      errorMessage = AppStrings.apiKeyNotConfigured;
+    try {
+      await _ensurePrefs();
+      final apiKey = _prefs.apiKey;
+      if (apiKey == null || apiKey.isEmpty) {
+        errorMessage = AppStrings.apiKeyNotConfigured;
+        compareResults!.add(CompareResult(
+          model: 'Error',
+          text: AppStrings.apiKeyNotConfigured,
+        ));
+        return;
+      }
+
+      final session = currentSession!;
+      // Don't persist the user message to session.messages in compare mode.
+      // Compare is a one-shot inspection — results live in compareResults only.
+      // If we persisted, the next real sendMessage would break role alternation
+      // (two consecutive user messages without an assistant reply between them).
+      final compareMessages = [
+        ..._truncateToFit(session.toApiMessages()),
+        {'role': 'user', 'content': comparePrompt},
+      ];
+      notifyListeners();
+
+      _skills = await SkillService.scanSkills();
+      await MemoryService.getMemories();
+      final skillIndex = SkillService.buildSkillIndex(_skills);
+      final memoryPrompt = MemoryService.buildMemoryPrompt();
+
+      final formatStr =
+          session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
+      final format =
+          formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
+
+      for (final model in models) {
+        if (_disposed) break;
+        try {
+          final config = LlmConfig(
+            format: format,
+            apiKey: apiKey,
+            model: model,
+            baseUrl: session.baseUrlOverride ??
+                _prefs.baseUrl ??
+                (format == ApiFormat.anthropic
+                    ? 'https://api.anthropic.com'
+                    : 'https://api.openai.com'),
+            maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
+            thinkingBudget: _prefs.thinkingBudget,
+            temperature: _prefs.temperature,
+          );
+          final llm = LlmService(config);
+          try {
+            final basePrompt = session.systemPrompt ??
+                _prefs.systemPrompt ??
+                AppConstants.defaultSystemPrompt;
+            final fullPrompt = basePrompt + skillIndex + memoryPrompt;
+            final response = await llm.chat(
+              system: fullPrompt,
+              messages: compareMessages,
+              tools: [],
+            );
+            final responseText = response.content
+                .where((b) => b.type == 'text')
+                .map((b) => b.text ?? '')
+                .join();
+            compareResults!.add(CompareResult(
+              model: model,
+              text: responseText,
+              tokens: response.outputTokens,
+            ));
+          } finally {
+            llm.dispose();
+          }
+        } catch (e) {
+          compareResults!.add(CompareResult(model: model, text: 'Error: $e'));
+        }
+        notifyListeners();
+      }
+    } catch (e) {
+      errorMessage = '对比失败: $e';
+      compareResults ??= [];
+      compareResults!.add(CompareResult(model: 'Error', text: '$e'));
+    } finally {
+      if (compareResults != null && compareResults!.isEmpty) {
+        compareResults!.add(CompareResult(
+          model: 'Error',
+          text: '对比失败：没有生成任何结果',
+        ));
+      }
       _isComparing = false;
       notifyListeners();
-      return;
     }
-
-    final session = currentSession!;
-    // Don't persist the user message to session.messages in compare mode.
-    // Compare is a one-shot inspection — results live in compareResults only.
-    // If we persisted, the next real sendMessage would break role alternation
-    // (two consecutive user messages without an assistant reply between them).
-    final compareMessages = [
-      ..._truncateToFit(session.toApiMessages()),
-      {'role': 'user', 'content': comparePrompt},
-    ];
-    notifyListeners();
-
-    _skills = await SkillService.scanSkills();
-    await MemoryService.getMemories();
-    final skillIndex = SkillService.buildSkillIndex(_skills);
-    final memoryPrompt = MemoryService.buildMemoryPrompt();
-
-    final formatStr =
-        session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
-    final format =
-        formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
-
-    for (final model in models) {
-      if (_disposed) break;
-      try {
-        final config = LlmConfig(
-          format: format,
-          apiKey: apiKey,
-          model: model,
-          baseUrl: session.baseUrlOverride ??
-              _prefs.baseUrl ??
-              (format == ApiFormat.anthropic
-                  ? 'https://api.anthropic.com'
-                  : 'https://api.openai.com'),
-          maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
-          thinkingBudget: _prefs.thinkingBudget,
-          temperature: _prefs.temperature,
-        );
-        final llm = LlmService(config);
-        try {
-          final basePrompt = session.systemPrompt ??
-              _prefs.systemPrompt ??
-              AppConstants.defaultSystemPrompt;
-          final fullPrompt = basePrompt + skillIndex + memoryPrompt;
-          final response = await llm.chat(
-            system: fullPrompt,
-            messages: compareMessages,
-            tools: [],
-          );
-          final responseText = response.content
-              .where((b) => b.type == 'text')
-              .map((b) => b.text ?? '')
-              .join();
-          compareResults!.add(CompareResult(
-            model: model,
-            text: responseText,
-            tokens: response.outputTokens,
-          ));
-        } finally {
-          llm.dispose();
-        }
-      } catch (e) {
-        compareResults!.add(CompareResult(model: model, text: 'Error: $e'));
-      }
-      notifyListeners();
-    }
-
-    _isComparing = false;
-    notifyListeners();
   }
 
   void clearCompareResults() {
