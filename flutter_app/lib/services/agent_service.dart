@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'llm_service.dart';
+import 'privacy_filter.dart';
 import 'tools/tool_policy.dart';
 import 'tools/tool_registry.dart';
 
@@ -45,6 +46,8 @@ class AgentService {
   final ToolPolicy _toolPolicy;
   final int maxIterations;
   final bool parallelTools;
+  final bool privacyMode;
+  final Map<String, String> envVars;
   bool _cancelled = false;
   List<Map<String, dynamic>> _lastMessages = [];
 
@@ -55,6 +58,8 @@ class AgentService {
     ToolPolicy? toolPolicy,
     this.maxIterations = 25,
     this.parallelTools = false,
+    this.privacyMode = true,
+    this.envVars = const {},
   })  : _llm = llm,
         _tools = tools,
         _systemPrompt = systemPrompt,
@@ -100,7 +105,9 @@ class AgentService {
       try {
         await for (final event in _llm.chatStream(
           system: _systemPrompt,
-          messages: messages,
+          // Keep [messages] raw for UI/session storage; only the LLM payload
+          // receives masked tool outputs.
+          messages: _filterHistoryMessages(messages),
           tools: toolDefs,
         )) {
           if (_cancelled) return;
@@ -202,6 +209,40 @@ class AgentService {
       });
       onMessagesUpdated?.call(messages);
     }
+  }
+
+  List<Map<String, dynamic>> _filterHistoryMessages(
+    List<Map<String, dynamic>> messages,
+  ) {
+    if (!privacyMode || envVars.isEmpty) return messages;
+    return messages.map((msg) {
+      final content = msg['content'];
+      if (content is! List) return msg;
+
+      var changed = false;
+      final filteredContent = content.map((block) {
+        if (block is Map && block['type'] == 'tool_result') {
+          final value = block['content'];
+          if (value is String) {
+            final masked = PrivacyFilter.maskEnvVarValues(value, envVars);
+            if (masked != value) {
+              changed = true;
+              return {
+                ...Map<String, dynamic>.from(block),
+                'content': masked,
+              };
+            }
+          }
+        }
+        return block;
+      }).toList();
+
+      if (!changed) return msg;
+      return {
+        ...msg,
+        'content': filteredContent,
+      };
+    }).toList();
   }
 
   Future<_ToolResult> _executeToolWithPolicy(

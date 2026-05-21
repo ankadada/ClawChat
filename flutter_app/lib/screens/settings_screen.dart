@@ -45,6 +45,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   double _fontScale = 1.0;
   bool _notifyOnComplete = true;
   int _agentMaxIterations = PreferencesService.defaultAgentMaxIterations;
+  bool _privacyMode = true;
   bool _allowPhoneCall = false;
   bool _allowSms = false;
   String _toolApprovalPolicy = PreferencesService.defaultToolApprovalPolicy;
@@ -73,6 +74,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _fontScale = _prefs.fontScale;
       _notifyOnComplete = _prefs.notifyOnComplete;
       _agentMaxIterations = _prefs.agentMaxIterations;
+      _privacyMode = _prefs.privacyMode;
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
       _toolApprovalPolicy = _prefs.toolApprovalPolicy;
@@ -731,6 +733,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ),
                         ),
                       ],
+                    ),
+                    SwitchListTile(
+                      title: const Text(AppStrings.privacyMode),
+                      subtitle: const Text(AppStrings.privacyModeSubtitle),
+                      value: _privacyMode,
+                      onChanged: (v) {
+                        HapticFeedback.lightImpact();
+                        setState(() => _privacyMode = v);
+                        _prefs.privacyMode = v;
+                      },
                     ),
                     if (_envVars.isEmpty)
                       Padding(

@@ -572,6 +572,8 @@ class ChatProvider extends ChangeNotifier {
         systemPrompt: fullPrompt,
         toolPolicy: ToolPolicy(onApprovalRequired: _requestToolApproval),
         maxIterations: _prefs.agentMaxIterations,
+        privacyMode: _prefs.privacyMode,
+        envVars: _prefs.envVars,
       );
 
       agentStatus = AgentStatus.thinking;

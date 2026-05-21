@@ -297,6 +297,10 @@ class AppStrings {
   // ── Notifications ─────────────────────────────────────────────────
   static const notifyOnComplete = '完成通知';
   static const notifyOnCompleteSubtitle = 'AI 回复完成后发送通知（后台时）';
+  static const privacyMode = '隐私模式';
+  static const privacyModeSubtitle =
+      '开启后，shell 输出中检测到的环境变量值在送达模型前会被打码（例如 sk-1********ajhks）。'
+      '少于 8 个字符的值会被全部替换为 *。聊天中用户可见的输出保持不变。';
 
   // ── Phone integration ─────────────────────────────────────────────
   static const phoneIntegration = '手机集成';
