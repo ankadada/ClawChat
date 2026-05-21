@@ -2522,8 +2522,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             FilledButton(
               onPressed: selectedModels.length >= 2
                   ? () {
-                      Navigator.pop(ctx);
+                      debugPrint(
+                        '[COMPARE] Button pressed. selectedModels=$selectedModels, count=${selectedModels.length}',
+                      );
+                      debugPrint(
+                        '[COMPARE] textController.text="${textController.text}"',
+                      );
+                      final selectedModelList = selectedModels.toList();
+                      final selectedModelCount = selectedModelList.length;
                       final text = textController.text.trim();
+                      Navigator.pop(ctx);
                       if (text.isEmpty) {
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(content: Text('请输入对比内容')),
@@ -2531,7 +2539,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         return;
                       }
                       debugPrint(
-                        'Starting model compare with ${selectedModels.length} models',
+                        'Starting model compare with $selectedModelCount models',
+                      );
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('正在对比 $selectedModelCount 个模型...'),
+                          duration: const Duration(seconds: 1),
+                        ),
                       );
                       _inputController.clear();
                       final provider = context.read<ChatProvider>();
@@ -2539,7 +2553,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         provider.saveDraft(provider.currentSession!.id, '');
                       }
                       unawaited(
-                        provider.sendCompare(text, selectedModels.toList()),
+                        provider.sendCompare(text, selectedModelList),
                       );
                     }
                   : null,

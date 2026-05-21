@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import '../constants.dart';
@@ -882,7 +883,12 @@ class ChatProvider extends ChangeNotifier {
   bool get isComparing => _isComparing;
 
   Future<void> sendCompare(String text, List<String> models) async {
-    debugPrint('sendCompare called with ${models.length} models: $models');
+    debugPrint(
+      '[COMPARE] sendCompare entered. models=$models, text="${text.substring(0, math.min(20, text.length))}"',
+    );
+    debugPrint(
+      '[COMPARE] Guards: _isSending=$_isSending, _isComparing=$_isComparing, session=${currentSession != null}',
+    );
     if (_isSending || _isComparing || currentSession == null) {
       errorMessage = _isSending
           ? '正在发送中，请等待完成'
@@ -894,6 +900,9 @@ class ChatProvider extends ChangeNotifier {
     }
     final compareModels =
         models.where((model) => model.trim().isNotEmpty).toList();
+    debugPrint(
+      '[COMPARE] compareModels=$compareModels, count=${compareModels.length}',
+    );
     if (text.trim().isEmpty || compareModels.length < 2) {
       errorMessage = text.trim().isEmpty ? '请输入对比内容' : '请选择至少两个模型';
       notifyListeners();
@@ -909,6 +918,9 @@ class ChatProvider extends ChangeNotifier {
     try {
       await _ensurePrefs();
       final apiKey = _prefs.apiKey;
+      debugPrint(
+        '[COMPARE] apiKey present: ${apiKey != null && apiKey.isNotEmpty}',
+      );
       if (apiKey == null || apiKey.isEmpty) {
         errorMessage = AppStrings.apiKeyNotConfigured;
         compareResults!.add(CompareResult(
@@ -939,9 +951,13 @@ class ChatProvider extends ChangeNotifier {
       final format =
           formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
 
+      debugPrint(
+        '[COMPARE] Starting model loop for ${compareModels.length} models',
+      );
       for (final model in compareModels) {
         if (_disposed) break;
         try {
+          debugPrint('[COMPARE] Calling model: $model');
           final config = LlmConfig(
             format: format,
             apiKey: apiKey,
@@ -975,6 +991,7 @@ class ChatProvider extends ChangeNotifier {
               text: responseText,
               tokens: response.outputTokens,
             ));
+            debugPrint('[COMPARE] Model $model completed');
           } finally {
             llm.dispose();
           }
