@@ -44,6 +44,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _themeMode = 'system';
   double _fontScale = 1.0;
   bool _notifyOnComplete = true;
+  int _agentMaxIterations = PreferencesService.defaultAgentMaxIterations;
   bool _allowPhoneCall = false;
   bool _allowSms = false;
   String _toolApprovalPolicy = PreferencesService.defaultToolApprovalPolicy;
@@ -71,6 +72,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _themeMode = _prefs.themeMode;
       _fontScale = _prefs.fontScale;
       _notifyOnComplete = _prefs.notifyOnComplete;
+      _agentMaxIterations = _prefs.agentMaxIterations;
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
       _toolApprovalPolicy = _prefs.toolApprovalPolicy;
@@ -621,6 +623,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         setState(() => _notifyOnComplete = v);
                         _prefs.notifyOnComplete = v;
                       },
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Agent 最大轮次: $_agentMaxIterations'),
+                          Slider(
+                            value: _agentMaxIterations.toDouble(),
+                            min: 1,
+                            max: PreferencesService.maxAgentMaxIterations
+                                .toDouble(),
+                            divisions:
+                                PreferencesService.maxAgentMaxIterations - 1,
+                            label: '$_agentMaxIterations',
+                            onChanged: (v) {
+                              final next = v.round();
+                              setState(() => _agentMaxIterations = next);
+                              _prefs.agentMaxIterations = next;
+                            },
+                          ),
+                        ],
+                      ),
                     ),
                     _settingsDivider(theme),
                     Padding(

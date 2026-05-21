@@ -81,12 +81,15 @@ class AgentService {
     _cancelled = false;
     _lastMessages = messages;
     final toolDefs = _tools.getToolDefinitions();
+    final effectiveMaxIterations = maxIterations.clamp(1, 99).toInt();
     int iteration = 0;
 
     while (!_cancelled) {
       iteration++;
-      if (iteration > maxIterations) {
-        yield AgentError('Agent loop exceeded maximum iterations ($maxIterations)');
+      if (iteration > effectiveMaxIterations) {
+        yield AgentError(
+          'Agent loop exceeded maximum iterations ($effectiveMaxIterations)',
+        );
         return;
       }
       yield AgentThinking();

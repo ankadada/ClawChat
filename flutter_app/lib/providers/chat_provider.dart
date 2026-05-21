@@ -568,6 +568,7 @@ class ChatProvider extends ChangeNotifier {
         tools: _tools,
         systemPrompt: fullPrompt,
         toolPolicy: ToolPolicy(onApprovalRequired: _requestToolApproval),
+        maxIterations: _prefs.agentMaxIterations,
       );
 
       agentStatus = AgentStatus.thinking;

@@ -20,6 +20,7 @@ class PreferencesService {
   static const _keyDarkMode = 'dark_mode';
   static const _keyFontSize = 'font_size';
   static const _keyNotifyOnComplete = 'notify_on_complete';
+  static const _keyAgentMaxIterations = 'agent_max_iterations';
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
   static const _keyToolApprovalPolicy = 'tool_approval_policy';
@@ -35,6 +36,8 @@ class PreferencesService {
   static const toolApprovalAuto = 'auto';
   static const defaultToolApprovalPolicy = toolApprovalSessionFirst;
   static const defaultDualPaneSidebarWidth = 280.0;
+  static const int defaultAgentMaxIterations = 25;
+  static const int maxAgentMaxIterations = 99;
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -475,6 +478,15 @@ class PreferencesService {
 
   bool get notifyOnComplete => _prefs.getBool(_keyNotifyOnComplete) ?? true;
   set notifyOnComplete(bool v) => _prefs.setBool(_keyNotifyOnComplete, v);
+
+  int get agentMaxIterations =>
+      (_prefs.getInt(_keyAgentMaxIterations) ?? defaultAgentMaxIterations)
+          .clamp(1, maxAgentMaxIterations)
+          .toInt();
+  set agentMaxIterations(int v) => _prefs.setInt(
+        _keyAgentMaxIterations,
+        v.clamp(1, maxAgentMaxIterations).toInt(),
+      );
 
   bool get allowPhoneCall =>
       _initialized ? (_prefs.getBool(_keyAllowPhoneCall) ?? false) : false;
