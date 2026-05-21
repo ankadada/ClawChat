@@ -6,10 +6,25 @@ import '../constants.dart';
 
 // Private aliases to keep dart:io usage contained
 typedef _File = io.File;
-final _base64 = base64;
+const _base64 = base64;
 
 class NativeBridge {
   static const _channel = MethodChannel(AppConstants.channelName);
+  static const _agentCallbackChannel =
+      MethodChannel('${AppConstants.channelName}/agent_callbacks');
+  static void Function()? _agentStopRequestedHandler;
+  static bool _agentCallbackInitialized = false;
+
+  static void setAgentStopRequestedHandler(void Function()? handler) {
+    _agentStopRequestedHandler = handler;
+    if (_agentCallbackInitialized) return;
+    _agentCallbackInitialized = true;
+    _agentCallbackChannel.setMethodCallHandler((call) async {
+      if (call.method == 'onAgentStopRequested') {
+        _agentStopRequestedHandler?.call();
+      }
+    });
+  }
 
   static Future<String> getProotPath() async {
     return (await _channel.invokeMethod<String>('getProotPath'))!;
@@ -85,6 +100,40 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('stopAgentService'))!;
   }
 
+  static Future<bool> updateAgentNotification({
+    required String status,
+    String previewText = '',
+    String? toolName,
+    bool overlayVisible = false,
+  }) async {
+    return await _channel.invokeMethod<bool>('updateAgentNotification', {
+          'status': status,
+          'previewText': previewText,
+          if (toolName != null) 'toolName': toolName,
+          'overlayVisible': overlayVisible,
+        }) ??
+        false;
+  }
+
+  static Future<bool> hasAgentOverlayPermission() async {
+    return await _channel.invokeMethod<bool>('hasAgentOverlayPermission') ??
+        false;
+  }
+
+  static Future<bool> requestAgentOverlayPermissionIfNeeded() async {
+    return await _channel
+            .invokeMethod<bool>('requestAgentOverlayPermissionIfNeeded') ??
+        false;
+  }
+
+  static Future<bool> setAgentOverlayVisible(bool visible) async {
+    return await _channel.invokeMethod<bool>(
+          'setAgentOverlayVisible',
+          {'visible': visible},
+        ) ??
+        false;
+  }
+
   static Future<Map<String, dynamic>> getBatteryStatus() async {
     final result = await _channel.invokeMethod<Map>('getBatteryStatus');
     return Map<String, dynamic>.from(result!);
@@ -117,7 +166,7 @@ class NativeBridge {
   static Future<void> showAgentCompleteNotification(String preview) async {
     await _channel.invokeMethod<void>(
       'showAgentCompleteNotification',
-      {'preview': preview},
+      {'preview': preview, 'summary': preview},
     );
   }
 

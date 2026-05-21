@@ -138,12 +138,43 @@ class MainActivity : FlutterActivity() {
                         result.error("SERVICE_ERROR", e.message, null)
                     }
                 }
+                "updateAgentNotification" -> {
+                    try {
+                        AgentTaskService.updateNotification(
+                            applicationContext,
+                            call.argument<String>("status") ?: "thinking",
+                            call.argument<String>("previewText") ?: "",
+                            call.argument<String>("toolName"),
+                            call.argument<Boolean>("overlayVisible") ?: false
+                        )
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
                 "stopAgentService" -> {
                     try {
                         AgentTaskService.stop(applicationContext)
                         result.success(true)
                     } catch (e: Exception) {
                         result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "hasAgentOverlayPermission" -> {
+                    result.success(AgentTaskService.hasOverlayPermission(applicationContext))
+                }
+                "requestAgentOverlayPermissionIfNeeded" -> {
+                    result.success(AgentTaskService.requestOverlayPermissionIfNeeded(this))
+                }
+                "setAgentOverlayVisible" -> {
+                    try {
+                        AgentTaskService.setOverlayVisible(
+                            applicationContext,
+                            call.argument<Boolean>("visible") ?: false
+                        )
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("OVERLAY_ERROR", e.message, null)
                     }
                 }
                 "requestBatteryOptimization" -> {
@@ -248,8 +279,10 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "showAgentCompleteNotification" -> {
-                    val preview = call.argument<String>("preview") ?: ""
-                    showAgentCompleteNotification(preview)
+                    val preview = call.argument<String>("preview")
+                        ?: call.argument<String>("summary")
+                        ?: ""
+                    AgentTaskService.showCompletionNotification(applicationContext, preview)
                     result.success(true)
                 }
                 "stopSetupService" -> {
@@ -574,6 +607,9 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        AgentTaskService.setCallbackChannel(
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AGENT_CALLBACK_CHANNEL)
+        )
         createNotificationChannel()
         createAgentCompleteNotificationChannel()
         requestNotificationPermission()
@@ -605,15 +641,16 @@ class MainActivity : FlutterActivity() {
 
     private fun createAgentCompleteNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.deleteNotificationChannel("clawchat_agent_complete")
             val channel = NotificationChannel(
                 AGENT_COMPLETE_CHANNEL_ID,
                 "ClawChat Agent",
-                NotificationManager.IMPORTANCE_DEFAULT
+                NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "AI task completion notifications"
                 enableVibration(true)
             }
-            val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
     }
@@ -698,7 +735,7 @@ class MainActivity : FlutterActivity() {
             .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
-            .setPriority(Notification.PRIORITY_DEFAULT)
+            .setPriority(Notification.PRIORITY_HIGH)
             .setDefaults(Notification.DEFAULT_ALL)
             .build()
 
@@ -746,7 +783,8 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         const val CHANNEL_ID = "clawchat_main"
-        const val AGENT_COMPLETE_CHANNEL_ID = "clawchat_agent_complete"
+        const val AGENT_CALLBACK_CHANNEL = "com.anka.clawbot/native/agent_callbacks"
+        const val AGENT_COMPLETE_CHANNEL_ID = "clawchat_agent_complete_v2"
         const val NOTIFICATION_PERMISSION_REQUEST = 1001
         const val STORAGE_PERMISSION_REQUEST = 1003
         const val AUDIO_PERMISSION_REQUEST = 1004

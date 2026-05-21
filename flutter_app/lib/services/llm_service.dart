@@ -191,6 +191,7 @@ class StreamError extends StreamEvent {
 class LlmService {
   final LlmConfig config;
   final http.Client _client;
+  final bool Function()? _isInBackground;
 
   static const _allowedApiHosts = {
     'api.anthropic.com',
@@ -209,12 +210,15 @@ class LlmService {
     'claude-haiku-4-20250514',
   ];
 
-  LlmService(this.config) : _client = _createPinnedClient();
+  LlmService(this.config, {bool Function()? isInBackground})
+      : _isInBackground = isInBackground,
+        _client = _createPinnedClient();
 
   /// Creates an HTTP client that rejects bad TLS certificates (self-signed,
   /// expired, wrong-host) to mitigate MITM attacks on API traffic.
   static http.Client _createPinnedClient() {
     final httpClient = HttpClient()
+      ..idleTimeout = const Duration(seconds: 120)
       ..badCertificateCallback = (X509Certificate cert, String host, int port) {
         return false;
       };
@@ -388,7 +392,14 @@ class LlmService {
   }
 
   static const Duration _requestTimeout = Duration(seconds: 120);
+  static const Duration _streamChunkTimeout = Duration(seconds: 60);
+  static const Duration _streamReconnectBaseDelay = Duration(seconds: 2);
   static const int _maxRetries = 3;
+  static const int _maxStreamReconnects = 2;
+  static const Map<String, String> _keepAliveHeaders = {
+    'Connection': 'keep-alive',
+    'Keep-Alive': 'timeout=120',
+  };
 
   /// Runs [fn] with exponential backoff retry on 429 and 5xx errors.
   Future<T> _retryWithBackoff<T>(Future<T> Function() fn) async {
@@ -411,6 +422,181 @@ class LlmService {
     // Match 429 (rate limit) and 5xx status codes in error messages
     final pattern = RegExp(r'\((429|5\d{2})\)');
     return pattern.hasMatch(msg);
+  }
+
+  bool _isRetryableStreamError(Object error) {
+    return error is http.ClientException ||
+        error is TimeoutException ||
+        error is SocketException ||
+        error is HttpException ||
+        error is IOException ||
+        (error is Exception && _isRetryableHttpError(error.toString()));
+  }
+
+  Future<void> _delayBeforeStreamReconnect(int completedAttempts) async {
+    final multiplier = 1 << completedAttempts;
+    await Future.delayed(_streamReconnectBaseDelay * multiplier);
+  }
+
+  Stream<String> _linesWithForegroundTimeout(
+    Stream<List<int>> byteStream, {
+    bool Function()? isInBackground,
+  }) {
+    late final StreamController<String> controller;
+    StreamSubscription<String>? subscription;
+    Timer? timeoutTimer;
+    var pendingLine = '';
+    var lastChunkTime = DateTime.now();
+    var closed = false;
+
+    void cancelTimeout() {
+      timeoutTimer?.cancel();
+      timeoutTimer = null;
+    }
+
+    void failWithTimeout() {
+      closed = true;
+      unawaited(subscription?.cancel());
+      controller.addError(
+        TimeoutException(
+          'No stream data received within $_streamChunkTimeout',
+          _streamChunkTimeout,
+        ),
+      );
+      unawaited(controller.close());
+    }
+
+    void scheduleTimeout([Duration delay = _streamChunkTimeout]) {
+      cancelTimeout();
+      if (closed) return;
+      timeoutTimer = Timer(delay, () {
+        if (closed) return;
+        if (isInBackground?.call() == true) {
+          lastChunkTime = DateTime.now();
+          scheduleTimeout();
+          return;
+        }
+
+        final idleDuration = DateTime.now().difference(lastChunkTime);
+        if (idleDuration < _streamChunkTimeout) {
+          scheduleTimeout(_streamChunkTimeout - idleDuration);
+          return;
+        }
+
+        failWithTimeout();
+      });
+    }
+
+    controller = StreamController<String>(
+      onListen: () {
+        scheduleTimeout();
+        subscription = byteStream.transform(utf8.decoder).listen(
+          (chunk) {
+            lastChunkTime = DateTime.now();
+            scheduleTimeout();
+            pendingLine += chunk;
+            while (true) {
+              final newlineIndex = pendingLine.indexOf('\n');
+              if (newlineIndex < 0) break;
+              var line = pendingLine.substring(0, newlineIndex);
+              if (line.endsWith('\r')) {
+                line = line.substring(0, line.length - 1);
+              }
+              controller.add(line);
+              pendingLine = pendingLine.substring(newlineIndex + 1);
+            }
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (closed) return;
+            closed = true;
+            cancelTimeout();
+            controller.addError(error, stackTrace);
+            unawaited(controller.close());
+          },
+          onDone: () {
+            if (closed) return;
+            if (pendingLine.isNotEmpty) {
+              controller.add(
+                pendingLine.endsWith('\r')
+                    ? pendingLine.substring(0, pendingLine.length - 1)
+                    : pendingLine,
+              );
+              pendingLine = '';
+            }
+            closed = true;
+            cancelTimeout();
+            unawaited(controller.close());
+          },
+        );
+      },
+      onPause: () {
+        cancelTimeout();
+        subscription?.pause();
+      },
+      onResume: () {
+        lastChunkTime = DateTime.now();
+        scheduleTimeout();
+        subscription?.resume();
+      },
+      onCancel: () async {
+        closed = true;
+        cancelTimeout();
+        await subscription?.cancel();
+      },
+    );
+
+    return controller.stream;
+  }
+
+  Stream<String> _resilientSseDataStream({
+    required Future<http.StreamedResponse> Function() openStream,
+    required bool Function(String data) isDoneData,
+    void Function(int attempt, Object error)? onRetry,
+    bool Function()? isInBackground,
+  }) async* {
+    for (int attempt = 0; attempt <= _maxStreamReconnects; attempt++) {
+      final sseDataLines = <String>[];
+      try {
+        final response = await openStream();
+        await for (final line in _linesWithForegroundTimeout(
+          response.stream,
+          isInBackground: isInBackground,
+        )) {
+          if (line.startsWith('data:')) {
+            final payload = line.length > 5 && line[5] == ' '
+                ? line.substring(6)
+                : line.substring(5);
+            sseDataLines.add(payload);
+            continue;
+          }
+          if (line.startsWith('event:') ||
+              line.startsWith('id:') ||
+              line.startsWith('retry:')) {
+            continue;
+          }
+          if (line.trim().isEmpty && sseDataLines.isNotEmpty) {
+            final data = sseDataLines.join('\n').trim();
+            sseDataLines.clear();
+            yield data;
+            if (isDoneData(data)) return;
+          }
+        }
+
+        if (sseDataLines.isNotEmpty) {
+          final data = sseDataLines.join('\n').trim();
+          sseDataLines.clear();
+          yield data;
+          if (isDoneData(data)) return;
+        }
+        return;
+      } catch (e) {
+        if (attempt >= _maxStreamReconnects || !_isRetryableStreamError(e)) {
+          rethrow;
+        }
+        onRetry?.call(attempt + 1, e);
+        await _delayBeforeStreamReconnect(attempt);
+      }
+    }
   }
 
   Future<LlmResponse> chat({
@@ -472,9 +658,8 @@ class LlmService {
     _validateApiHost(url);
     final body = _buildAnthropicBody(system, messages, tools, stream: true);
 
-    http.StreamedResponse streamedResponse;
-    try {
-      streamedResponse = await _retryWithBackoff(() async {
+    Future<http.StreamedResponse> openStream() {
+      return _retryWithBackoff(() async {
         final request = http.Request('POST', Uri.parse(url));
         request.headers.addAll(_anthropicHeaders());
         request.body = jsonEncode(body);
@@ -486,9 +671,6 @@ class LlmService {
         }
         return response;
       });
-    } catch (e) {
-      yield StreamError('Anthropic request failed after retries: $e');
-      return;
     }
 
     final List<ContentBlock> collectedBlocks = [];
@@ -497,19 +679,29 @@ class LlmService {
     String currentToolName = '';
     StringBuffer currentToolInput = StringBuffer();
     String stopReason = 'end_turn';
-    final List<String> _sseDataLines = [];
     bool receivedMessageStop = false;
-    bool _isThinkingBlock = false;
-    int? _inputTokens;
-    int? _outputTokens;
+    bool isThinkingBlock = false;
+    int? inputTokens;
+    int? outputTokens;
     bool streamFailed = false;
+    int textSkipRemaining = 0;
+    int toolInputSkipRemaining = 0;
+    int toolStartSkipRemaining = 0;
+    int completedToolBlockSkipRemaining = 0;
+    int emittedTextLength = 0;
+    int emittedToolInputLength = 0;
+    int emittedToolStarts = 0;
+    int completedToolBlocks = 0;
+    bool suppressCurrentToolBlock = false;
 
     void finishCurrentAnthropicBlock() {
-      if (_isThinkingBlock) {
-        _isThinkingBlock = false;
+      if (isThinkingBlock) {
+        isThinkingBlock = false;
         return;
       }
       if (currentToolName.isNotEmpty && currentToolId.isNotEmpty) {
+        final shouldSuppressToolBlock = suppressCurrentToolBlock;
+        suppressCurrentToolBlock = false;
         Map<String, dynamic> input = {};
         try {
           final inputStr = currentToolInput.toString();
@@ -517,12 +709,15 @@ class LlmService {
         } catch (_) {
           // Malformed tool input JSON - proceed with empty input
         }
-        collectedBlocks.add(ContentBlock(
-          type: 'tool_use',
-          toolUseId: currentToolId,
-          toolName: currentToolName,
-          toolInput: input,
-        ));
+        if (!shouldSuppressToolBlock) {
+          collectedBlocks.add(ContentBlock(
+            type: 'tool_use',
+            toolUseId: currentToolId,
+            toolName: currentToolName,
+            toolInput: input,
+          ));
+          completedToolBlocks++;
+        }
         currentToolId = '';
         currentToolName = '';
         currentToolInput = StringBuffer();
@@ -548,7 +743,7 @@ class LlmService {
             if (message != null) {
               final usage = message['usage'] as Map<String, dynamic>?;
               if (usage != null) {
-                _inputTokens = usage['input_tokens'] as int?;
+                inputTokens = usage['input_tokens'] as int?;
               }
             }
             break;
@@ -556,29 +751,73 @@ class LlmService {
           case 'content_block_start':
             final block = event['content_block'] as Map<String, dynamic>;
             if (block['type'] == 'thinking') {
-              _isThinkingBlock = true;
+              isThinkingBlock = true;
             } else if (block['type'] == 'tool_use') {
-              _isThinkingBlock = false;
-              currentToolId = block['id'] as String;
-              currentToolName = block['name'] as String;
-              currentToolInput = StringBuffer();
-              yield ToolUseStart(currentToolId, currentToolName);
+              isThinkingBlock = false;
+              final duplicateToolStart = toolStartSkipRemaining > 0;
+              final duplicateCompletedToolBlock =
+                  completedToolBlockSkipRemaining > 0;
+              if (!duplicateToolStart ||
+                  duplicateCompletedToolBlock ||
+                  currentToolId.isEmpty) {
+                currentToolId = block['id'] as String;
+                currentToolName = block['name'] as String;
+              }
+              if (!duplicateToolStart || duplicateCompletedToolBlock) {
+                currentToolInput = StringBuffer();
+              }
+              suppressCurrentToolBlock = duplicateCompletedToolBlock;
+              if (duplicateCompletedToolBlock) {
+                completedToolBlockSkipRemaining--;
+              }
+              if (duplicateToolStart) {
+                toolStartSkipRemaining--;
+              } else {
+                emittedToolStarts++;
+                yield ToolUseStart(currentToolId, currentToolName);
+              }
             } else {
-              _isThinkingBlock = false;
+              isThinkingBlock = false;
             }
             break;
 
           case 'content_block_delta':
-            if (_isThinkingBlock) break;
+            if (isThinkingBlock) break;
             final delta = event['delta'] as Map<String, dynamic>;
             if (delta['type'] == 'text_delta') {
               final text = delta['text'] as String;
-              currentText += text;
-              yield TextDelta(text);
+              var textToEmit = text;
+              if (textSkipRemaining > 0) {
+                if (textSkipRemaining >= text.length) {
+                  textSkipRemaining -= text.length;
+                  textToEmit = '';
+                } else {
+                  textToEmit = text.substring(textSkipRemaining);
+                  textSkipRemaining = 0;
+                }
+              }
+              if (textToEmit.isNotEmpty) {
+                currentText += textToEmit;
+                emittedTextLength += textToEmit.length;
+                yield TextDelta(textToEmit);
+              }
             } else if (delta['type'] == 'input_json_delta') {
               final json = delta['partial_json'] as String;
-              currentToolInput.write(json);
-              yield ToolInputDelta(json);
+              var jsonToEmit = json;
+              if (toolInputSkipRemaining > 0) {
+                if (toolInputSkipRemaining >= json.length) {
+                  toolInputSkipRemaining -= json.length;
+                  jsonToEmit = '';
+                } else {
+                  jsonToEmit = json.substring(toolInputSkipRemaining);
+                  toolInputSkipRemaining = 0;
+                }
+              }
+              if (jsonToEmit.isNotEmpty) {
+                currentToolInput.write(jsonToEmit);
+                emittedToolInputLength += jsonToEmit.length;
+                yield ToolInputDelta(jsonToEmit);
+              }
             }
             break;
 
@@ -591,7 +830,7 @@ class LlmService {
             stopReason = delta['stop_reason'] as String? ?? 'end_turn';
             final usage = event['usage'] as Map<String, dynamic>?;
             if (usage != null) {
-              _outputTokens = usage['output_tokens'] as int?;
+              outputTokens = usage['output_tokens'] as int?;
             }
             break;
 
@@ -610,42 +849,26 @@ class LlmService {
       }
     }
 
-    await for (final chunk in streamedResponse.stream
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())) {
-      if (chunk.startsWith('data:')) {
-        // SSE spec: strip at most one leading space after "data:"
-        final payload = chunk.length > 5 && chunk[5] == ' '
-            ? chunk.substring(6)
-            : chunk.substring(5);
-        _sseDataLines.add(payload);
-        continue;
-      }
-      // event:, id:, retry: are part of the SSE spec — ignore them silently
-      if (chunk.startsWith('event:') ||
-          chunk.startsWith('id:') ||
-          chunk.startsWith('retry:')) {
-        continue;
-      }
-      // Flush buffer on empty line (normal SSE delimiter) OR when stream ends
-      // (handled after the loop). Some proxies omit the final blank line.
-      if (chunk.trim().isEmpty && _sseDataLines.isNotEmpty) {
-        final data = _sseDataLines.join('\n').trim();
-        _sseDataLines.clear();
+    try {
+      await for (final data in _resilientSseDataStream(
+        openStream: openStream,
+        isDoneData: (data) => data == '[DONE]',
+        isInBackground: _isInBackground,
+        onRetry: (_, __) {
+          textSkipRemaining = emittedTextLength;
+          toolInputSkipRemaining = emittedToolInputLength;
+          toolStartSkipRemaining = emittedToolStarts;
+          completedToolBlockSkipRemaining = completedToolBlocks;
+        },
+      )) {
         for (final event in parseAnthropicSseData(data)) {
           yield event;
         }
         if (streamFailed) return;
       }
-    }
-
-    if (_sseDataLines.isNotEmpty) {
-      final data = _sseDataLines.join('\n').trim();
-      _sseDataLines.clear();
-      for (final event in parseAnthropicSseData(data)) {
-        yield event;
-      }
-      if (streamFailed) return;
+    } catch (e) {
+      yield StreamError('Anthropic stream interrupted after retries: $e');
+      return;
     }
 
     finishCurrentAnthropicBlock();
@@ -658,8 +881,8 @@ class LlmService {
     yield StreamDone(LlmResponse(
       stopReason: stopReason,
       content: collectedBlocks,
-      inputTokens: _inputTokens,
-      outputTokens: _outputTokens,
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
     ));
   }
 
@@ -702,6 +925,7 @@ class LlmService {
       'x-api-key': config.apiKey,
       'anthropic-version': '2023-06-01',
       'Accept-Encoding': 'identity',
+      ..._keepAliveHeaders,
     };
     if (config.thinkingBudget > 0) {
       headers['anthropic-version'] = '2025-04-15';
@@ -748,7 +972,7 @@ class LlmService {
       );
       if (response.statusCode == 400 &&
           (_tryTokenKeyFallback(response.body) ||
-           _tryReasoningContentFallback(response.body))) {
+              _tryReasoningContentFallback(response.body))) {
         final retryBody =
             _buildOpenAIBody(system, messages, tools, stream: false);
         final retryResponse = await _client.post(
@@ -779,9 +1003,8 @@ class LlmService {
     _validateApiHost(url);
     var body = _buildOpenAIBody(system, messages, tools, stream: true);
 
-    http.StreamedResponse streamedResponse;
-    try {
-      streamedResponse = await _retryWithBackoff(() async {
+    Future<http.StreamedResponse> openStream() {
+      return _retryWithBackoff(() async {
         final request = http.Request('POST', Uri.parse(url));
         request.headers.addAll(_openaiHeaders());
         request.body = jsonEncode(body);
@@ -812,9 +1035,6 @@ class LlmService {
         }
         return response;
       });
-    } catch (e) {
-      yield StreamError('OpenAI request failed after retries: $e');
-      return;
     }
 
     String currentText = '';
@@ -822,10 +1042,14 @@ class LlmService {
     final List<ContentBlock> collectedBlocks = [];
     final Map<int, Map<String, String>> toolCallsAccum = {};
     String stopReason = 'stop';
-    final List<String> _sseDataLines = [];
     bool receivedDone = false;
-    int? _inputTokens;
-    int? _outputTokens;
+    int? inputTokens;
+    int? outputTokens;
+    int textSkipRemaining = 0;
+    int reasoningSkipRemaining = 0;
+    int emittedTextLength = 0;
+    int emittedReasoningLength = 0;
+    final Map<int, int> toolArgumentSkipRemaining = {};
 
     Iterable<StreamEvent> parseOpenAiSseData(String data) sync* {
       if (data == '[DONE]') {
@@ -838,8 +1062,8 @@ class LlmService {
         // Parse usage from streaming chunk (OpenAI sends it in final chunk)
         final usage = event['usage'] as Map<String, dynamic>?;
         if (usage != null) {
-          _inputTokens = usage['prompt_tokens'] as int?;
-          _outputTokens = usage['completion_tokens'] as int?;
+          inputTokens = usage['prompt_tokens'] as int?;
+          outputTokens = usage['completion_tokens'] as int?;
         }
 
         final choices = event['choices'] as List?;
@@ -853,12 +1077,39 @@ class LlmService {
 
         final content = delta['content'] as String?;
         if (content != null) {
-          currentText += content;
-          yield TextDelta(content);
+          var contentToEmit = content;
+          if (textSkipRemaining > 0) {
+            if (textSkipRemaining >= content.length) {
+              textSkipRemaining -= content.length;
+              contentToEmit = '';
+            } else {
+              contentToEmit = content.substring(textSkipRemaining);
+              textSkipRemaining = 0;
+            }
+          }
+          if (contentToEmit.isNotEmpty) {
+            currentText += contentToEmit;
+            emittedTextLength += contentToEmit.length;
+            yield TextDelta(contentToEmit);
+          }
         }
         final reasoningContent = delta['reasoning_content'] as String?;
         if (reasoningContent != null) {
-          currentReasoningContent += reasoningContent;
+          var reasoningToAppend = reasoningContent;
+          if (reasoningSkipRemaining > 0) {
+            if (reasoningSkipRemaining >= reasoningContent.length) {
+              reasoningSkipRemaining -= reasoningContent.length;
+              reasoningToAppend = '';
+            } else {
+              reasoningToAppend =
+                  reasoningContent.substring(reasoningSkipRemaining);
+              reasoningSkipRemaining = 0;
+            }
+          }
+          if (reasoningToAppend.isNotEmpty) {
+            currentReasoningContent += reasoningToAppend;
+            emittedReasoningLength += reasoningToAppend.length;
+          }
         }
 
         final toolCalls = delta['tool_calls'] as List?;
@@ -869,10 +1120,12 @@ class LlmService {
               index,
               () => {'id': '', 'name': '', 'arguments': '', 'started': ''},
             );
-            if (tc['id'] != null) entry['id'] = tc['id'];
+            if (tc['id'] != null && entry['id']!.isEmpty) {
+              entry['id'] = tc['id'];
+            }
             if (tc['function'] != null) {
               final func = tc['function'] as Map<String, dynamic>;
-              if (func['name'] != null) {
+              if (func['name'] != null && entry['name']!.isEmpty) {
                 entry['name'] = func['name'];
               }
               // Only emit ToolUseStart once both id and name are known
@@ -883,8 +1136,23 @@ class LlmService {
                 yield ToolUseStart(entry['id']!, entry['name']!);
               }
               if (func['arguments'] != null) {
-                entry['arguments'] = entry['arguments']! + func['arguments'];
-                yield ToolInputDelta(func['arguments']);
+                final arguments = func['arguments'] as String;
+                var argumentsToEmit = arguments;
+                final skipRemaining = toolArgumentSkipRemaining[index] ?? 0;
+                if (skipRemaining > 0) {
+                  if (skipRemaining >= arguments.length) {
+                    toolArgumentSkipRemaining[index] =
+                        skipRemaining - arguments.length;
+                    argumentsToEmit = '';
+                  } else {
+                    argumentsToEmit = arguments.substring(skipRemaining);
+                    toolArgumentSkipRemaining[index] = 0;
+                  }
+                }
+                if (argumentsToEmit.isNotEmpty) {
+                  entry['arguments'] = entry['arguments']! + argumentsToEmit;
+                  yield ToolInputDelta(argumentsToEmit);
+                }
               }
             }
           }
@@ -894,37 +1162,32 @@ class LlmService {
       }
     }
 
-    await for (final chunk in streamedResponse.stream
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())) {
-      if (chunk.startsWith('data:')) {
-        final payload = chunk.length > 5 && chunk[5] == ' '
-            ? chunk.substring(6)
-            : chunk.substring(5);
-        _sseDataLines.add(payload);
-        continue;
-      }
-      if (chunk.startsWith('event:') ||
-          chunk.startsWith('id:') ||
-          chunk.startsWith('retry:')) {
-        continue;
-      }
-      if (chunk.trim().isEmpty && _sseDataLines.isNotEmpty) {
-        final data = _sseDataLines.join('\n').trim();
-        _sseDataLines.clear();
+    try {
+      await for (final data in _resilientSseDataStream(
+        openStream: openStream,
+        isDoneData: (data) => data == '[DONE]',
+        isInBackground: _isInBackground,
+        onRetry: (_, __) {
+          textSkipRemaining = emittedTextLength;
+          reasoningSkipRemaining = emittedReasoningLength;
+          toolArgumentSkipRemaining
+            ..clear()
+            ..addEntries(toolCallsAccum.entries.map(
+              (entry) => MapEntry(
+                entry.key,
+                entry.value['arguments']?.length ?? 0,
+              ),
+            ));
+        },
+      )) {
         for (final event in parseOpenAiSseData(data)) {
           yield event;
         }
         if (receivedDone) break;
       }
-    }
-
-    if (_sseDataLines.isNotEmpty) {
-      final data = _sseDataLines.join('\n').trim();
-      _sseDataLines.clear();
-      for (final event in parseOpenAiSseData(data)) {
-        yield event;
-      }
+    } catch (e) {
+      yield StreamError('OpenAI stream interrupted after retries: $e');
+      return;
     }
 
     if (currentText.isNotEmpty || currentReasoningContent.isNotEmpty) {
@@ -968,8 +1231,8 @@ class LlmService {
     yield StreamDone(LlmResponse(
       stopReason: mappedStopReason,
       content: collectedBlocks,
-      inputTokens: _inputTokens,
-      outputTokens: _outputTokens,
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
     ));
   }
 
@@ -1491,6 +1754,7 @@ class LlmService {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ${config.apiKey}',
         'Accept-Encoding': 'identity',
+        ..._keepAliveHeaders,
       };
 
   LlmResponse _parseOpenAIResponse(Map<String, dynamic> json) {

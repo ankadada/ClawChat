@@ -736,7 +736,128 @@ void main() {
       expect(textBlock.text, 'visible');
       expect(textBlock.reasoningContent, 'hidden state');
     });
+
+    test('reconnects OpenAI streams without duplicating emitted text',
+        () async {
+      var requestCount = 0;
+      final events = await collectOpenAiStreamEventsWithHandler(
+        (request) async {
+          requestCount++;
+          if (requestCount == 1) {
+            request.response.contentLength = 1024;
+            request.response.write(sseData({
+              'choices': [
+                {
+                  'delta': {'content': 'hel'},
+                  'finish_reason': null,
+                }
+              ],
+            }));
+            await request.response.flush();
+            await closeIncompleteResponse(request.response);
+            return;
+          }
+
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {'content': 'hel'},
+                'finish_reason': null,
+              }
+            ],
+          }));
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {'content': 'lo'},
+                'finish_reason': null,
+              }
+            ],
+          }));
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {},
+                'finish_reason': 'stop',
+              }
+            ],
+            'usage': {
+              'prompt_tokens': 1,
+              'completion_tokens': 1,
+            },
+          }));
+          request.response.write('data: [DONE]\n\n');
+          await request.response.close();
+        },
+      );
+
+      expect(requestCount, 2);
+      expect(events.whereType<StreamError>().map((e) => e.message), isEmpty);
+      expect(events.whereType<TextDelta>().map((e) => e.text).join(), 'hello');
+      final done = events.whereType<StreamDone>().single;
+      expect(done.response.content.single.text, 'hello');
+    });
+
+    test('reconnects Anthropic streams without duplicating emitted text',
+        () async {
+      var requestCount = 0;
+      final events = await collectAnthropicStreamEventsWithHandler(
+        (request) async {
+          requestCount++;
+          if (requestCount == 1) {
+            request.response.contentLength = 1024;
+          }
+          request.response.write(sseData({
+            'type': 'message_start',
+            'message': {
+              'usage': {'input_tokens': 1},
+            },
+          }));
+          request.response.write(sseData({
+            'type': 'content_block_start',
+            'content_block': {'type': 'text'},
+          }));
+          request.response.write(sseData({
+            'type': 'content_block_delta',
+            'delta': {'type': 'text_delta', 'text': 'hel'},
+          }));
+          await request.response.flush();
+
+          if (requestCount == 1) {
+            await closeIncompleteResponse(request.response);
+            return;
+          }
+
+          request.response.write(sseData({
+            'type': 'content_block_delta',
+            'delta': {'type': 'text_delta', 'text': 'lo'},
+          }));
+          request.response.write(sseData({'type': 'content_block_stop'}));
+          request.response.write(sseData({
+            'type': 'message_delta',
+            'delta': {'stop_reason': 'end_turn'},
+            'usage': {'output_tokens': 1},
+          }));
+          request.response.write(sseData({'type': 'message_stop'}));
+          await request.response.close();
+        },
+      );
+
+      expect(requestCount, 2);
+      expect(events.whereType<StreamError>().map((e) => e.message), isEmpty);
+      expect(events.whereType<TextDelta>().map((e) => e.text).join(), 'hello');
+      final done = events.whereType<StreamDone>().single;
+      expect(done.response.content.single.text, 'hello');
+    });
   });
+}
+
+Future<void> closeIncompleteResponse(HttpResponse response) async {
+  try {
+    await response.close();
+  } on HttpException {
+    // The incomplete response is intentional: it simulates a dropped stream.
+  }
 }
 
 Future<String> sanitizedErrorBody(String responseBody) async {
@@ -1054,17 +1175,25 @@ String sseData(Map<String, dynamic> data, {bool delimiter = true}) {
 Future<List<StreamEvent>> collectAnthropicStreamEvents(
   List<String> responseChunks,
 ) async {
+  return collectAnthropicStreamEventsWithHandler((request) async {
+    for (final chunk in responseChunks) {
+      request.response.write(chunk);
+      await request.response.flush();
+    }
+    await request.response.close();
+  });
+}
+
+Future<List<StreamEvent>> collectAnthropicStreamEventsWithHandler(
+  Future<void> Function(HttpRequest request) handleRequest,
+) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.listen((request) async {
     await utf8.decoder.bind(request).join();
     request.response.statusCode = 200;
     request.response.headers.contentType =
         ContentType('text', 'event-stream', charset: 'utf-8');
-    for (final chunk in responseChunks) {
-      request.response.write(chunk);
-      await request.response.flush();
-    }
-    await request.response.close();
+    await handleRequest(request);
   });
 
   final service = LlmService(LlmConfig.anthropic(
@@ -1089,17 +1218,25 @@ Future<List<StreamEvent>> collectAnthropicStreamEvents(
 Future<List<StreamEvent>> collectOpenAiStreamEvents(
   List<String> responseChunks,
 ) async {
+  return collectOpenAiStreamEventsWithHandler((request) async {
+    for (final chunk in responseChunks) {
+      request.response.write(chunk);
+      await request.response.flush();
+    }
+    await request.response.close();
+  });
+}
+
+Future<List<StreamEvent>> collectOpenAiStreamEventsWithHandler(
+  Future<void> Function(HttpRequest request) handleRequest,
+) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.listen((request) async {
     await utf8.decoder.bind(request).join();
     request.response.statusCode = 200;
     request.response.headers.contentType =
         ContentType('text', 'event-stream', charset: 'utf-8');
-    for (final chunk in responseChunks) {
-      request.response.write(chunk);
-      await request.response.flush();
-    }
-    await request.response.close();
+    await handleRequest(request);
   });
 
   final service = LlmService(LlmConfig.openai(

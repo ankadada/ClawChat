@@ -93,11 +93,12 @@ class ChatProvider extends ChangeNotifier {
   String? _agentServiceText;
   int _agentServiceGeneration = 0;
   bool _agentCompletionFinalizing = false;
+  bool _agentOverlayPermissionRequestStarted = false;
 
   static const _backgroundApprovalTimeout = Duration(seconds: 15);
   static const _agentServiceThinkingText = 'AI 正在思考...';
   static const _agentServiceToolingText = 'AI 正在执行命令...';
-  static const _agentServiceStreamingText = 'AI 正在生成回复...';
+  static const _agentServiceStreamingText = 'AI 正在回复...';
 
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
 
@@ -108,12 +109,27 @@ class ChatProvider extends ChangeNotifier {
 
   Future<void> _startAgentService(String text) async {
     if (_disposed) return;
-    if (_agentServiceActive && _agentServiceText == text) return;
+    final shouldStartService =
+        !_agentServiceActive || _agentServiceText != text;
     final generation = ++_agentServiceGeneration;
     _agentServiceActive = true;
     _agentServiceText = text;
+    if (!_appInBackground && !_agentOverlayPermissionRequestStarted) {
+      _agentOverlayPermissionRequestStarted = true;
+      unawaited(
+        NativeBridge.requestAgentOverlayPermissionIfNeeded().catchError((
+          Object e,
+        ) {
+          debugPrint('Agent overlay permission prompt failed: $e');
+          return false;
+        }),
+      );
+    }
     try {
-      await NativeBridge.startAgentService(text: text);
+      if (shouldStartService) {
+        await NativeBridge.startAgentService(text: text);
+      }
+      await _updateAgentNativeStatus(_statusForAgentServiceText(text));
     } catch (e) {
       if (generation == _agentServiceGeneration) {
         _agentServiceActive = false;
@@ -121,6 +137,36 @@ class ChatProvider extends ChangeNotifier {
       }
       debugPrint('Failed to start agent foreground service: $e');
     }
+  }
+
+  String _statusForAgentServiceText(String text) {
+    if (text == _agentServiceThinkingText) return 'thinking';
+    if (text == _agentServiceStreamingText) return 'streaming';
+    if (text == _agentServiceToolingText) return 'tooling';
+    return 'thinking';
+  }
+
+  Future<void> _updateAgentNativeStatus(
+    String status, {
+    String? previewText,
+    String? toolName,
+  }) async {
+    if (_disposed) return;
+    try {
+      await NativeBridge.updateAgentNotification(
+        status: status,
+        previewText: previewText ?? _tailOfStreamBuffer(250),
+        toolName: toolName,
+        overlayVisible: _appInBackground && _isSending,
+      );
+    } catch (e) {
+      debugPrint('Failed to update agent notification: $e');
+    }
+  }
+
+  String _tailOfStreamBuffer(int maxLength) {
+    final s = _streamBuffer.toString();
+    return s.length <= maxLength ? s : s.substring(s.length - maxLength);
   }
 
   Future<void> _stopAgentService() async {
@@ -157,7 +203,11 @@ class ChatProvider extends ChangeNotifier {
     Completer<void>? completer,
   ) async {
     try {
+      await _updateAgentNativeStatus('complete', previewText: finalText);
       await _showCompletionNotificationIfNeeded(finalText);
+      if (_appInBackground) {
+        await Future.delayed(const Duration(seconds: 2));
+      }
     } finally {
       await _stopAgentService();
       if (completer != null && !completer.isCompleted) {
@@ -176,6 +226,7 @@ class ChatProvider extends ChangeNotifier {
   }
 
   ChatProvider() {
+    NativeBridge.setAgentStopRequestedHandler(cancelAgent);
     _tools = ToolRegistry.withDefaults(prefs: _prefs);
     _init();
   }
@@ -183,6 +234,7 @@ class ChatProvider extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    NativeBridge.setAgentStopRequestedHandler(null);
     unawaited(_stopAgentService());
     _completePendingApproval(false);
     _streamThrottle?.cancel();
@@ -335,7 +387,29 @@ class ChatProvider extends ChangeNotifier {
     _appInBackground = inBackground;
     if (!_appInBackground) {
       _cancelApprovalTimeout();
+      _resumeActiveAgentStreamAfterForeground();
       if (pendingApproval != null && !_disposed) notifyListeners();
+    }
+    if (_isSending) {
+      unawaited(NativeBridge.setAgentOverlayVisible(_appInBackground));
+      unawaited(_updateAgentNativeStatus(_statusForAgentServiceText(
+        _agentServiceText ?? _agentServiceThinkingText,
+      )));
+    }
+  }
+
+  void _resumeActiveAgentStreamAfterForeground() {
+    if (_disposed || !_isSending) return;
+    switch (agentStatus) {
+      case AgentStatus.thinking:
+        unawaited(_startAgentService(_agentServiceThinkingText));
+      case AgentStatus.streaming:
+        unawaited(_startAgentService(_agentServiceStreamingText));
+      case AgentStatus.tooling:
+        unawaited(_startAgentService(_agentServiceToolingText));
+      case AgentStatus.idle:
+      case AgentStatus.error:
+        break;
     }
   }
 
@@ -470,7 +544,10 @@ class ChatProvider extends ChangeNotifier {
       final llmConfig = _buildLlmConfig(_prefs);
       if (_cachedLlm == null || _cachedLlmConfig != llmConfig) {
         _cachedLlm?.dispose();
-        _cachedLlm = LlmService(llmConfig);
+        _cachedLlm = LlmService(
+          llmConfig,
+          isInBackground: () => _appInBackground,
+        );
         _cachedLlmConfig = llmConfig;
       }
       final llm = _cachedLlm!;
@@ -520,18 +597,22 @@ class ChatProvider extends ChangeNotifier {
 
               case AgentTextDelta(:final text):
                 agentStatus = AgentStatus.streaming;
-                unawaited(_startAgentService(_agentServiceStreamingText));
                 _streamBuffer.write(text);
                 _streamThrottle ??= Timer(const Duration(milliseconds: 50), () {
                   streamingText = _streamBuffer.toString();
                   _streamThrottle = null;
                   notifyListeners();
+                  unawaited(_startAgentService(_agentServiceStreamingText));
                 });
 
-              case AgentToolStart():
+              case AgentToolStart(:final toolName):
                 agentStatus = AgentStatus.tooling;
                 notifyListeners();
                 unawaited(_startAgentService(_agentServiceToolingText));
+                unawaited(_updateAgentNativeStatus(
+                  'tooling',
+                  toolName: toolName,
+                ));
 
               case AgentToolDone():
                 notifyListeners();
