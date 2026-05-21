@@ -93,6 +93,8 @@ class ChatProvider extends ChangeNotifier {
   String? _agentServiceText;
   int _agentServiceGeneration = 0;
   bool _agentCompletionFinalizing = false;
+  bool _partialAgentResponseSaved = false;
+  int _initialApiMsgCount = 0;
   bool _agentOverlayPermissionRequestStarted = false;
 
   static const _backgroundApprovalTimeout = Duration(seconds: 15);
@@ -591,6 +593,8 @@ class ChatProvider extends ChangeNotifier {
         notifyListeners();
       }
       final initialApiMsgCount = apiMessages.length;
+      _initialApiMsgCount = initialApiMsgCount;
+      _partialAgentResponseSaved = false;
       try {
         _agentSubscription = _agent!.runAgentLoop(apiMessages).listen(
           (event) {
@@ -692,6 +696,8 @@ class ChatProvider extends ChangeNotifier {
       } finally {
         _agentSubscription = null;
         _agentCompleter = null;
+        _partialAgentResponseSaved = false;
+        _initialApiMsgCount = 0;
         unawaited(_stopAgentService());
       }
     } finally {
@@ -708,6 +714,7 @@ class ChatProvider extends ChangeNotifier {
     _agentSubscription = null;
     _streamThrottle?.cancel();
     _streamThrottle = null;
+    _savePartialAgentResponse();
     _streamBuffer = StringBuffer();
     if (_agentCompleter != null && !_agentCompleter!.isCompleted) {
       _agentCompleter!.complete();
@@ -715,6 +722,34 @@ class ChatProvider extends ChangeNotifier {
     agentStatus = AgentStatus.idle;
     streamingText = '';
     notifyListeners();
+  }
+
+  void _savePartialAgentResponse() {
+    if (_partialAgentResponseSaved || _agentCompletionFinalizing) return;
+    final session = currentSession;
+    final agent = _agent;
+    if (session == null || agent == null) return;
+
+    final partialText = _streamBuffer.toString();
+    _appendNewAgentMessages(session, agent.messages, _initialApiMsgCount);
+
+    final lastAgentMsg = agent.messages.isNotEmpty ? agent.messages.last : null;
+    final lastMsgIsAssistant =
+        lastAgentMsg != null && lastAgentMsg['role'] == 'assistant';
+    if (partialText.isNotEmpty && !lastMsgIsAssistant) {
+      session.messages.add(ChatMessage(
+        role: 'assistant',
+        content: [TextContent(partialText)],
+        alternatives: _pendingAlternatives,
+        activeAlternative: -1,
+      ));
+      _pendingAlternatives = null;
+    }
+
+    _partialAgentResponseSaved = true;
+    unawaited(_storage.saveSession(session).catchError((Object e) {
+      debugPrint('Failed to save partial agent response: $e');
+    }));
   }
 
   // Stored alternatives from previous generations, used during regeneration
