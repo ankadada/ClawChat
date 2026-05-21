@@ -882,6 +882,7 @@ class ChatProvider extends ChangeNotifier {
   bool get isComparing => _isComparing;
 
   Future<void> sendCompare(String text, List<String> models) async {
+    debugPrint('sendCompare called with ${models.length} models: $models');
     if (_isSending || _isComparing || currentSession == null) {
       errorMessage = _isSending
           ? '正在发送中，请等待完成'
@@ -891,8 +892,10 @@ class ChatProvider extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    if (text.trim().isEmpty || models.isEmpty) {
-      errorMessage = text.trim().isEmpty ? '请输入对比内容' : '请选择至少一个模型';
+    final compareModels =
+        models.where((model) => model.trim().isNotEmpty).toList();
+    if (text.trim().isEmpty || compareModels.length < 2) {
+      errorMessage = text.trim().isEmpty ? '请输入对比内容' : '请选择至少两个模型';
       notifyListeners();
       return;
     }
@@ -936,7 +939,7 @@ class ChatProvider extends ChangeNotifier {
       final format =
           formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
 
-      for (final model in models) {
+      for (final model in compareModels) {
         if (_disposed) break;
         try {
           final config = LlmConfig(

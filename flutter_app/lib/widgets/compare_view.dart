@@ -39,6 +39,7 @@ class _CompareViewState extends State<CompareView> {
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
         border: Border.all(color: theme.colorScheme.outline.withAlpha(80)),
         borderRadius: BorderRadius.circular(12),
       ),
@@ -79,7 +80,11 @@ class _CompareViewState extends State<CompareView> {
                 const Spacer(),
                 if (widget.onDismiss != null)
                   IconButton(
-                    icon: const Icon(Icons.close, size: 18),
+                    icon: Icon(
+                      Icons.close,
+                      size: 18,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                     onPressed: widget.onDismiss,
                     padding: EdgeInsets.zero,
                     constraints:
@@ -232,33 +237,50 @@ class _CompareCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(Icons.smart_toy, size: 16, color: theme.colorScheme.primary),
-              const SizedBox(width: 4),
-              Expanded(
-                child: Text(
-                  result.model,
-                  style: theme.textTheme.bodyMedium
-                      ?.copyWith(fontWeight: FontWeight.bold),
-                  overflow: TextOverflow.ellipsis,
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Icon(
+                  Icons.smart_toy,
+                  size: 16,
+                  color: theme.colorScheme.primary,
                 ),
               ),
-              Text(
-                '${index + 1}/$total',
-                style: theme.textTheme.bodySmall?.copyWith(
+              const SizedBox(width: 6),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      result.model,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: theme.colorScheme.onSurface,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      result.tokens == null
+                          ? '${index + 1}/$total'
+                          : '${index + 1}/$total · ${result.tokens} tokens',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                icon: Icon(
+                  Icons.copy,
+                  size: 16,
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
-              ),
-              const SizedBox(width: 4),
-              if (result.tokens != null)
-                Text(
-                  '${result.tokens} tokens',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              IconButton(
-                icon: const Icon(Icons.copy, size: 16),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
                 onPressed: () {
