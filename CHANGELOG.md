@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.9.0 — Background Stream Resilience & Dynamic Island
+## v2.1.0 — Background Stream Resilience & Dynamic Island
 
 ### New Features
 
