@@ -627,6 +627,22 @@ class ChatProvider extends ChangeNotifier {
               case AgentToolDone():
                 notifyListeners();
 
+              case AgentIterationDone(:final messages):
+                _streamThrottle?.cancel();
+                _streamThrottle = null;
+                streamingText = '';
+                _streamBuffer = StringBuffer();
+                _appendNewAgentMessages(
+                  session,
+                  messages,
+                  _initialApiMsgCount,
+                );
+                _initialApiMsgCount = messages.length;
+                unawaited(_storage.saveSession(session).then((_) {
+                  if (!_disposed) notifyListeners();
+                }));
+                notifyListeners();
+
               case AgentComplete(
                   :final finalText,
                   :final inputTokens,
@@ -639,7 +655,11 @@ class ChatProvider extends ChangeNotifier {
                 agentStatus = AgentStatus.idle;
                 streamingText = '';
                 _appendNewAgentMessages(
-                    session, _agent!.messages, initialApiMsgCount);
+                  session,
+                  _agent!.messages,
+                  _initialApiMsgCount,
+                );
+                _initialApiMsgCount = _agent!.messages.length;
                 // Store token usage on the last assistant message
                 for (int i = session.messages.length - 1; i >= 0; i--) {
                   if (session.messages[i].role == 'assistant') {

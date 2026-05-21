@@ -27,6 +27,11 @@ class AgentToolDone extends AgentEvent {
   AgentToolDone(this.toolUseId, this.output, {this.isError = false});
 }
 
+class AgentIterationDone extends AgentEvent {
+  final List<Map<String, dynamic>> messages;
+  AgentIterationDone(this.messages);
+}
+
 class AgentComplete extends AgentEvent {
   final String finalText;
   final int? inputTokens;
@@ -208,6 +213,7 @@ class AgentService {
         'content': toolResults,
       });
       onMessagesUpdated?.call(messages);
+      yield AgentIterationDone(messages);
     }
   }
 
