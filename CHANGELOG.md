@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.9.0 — Background Stream Resilience & Dynamic Island
+
+### New Features
+
+- **Dynamic Island Overlay** — 后台运行 Agent 时在屏幕顶部显示灵动岛胶囊，实时展示思考/回复/工具执行状态。状态变化时自动向下展开显示预览，3 秒后收缩。点击跳回 App，完成时变为主题蓝色后消失。需悬浮窗权限，拒绝则静默降级为通知
+- **增强前台通知** — Agent 运行时通知栏实时更新状态标题、输出预览（BigTextStyle 展开）、thinking 阶段进度条，并提供"查看"和"停止"操作按钮。原生侧 500ms 节流防止 ANR
+- **Heads-up 完成通知** — Agent 后台完成后弹出横幅卡片通知（IMPORTANCE_HIGH），点击跳转查看回复
+
+### Bug Fixes
+
+- **后台流式请求断连** — 所有 LLM 代理（Mimo、Anthropic、OpenAI 兼容）切后台时 HTTP 连接被代理/系统关闭导致 `Connection closed while receiving data`。添加 HTTP Keep-Alive 头 + 统一重连机制（最多 2 次，指数退避）+ 重连去重（跳过已输出内容避免重复）
+- **后台 Timeout 误触发** — `.timeout(60s)` 在 Dart event loop 被系统挂起时仍然计时，后台超 60 秒必然假超时。改为手动 Timer + `isInBackground` 检查，后台时不触发超时
+
+### Enhancements
+
+- **国产手机悬浮窗适配** — 小米 MIUI / 华为 HarmonyOS 权限跳转 intent 适配，OPPO/vivo 悬浮窗拦截时 try-catch 静默降级
+- **通知停止按钮** — 通知栏"停止"按钮通过 MethodChannel 回调 Dart 侧 `cancelAgent()`，延迟 1 秒再停止服务确保清理完成
+
+---
+
 ## v1.8.6 — Config Repair, Gateway Mode & Node.js Update
 
 ### Bug Fixes
