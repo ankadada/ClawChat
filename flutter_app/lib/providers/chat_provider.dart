@@ -387,11 +387,14 @@ class ChatProvider extends ChangeNotifier {
     _appInBackground = inBackground;
     if (!_appInBackground) {
       _cancelApprovalTimeout();
+      unawaited(NativeBridge.setAgentOverlayVisible(false));
       _resumeActiveAgentStreamAfterForeground();
       if (pendingApproval != null && !_disposed) notifyListeners();
     }
     if (_isSending) {
-      unawaited(NativeBridge.setAgentOverlayVisible(_appInBackground));
+      if (_appInBackground) {
+        unawaited(NativeBridge.setAgentOverlayVisible(true));
+      }
       unawaited(_updateAgentNativeStatus(_statusForAgentServiceText(
         _agentServiceText ?? _agentServiceThinkingText,
       )));
@@ -653,6 +656,8 @@ class ChatProvider extends ChangeNotifier {
                 agentStatus = AgentStatus.error;
                 errorMessage = message;
                 notifyListeners();
+                final c = _agentCompleter;
+                if (c != null && !c.isCompleted) c.complete();
                 unawaited(_stopAgentService());
             }
           },
