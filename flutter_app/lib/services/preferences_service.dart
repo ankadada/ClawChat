@@ -5,6 +5,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/provider_profile.dart';
 
+enum ConflictResolution { merge, replace, skip }
+
 class PreferencesService {
   static const _keyApiKey = 'api_key';
   static const _keyApiFormat = 'api_format';
@@ -566,5 +568,130 @@ class PreferencesService {
     } else {
       _prefs.remove(_keyTtsModel);
     }
+  }
+
+  Map<String, dynamic> exportAllSettings() {
+    return {
+      'activeProfileId': activeProfileId,
+      'systemPrompt': _prefs.getString(_keySystemPrompt),
+      'themeMode': themeMode,
+      'fontScale': fontScale,
+      'contextLength': contextLength,
+      'autoCompact': autoCompact,
+      'agentMaxIterations': agentMaxIterations,
+      'toolApprovalPolicy': toolApprovalPolicy,
+      'notifyOnComplete': notifyOnComplete,
+      'privacyMode': privacyMode,
+      'allowPhoneCall': allowPhoneCall,
+      'allowSms': allowSms,
+      'whisperModel': _prefs.getString(_keyWhisperModel),
+      'ttsModel': _prefs.getString(_keyTtsModel),
+      'temperature': temperature,
+    };
+  }
+
+  void importAllSettings(Map<String, dynamic> settings) {
+    if (settings.containsKey('systemPrompt')) {
+      final value = settings['systemPrompt'];
+      if (value is String) {
+        systemPrompt = value;
+      } else if (value == null) {
+        systemPrompt = null;
+      }
+    }
+    if (settings['themeMode'] is String) {
+      themeMode = settings['themeMode'] as String;
+    }
+    final importedFontScale = _finiteDouble(settings['fontScale']);
+    if (importedFontScale != null) fontScale = importedFontScale;
+
+    final importedContextLength = _intValue(settings['contextLength']);
+    if (importedContextLength != null) contextLength = importedContextLength;
+
+    if (settings['autoCompact'] is bool) {
+      autoCompact = settings['autoCompact'] as bool;
+    }
+    final importedAgentMaxIterations =
+        _intValue(settings['agentMaxIterations']);
+    if (importedAgentMaxIterations != null) {
+      agentMaxIterations = importedAgentMaxIterations;
+    }
+    if (settings['toolApprovalPolicy'] is String) {
+      toolApprovalPolicy = settings['toolApprovalPolicy'] as String;
+    }
+    if (settings['notifyOnComplete'] is bool) {
+      notifyOnComplete = settings['notifyOnComplete'] as bool;
+    }
+    if (settings['privacyMode'] is bool) {
+      privacyMode = settings['privacyMode'] as bool;
+    }
+    if (settings['allowPhoneCall'] is bool) {
+      allowPhoneCall = settings['allowPhoneCall'] as bool;
+    }
+    if (settings['allowSms'] is bool) {
+      allowSms = settings['allowSms'] as bool;
+    }
+    if (settings.containsKey('whisperModel')) {
+      final value = settings['whisperModel'];
+      if (value is String) {
+        whisperModel = value;
+      } else if (value == null) {
+        whisperModel = null;
+      }
+    }
+    if (settings.containsKey('ttsModel')) {
+      final value = settings['ttsModel'];
+      if (value is String) {
+        ttsModel = value;
+      } else if (value == null) {
+        ttsModel = null;
+      }
+    }
+    final importedTemperature = _finiteDouble(settings['temperature']);
+    if (importedTemperature != null) temperature = importedTemperature;
+  }
+
+  Future<({int imported, int skipped})> importProfiles(
+    List<ProviderProfile> importedProfiles,
+    ConflictResolution resolution,
+  ) async {
+    final existing = profiles;
+    final existingIds = existing.map((p) => p.id).toSet();
+    var imported = 0;
+    var skipped = 0;
+
+    switch (resolution) {
+      case ConflictResolution.replace:
+        await setProfiles(importedProfiles);
+        imported = importedProfiles.length;
+      case ConflictResolution.merge:
+      case ConflictResolution.skip:
+        final merged = List<ProviderProfile>.from(existing);
+        for (final profile in importedProfiles) {
+          if (existingIds.contains(profile.id)) {
+            skipped++;
+          } else {
+            merged.add(profile);
+            imported++;
+          }
+        }
+        await setProfiles(merged);
+    }
+
+    return (imported: imported, skipped: skipped);
+  }
+
+  int? _intValue(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.round();
+    return int.tryParse(value?.toString() ?? '');
+  }
+
+  double? _finiteDouble(Object? value) {
+    final parsed = value is num
+        ? value.toDouble()
+        : double.tryParse(value?.toString() ?? '');
+    if (parsed == null || !parsed.isFinite) return null;
+    return parsed;
   }
 }

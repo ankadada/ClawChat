@@ -2565,12 +2565,55 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildMessageQueueBar(
+    ThemeData theme,
+    ChatProvider provider,
+    bool isRunning,
+  ) {
+    final queue = provider.messageQueue;
+    if (queue.isEmpty) return const SizedBox.shrink();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(AppRadii.s),
+        border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.queue, size: 16, color: theme.colorScheme.primary),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              AppStrings.messagesQueued(queue.length),
+              style: theme.textTheme.bodySmall,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (!isRunning)
+            TextButton(
+              onPressed: provider.sendNextQueued,
+              child: const Text(AppStrings.sendQueued),
+            ),
+          IconButton(
+            tooltip: AppStrings.clearMessageQueue,
+            icon: const Icon(Icons.clear_all, size: 18),
+            onPressed: provider.clearMessageQueue,
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildInputArea(ThemeData theme) {
     return Consumer<ChatProvider>(
       builder: (_, provider, __) {
         final isRunning = provider.agentStatus != AgentStatus.idle &&
             provider.agentStatus != AgentStatus.error;
         final isRecording = _isListening || _isWhisperRecording;
+        final queueFull =
+            provider.messageQueue.length >= ChatProvider.maxQueuedMessages;
 
         return Container(
           padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
@@ -2589,6 +2632,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     _buildAttachmentPreviews(theme),
+                    _buildMessageQueueBar(theme, provider, isRunning),
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.end,
                       children: [
@@ -2604,7 +2648,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               foregroundColor:
                                   theme.colorScheme.onSurfaceVariant,
                             ),
-                            onPressed: isRunning ? null : _showAttachOptions,
+                            onPressed: _showAttachOptions,
                           ),
                         ),
                         const SizedBox(width: 8),
@@ -2612,14 +2656,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           child: TextField(
                             controller: _inputController,
                             focusNode: _focusNode,
-                            enabled: !isRunning,
+                            enabled: true,
                             maxLines: 5,
                             minLines: 1,
                             textInputAction: TextInputAction.send,
                             onSubmitted: (_) => _sendMessage(),
                             decoration: InputDecoration(
                               hintText: isRunning
-                                  ? AppStrings.aiProcessing
+                                  ? (queueFull
+                                      ? AppStrings.messageQueueFullHint(
+                                          provider.messageQueue.length,
+                                          ChatProvider.maxQueuedMessages,
+                                        )
+                                      : AppStrings.queueInputHint)
                                   : AppStrings.inputHint,
                               filled: true,
                               fillColor:
@@ -2693,22 +2742,50 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           ),
                         const SizedBox(width: 6),
                         if (isRunning)
-                          SizedBox(
-                            width: 52,
-                            height: 48,
-                            child: IconButton.filled(
-                              onPressed: provider.cancelAgent,
-                              icon: const Icon(Icons.stop),
-                              iconSize: 20,
-                              style: IconButton.styleFrom(
-                                backgroundColor: AppColors.statusRed,
-                                foregroundColor: Colors.white,
-                                shape: RoundedRectangleBorder(
-                                  borderRadius:
-                                      BorderRadius.circular(AppRadii.xl),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                width: 48,
+                                height: 48,
+                                child: IconButton.filled(
+                                  onPressed: provider.cancelAgent,
+                                  icon: const Icon(Icons.stop),
+                                  iconSize: 20,
+                                  style: IconButton.styleFrom(
+                                    backgroundColor: AppColors.statusRed,
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius:
+                                          BorderRadius.circular(AppRadii.xl),
+                                    ),
+                                  ),
                                 ),
                               ),
-                            ),
+                              const SizedBox(width: 6),
+                              SizedBox(
+                                width: 48,
+                                height: 48,
+                                child: IconButton.filled(
+                                  onPressed: queueFull ? null : _sendMessage,
+                                  icon: const Icon(Icons.send),
+                                  iconSize: 20,
+                                  style: IconButton.styleFrom(
+                                    backgroundColor: theme.colorScheme.primary,
+                                    foregroundColor:
+                                        theme.colorScheme.onPrimary,
+                                    disabledBackgroundColor: theme
+                                        .colorScheme.surfaceContainerHighest,
+                                    disabledForegroundColor:
+                                        theme.colorScheme.onSurfaceVariant,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius:
+                                          BorderRadius.circular(AppRadii.xl),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
                           )
                         else
                           SizedBox(

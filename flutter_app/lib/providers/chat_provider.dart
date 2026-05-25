@@ -26,7 +26,22 @@ enum AgentStatus {
   error,
 }
 
+class QueuedMessage {
+  final String id;
+  final String text;
+  final List<MessageContent> attachments;
+  final DateTime queuedAt;
+
+  QueuedMessage({
+    required this.text,
+    this.attachments = const [],
+  })  : id = const Uuid().v4(),
+        queuedAt = DateTime.now();
+}
+
 class ChatProvider extends ChangeNotifier {
+  static const int maxQueuedMessages = 3;
+
   List<SessionSummary> sessions = [];
   ChatSession? currentSession;
   AgentStatus agentStatus = AgentStatus.idle;
@@ -97,17 +112,23 @@ class ChatProvider extends ChangeNotifier {
   bool _partialAgentResponseSaved = false;
   int _initialApiMsgCount = 0;
   bool _agentOverlayPermissionRequestStarted = false;
+  final List<QueuedMessage> _messageQueue = [];
+  bool _wasCancelled = false;
 
   static const _backgroundApprovalTimeout = Duration(seconds: 15);
   static const _agentServiceThinkingText = 'AI 正在思考...';
   static const _agentServiceToolingText = 'AI 正在执行命令...';
   static const _agentServiceStreamingText = 'AI 正在回复...';
 
+  List<QueuedMessage> get messageQueue => List.unmodifiable(_messageQueue);
+
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
 
   void _clearSessionScopedState() {
     _sessionApprovedTools.clear();
     ToolCallExpansionState.clear();
+    _messageQueue.clear();
+    _wasCancelled = false;
   }
 
   Future<void> _startAgentService(String text) async {
@@ -515,11 +536,13 @@ class ChatProvider extends ChangeNotifier {
     final pendingAlternativesForSend = pendingAlternatives == null
         ? null
         : List<String>.from(pendingAlternatives);
-    // Guard against concurrent sends. In single-threaded Dart, the check-then-set
-    // is safe because no other code can run between the check and the assignment
-    // (no preemption between await points). The real protection is that _isSending
-    // is only cleared in the finally block after all awaits complete.
-    if (_isSending) return;
+    // Guard against concurrent sends. Messages entered while the agent is
+    // running are queued and drained FIFO after the current response completes.
+    if (_isSending) {
+      if (trimmedText.isEmpty && attachments.isEmpty) return;
+      _enqueueMessage(trimmedText, attachments);
+      return;
+    }
 
     _pendingAlternatives = null;
     if (trimmedText.isEmpty && attachments.isEmpty) return;
@@ -724,10 +747,12 @@ class ChatProvider extends ChangeNotifier {
     } finally {
       _pendingAlternatives = null;
       _isSending = false;
+      _drainMessageQueue();
     }
   }
 
   void cancelAgent() {
+    _wasCancelled = true;
     _agent?.cancel();
     unawaited(_stopAgentService());
     _completePendingApproval(false);
@@ -743,6 +768,55 @@ class ChatProvider extends ChangeNotifier {
     agentStatus = AgentStatus.idle;
     streamingText = '';
     notifyListeners();
+  }
+
+  void _enqueueMessage(String text, List<MessageContent> attachments) {
+    if (_messageQueue.length >= maxQueuedMessages) {
+      errorMessage = AppStrings.messageQueueFull(maxQueuedMessages);
+      notifyListeners();
+      return;
+    }
+    _messageQueue.add(QueuedMessage(
+      text: text,
+      attachments: List<MessageContent>.from(attachments),
+    ));
+    notifyListeners();
+  }
+
+  void _drainMessageQueue() {
+    if (_messageQueue.isEmpty ||
+        _disposed ||
+        _wasCancelled ||
+        agentStatus == AgentStatus.error) {
+      _wasCancelled = false;
+      return;
+    }
+    final next = _messageQueue.removeAt(0);
+    notifyListeners();
+    Future.microtask(() {
+      if (!_disposed) {
+        sendMessage(next.text, attachments: next.attachments);
+      }
+    });
+  }
+
+  void removeQueuedMessage(String id) {
+    _messageQueue.removeWhere((m) => m.id == id);
+    notifyListeners();
+  }
+
+  void clearMessageQueue() {
+    _messageQueue.clear();
+    _wasCancelled = false;
+    notifyListeners();
+  }
+
+  void sendNextQueued() {
+    if (_isSending || _messageQueue.isEmpty) return;
+    _wasCancelled = false;
+    final next = _messageQueue.removeAt(0);
+    notifyListeners();
+    sendMessage(next.text, attachments: next.attachments);
   }
 
   void _savePartialAgentResponse() {
@@ -777,6 +851,11 @@ class ChatProvider extends ChangeNotifier {
   List<String>? _pendingAlternatives;
 
   Future<void> regenerateLastResponse() async {
+    if (_messageQueue.isNotEmpty) {
+      errorMessage = AppStrings.clearQueueBeforeRegenerate;
+      notifyListeners();
+      return;
+    }
     if (currentSession == null || _isSending) return;
     final messages = currentSession!.messages;
 

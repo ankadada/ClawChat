@@ -4,8 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
-import '../app.dart' show AppRadii, themeNotifier, fontScaleNotifier;
+import '../app.dart' show AppColors, AppRadii, fontScaleNotifier, themeNotifier;
 import '../constants.dart';
+import '../services/config_export_service.dart';
 import '../services/memory_service.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
@@ -774,6 +775,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       trailing: const Icon(Icons.chevron_right),
                       onTap: _importConversations,
                     ),
+                    ListTile(
+                      title: const Text(AppStrings.exportConfig),
+                      subtitle: const Text(AppStrings.exportConfigSubtitle),
+                      leading: const Icon(Icons.upload_file),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: _exportConfig,
+                    ),
+                    ListTile(
+                      title: const Text(AppStrings.importConfig),
+                      subtitle: const Text(AppStrings.importConfigSubtitle),
+                      leading: const Icon(Icons.download),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: _importConfig,
+                    ),
                     _settingsDivider(theme),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -1178,6 +1193,359 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _exportConfig() async {
+    try {
+      final options = await _showExportConfigDialog();
+      if (options == null) return;
+
+      if (!options.encrypt) {
+        if (!mounted) return;
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text(AppStrings.exportConfigWithoutEncryption),
+            content: const Text(AppStrings.exportConfigPlainWarning),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text(AppStrings.cancel),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.statusRed,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text(AppStrings.confirm),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true) return;
+      }
+
+      final jsonStr = await ConfigExportService.exportConfig(
+        password: options.encrypt ? options.password : null,
+      );
+      final date = DateTime.now().toIso8601String().split('T').first;
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: AppStrings.exportConfig,
+        fileName: 'clawchat-config-$date.json',
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+      );
+      if (path == null || path.isEmpty) return;
+
+      await File(path).writeAsString(jsonStr);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text(AppStrings.configExported)),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${AppStrings.exportConfigFailed}: $e')),
+        );
+      }
+    }
+  }
+
+  Future<_ConfigExportOptions?> _showExportConfigDialog() {
+    var encrypt = true;
+    final passwordController = TextEditingController();
+    final confirmController = TextEditingController();
+    return showDialog<_ConfigExportOptions>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text(AppStrings.exportConfig),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text(AppStrings.encryptSecrets),
+                  subtitle: const Text(AppStrings.encryptSecretsSubtitle),
+                  value: encrypt,
+                  onChanged: (value) => setDialogState(() => encrypt = value),
+                ),
+                if (encrypt) ...[
+                  TextField(
+                    controller: passwordController,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.setPassword,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: confirmController,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.confirmPassword,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel),
+            ),
+            FilledButton(
+              onPressed: () {
+                final password = passwordController.text;
+                if (encrypt) {
+                  if (password.isEmpty) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                          content: Text(AppStrings.passwordRequired)),
+                    );
+                    return;
+                  }
+                  if (password != confirmController.text) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                          content: Text(AppStrings.passwordMismatch)),
+                    );
+                    return;
+                  }
+                }
+                Navigator.pop(
+                  ctx,
+                  _ConfigExportOptions(
+                    encrypt: encrypt,
+                    password: password,
+                  ),
+                );
+              },
+              child: const Text(AppStrings.exportConfig),
+            ),
+          ],
+        ),
+      ),
+    ).whenComplete(() {
+      passwordController.dispose();
+      confirmController.dispose();
+    });
+  }
+
+  Future<void> _importConfig() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+      );
+      if (result == null || result.files.isEmpty) return;
+      final path = result.files.single.path;
+      if (path == null) return;
+
+      final jsonStr = await File(path).readAsString();
+      final preview = ConfigExportService.previewImport(jsonStr);
+      final options = await _showImportConfigDialog(preview);
+      if (options == null) return;
+
+      final importResult = await ConfigExportService.importConfig(
+        jsonStr,
+        password: options.password,
+        conflictResolution: options.resolution,
+      );
+      await _prefs.init();
+      await _loadSettings();
+      themeNotifier.value = switch (_prefs.themeMode) {
+        'light' => ThemeMode.light,
+        'dark' => ThemeMode.dark,
+        _ => ThemeMode.system,
+      };
+      fontScaleNotifier.value = _prefs.fontScale;
+
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text(AppStrings.importConfigComplete),
+          content: Text(AppStrings.configImportSummary(
+            importResult.profilesImported,
+            importResult.envVarsImported,
+            importResult.profilesSkipped,
+          )),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.confirm),
+            ),
+          ],
+        ),
+      );
+    } on FormatException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text('${AppStrings.invalidConfigFile}: ${e.message}')),
+        );
+      }
+    } on StateError catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message)),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${AppStrings.importConfigFailed}: $e')),
+        );
+      }
+    }
+  }
+
+  Future<_ConfigImportOptions?> _showImportConfigDialog(
+    ConfigImportPreview preview,
+  ) {
+    var resolution = ConflictResolution.merge;
+    final passwordController = TextEditingController();
+    return showDialog<_ConfigImportOptions>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text(AppStrings.importConfigPreview),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _previewLine(
+                  AppStrings.configVersion,
+                  'v${preview.version}',
+                ),
+                _previewLine(
+                  AppStrings.configExportedAt,
+                  preview.exportedAt?.toLocal().toString().split('.').first ??
+                      AppStrings.unknown,
+                ),
+                _previewLine(
+                  AppStrings.configEncrypted,
+                  preview.isEncrypted ? AppStrings.yes : AppStrings.no,
+                ),
+                _previewLine(
+                  AppStrings.providerProfiles,
+                  preview.profileCount >= 0
+                      ? '${preview.profileCount}'
+                      : AppStrings.encryptedPreviewHidden,
+                ),
+                _previewLine(
+                  AppStrings.envVars,
+                  preview.envVarCount >= 0
+                      ? '${preview.envVarCount}'
+                      : AppStrings.encryptedPreviewHidden,
+                ),
+                _previewLine(
+                  AppStrings.settings,
+                  preview.hasSettings ? AppStrings.yes : AppStrings.no,
+                ),
+                if (preview.isEncrypted) ...[
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: passwordController,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.password,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 12),
+                Text(
+                  AppStrings.conflictResolution,
+                  style: Theme.of(ctx).textTheme.titleSmall,
+                ),
+                RadioListTile<ConflictResolution>(
+                  contentPadding: EdgeInsets.zero,
+                  value: ConflictResolution.merge,
+                  groupValue: resolution,
+                  title: const Text(AppStrings.conflictMerge),
+                  onChanged: (value) {
+                    if (value != null) {
+                      setDialogState(() => resolution = value);
+                    }
+                  },
+                ),
+                RadioListTile<ConflictResolution>(
+                  contentPadding: EdgeInsets.zero,
+                  value: ConflictResolution.replace,
+                  groupValue: resolution,
+                  title: const Text(AppStrings.conflictReplace),
+                  onChanged: (value) {
+                    if (value != null) {
+                      setDialogState(() => resolution = value);
+                    }
+                  },
+                ),
+                RadioListTile<ConflictResolution>(
+                  contentPadding: EdgeInsets.zero,
+                  value: ConflictResolution.skip,
+                  groupValue: resolution,
+                  title: const Text(AppStrings.conflictSkip),
+                  onChanged: (value) {
+                    if (value != null) {
+                      setDialogState(() => resolution = value);
+                    }
+                  },
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (preview.isEncrypted && passwordController.text.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text(AppStrings.passwordRequired)),
+                  );
+                  return;
+                }
+                Navigator.pop(
+                  ctx,
+                  _ConfigImportOptions(
+                    password: passwordController.text,
+                    resolution: resolution,
+                  ),
+                );
+              },
+              child: const Text(AppStrings.importConfig),
+            ),
+          ],
+        ),
+      ),
+    ).whenComplete(passwordController.dispose);
+  }
+
+  Widget _previewLine(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 92,
+            child: Text(
+              label,
+              style: TextStyle(color: Theme.of(context).hintColor),
+            ),
+          ),
+          Expanded(child: Text(value)),
+        ],
+      ),
+    );
+  }
+
   Future<void> _addMemory() async {
     final controller = TextEditingController();
     final result = await showDialog<String>(
@@ -1227,4 +1595,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _ttsModelController.dispose();
     super.dispose();
   }
+}
+
+class _ConfigExportOptions {
+  final bool encrypt;
+  final String password;
+
+  const _ConfigExportOptions({
+    required this.encrypt,
+    required this.password,
+  });
+}
+
+class _ConfigImportOptions {
+  final String password;
+  final ConflictResolution resolution;
+
+  const _ConfigImportOptions({
+    required this.password,
+    required this.resolution,
+  });
 }

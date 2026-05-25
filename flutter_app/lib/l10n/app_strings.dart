@@ -34,6 +34,12 @@ class AppStrings {
   static const open = 'Open';
   static const renderError = '渲染错误';
   static const searchSources = '搜索来源';
+  static const yes = '是';
+  static const no = '否';
+  static const unknown = '未知';
+  static const password = '密码';
+  static const passwordRequired = '请输入密码';
+  static const passwordMismatch = '两次输入的密码不一致';
 
   // ── Chat screen ──────────────────────────────────────────────────
   static const newChat = '新对话';
@@ -53,6 +59,14 @@ class AppStrings {
   static const userLabel = '你';
   static const aiLabel = 'AI';
   static const aiProcessing = 'AI 正在处理...';
+  static const queueInputHint = '输入消息加入队列...';
+  static String messageQueueFullHint(int current, int max) =>
+      '队列已满 ($current/$max)';
+  static String messageQueueFull(int max) => '消息队列已满（最多 $max 条）';
+  static String messagesQueued(int count) => '$count 条消息排队中';
+  static const sendQueued = '发送';
+  static const clearMessageQueue = '清空队列';
+  static const clearQueueBeforeRegenerate = '请先清空消息队列再重新生成';
   static String contextCompactedNotice(int retainedCount) =>
       '对话上下文已压缩（保留最近 $retainedCount 条消息）';
   static const inputHint = '输入消息...';
@@ -412,6 +426,33 @@ class AppStrings {
   static const importConversations = '导入对话';
   static const exportSuccess = '已导出到剪贴板';
   static String importSuccess(int count) => '成功导入 $count 个对话';
+  static const exportConfig = '导出配置';
+  static const exportConfigSubtitle = '备份 API 密钥、环境变量、应用设置';
+  static const importConfig = '导入配置';
+  static const importConfigSubtitle = '从备份文件恢复配置';
+  static const encryptSecrets = '加密敏感信息';
+  static const encryptSecretsSubtitle = '使用密码加密 API 密钥和环境变量';
+  static const setPassword = '设置密码';
+  static const confirmPassword = '确认密码';
+  static const exportConfigWithoutEncryption = '不加密导出？';
+  static const exportConfigPlainWarning =
+      '导出文件将包含你的 API 密钥和环境变量明文，请妥善保管。确定不加密？';
+  static const configExported = '配置已导出';
+  static const exportConfigFailed = '导出配置失败';
+  static const importConfigPreview = '导入预览';
+  static const configVersion = '版本';
+  static const configExportedAt = '导出时间';
+  static const configEncrypted = '已加密';
+  static const encryptedPreviewHidden = '加密文件，导入后可查看';
+  static const conflictResolution = '冲突处理';
+  static const conflictMerge = '合并（新增不覆盖）';
+  static const conflictReplace = '覆盖（全部替换）';
+  static const conflictSkip = '跳过已有';
+  static const importConfigComplete = '配置导入完成';
+  static String configImportSummary(int profiles, int envVars, int skipped) =>
+      '导入了 $profiles 个配置文件，$envVars 个环境变量，跳过 $skipped 个已有配置。';
+  static const invalidConfigFile = '无效的配置文件格式';
+  static const importConfigFailed = '导入配置失败';
   // importFailed is already defined in the Skills section above
 
   // ── Folder / grouping ─────────────────────────────────────────────
