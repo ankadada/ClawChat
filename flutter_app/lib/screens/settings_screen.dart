@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1272,15 +1274,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
         password: options.encrypt ? options.password : null,
       );
       final date = DateTime.now().toIso8601String().split('T').first;
+      final bytes = utf8.encode(jsonStr);
       final path = await FilePicker.platform.saveFile(
         dialogTitle: AppStrings.exportConfig,
         fileName: 'clawchat-config-$date.json',
         type: FileType.custom,
         allowedExtensions: ['json'],
+        bytes: Uint8List.fromList(bytes),
       );
       if (path == null || path.isEmpty) return;
-
-      await File(path).writeAsString(jsonStr);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text(AppStrings.configExported)),
