@@ -2599,7 +2599,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           IconButton(
             tooltip: AppStrings.clearMessageQueue,
             icon: const Icon(Icons.clear_all, size: 18),
-            onPressed: provider.clearMessageQueue,
+            onPressed: () {
+              provider.clearMessageQueue();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(AppStrings.messageQueueCleared),
+                  duration: Duration(seconds: 1),
+                ),
+              );
+            },
           ),
         ],
       ),

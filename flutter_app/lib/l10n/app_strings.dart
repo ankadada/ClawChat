@@ -66,6 +66,7 @@ class AppStrings {
   static String messagesQueued(int count) => '$count 条消息排队中';
   static const sendQueued = '发送';
   static const clearMessageQueue = '清空队列';
+  static const messageQueueCleared = '队列已清空';
   static const clearQueueBeforeRegenerate = '请先清空消息队列再重新生成';
   static String contextCompactedNotice(int retainedCount) =>
       '对话上下文已压缩（保留最近 $retainedCount 条消息）';
