@@ -504,11 +504,11 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
             timeLabel: _formatTime(session.updatedAt),
             matchPreview: searchResult?.matchPreview,
           ),
-          leading: Icon(
-            Icons.chat_bubble_outline,
-            color: isSelected
-                ? theme.colorScheme.primary
-                : theme.colorScheme.onSurfaceVariant,
+          leading: _buildSessionIcon(
+            theme,
+            provider,
+            session.id,
+            isSelected: isSelected,
           ),
           trailing: PopupMenuButton<String>(
             tooltip: AppStrings.more,
@@ -562,6 +562,56 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
         ),
       ),
     );
+  }
+
+  Widget _buildSessionIcon(
+    ThemeData theme,
+    ChatProvider provider,
+    String sessionId, {
+    required bool isSelected,
+  }) {
+    final status = provider.agentStatusFor(sessionId);
+    final iconColor = isSelected
+        ? theme.colorScheme.primary
+        : theme.colorScheme.onSurfaceVariant;
+
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Icon(
+          Icons.chat_bubble_outline,
+          size: 20,
+          color: iconColor,
+        ),
+        if (status != AgentStatus.idle)
+          Positioned(
+            right: -3,
+            bottom: -3,
+            child: Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                color: _statusColor(status, theme),
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: theme.scaffoldBackgroundColor,
+                  width: 1.5,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Color _statusColor(AgentStatus status, ThemeData theme) {
+    return switch (status) {
+      AgentStatus.thinking => theme.colorScheme.primary,
+      AgentStatus.streaming => theme.colorScheme.primary,
+      AgentStatus.tooling => Colors.amber,
+      AgentStatus.error => theme.colorScheme.error,
+      AgentStatus.idle => Colors.transparent,
+    };
   }
 
   void _showSessionOptions(BuildContext context, SessionSummary session, ChatProvider provider) {
