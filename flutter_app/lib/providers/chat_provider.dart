@@ -293,6 +293,24 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
+  void _clearIdleLlmCaches() {
+    for (final state in _agentStates.values) {
+      if (state.isSending) continue;
+      state.cachedLlm?.dispose();
+      state.cachedLlm = null;
+      state.cachedLlmConfig = null;
+    }
+  }
+
+  void _cleanupIdleState(String sessionId) {
+    final state = _agentStates[sessionId];
+    if (state == null || state.isSending) return;
+    if (state.messageQueue.isNotEmpty) return;
+    if (state.status == AgentStatus.error) return;
+    state.dispose();
+    _agentStates.remove(sessionId);
+  }
+
   String _completionNotificationPreview(String text) {
     final normalized = text.replaceAll(RegExp(r'\s+'), ' ').trim();
     return String.fromCharCodes(normalized.runes.take(50));
@@ -335,6 +353,7 @@ class ChatProvider extends ChangeNotifier {
         completer.complete();
       }
       state.agentCompletionFinalizing = false;
+      Future.microtask(() => _cleanupIdleState(state.sessionId));
     }
   }
 
@@ -350,6 +369,9 @@ class ChatProvider extends ChangeNotifier {
     NativeBridge.setAgentStopRequestedHandler(
       ({String? sessionId}) => cancelAgent(sessionId: sessionId),
     );
+    NativeBridge.setNavigateToSessionHandler((sessionId) {
+      unawaited(selectSession(sessionId));
+    });
     _tools = ToolRegistry.withDefaults(prefs: _prefs);
     _init();
   }
@@ -358,6 +380,7 @@ class ChatProvider extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     NativeBridge.setAgentStopRequestedHandler(null);
+    NativeBridge.setNavigateToSessionHandler(null);
     unawaited(_stopAgentService());
     _completePendingApproval(false);
     for (final state in _agentStates.values) {
@@ -465,13 +488,18 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> clearAllSessions() async {
-    await _storage.clearAll();
-    sessions.clear();
-    currentSession = null;
+    for (final id in _agentStates.keys.toList()) {
+      if (_agentStates[id]?.isSending ?? false) {
+        cancelAgent(sessionId: id, savePartial: false);
+      }
+    }
     for (final state in _agentStates.values) {
       state.dispose();
     }
     _agentStates.clear();
+    await _storage.clearAll();
+    sessions.clear();
+    currentSession = null;
     _clearSessionScopedState();
     notifyListeners();
   }
@@ -947,6 +975,7 @@ class ChatProvider extends ChangeNotifier {
       if (state != null) {
         state.pendingAlternatives = null;
         state.isSending = false;
+        notifyListeners();
         _drainMessageQueue(state);
       }
     }
@@ -1003,12 +1032,27 @@ class ChatProvider extends ChangeNotifier {
         state.wasCancelled ||
         state.status == AgentStatus.error) {
       state.wasCancelled = false;
+      _cleanupIdleState(state.sessionId);
       return;
     }
-    final next = state.messageQueue.removeAt(0);
+    final next = state.messageQueue.first;
     notifyListeners();
     Future.delayed(const Duration(seconds: 1), () {
       if (!_disposed && !state.wasCancelled) {
+        final activeCount = _activeAgentStates.length;
+        if (activeCount >= maxConcurrentAgents) {
+          notifyListeners();
+          return;
+        }
+        if (state.messageQueue.isEmpty ||
+            state.messageQueue.first.id != next.id) {
+          if (state.messageQueue.isEmpty) {
+            _cleanupIdleState(state.sessionId);
+          }
+          return;
+        }
+        state.messageQueue.removeAt(0);
+        notifyListeners();
         sendMessage(
           next.text,
           attachments: next.attachments,
@@ -1022,6 +1066,7 @@ class ChatProvider extends ChangeNotifier {
     final state = _getState(currentSession?.id);
     if (state == null) return;
     state.messageQueue.removeWhere((m) => m.id == id);
+    _cleanupIdleState(state.sessionId);
     notifyListeners();
   }
 
@@ -1030,6 +1075,7 @@ class ChatProvider extends ChangeNotifier {
     if (state == null) return;
     state.messageQueue.clear();
     state.wasCancelled = false;
+    _cleanupIdleState(state.sessionId);
     notifyListeners();
   }
 
@@ -1361,11 +1407,7 @@ class ChatProvider extends ChangeNotifier {
     currentSession!.baseUrlOverride = baseUrl;
     currentSession!.apiFormatOverride = apiFormat;
     await _storage.saveSession(currentSession!);
-    for (final state in _agentStates.values) {
-      state.cachedLlm?.dispose();
-      state.cachedLlm = null;
-      state.cachedLlmConfig = null;
-    }
+    _clearIdleLlmCaches();
     notifyListeners();
   }
 
@@ -1373,11 +1415,7 @@ class ChatProvider extends ChangeNotifier {
     await _ensurePrefs();
     await _prefs.setActiveProfileId(profileId);
     LlmService.clearTokenKeyOverrides();
-    for (final state in _agentStates.values) {
-      state.cachedLlm?.dispose();
-      state.cachedLlm = null;
-      state.cachedLlmConfig = null;
-    }
+    _clearIdleLlmCaches();
     notifyListeners();
   }
 

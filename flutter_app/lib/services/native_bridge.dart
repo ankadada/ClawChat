@@ -13,12 +13,31 @@ class NativeBridge {
   static const _agentCallbackChannel =
       MethodChannel('${AppConstants.channelName}/agent_callbacks');
   static void Function({String? sessionId})? _agentStopRequestedHandler;
+  static void Function(String sessionId)? _navigateToSessionHandler;
   static bool _agentCallbackInitialized = false;
 
   static void setAgentStopRequestedHandler(
     void Function({String? sessionId})? handler,
   ) {
     _agentStopRequestedHandler = handler;
+    _ensureAgentCallbackHandler();
+  }
+
+  static void setNavigateToSessionHandler(
+    void Function(String sessionId)? handler,
+  ) {
+    _navigateToSessionHandler = handler;
+    _ensureAgentCallbackHandler();
+    if (handler != null) {
+      consumePendingNavigateToSession().then((sessionId) {
+        if (sessionId != null && sessionId.isNotEmpty) {
+          _navigateToSessionHandler?.call(sessionId);
+        }
+      });
+    }
+  }
+
+  static void _ensureAgentCallbackHandler() {
     if (_agentCallbackInitialized) return;
     _agentCallbackInitialized = true;
     _agentCallbackChannel.setMethodCallHandler((call) async {
@@ -26,6 +45,12 @@ class NativeBridge {
         final args = call.arguments;
         final sessionId = args is Map ? args['sessionId'] as String? : null;
         _agentStopRequestedHandler?.call(sessionId: sessionId);
+      } else if (call.method == 'navigateToSession') {
+        final args = call.arguments;
+        final sessionId = args is Map ? args['sessionId'] as String? : null;
+        if (sessionId != null && sessionId.isNotEmpty) {
+          _navigateToSessionHandler?.call(sessionId);
+        }
       }
     });
   }
@@ -48,6 +73,10 @@ class NativeBridge {
 
   static Future<bool> isBootstrapComplete() async {
     return (await _channel.invokeMethod<bool>('isBootstrapComplete'))!;
+  }
+
+  static Future<String?> consumePendingNavigateToSession() async {
+    return _channel.invokeMethod<String>('consumePendingNavigateToSession');
   }
 
   static Future<Map<String, dynamic>> getBootstrapStatus() async {

@@ -122,6 +122,7 @@ class AgentTaskService : Service() {
             }
             val manager = context.getSystemService(NotificationManager::class.java)
             manager.cancel(notificationIdFor(sessionId))
+            manager.cancel(SUMMARY_NOTIFICATION_ID)
         }
 
         fun showCompletionNotification(

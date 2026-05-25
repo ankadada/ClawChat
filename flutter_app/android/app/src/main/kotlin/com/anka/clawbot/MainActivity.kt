@@ -38,6 +38,7 @@ class MainActivity : FlutterActivity() {
     private var pendingSpeechResult: MethodChannel.Result? = null
     private var mediaRecorder: MediaRecorder? = null
     private var recordingPath: String? = null
+    private var pendingNavigateToSessionId: String? = null
     private var mediaPlayer: MediaPlayer? = null
 
     private fun safeRunOnUiThread(action: () -> Unit) {
@@ -627,6 +628,10 @@ class MainActivity : FlutterActivity() {
                         result.error("FOREGROUND_ERROR", e.message, null)
                     }
                 }
+                "consumePendingNavigateToSession" -> {
+                    result.success(pendingNavigateToSessionId)
+                    pendingNavigateToSessionId = null
+                }
                 else -> result.notImplemented()
             }
         }
@@ -637,6 +642,36 @@ class MainActivity : FlutterActivity() {
         createNotificationChannel()
         createAgentCompleteNotificationChannel()
         requestNotificationPermission()
+        handleNavigateToSession(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNavigateToSession(intent)
+    }
+
+    private fun handleNavigateToSession(intent: Intent?) {
+        val sessionId = intent?.getStringExtra("navigateToSession") ?: return
+        pendingNavigateToSessionId = sessionId
+        val messenger = flutterEngine?.dartExecutor?.binaryMessenger ?: return
+        MethodChannel(messenger, AGENT_CALLBACK_CHANNEL).invokeMethod(
+            "navigateToSession",
+            mapOf("sessionId" to sessionId),
+            object : MethodChannel.Result {
+                override fun success(result: Any?) {
+                    if (pendingNavigateToSessionId == sessionId) {
+                        pendingNavigateToSessionId = null
+                    }
+                }
+
+                override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                }
+
+                override fun notImplemented() {
+                }
+            }
+        )
     }
 
     private fun requestNotificationPermission() {
