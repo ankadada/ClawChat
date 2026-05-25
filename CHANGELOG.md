@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.3.0 — Multi-Session Parallel AI
+
+### New Features
+
+- **多会话并行 Agent** — 多个 chat session 可同时运行 AI agent，每个 session 独立维护发送状态、streaming 文本、队列、LLM client 与错误状态
+- **每会话通知** — Android 前台服务通知按 session 独立显示状态和预览，多任务时自动分组并显示 summary；通知栏停止按钮只取消对应 session
+- **灵动岛轮播** — 后台多个 agent 同时运行时，悬浮窗灵动岛每 3 秒轮播不同 session 的状态；单 session 时保持原有无编号展示
+- **Session 状态指示** — 会话列表显示 agent 运行状态 badge，便于快速识别正在思考、回复、执行工具或出错的会话
+
+### Bug Fixes
+
+- **删除运行中会话** — 删除 session 前会先取消该 session 的 agent 并清理状态，避免残留通知或后台任务
+- **并发工具授权** — 非当前 session 的工具授权按后台任务处理，不会抢占当前会话的授权弹窗
+- **环境变量修改提示** — 有 agent 运行时修改环境变量会提示“下次启动 Agent 时生效”
+
+---
+
 ## v2.2.0 — Message Queue, Config Backup & Agent UX
 
 ### New Features

@@ -371,6 +371,7 @@ class AppStrings {
 
   // ── Environment Variables (additional) ─────────────────────────────
   static const noEnvVars = '暂无环境变量';
+  static const envVarsAgentRunningNotice = '修改将在下次启动 Agent 时生效';
 
   // ── Preset skills ──────────────────────────────────────────────────
   static String presetSkillsInstalled(int count) => '已安装 $count 个预设技能';

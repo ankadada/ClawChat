@@ -422,9 +422,13 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> deleteSession(String id) async {
+    final state = _agentStates[id];
+    if (state != null && state.isSending) {
+      cancelAgent(sessionId: id, savePartial: false);
+    }
+    _agentStates.remove(id)?.dispose();
     await _storage.deleteSession(id);
     sessions.removeWhere((s) => s.id == id);
-    _agentStates.remove(id)?.dispose();
     if (currentSession?.id == id) {
       currentSession = null;
       _clearSessionScopedState();
@@ -485,6 +489,10 @@ class ChatProvider extends ChangeNotifier {
     if (policy == PreferencesService.toolApprovalSessionFirst &&
         state.sessionApprovedTools.contains(request.toolName)) {
       return true;
+    }
+    if (state.sessionId != currentSession?.id) {
+      await Future.delayed(_backgroundApprovalTimeout);
+      return !_disposed;
     }
 
     _completePendingApproval(false, notify: false);
@@ -944,7 +952,7 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
-  void cancelAgent({String? sessionId}) {
+  void cancelAgent({String? sessionId, bool savePartial = true}) {
     final id = sessionId ?? currentSession?.id;
     if (id == null) return;
     final state = _agentStates[id];
@@ -960,7 +968,9 @@ class ChatProvider extends ChangeNotifier {
     state.agentSubscription = null;
     state.streamThrottle?.cancel();
     state.streamThrottle = null;
-    _savePartialAgentResponse(state);
+    if (savePartial) {
+      _savePartialAgentResponse(state);
+    }
     state.streamBuffer = StringBuffer();
     if (state.agentCompleter != null && !state.agentCompleter!.isCompleted) {
       state.agentCompleter!.complete();

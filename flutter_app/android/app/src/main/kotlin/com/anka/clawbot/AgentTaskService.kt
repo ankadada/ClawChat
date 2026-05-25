@@ -19,6 +19,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -558,8 +559,8 @@ class AgentTaskService : Service() {
     }
 
     private fun updateOverlay() {
-        val state = overlaySessionId?.let { activeSessions[it] } ?: activeSessions.values.lastOrNull()
-        if (!overlayShouldBeVisible || state == null || state.status == "error") {
+        val activeList = activeSessions.values.filter { it.status != "error" }
+        if (!overlayShouldBeVisible || activeList.isEmpty()) {
             hideOverlay()
             return
         }
@@ -571,7 +572,7 @@ class AgentTaskService : Service() {
             if (overlay == null) {
                 overlay = AgentIslandOverlay(this)
             }
-            overlay?.showOrUpdate(state.status, statusTitle(state), compactPreview(state, 140))
+            overlay?.showOrUpdate(activeList)
         } catch (e: Exception) {
             Log.w("ClawChat", "Agent overlay update failed", e)
             hideOverlay()
@@ -627,11 +628,17 @@ class AgentTaskService : Service() {
         private var added = false
         private var expanded = false
         private var lastStatus: String? = null
+        private var currentStatus: String? = null
         private var breathing: ObjectAnimator? = null
+        private var carouselIndex = 0
+        private var carouselTimer: Runnable? = null
+        private var collapseTimer: Runnable? = null
+        private var currentSessions: List<AgentSessionNotification> = emptyList()
 
         private val islandWidth = dp(200)
         private val collapsedHeight = dp(36)
         private val collapsedCornerRadius = dp(18).toFloat()
+        private val carouselIntervalMs = 3000L
 
         init {
             root.orientation = LinearLayout.VERTICAL
@@ -649,12 +656,14 @@ class AgentTaskService : Service() {
             titleView.textSize = 13f
             titleView.typeface = Typeface.DEFAULT_BOLD
             titleView.maxLines = 1
+            titleView.ellipsize = TextUtils.TruncateAt.END
             titleView.gravity = Gravity.CENTER_VERTICAL
             headerRow.addView(
                 titleView,
                 LinearLayout.LayoutParams(
+                    0,
                     LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
+                    1f
                 ).apply {
                     leftMargin = dp(8)
                 }
@@ -682,39 +691,67 @@ class AgentTaskService : Service() {
             )
 
             root.setOnClickListener {
-                openApp()
+                val sessions = currentSessions
+                if (sessions.isNotEmpty()) {
+                    val current = sessions[carouselIndex % sessions.size]
+                    openApp(current.sessionId)
+                } else {
+                    openApp()
+                }
             }
         }
 
-        fun showOrUpdate(status: String, title: String, preview: String) {
-            val statusChanged = lastStatus != status
-            lastStatus = status
-            titleView.text = compactTitle(status, title)
-            previewView.text = preview
-            progress.visibility = if (status == "complete") View.GONE else View.VISIBLE
+        fun showOrUpdate(sessions: List<AgentSessionNotification>) {
+            if (sessions.isEmpty()) {
+                hide()
+                return
+            }
+            currentSessions = sessions
+            if (carouselIndex >= currentSessions.size) carouselIndex = 0
+            val current = currentSessions[carouselIndex]
+            val statusKey = "${current.sessionId}:${current.status}"
+            val statusChanged = lastStatus != statusKey
+            lastStatus = statusKey
+            currentStatus = current.status
+            val indicator = if (currentSessions.size > 1) {
+                "[${carouselIndex + 1}/${currentSessions.size}] "
+            } else {
+                ""
+            }
+            titleView.text = indicator + compactTitle(current.status, current.sessionTitle)
+            previewView.text = current.preview
+            progress.visibility = if (current.status == "complete") View.GONE else View.VISIBLE
             headerRow.gravity = if (expanded) Gravity.CENTER_VERTICAL else Gravity.CENTER
             root.background = roundedBackground(
-                if (status == "complete") Color.rgb(37, 99, 235)
+                if (current.status == "complete") Color.rgb(37, 99, 235)
                 else Color.BLACK,
                 if (expanded) dp(22).toFloat() else collapsedCornerRadius
             )
             if (!added) add()
-            updateAnimation(status)
-            if (status == "complete") {
+            updateAnimation(current.status)
+            if (current.status == "complete") {
                 expand()
-                handler.postDelayed({ hide() }, 2000)
-            } else if (statusChanged && preview.isNotBlank()) {
+                if (currentSessions.size == 1) {
+                    handler.postDelayed({ hide() }, 2000)
+                }
+            } else if (statusChanged && current.preview.isNotBlank()) {
                 expand()
             }
+            scheduleCarousel()
         }
 
         fun hide() {
             handler.removeCallbacksAndMessages(null)
+            carouselTimer = null
+            collapseTimer = null
+            carouselIndex = 0
+            currentSessions = emptyList()
             breathing?.cancel()
             breathing = null
             previewView.animate().cancel()
             expanded = false
             lastStatus = null
+            currentStatus = null
             previewView.visibility = View.GONE
             headerRow.gravity = Gravity.CENTER
             root.setPadding(dp(14), dp(7), dp(14), dp(7))
@@ -760,12 +797,14 @@ class AgentTaskService : Service() {
             previewView.visibility = View.VISIBLE
             root.setPadding(dp(18), dp(12), dp(18), dp(14))
             root.background = roundedBackground(
-                if (lastStatus == "complete") Color.rgb(37, 99, 235) else Color.BLACK,
+                if (currentStatus == "complete") Color.rgb(37, 99, 235) else Color.BLACK,
                 dp(22).toFloat()
             )
-            handler.removeCallbacksAndMessages(null)
+            collapseTimer?.let { handler.removeCallbacks(it) }
             previewView.animate().alpha(1f).setDuration(200).start()
-            handler.postDelayed({ collapse() }, 3000)
+            val runnable = Runnable { collapse() }
+            collapseTimer = runnable
+            handler.postDelayed(runnable, carouselIntervalMs)
         }
 
         private fun collapse() {
@@ -776,7 +815,7 @@ class AgentTaskService : Service() {
                 headerRow.gravity = Gravity.CENTER
                 root.setPadding(dp(14), dp(7), dp(14), dp(7))
                 root.background = roundedBackground(
-                    if (lastStatus == "complete") Color.rgb(37, 99, 235) else Color.BLACK,
+                    if (currentStatus == "complete") Color.rgb(37, 99, 235) else Color.BLACK,
                     collapsedCornerRadius
                 )
                 layoutParams?.let {
@@ -804,18 +843,37 @@ class AgentTaskService : Service() {
         }
 
         private fun compactTitle(status: String, title: String): String {
-            return when (status) {
+            val sessionTitle = title.ifBlank { "ClawChat" }
+            val suffix = when (status) {
                 "thinking" -> "思考中..."
                 "streaming" -> "回复中..."
-                "tooling" -> title.replace("AI 正在", "")
+                "tooling" -> "工具中..."
                 "complete" -> "完成"
-                else -> title
+                else -> "运行中..."
             }
+            return "$sessionTitle $suffix"
         }
 
-        private fun openApp() {
+        private fun scheduleCarousel() {
+            carouselTimer?.let { handler.removeCallbacks(it) }
+            carouselTimer = null
+            if (currentSessions.size <= 1 || !added) return
+            val runnable = Runnable {
+                if (currentSessions.isNotEmpty()) {
+                    carouselIndex = (carouselIndex + 1) % currentSessions.size
+                    showOrUpdate(currentSessions)
+                }
+            }
+            carouselTimer = runnable
+            handler.postDelayed(runnable, carouselIntervalMs)
+        }
+
+        private fun openApp(sessionId: String? = null) {
             val intent = Intent(context, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                if (sessionId != null) {
+                    putExtra("navigateToSession", sessionId)
+                }
             }
             context.startActivity(intent)
         }

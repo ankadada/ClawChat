@@ -3,6 +3,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../app.dart' show AppColors, AppRadii, fontScaleNotifier, themeNotifier;
 import '../constants.dart';
@@ -13,6 +14,7 @@ import '../services/preferences_service.dart';
 import '../services/session_storage.dart';
 import '../services/skill_service.dart';
 import '../services/tts_service.dart';
+import '../providers/chat_provider.dart';
 import 'model_api_settings_screen.dart';
 import 'setup_wizard_screen.dart';
 import '../l10n/app_strings.dart';
@@ -976,6 +978,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _envVars.remove(name);
     });
     _prefs.envVars = _envVars;
+    _showEnvVarAgentRunningNotice();
+  }
+
+  void _showEnvVarAgentRunningNotice() {
+    if (!mounted) return;
+    final provider = context.read<ChatProvider>();
+    if (provider.activeAgentSessionIds.isEmpty) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text(AppStrings.envVarsAgentRunningNotice)),
+    );
   }
 
   Future<void> _confirmReinitialize() async {
@@ -1093,10 +1105,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (result == true && keyController.text.isNotEmpty) {
+      if (!mounted) return;
       setState(() {
         _envVars[keyController.text.trim()] = valueController.text;
       });
       _prefs.envVars = _envVars;
+      _showEnvVarAgentRunningNotice();
     }
   }
 
