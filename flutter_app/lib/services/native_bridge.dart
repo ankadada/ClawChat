@@ -12,16 +12,20 @@ class NativeBridge {
   static const _channel = MethodChannel(AppConstants.channelName);
   static const _agentCallbackChannel =
       MethodChannel('${AppConstants.channelName}/agent_callbacks');
-  static void Function()? _agentStopRequestedHandler;
+  static void Function({String? sessionId})? _agentStopRequestedHandler;
   static bool _agentCallbackInitialized = false;
 
-  static void setAgentStopRequestedHandler(void Function()? handler) {
+  static void setAgentStopRequestedHandler(
+    void Function({String? sessionId})? handler,
+  ) {
     _agentStopRequestedHandler = handler;
     if (_agentCallbackInitialized) return;
     _agentCallbackInitialized = true;
     _agentCallbackChannel.setMethodCallHandler((call) async {
       if (call.method == 'onAgentStopRequested') {
-        _agentStopRequestedHandler?.call();
+        final args = call.arguments;
+        final sessionId = args is Map ? args['sessionId'] as String? : null;
+        _agentStopRequestedHandler?.call(sessionId: sessionId);
       }
     });
   }
@@ -88,11 +92,17 @@ class NativeBridge {
   }
 
   static Future<bool> startAgentService({
+    required String sessionId,
+    required String sessionTitle,
     String text = 'AI 正在执行任务...',
   }) async {
     return (await _channel.invokeMethod<bool>(
       'startAgentService',
-      {'text': text},
+      {
+        'text': text,
+        'sessionId': sessionId,
+        'sessionTitle': sessionTitle,
+      },
     ))!;
   }
 
@@ -100,13 +110,24 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('stopAgentService'))!;
   }
 
+  static Future<bool> stopAgentServiceForSession(String sessionId) async {
+    return (await _channel.invokeMethod<bool>(
+      'stopAgentServiceForSession',
+      {'sessionId': sessionId},
+    ))!;
+  }
+
   static Future<bool> updateAgentNotification({
+    required String sessionId,
+    required String sessionTitle,
     required String status,
     String previewText = '',
     String? toolName,
     bool overlayVisible = false,
   }) async {
     return await _channel.invokeMethod<bool>('updateAgentNotification', {
+          'sessionId': sessionId,
+          'sessionTitle': sessionTitle,
           'status': status,
           'previewText': previewText,
           if (toolName != null) 'toolName': toolName,
@@ -163,10 +184,19 @@ class NativeBridge {
         false;
   }
 
-  static Future<void> showAgentCompleteNotification(String preview) async {
+  static Future<void> showAgentCompleteNotification({
+    required String sessionId,
+    required String sessionTitle,
+    required String preview,
+  }) async {
     await _channel.invokeMethod<void>(
       'showAgentCompleteNotification',
-      {'preview': preview, 'summary': preview},
+      {
+        'sessionId': sessionId,
+        'sessionTitle': sessionTitle,
+        'preview': preview,
+        'summary': preview,
+      },
     );
   }
 

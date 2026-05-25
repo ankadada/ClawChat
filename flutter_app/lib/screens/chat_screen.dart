@@ -2686,6 +2686,39 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return '${text.substring(0, 50)}...';
   }
 
+  Widget _buildBackgroundTasksBar(ThemeData theme, ChatProvider provider) {
+    final currentStatus = provider.agentStatus;
+    final currentSessionId = provider.currentSession?.id;
+    final activeCount = provider.activeAgentSessionIds
+        .where((sessionId) => sessionId != currentSessionId)
+        .length;
+    if (currentStatus != AgentStatus.idle || activeCount == 0) {
+      return const SizedBox.shrink();
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primaryContainer.withAlpha(40),
+        borderRadius: BorderRadius.circular(AppRadii.s),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.play_circle_outline,
+            size: 16,
+            color: theme.colorScheme.primary,
+          ),
+          const SizedBox(width: 6),
+          Text(
+            '$activeCount 个 AI 任务在其他会话中运行',
+            style: theme.textTheme.bodySmall,
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildInputArea(ThemeData theme) {
     return Consumer<ChatProvider>(
       builder: (_, provider, __) {
@@ -2712,6 +2745,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     _buildAttachmentPreviews(theme),
+                    _buildBackgroundTasksBar(theme, provider),
                     _buildMessageQueueBar(theme, provider, isRunning),
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.end,

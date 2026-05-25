@@ -142,6 +142,24 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
+  String _sessionTitleForState(AgentState state) {
+    final currentTitle =
+        currentSession?.id == state.sessionId ? currentSession?.title : null;
+    final summaryTitle = sessions
+        .where((session) => session.id == state.sessionId)
+        .map((session) => session.title)
+        .firstOrNull;
+    final title = (currentTitle?.trim().isNotEmpty ?? false)
+        ? currentTitle!
+        : (state.sessionTitle.trim().isNotEmpty
+            ? state.sessionTitle
+            : (summaryTitle?.trim().isNotEmpty ?? false)
+                ? summaryTitle!
+                : '未命名会话');
+    state.sessionTitle = title;
+    return title;
+  }
+
   void _clearSessionScopedState() {
     ToolCallExpansionState.clear();
   }
@@ -166,7 +184,11 @@ class ChatProvider extends ChangeNotifier {
     }
     try {
       if (shouldStartService) {
-        await NativeBridge.startAgentService(text: text);
+        await NativeBridge.startAgentService(
+          sessionId: state.sessionId,
+          sessionTitle: _sessionTitleForState(state),
+          text: text,
+        );
       }
       await _updateAgentNativeStatusForState(
         state,
@@ -197,6 +219,8 @@ class ChatProvider extends ChangeNotifier {
     if (_disposed) return;
     try {
       await NativeBridge.updateAgentNotification(
+        sessionId: state.sessionId,
+        sessionTitle: _sessionTitleForState(state),
         status: status,
         previewText: previewText ?? _tailOfStreamBuffer(state, 250),
         toolName: toolName,
@@ -239,20 +263,20 @@ class ChatProvider extends ChangeNotifier {
     state.agentServiceActive = false;
     state.agentServiceText = null;
 
+    if (shouldStop) {
+      try {
+        await NativeBridge.stopAgentServiceForSession(state.sessionId);
+      } catch (e) {
+        debugPrint('Failed to stop agent foreground service: $e');
+      }
+    }
+
     final nextState = _nextActiveStateAfter(state);
     if (nextState != null) {
       await _startAgentServiceForState(
         nextState,
         _agentServiceTextForState(nextState),
       );
-      return;
-    }
-
-    if (!shouldStop) return;
-    try {
-      await NativeBridge.stopAgentService();
-    } catch (e) {
-      debugPrint('Failed to stop agent foreground service: $e');
     }
   }
 
@@ -274,11 +298,16 @@ class ChatProvider extends ChangeNotifier {
     return String.fromCharCodes(normalized.runes.take(50));
   }
 
-  Future<void> _showCompletionNotificationIfNeeded(String finalText) async {
+  Future<void> _showCompletionNotificationIfNeeded(
+    AgentState state,
+    String finalText,
+  ) async {
     if (!_appInBackground || !_prefs.notifyOnComplete) return;
     try {
       await NativeBridge.showAgentCompleteNotification(
-        _completionNotificationPreview(finalText),
+        sessionId: state.sessionId,
+        sessionTitle: _sessionTitleForState(state),
+        preview: _completionNotificationPreview(finalText),
       );
     } catch (e) {
       debugPrint('Failed to show agent completion notification: $e');
@@ -296,7 +325,7 @@ class ChatProvider extends ChangeNotifier {
         'complete',
         previewText: finalText,
       );
-      await _showCompletionNotificationIfNeeded(finalText);
+      await _showCompletionNotificationIfNeeded(state, finalText);
       if (_appInBackground) {
         await Future.delayed(const Duration(seconds: 2));
       }
@@ -318,7 +347,9 @@ class ChatProvider extends ChangeNotifier {
   }
 
   ChatProvider() {
-    NativeBridge.setAgentStopRequestedHandler(cancelAgent);
+    NativeBridge.setAgentStopRequestedHandler(
+      ({String? sessionId}) => cancelAgent(sessionId: sessionId),
+    );
     _tools = ToolRegistry.withDefaults(prefs: _prefs);
     _init();
   }
@@ -421,6 +452,10 @@ class ChatProvider extends ChangeNotifier {
     }
     if (currentSession?.id == id) {
       currentSession!.title = newTitle;
+    }
+    final state = _getState(id);
+    if (state != null) {
+      state.sessionTitle = newTitle;
     }
     notifyListeners();
   }
@@ -696,6 +731,7 @@ class ChatProvider extends ChangeNotifier {
         ...attachments,
       ]));
       activeSession.autoTitle();
+      state.sessionTitle = activeSession.title;
       await _storage.saveSession(activeSession);
       _syncCurrentSessionReference(activeSession);
       notifyListeners();

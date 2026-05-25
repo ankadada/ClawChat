@@ -23,6 +23,7 @@ class QueuedMessage {
 
 class AgentState {
   final String sessionId;
+  String sessionTitle = '';
 
   bool isSending = false;
   AgentService? agent;

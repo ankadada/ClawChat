@@ -131,6 +131,8 @@ class MainActivity : FlutterActivity() {
                     try {
                         AgentTaskService.start(
                             applicationContext,
+                            call.argument<String>("sessionId") ?: "default",
+                            call.argument<String>("sessionTitle") ?: "ClawChat",
                             call.argument<String>("text") ?: "AI 正在执行任务..."
                         )
                         result.success(true)
@@ -142,6 +144,8 @@ class MainActivity : FlutterActivity() {
                     try {
                         AgentTaskService.updateNotification(
                             applicationContext,
+                            call.argument<String>("sessionId") ?: "default",
+                            call.argument<String>("sessionTitle") ?: "ClawChat",
                             call.argument<String>("status") ?: "thinking",
                             call.argument<String>("previewText") ?: "",
                             call.argument<String>("toolName"),
@@ -156,6 +160,19 @@ class MainActivity : FlutterActivity() {
                     try {
                         AgentTaskService.stop(applicationContext)
                         result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "stopAgentServiceForSession" -> {
+                    try {
+                        val sessionId = call.argument<String>("sessionId")
+                        if (sessionId.isNullOrBlank()) {
+                            result.error("INVALID_ARGS", "sessionId required", null)
+                        } else {
+                            AgentTaskService.stopSession(applicationContext, sessionId)
+                            result.success(true)
+                        }
                     } catch (e: Exception) {
                         result.error("SERVICE_ERROR", e.message, null)
                     }
@@ -279,10 +296,17 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "showAgentCompleteNotification" -> {
+                    val sessionId = call.argument<String>("sessionId") ?: "default"
+                    val sessionTitle = call.argument<String>("sessionTitle") ?: "ClawChat"
                     val preview = call.argument<String>("preview")
                         ?: call.argument<String>("summary")
                         ?: ""
-                    AgentTaskService.showCompletionNotification(applicationContext, preview)
+                    AgentTaskService.showCompletionNotification(
+                        applicationContext,
+                        sessionId,
+                        sessionTitle,
+                        preview
+                    )
                     result.success(true)
                 }
                 "stopSetupService" -> {

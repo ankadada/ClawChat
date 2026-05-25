@@ -30,9 +30,11 @@ import io.flutter.plugin.common.MethodChannel
 
 class AgentTaskService : Service() {
     companion object {
-        const val NOTIFICATION_ID = 5
-        private const val COMPLETE_NOTIFICATION_ID = 2002
+        private const val SUMMARY_NOTIFICATION_ID = 9999
+        private const val AGENT_GROUP_KEY = "com.anka.clawbot.AGENT_GROUP"
         private const val EXTRA_TEXT = "text"
+        private const val EXTRA_SESSION_ID = "sessionId"
+        private const val EXTRA_SESSION_TITLE = "sessionTitle"
         private const val EXTRA_STATUS = "status"
         private const val EXTRA_PREVIEW = "previewText"
         private const val EXTRA_TOOL_NAME = "toolName"
@@ -57,8 +59,15 @@ class AgentTaskService : Service() {
             callbackChannel = channel
         }
 
-        fun start(context: Context, text: String = DEFAULT_TEXT) {
+        fun start(
+            context: Context,
+            sessionId: String,
+            sessionTitle: String,
+            text: String = DEFAULT_TEXT
+        ) {
             val intent = Intent(context, AgentTaskService::class.java).apply {
+                putExtra(EXTRA_SESSION_ID, sessionId.ifBlank { "default" })
+                putExtra(EXTRA_SESSION_TITLE, sessionTitle.ifBlank { "ClawChat" })
                 putExtra(EXTRA_TEXT, text.ifBlank { DEFAULT_TEXT })
                 putExtra(EXTRA_STATUS, DEFAULT_STATUS)
             }
@@ -66,12 +75,15 @@ class AgentTaskService : Service() {
         }
 
         fun stop(context: Context) {
+            instance?.clearAllSessionNotifications()
             instance?.hideOverlay()
             context.stopService(Intent(context, AgentTaskService::class.java))
         }
 
         fun updateNotification(
             context: Context,
+            sessionId: String,
+            sessionTitle: String,
             status: String,
             previewText: String,
             toolName: String?,
@@ -79,11 +91,20 @@ class AgentTaskService : Service() {
         ) {
             val service = instance
             if (service != null) {
-                service.updateAgentState(status, previewText, toolName, overlayVisible)
+                service.updateAgentSessionState(
+                    sessionId,
+                    sessionTitle,
+                    status,
+                    previewText,
+                    toolName,
+                    overlayVisible
+                )
                 return
             }
             val intent = Intent(context, AgentTaskService::class.java).apply {
                 action = ACTION_UPDATE
+                putExtra(EXTRA_SESSION_ID, sessionId.ifBlank { "default" })
+                putExtra(EXTRA_SESSION_TITLE, sessionTitle.ifBlank { "ClawChat" })
                 putExtra(EXTRA_STATUS, status)
                 putExtra(EXTRA_PREVIEW, previewText)
                 putExtra(EXTRA_TOOL_NAME, toolName)
@@ -92,7 +113,22 @@ class AgentTaskService : Service() {
             startServiceCompat(context, intent)
         }
 
-        fun showCompletionNotification(context: Context, summary: String) {
+        fun stopSession(context: Context, sessionId: String) {
+            val service = instance
+            if (service != null) {
+                service.removeSessionNotification(sessionId)
+                return
+            }
+            val manager = context.getSystemService(NotificationManager::class.java)
+            manager.cancel(notificationIdFor(sessionId))
+        }
+
+        fun showCompletionNotification(
+            context: Context,
+            sessionId: String,
+            sessionTitle: String,
+            summary: String
+        ) {
             val manager = context.getSystemService(NotificationManager::class.java)
             val launchIntent = Intent(context, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
@@ -112,7 +148,7 @@ class AgentTaskService : Service() {
             }
             val notification = builder
                 .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle("AI 任务完成")
+                .setContentTitle("${sessionTitle.ifBlank { "ClawChat" }} - AI 任务完成")
                 .setContentText(text)
                 .setStyle(Notification.BigTextStyle().bigText(text))
                 .setContentIntent(pendingIntent)
@@ -120,7 +156,7 @@ class AgentTaskService : Service() {
                 .setPriority(Notification.PRIORITY_HIGH)
                 .setDefaults(Notification.DEFAULT_ALL)
                 .build()
-            manager.notify(COMPLETE_NOTIFICATION_ID, notification)
+            manager.notify(completionNotificationIdFor(sessionId), notification)
         }
 
         fun hasOverlayPermission(context: Context): Boolean {
@@ -186,18 +222,39 @@ class AgentTaskService : Service() {
             } ?: Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
         }
 
-        private fun requestStopFromNotification() {
-            callbackChannel?.invokeMethod("onAgentStopRequested", null)
+        private fun requestStopFromNotification(sessionId: String?) {
+            callbackChannel?.invokeMethod(
+                "onAgentStopRequested",
+                sessionId?.let { mapOf("sessionId" to it) }
+            )
+        }
+
+        private fun notificationIdFor(sessionId: String): Int {
+            return (sessionId.hashCode() and 0x7FFFFFFF) % 100000 + 10000
+        }
+
+        private fun completionNotificationIdFor(sessionId: String): Int {
+            return (sessionId.hashCode() and 0x7FFFFFFF) % 100000 + 110000
         }
     }
 
+    private data class AgentSessionNotification(
+        val sessionId: String,
+        var sessionTitle: String,
+        var status: String,
+        var preview: String,
+        var toolName: String?,
+        val notificationId: Int
+    )
+
     private var wakeLock: PowerManager.WakeLock? = null
-    private var currentStatus = DEFAULT_STATUS
-    private var currentPreview = ""
-    private var currentToolName: String? = null
+    private val activeSessions = mutableMapOf<String, AgentSessionNotification>()
+    private var foregroundSessionId: String? = null
+    private var overlaySessionId: String? = null
     private var overlayShouldBeVisible = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private val wakeLockHandler = Handler(Looper.getMainLooper())
+    private val pendingNotificationSessionIds = mutableSetOf<String>()
     private var lastNotificationUpdateMs = 0L
     private var notificationUpdateScheduled = false
     private var overlay: AgentIslandOverlay? = null
@@ -217,28 +274,43 @@ class AgentTaskService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_AGENT) {
-            requestStopFromNotification()
-            mainHandler.postDelayed({ stopSelf() }, 1000)
+            val sessionId = intent.getStringExtra(EXTRA_SESSION_ID)
+            requestStopFromNotification(sessionId)
+            mainHandler.postDelayed({
+                if (activeSessions.isEmpty()) stopSelf()
+            }, 1000)
             return START_NOT_STICKY
         }
 
         val fallbackText = intent?.getStringExtra(EXTRA_TEXT)?.takeIf { it.isNotBlank() }
             ?: DEFAULT_TEXT
-        currentStatus = intent?.getStringExtra(EXTRA_STATUS) ?: statusFromText(fallbackText)
-        currentPreview = intent?.getStringExtra(EXTRA_PREVIEW) ?: currentPreview
-        currentToolName = intent?.getStringExtra(EXTRA_TOOL_NAME)?.takeIf { it.isNotBlank() }
-            ?: currentToolName
+        val sessionId = intent?.getStringExtra(EXTRA_SESSION_ID)?.takeIf { it.isNotBlank() }
+            ?: "default"
+        val sessionTitle = intent?.getStringExtra(EXTRA_SESSION_TITLE)?.takeIf { it.isNotBlank() }
+            ?: "ClawChat"
+        val status = intent?.getStringExtra(EXTRA_STATUS) ?: statusFromText(fallbackText)
+        val preview = intent?.getStringExtra(EXTRA_PREVIEW) ?: ""
+        val toolName = intent?.getStringExtra(EXTRA_TOOL_NAME)?.takeIf { it.isNotBlank() }
         overlayShouldBeVisible = intent?.getBooleanExtra(EXTRA_OVERLAY_VISIBLE, overlayShouldBeVisible)
             ?: overlayShouldBeVisible
+        val state = upsertAgentSessionState(sessionId, sessionTitle, status, preview, toolName)
 
-        startForeground(NOTIFICATION_ID, buildNotification())
-        isRunning = true
+        if (!isRunning || foregroundSessionId == null) {
+            foregroundSessionId = state.sessionId
+            startForeground(state.notificationId, buildNotification(state))
+        } else {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(state.notificationId, buildNotification(state))
+        }
+        isRunning = activeSessions.isNotEmpty()
         acquireWakeLock()
+        updateSummaryNotification()
         updateOverlay()
         return START_STICKY
     }
 
     override fun onDestroy() {
+        clearAllSessionNotifications()
         isRunning = false
         instance = null
         mainHandler.removeCallbacksAndMessages(null)
@@ -248,18 +320,58 @@ class AgentTaskService : Service() {
         super.onDestroy()
     }
 
-    private fun updateAgentState(
+    private fun updateAgentSessionState(
+        sessionId: String,
+        sessionTitle: String,
         status: String,
         previewText: String,
         toolName: String?,
         overlayVisible: Boolean
     ) {
-        currentStatus = status
-        currentPreview = previewText.takeLast(220)
-        currentToolName = toolName?.takeIf { it.isNotBlank() }
+        val state = upsertAgentSessionState(
+            sessionId,
+            sessionTitle,
+            status,
+            previewText,
+            toolName
+        )
         overlayShouldBeVisible = overlayVisible
-        scheduleNotificationUpdate()
+        if (!isRunning || foregroundSessionId == null) {
+            foregroundSessionId = state.sessionId
+            startForeground(state.notificationId, buildNotification(state))
+            isRunning = true
+            acquireWakeLock()
+            updateSummaryNotification()
+        } else {
+            scheduleNotificationUpdate(state.sessionId)
+        }
         updateOverlay()
+    }
+
+    private fun upsertAgentSessionState(
+        sessionId: String,
+        sessionTitle: String,
+        status: String,
+        previewText: String,
+        toolName: String?
+    ): AgentSessionNotification {
+        val normalizedSessionId = sessionId.ifBlank { "default" }
+        val state = activeSessions.getOrPut(normalizedSessionId) {
+            AgentSessionNotification(
+                sessionId = normalizedSessionId,
+                sessionTitle = sessionTitle.ifBlank { "ClawChat" },
+                status = status,
+                preview = "",
+                toolName = null,
+                notificationId = notificationIdFor(normalizedSessionId)
+            )
+        }
+        state.sessionTitle = sessionTitle.ifBlank { state.sessionTitle.ifBlank { "ClawChat" } }
+        state.status = status
+        state.preview = previewText.takeLast(220)
+        state.toolName = toolName?.takeIf { it.isNotBlank() }
+        overlaySessionId = state.sessionId
+        return state
     }
 
     private fun setOverlayVisible(visible: Boolean) {
@@ -267,7 +379,8 @@ class AgentTaskService : Service() {
         updateOverlay()
     }
 
-    private fun scheduleNotificationUpdate() {
+    private fun scheduleNotificationUpdate(sessionId: String) {
+        pendingNotificationSessionIds.add(sessionId)
         val now = System.currentTimeMillis()
         val elapsed = now - lastNotificationUpdateMs
         if (elapsed >= NOTIFICATION_THROTTLE_MS) {
@@ -285,7 +398,15 @@ class AgentTaskService : Service() {
     private fun updateNotificationNow() {
         lastNotificationUpdateMs = System.currentTimeMillis()
         val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification())
+        val sessionIds = pendingNotificationSessionIds.toList().ifEmpty {
+            activeSessions.keys.toList()
+        }
+        pendingNotificationSessionIds.clear()
+        for (sessionId in sessionIds) {
+            val state = activeSessions[sessionId] ?: continue
+            manager.notify(state.notificationId, buildNotification(state))
+        }
+        updateSummaryNotification()
     }
 
     private fun statusFromText(text: String): String {
@@ -297,43 +418,45 @@ class AgentTaskService : Service() {
         }
     }
 
-    private fun statusTitle(): String {
-        return when (currentStatus) {
+    private fun statusTitle(state: AgentSessionNotification): String {
+        val statusText = when (state.status) {
             "thinking" -> "AI 正在思考..."
             "streaming" -> "AI 正在回复..."
-            "tooling" -> if (currentToolName.isNullOrBlank()) {
+            "tooling" -> if (state.toolName.isNullOrBlank()) {
                 "AI 正在执行工具..."
             } else {
-                "AI 正在执行工具: $currentToolName..."
+                "AI 正在执行工具: ${state.toolName}..."
             }
             "complete" -> "AI 任务完成"
             "error" -> "AI 任务出错"
             else -> "AI 正在执行任务..."
         }
+        return "${state.sessionTitle} - $statusText"
     }
 
-    private fun compactPreview(limit: Int = 100): String {
-        return currentPreview.replace(Regex("\\s+"), " ").trim().takeLast(limit)
-            .ifBlank { statusTitle() }
+    private fun compactPreview(state: AgentSessionNotification, limit: Int = 100): String {
+        return state.preview.replace(Regex("\\s+"), " ").trim().takeLast(limit)
+            .ifBlank { statusTitle(state) }
     }
 
     @Suppress("DEPRECATION")
-    private fun buildNotification(): Notification {
+    private fun buildNotification(state: AgentSessionNotification): Notification {
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
         }
         val openPendingIntent = PendingIntent.getActivity(
             this,
-            0,
+            state.notificationId,
             openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val stopIntent = Intent(this, AgentTaskService::class.java).apply {
             action = ACTION_STOP_AGENT
+            putExtra(EXTRA_SESSION_ID, state.sessionId)
         }
         val stopPendingIntent = PendingIntent.getService(
             this,
-            1,
+            state.notificationId + 1,
             stopIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -344,29 +467,99 @@ class AgentTaskService : Service() {
             Notification.Builder(this)
         }
 
-        val ongoing = currentStatus != "complete" && currentStatus != "error"
-        val preview = compactPreview()
+        val ongoing = state.status != "complete" && state.status != "error"
+        val preview = compactPreview(state)
         builder
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle(statusTitle())
+            .setContentTitle(statusTitle(state))
             .setContentText(preview)
-            .setStyle(Notification.BigTextStyle().bigText(currentPreview.ifBlank { preview }))
+            .setStyle(Notification.BigTextStyle().bigText(state.preview.ifBlank { preview }))
             .setContentIntent(openPendingIntent)
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(Notification.PRIORITY_LOW)
+            .setGroup(AGENT_GROUP_KEY)
             .addAction(R.mipmap.ic_launcher, "查看", openPendingIntent)
         if (ongoing) {
             builder
                 .addAction(R.mipmap.ic_launcher, "停止", stopPendingIntent)
-                .setProgress(0, 0, currentStatus == "thinking")
+                .setProgress(0, 0, state.status == "thinking")
         }
         return builder.build()
     }
 
+    @Suppress("DEPRECATION")
+    private fun updateSummaryNotification() {
+        val manager = getSystemService(NotificationManager::class.java)
+        if (activeSessions.size <= 1) {
+            manager.cancel(SUMMARY_NOTIFICATION_ID)
+            return
+        }
+        val title = "${activeSessions.size} 个 AI 任务运行中"
+        val text = activeSessions.values.joinToString(", ") { it.sessionTitle }
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, MainActivity.CHANNEL_ID)
+        } else {
+            Notification.Builder(this)
+        }
+        val notification = builder
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setGroup(AGENT_GROUP_KEY)
+            .setGroupSummary(true)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setPriority(Notification.PRIORITY_LOW)
+            .build()
+        manager.notify(SUMMARY_NOTIFICATION_ID, notification)
+    }
+
+    private fun removeSessionNotification(sessionId: String) {
+        val state = activeSessions.remove(sessionId) ?: return
+        pendingNotificationSessionIds.remove(sessionId)
+        if (overlaySessionId == sessionId) {
+            overlaySessionId = activeSessions.keys.lastOrNull()
+        }
+        val manager = getSystemService(NotificationManager::class.java)
+        val nextState = activeSessions.values.firstOrNull()
+        if (foregroundSessionId == sessionId) {
+            if (nextState != null) {
+                foregroundSessionId = nextState.sessionId
+                startForeground(nextState.notificationId, buildNotification(nextState))
+            } else {
+                foregroundSessionId = null
+            }
+        }
+        manager.cancel(state.notificationId)
+        updateSummaryNotification()
+        isRunning = activeSessions.isNotEmpty()
+        updateOverlay()
+        if (activeSessions.isEmpty()) {
+            hideOverlay()
+            stopSelf()
+        }
+    }
+
+    private fun clearAllSessionNotifications() {
+        val manager = getSystemService(NotificationManager::class.java)
+        for (state in activeSessions.values) {
+            manager.cancel(state.notificationId)
+        }
+        manager.cancel(SUMMARY_NOTIFICATION_ID)
+        activeSessions.clear()
+        pendingNotificationSessionIds.clear()
+        foregroundSessionId = null
+        overlaySessionId = null
+        isRunning = false
+    }
+
     private fun updateOverlay() {
-        if (!overlayShouldBeVisible || currentStatus == "error") {
+        val state = overlaySessionId?.let { activeSessions[it] } ?: activeSessions.values.lastOrNull()
+        if (!overlayShouldBeVisible || state == null || state.status == "error") {
             hideOverlay()
             return
         }
@@ -378,7 +571,7 @@ class AgentTaskService : Service() {
             if (overlay == null) {
                 overlay = AgentIslandOverlay(this)
             }
-            overlay?.showOrUpdate(currentStatus, statusTitle(), compactPreview(140))
+            overlay?.showOrUpdate(state.status, statusTitle(state), compactPreview(state, 140))
         } catch (e: Exception) {
             Log.w("ClawChat", "Agent overlay update failed", e)
             hideOverlay()
