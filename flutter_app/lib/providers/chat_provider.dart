@@ -793,8 +793,8 @@ class ChatProvider extends ChangeNotifier {
     }
     final next = _messageQueue.removeAt(0);
     notifyListeners();
-    Future.microtask(() {
-      if (!_disposed) {
+    Future.delayed(const Duration(seconds: 1), () {
+      if (!_disposed && !_wasCancelled) {
         sendMessage(next.text, attachments: next.attachments);
       }
     });
