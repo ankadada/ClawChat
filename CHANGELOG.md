@@ -1,5 +1,24 @@
 # Changelog
 
+## v2.2.0 — Message Queue, Config Backup & Agent UX
+
+### New Features
+
+- **消息队列** — AI 回复过程中可以继续输入和发送消息，FIFO 排队（上限 3 条），当前回复完成后自动发送下一条。取消 agent 时队列保留，用户可手动发送或清空
+- **配置导入/导出** — 支持将 Provider Profiles（含 API 密钥）、环境变量、应用设置导出为 JSON 文件。默认 AES-256-GCM 加密（PBKDF2-SHA256 密钥推导），可选明文导出（带风险提示）。导入支持预览、密码解密、冲突策略（合并/覆盖/跳过）
+- **环境变量隐私模式** — 工具执行输出发送给 LLM 前自动脱敏环境变量值（默认开启），聊天 UI 中用户仍看到原始输出
+- **Agent 最大轮次可配置** — 设置页 Slider 调整，范围 1-99，默认 25
+
+### Bug Fixes
+
+- **取消 Agent 时保留部分回复** — 之前取消会丢弃所有已收到的内容，现在保存已完成轮次和正在 streaming 的部分文本
+- **多轮任务增量显示** — Agent 每完成一轮（工具调用+结果）立即写入聊天记录并在 UI 显示，不再等整个任务完成
+- **多模型对比修复** — 修复无 session 时静默失败、深色模式透明背景、三模型对比无反应、错误反馈缺失等问题
+- **灵动岛回前台不消失** — 回前台无条件隐藏 overlay，不再依赖 `_isSending` 状态
+- **Agent error 卡住** — AgentError 时补全 completer，防止 UI 停留在 thinking 状态
+
+---
+
 ## v2.1.0 — Background Stream Resilience & Dynamic Island
 
 ### New Features
