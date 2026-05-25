@@ -24,6 +24,7 @@ class PreferencesService {
   static const _keyNotifyOnComplete = 'notify_on_complete';
   static const _keyPrivacyMode = 'privacy_mode';
   static const _keyAgentMaxIterations = 'agent_max_iterations';
+  static const _keyMaxConcurrentAgents = 'max_concurrent_agents';
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
   static const _keyToolApprovalPolicy = 'tool_approval_policy';
@@ -41,6 +42,8 @@ class PreferencesService {
   static const defaultDualPaneSidebarWidth = 280.0;
   static const int defaultAgentMaxIterations = 25;
   static const int maxAgentMaxIterations = 99;
+  static const int defaultMaxConcurrentAgents = 3;
+  static const int maxMaxConcurrentAgents = 5;
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -494,6 +497,15 @@ class PreferencesService {
         v.clamp(1, maxAgentMaxIterations).toInt(),
       );
 
+  int get maxConcurrentAgents =>
+      (_prefs.getInt(_keyMaxConcurrentAgents) ?? defaultMaxConcurrentAgents)
+          .clamp(1, maxMaxConcurrentAgents)
+          .toInt();
+  set maxConcurrentAgents(int v) => _prefs.setInt(
+        _keyMaxConcurrentAgents,
+        v.clamp(1, maxMaxConcurrentAgents).toInt(),
+      );
+
   bool get allowPhoneCall =>
       _initialized ? (_prefs.getBool(_keyAllowPhoneCall) ?? false) : false;
   set allowPhoneCall(bool v) => _prefs.setBool(_keyAllowPhoneCall, v);
@@ -579,6 +591,7 @@ class PreferencesService {
       'contextLength': contextLength,
       'autoCompact': autoCompact,
       'agentMaxIterations': agentMaxIterations,
+      'maxConcurrentAgents': maxConcurrentAgents,
       'toolApprovalPolicy': toolApprovalPolicy,
       'notifyOnComplete': notifyOnComplete,
       'privacyMode': privacyMode,
@@ -615,6 +628,11 @@ class PreferencesService {
         _intValue(settings['agentMaxIterations']);
     if (importedAgentMaxIterations != null) {
       agentMaxIterations = importedAgentMaxIterations;
+    }
+    final importedMaxConcurrentAgents =
+        _intValue(settings['maxConcurrentAgents']);
+    if (importedMaxConcurrentAgents != null) {
+      maxConcurrentAgents = importedMaxConcurrentAgents;
     }
     if (settings['toolApprovalPolicy'] is String) {
       toolApprovalPolicy = settings['toolApprovalPolicy'] as String;

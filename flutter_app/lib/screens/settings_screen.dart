@@ -46,6 +46,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   double _fontScale = 1.0;
   bool _notifyOnComplete = true;
   int _agentMaxIterations = PreferencesService.defaultAgentMaxIterations;
+  int _maxConcurrentAgents = PreferencesService.defaultMaxConcurrentAgents;
   bool _privacyMode = true;
   bool _allowPhoneCall = false;
   bool _allowSms = false;
@@ -75,6 +76,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _fontScale = _prefs.fontScale;
       _notifyOnComplete = _prefs.notifyOnComplete;
       _agentMaxIterations = _prefs.agentMaxIterations;
+      _maxConcurrentAgents = _prefs.maxConcurrentAgents;
       _privacyMode = _prefs.privacyMode;
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
@@ -648,6 +650,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               final next = v.round();
                               setState(() => _agentMaxIterations = next);
                               _prefs.agentMaxIterations = next;
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(AppStrings.maxConcurrentAgents(
+                            _maxConcurrentAgents,
+                          )),
+                          Slider(
+                            value: _maxConcurrentAgents.toDouble(),
+                            min: 1,
+                            max: PreferencesService.maxMaxConcurrentAgents
+                                .toDouble(),
+                            divisions:
+                                PreferencesService.maxMaxConcurrentAgents - 1,
+                            label: '$_maxConcurrentAgents',
+                            onChanged: (v) {
+                              final next = v.round();
+                              setState(() => _maxConcurrentAgents = next);
+                              _prefs.maxConcurrentAgents = next;
                             },
                           ),
                         ],

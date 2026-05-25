@@ -190,6 +190,8 @@ class AppStrings {
   static const toolApprovalPolicyAutoWarning = '所有工具将自动执行，包括命令行和文件操作';
   static String toolAutoApprovedNotification(String name) =>
       'ClawChat 已自动允许 $name 执行';
+  static String maxConcurrentAgents(int count) => '最大并发任务数: $count';
+  static String maxConcurrentAgentsReached(int count) => '已达最大并发数（$count 个任务）';
 
   // ── Setup wizard screen ──────────────────────────────────────────
   static const initClawChat = '初始化 ClawChat';

@@ -64,6 +64,13 @@ class ChatProvider extends ChangeNotifier {
     return _prefs.toolApprovalPolicy;
   }
 
+  int get maxConcurrentAgents {
+    if (!_prefsInitialized) {
+      return PreferencesService.defaultMaxConcurrentAgents;
+    }
+    return _prefs.maxConcurrentAgents;
+  }
+
   List<SkillInfo> _skills = [];
 
   bool _disposed = false;
@@ -92,25 +99,19 @@ class ChatProvider extends ChangeNotifier {
     return sessionId != null ? _agentStates[sessionId] : null;
   }
 
-  AgentState? get _runningState {
-    final currentState = _getState(currentSession?.id);
-    if (currentState != null && currentState.isSending) return currentState;
-    for (final state in _agentStates.values) {
-      if (state.isSending) return state;
-    }
-    return currentState;
-  }
+  Iterable<AgentState> get _activeAgentStates =>
+      _agentStates.values.where((state) => state.isSending);
 
-  bool get _isSendingLegacy => _agentStates.values.any((s) => s.isSending);
+  AgentStatus get agentStatus =>
+      _getState(currentSession?.id)?.status ?? AgentStatus.idle;
 
-  AgentStatus get agentStatus => _runningState?.status ?? AgentStatus.idle;
-
-  String get streamingText => _runningState?.streamingText ?? '';
+  String get streamingText =>
+      _getState(currentSession?.id)?.streamingText ?? '';
 
   String? get errorMessage =>
-      _runningState?.errorMessage ?? _fallbackErrorMessage;
+      _getState(currentSession?.id)?.errorMessage ?? _fallbackErrorMessage;
   set errorMessage(String? value) {
-    final state = _runningState;
+    final state = _getState(currentSession?.id);
     if (value == null) _fallbackErrorMessage = null;
     if (state != null) {
       state.errorMessage = value;
@@ -119,8 +120,8 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
-  List<QueuedMessage> get messageQueue =>
-      List.unmodifiable(_runningState?.messageQueue ?? const []);
+  List<QueuedMessage> get messageQueue => List.unmodifiable(
+      _getState(currentSession?.id)?.messageQueue ?? const []);
 
   Set<String> get activeAgentSessionIds => _agentStates.entries
       .where((entry) => entry.value.isSending)
@@ -135,19 +136,18 @@ class ChatProvider extends ChangeNotifier {
 
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
 
-  void _clearSessionScopedState() {
-    for (final state in _agentStates.values) {
-      state.sessionApprovedTools.clear();
-      state.messageQueue.clear();
-      state.wasCancelled = false;
+  void _syncCurrentSessionReference(ChatSession session) {
+    if (currentSession?.id == session.id) {
+      currentSession = session;
     }
+  }
+
+  void _clearSessionScopedState() {
     ToolCallExpansionState.clear();
   }
 
-  Future<void> _startAgentService(String text) async {
+  Future<void> _startAgentServiceForState(AgentState state, String text) async {
     if (_disposed) return;
-    final state = _runningState;
-    if (state == null) return;
     final shouldStartService =
         !state.agentServiceActive || state.agentServiceText != text;
     final generation = ++state.agentServiceGeneration;
@@ -168,7 +168,10 @@ class ChatProvider extends ChangeNotifier {
       if (shouldStartService) {
         await NativeBridge.startAgentService(text: text);
       }
-      await _updateAgentNativeStatus(_statusForAgentServiceText(text));
+      await _updateAgentNativeStatusForState(
+        state,
+        _statusForAgentServiceText(text),
+      );
     } catch (e) {
       if (generation == state.agentServiceGeneration) {
         state.agentServiceActive = false;
@@ -185,20 +188,19 @@ class ChatProvider extends ChangeNotifier {
     return 'thinking';
   }
 
-  Future<void> _updateAgentNativeStatus(
+  Future<void> _updateAgentNativeStatusForState(
+    AgentState state,
     String status, {
     String? previewText,
     String? toolName,
   }) async {
     if (_disposed) return;
-    final state = _runningState;
     try {
       await NativeBridge.updateAgentNotification(
         status: status,
-        previewText: previewText ??
-            (state != null ? _tailOfStreamBuffer(state, 250) : ''),
+        previewText: previewText ?? _tailOfStreamBuffer(state, 250),
         toolName: toolName,
-        overlayVisible: _appInBackground && (state?.isSending ?? false),
+        overlayVisible: _appInBackground && _activeAgentStates.isNotEmpty,
       );
     } catch (e) {
       debugPrint('Failed to update agent notification: $e');
@@ -210,15 +212,56 @@ class ChatProvider extends ChangeNotifier {
     return s.length <= maxLength ? s : s.substring(s.length - maxLength);
   }
 
-  Future<void> _stopAgentService() async {
-    final state = _runningState;
-    if (state == null) return;
+  AgentState? _nextActiveStateAfter(AgentState state) {
+    for (final candidate in _agentStates.values) {
+      if (!identical(candidate, state) && candidate.isSending) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  String _agentServiceTextForState(AgentState state) {
+    return state.agentServiceText ??
+        switch (state.status) {
+          AgentStatus.streaming => _agentServiceStreamingText,
+          AgentStatus.tooling => _agentServiceToolingText,
+          AgentStatus.thinking => _agentServiceThinkingText,
+          AgentStatus.idle => _agentServiceThinkingText,
+          AgentStatus.error => _agentServiceThinkingText,
+        };
+  }
+
+  Future<void> _stopAgentServiceForState(AgentState state) async {
     state.agentServiceGeneration++;
     final shouldStop =
         state.agentServiceActive || state.agentServiceText != null;
     state.agentServiceActive = false;
     state.agentServiceText = null;
+
+    final nextState = _nextActiveStateAfter(state);
+    if (nextState != null) {
+      await _startAgentServiceForState(
+        nextState,
+        _agentServiceTextForState(nextState),
+      );
+      return;
+    }
+
     if (!shouldStop) return;
+    try {
+      await NativeBridge.stopAgentService();
+    } catch (e) {
+      debugPrint('Failed to stop agent foreground service: $e');
+    }
+  }
+
+  Future<void> _stopAgentService() async {
+    for (final state in _agentStates.values) {
+      state.agentServiceGeneration++;
+      state.agentServiceActive = false;
+      state.agentServiceText = null;
+    }
     try {
       await NativeBridge.stopAgentService();
     } catch (e) {
@@ -248,13 +291,17 @@ class ChatProvider extends ChangeNotifier {
     Completer<void>? completer,
   ) async {
     try {
-      await _updateAgentNativeStatus('complete', previewText: finalText);
+      await _updateAgentNativeStatusForState(
+        state,
+        'complete',
+        previewText: finalText,
+      );
       await _showCompletionNotificationIfNeeded(finalText);
       if (_appInBackground) {
         await Future.delayed(const Duration(seconds: 2));
       }
     } finally {
-      await _stopAgentService();
+      await _stopAgentServiceForState(state);
       if (completer != null && !completer.isCompleted) {
         completer.complete();
       }
@@ -443,31 +490,40 @@ class ChatProvider extends ChangeNotifier {
       unawaited(NativeBridge.setAgentOverlayVisible(false));
       _resumeActiveAgentStreamAfterForeground();
       if (pendingApproval != null && !_disposed) notifyListeners();
-    }
-    final state = _runningState;
-    if (state != null && state.isSending) {
-      if (_appInBackground) {
-        unawaited(NativeBridge.setAgentOverlayVisible(true));
+    } else if (_activeAgentStates.isNotEmpty) {
+      unawaited(NativeBridge.setAgentOverlayVisible(true));
+      for (final state in _activeAgentStates) {
+        unawaited(_updateAgentNativeStatusForState(
+          state,
+          _statusForAgentServiceText(_agentServiceTextForState(state)),
+        ));
       }
-      unawaited(_updateAgentNativeStatus(_statusForAgentServiceText(
-        state.agentServiceText ?? _agentServiceThinkingText,
-      )));
     }
   }
 
   void _resumeActiveAgentStreamAfterForeground() {
-    final state = _runningState;
-    if (_disposed || state == null || !state.isSending) return;
-    switch (state.status) {
-      case AgentStatus.thinking:
-        unawaited(_startAgentService(_agentServiceThinkingText));
-      case AgentStatus.streaming:
-        unawaited(_startAgentService(_agentServiceStreamingText));
-      case AgentStatus.tooling:
-        unawaited(_startAgentService(_agentServiceToolingText));
-      case AgentStatus.idle:
-      case AgentStatus.error:
-        break;
+    if (_disposed) return;
+    for (final state in _activeAgentStates) {
+      switch (state.status) {
+        case AgentStatus.thinking:
+          unawaited(_startAgentServiceForState(
+            state,
+            _agentServiceThinkingText,
+          ));
+        case AgentStatus.streaming:
+          unawaited(_startAgentServiceForState(
+            state,
+            _agentServiceStreamingText,
+          ));
+        case AgentStatus.tooling:
+          unawaited(_startAgentServiceForState(
+            state,
+            _agentServiceToolingText,
+          ));
+        case AgentStatus.idle:
+        case AgentStatus.error:
+          break;
+      }
     }
   }
 
@@ -565,33 +621,45 @@ class ChatProvider extends ChangeNotifier {
     String text, {
     List<MessageContent> attachments = const [],
     List<String>? pendingAlternatives,
+    String? targetSessionId,
   }) async {
     final trimmedText = text.trim();
     final pendingAlternativesForSend = pendingAlternatives == null
         ? null
         : List<String>.from(pendingAlternatives);
-    // Guard against concurrent sends. Messages entered while the agent is
-    // running are queued and drained FIFO after the current response completes.
-    if (_isSendingLegacy) {
-      if (trimmedText.isEmpty && attachments.isEmpty) return;
-      final runningState = _runningState;
-      if (runningState != null) {
-        _enqueueMessage(runningState, trimmedText, attachments);
-      }
-      return;
-    }
 
     if (trimmedText.isEmpty && attachments.isEmpty) return;
 
     AgentState? activeState;
     try {
       await _ensurePrefs();
+
+      ChatSession? session;
+      if (targetSessionId != null) {
+        session = currentSession?.id == targetSessionId
+            ? currentSession
+            : await _storage.getSession(targetSessionId);
+        if (session == null) {
+          _fallbackErrorMessage = '会话不存在';
+          notifyListeners();
+          return;
+        }
+      } else {
+        session = currentSession;
+      }
+
+      AgentState? sessionState =
+          session != null ? _getOrCreateState(session.id) : null;
+      if (sessionState != null && sessionState.isSending) {
+        _enqueueMessage(sessionState, trimmedText, attachments);
+        return;
+      }
+
       final apiKey = _prefs.apiKey;
       if (apiKey == null || apiKey.isEmpty) {
-        if (currentSession != null) {
-          final errorState = _getOrCreateState(currentSession!.id);
-          errorState.errorMessage = AppStrings.apiKeyNotConfigured;
-          errorState.status = AgentStatus.error;
+        if (sessionState != null) {
+          sessionState.errorMessage = AppStrings.apiKeyNotConfigured;
+          sessionState.status = AgentStatus.error;
         } else {
           _fallbackErrorMessage = AppStrings.apiKeyNotConfigured;
         }
@@ -599,23 +667,40 @@ class ChatProvider extends ChangeNotifier {
         return;
       }
 
-      if (currentSession == null) await createSession();
+      final activeCount = _activeAgentStates.length;
+      final concurrentLimit = maxConcurrentAgents;
+      if (activeCount >= concurrentLimit) {
+        final message = AppStrings.maxConcurrentAgentsReached(concurrentLimit);
+        if (sessionState != null) {
+          sessionState.errorMessage = message;
+        } else {
+          _fallbackErrorMessage = message;
+        }
+        notifyListeners();
+        return;
+      }
 
-      final session = currentSession!;
-      final state = _getOrCreateState(session.id);
+      if (session == null) {
+        session = await createSession();
+        sessionState = _getOrCreateState(session.id);
+      }
+
+      final activeSession = session;
+      final state = sessionState!;
       activeState = state;
       state.pendingAlternatives = null;
       state.isSending = true;
       state.pendingAlternatives = pendingAlternativesForSend;
-      session.messages.add(ChatMessage.userContent([
+      activeSession.messages.add(ChatMessage.userContent([
         if (trimmedText.isNotEmpty) TextContent(trimmedText),
         ...attachments,
       ]));
-      session.autoTitle();
-      await _storage.saveSession(session);
+      activeSession.autoTitle();
+      await _storage.saveSession(activeSession);
+      _syncCurrentSessionReference(activeSession);
       notifyListeners();
 
-      final llmConfig = _buildLlmConfig(_prefs, session);
+      final llmConfig = _buildLlmConfig(_prefs, activeSession);
       if (state.cachedLlm == null || state.cachedLlmConfig != llmConfig) {
         state.cachedLlm?.dispose();
         state.cachedLlm = LlmService(
@@ -630,7 +715,7 @@ class ChatProvider extends ChangeNotifier {
       _skills = await SkillService.scanSkills();
       await MemoryService.getMemories();
 
-      final basePrompt = session.systemPrompt ??
+      final basePrompt = activeSession.systemPrompt ??
           _prefs.systemPrompt ??
           AppConstants.defaultSystemPrompt;
       final skillIndex = SkillService.buildSkillIndex(_skills);
@@ -656,14 +741,18 @@ class ChatProvider extends ChangeNotifier {
       state.streamingText = '';
       state.errorMessage = null;
       notifyListeners();
-      unawaited(_startAgentService(_agentServiceThinkingText));
+      unawaited(_startAgentServiceForState(
+        state,
+        _agentServiceThinkingText,
+      ));
 
       state.agentCompleter = Completer<void>();
-      final fullApiMessages = session.toApiMessages();
+      final fullApiMessages = activeSession.toApiMessages();
       final apiMessages = _truncateToFit(fullApiMessages);
       if (apiMessages.length < fullApiMessages.length) {
-        _appendContextCompactionNotice(session, apiMessages.length);
-        await _storage.saveSession(session);
+        _appendContextCompactionNotice(activeSession, apiMessages.length);
+        await _storage.saveSession(activeSession);
+        _syncCurrentSessionReference(activeSession);
         notifyListeners();
       }
       final initialApiMsgCount = apiMessages.length;
@@ -677,7 +766,10 @@ class ChatProvider extends ChangeNotifier {
                 state.status = AgentStatus.thinking;
                 state.streamBuffer = StringBuffer();
                 notifyListeners();
-                unawaited(_startAgentService(_agentServiceThinkingText));
+                unawaited(_startAgentServiceForState(
+                  state,
+                  _agentServiceThinkingText,
+                ));
 
               case AgentTextDelta(:final text):
                 state.status = AgentStatus.streaming;
@@ -687,14 +779,21 @@ class ChatProvider extends ChangeNotifier {
                   state.streamingText = state.streamBuffer.toString();
                   state.streamThrottle = null;
                   notifyListeners();
-                  unawaited(_startAgentService(_agentServiceStreamingText));
+                  unawaited(_startAgentServiceForState(
+                    state,
+                    _agentServiceStreamingText,
+                  ));
                 });
 
               case AgentToolStart(:final toolName):
                 state.status = AgentStatus.tooling;
                 notifyListeners();
-                unawaited(_startAgentService(_agentServiceToolingText));
-                unawaited(_updateAgentNativeStatus(
+                unawaited(_startAgentServiceForState(
+                  state,
+                  _agentServiceToolingText,
+                ));
+                unawaited(_updateAgentNativeStatusForState(
+                  state,
                   'tooling',
                   toolName: toolName,
                 ));
@@ -709,12 +808,13 @@ class ChatProvider extends ChangeNotifier {
                 state.streamBuffer = StringBuffer();
                 _appendNewAgentMessages(
                   state,
-                  session,
+                  activeSession,
                   messages,
                   state.initialApiMsgCount,
                 );
                 state.initialApiMsgCount = messages.length;
-                unawaited(_storage.saveSession(session).then((_) {
+                _syncCurrentSessionReference(activeSession);
+                unawaited(_storage.saveSession(activeSession).then((_) {
                   if (!_disposed) notifyListeners();
                 }));
                 notifyListeners();
@@ -732,20 +832,21 @@ class ChatProvider extends ChangeNotifier {
                 state.streamingText = '';
                 _appendNewAgentMessages(
                   state,
-                  session,
+                  activeSession,
                   state.agent!.messages,
                   state.initialApiMsgCount,
                 );
                 state.initialApiMsgCount = state.agent!.messages.length;
                 // Store token usage on the last assistant message
-                for (int i = session.messages.length - 1; i >= 0; i--) {
-                  if (session.messages[i].role == 'assistant') {
-                    session.messages[i].inputTokens = inputTokens;
-                    session.messages[i].outputTokens = outputTokens;
+                for (int i = activeSession.messages.length - 1; i >= 0; i--) {
+                  if (activeSession.messages[i].role == 'assistant') {
+                    activeSession.messages[i].inputTokens = inputTokens;
+                    activeSession.messages[i].outputTokens = outputTokens;
                     break;
                   }
                 }
-                _storage.saveSession(session).then((_) {
+                _syncCurrentSessionReference(activeSession);
+                _storage.saveSession(activeSession).then((_) {
                   if (!_disposed) notifyListeners();
                 });
                 final c = state.agentCompleter;
@@ -761,7 +862,7 @@ class ChatProvider extends ChangeNotifier {
                 notifyListeners();
                 final c = state.agentCompleter;
                 if (c != null && !c.isCompleted) c.complete();
-                unawaited(_stopAgentService());
+                unawaited(_stopAgentServiceForState(state));
             }
           },
           onError: (Object e) {
@@ -773,14 +874,14 @@ class ChatProvider extends ChangeNotifier {
             if (!state.agentCompletionFinalizing) {
               final c = state.agentCompleter;
               if (c != null && !c.isCompleted) c.complete();
-              unawaited(_stopAgentService());
+              unawaited(_stopAgentServiceForState(state));
             }
           },
           onDone: () {
             if (!state.agentCompletionFinalizing) {
               final c = state.agentCompleter;
               if (c != null && !c.isCompleted) c.complete();
-              unawaited(_stopAgentService());
+              unawaited(_stopAgentServiceForState(state));
             }
           },
           cancelOnError: false,
@@ -795,7 +896,7 @@ class ChatProvider extends ChangeNotifier {
         state.agentCompleter = null;
         state.partialAgentResponseSaved = false;
         state.initialApiMsgCount = 0;
-        unawaited(_stopAgentService());
+        unawaited(_stopAgentServiceForState(state));
       }
     } finally {
       final state = activeState;
@@ -808,13 +909,17 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void cancelAgent({String? sessionId}) {
-    final state = _runningState;
-    if (state == null) return;
+    final id = sessionId ?? currentSession?.id;
+    if (id == null) return;
+    final state = _agentStates[id];
+    if (state == null || !state.isSending) return;
 
     state.wasCancelled = true;
     state.agent?.cancel();
-    unawaited(_stopAgentService());
-    _completePendingApproval(false);
+    unawaited(_stopAgentServiceForState(state));
+    if (identical(_pendingApprovalState, state)) {
+      _completePendingApproval(false);
+    }
     state.agentSubscription?.cancel();
     state.agentSubscription = null;
     state.streamThrottle?.cancel();
@@ -858,20 +963,24 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
     Future.delayed(const Duration(seconds: 1), () {
       if (!_disposed && !state.wasCancelled) {
-        sendMessage(next.text, attachments: next.attachments);
+        sendMessage(
+          next.text,
+          attachments: next.attachments,
+          targetSessionId: state.sessionId,
+        );
       }
     });
   }
 
   void removeQueuedMessage(String id) {
-    final state = _runningState;
+    final state = _getState(currentSession?.id);
     if (state == null) return;
     state.messageQueue.removeWhere((m) => m.id == id);
     notifyListeners();
   }
 
   void clearMessageQueue() {
-    final state = _runningState;
+    final state = _getState(currentSession?.id);
     if (state == null) return;
     state.messageQueue.clear();
     state.wasCancelled = false;
@@ -879,12 +988,14 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void sendNextQueued() {
-    final state = _runningState;
+    final id = currentSession?.id;
+    if (id == null) return;
+    final state = _getState(id);
     if (state == null || state.isSending || state.messageQueue.isEmpty) return;
     state.wasCancelled = false;
     final next = state.messageQueue.removeAt(0);
     notifyListeners();
-    sendMessage(next.text, attachments: next.attachments);
+    sendMessage(next.text, attachments: next.attachments, targetSessionId: id);
   }
 
   void _savePartialAgentResponse(AgentState state) {
@@ -937,19 +1048,21 @@ class ChatProvider extends ChangeNotifier {
       state.pendingAlternatives = null;
     }
 
+    _syncCurrentSessionReference(session);
     unawaited(_storage.saveSession(session).catchError((Object e) {
       debugPrint('Failed to save partial agent response: $e');
     }));
   }
 
   Future<void> regenerateLastResponse() async {
-    final state = _runningState;
+    final id = currentSession?.id;
+    final state = _getState(id);
     if (state != null && state.messageQueue.isNotEmpty) {
-      _fallbackErrorMessage = AppStrings.clearQueueBeforeRegenerate;
+      state.errorMessage = AppStrings.clearQueueBeforeRegenerate;
       notifyListeners();
       return;
     }
-    if (currentSession == null || _isSendingLegacy) return;
+    if (currentSession == null || (state?.isSending ?? false)) return;
     final messages = currentSession!.messages;
 
     // Find the last assistant message to preserve its text as an alternative
@@ -1055,18 +1168,20 @@ class ChatProvider extends ChangeNotifier {
   bool get isComparing => _isComparing;
 
   Future<void> sendCompare(String text, List<String> models) async {
+    if (currentSession == null) await createSession();
+    final currentState = _getState(currentSession?.id);
     debugPrint(
       '[COMPARE] sendCompare entered. models=$models, text="${text.substring(0, math.min(20, text.length))}"',
     );
     debugPrint(
-      '[COMPARE] Guards: _isSending=$_isSendingLegacy, _isComparing=$_isComparing, session=${currentSession != null}',
+      '[COMPARE] Guards: currentSending=${currentState?.isSending ?? false}, _isComparing=$_isComparing, session=${currentSession != null}',
     );
-    if (_isSendingLegacy || _isComparing) {
-      errorMessage = _isSendingLegacy ? '正在发送中，请等待完成' : '正在对比中，请等待完成';
+    if ((currentState?.isSending ?? false) || _isComparing) {
+      errorMessage =
+          (currentState?.isSending ?? false) ? '当前会话正在发送中' : '正在对比中，请等待完成';
       notifyListeners();
       return;
     }
-    if (currentSession == null) await createSession();
     final compareModels =
         models.where((model) => model.trim().isNotEmpty).toList();
     debugPrint(
