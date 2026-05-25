@@ -67,6 +67,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final Set<String> _seenMessageAnimationIds = {};
   String? _seenAnimationSessionId;
   bool _queueExpanded = false;
+  bool _backgroundTasksExpanded = false;
 
   bool get _isListening => _voiceInput.isListening;
   bool get _isWhisperRecording => _voiceInput.isWhisperRecording;
@@ -2687,36 +2688,138 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Widget _buildBackgroundTasksBar(ThemeData theme, ChatProvider provider) {
-    final currentStatus = provider.agentStatus;
     final currentSessionId = provider.currentSession?.id;
-    final activeCount = provider.activeAgentSessionIds
+    final otherActiveIds = provider.activeAgentSessionIds
         .where((sessionId) => sessionId != currentSessionId)
-        .length;
-    if (currentStatus != AgentStatus.idle || activeCount == 0) {
+        .toList();
+    if (otherActiveIds.isEmpty) {
+      _backgroundTasksExpanded = false;
       return const SizedBox.shrink();
     }
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
         color: theme.colorScheme.primaryContainer.withAlpha(40),
         borderRadius: BorderRadius.circular(AppRadii.s),
       ),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            Icons.play_circle_outline,
-            size: 16,
-            color: theme.colorScheme.primary,
+          InkWell(
+            onTap: () => setState(
+              () => _backgroundTasksExpanded = !_backgroundTasksExpanded,
+            ),
+            borderRadius: BorderRadius.circular(AppRadii.s),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.play_circle_outline,
+                    size: 16,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '${otherActiveIds.length} 个 AI 任务在其他会话中运行',
+                      style: theme.textTheme.bodySmall,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  Icon(
+                    _backgroundTasksExpanded
+                        ? Icons.expand_less
+                        : Icons.expand_more,
+                    size: 20,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
           ),
-          const SizedBox(width: 6),
-          Text(
-            '$activeCount 个 AI 任务在其他会话中运行',
-            style: theme.textTheme.bodySmall,
-          ),
+          if (_backgroundTasksExpanded)
+            ...otherActiveIds.map(
+              (sessionId) {
+                final status = provider.agentStatusFor(sessionId);
+                return InkWell(
+                  onTap: () {
+                    setState(() => _backgroundTasksExpanded = false);
+                    unawaited(provider.selectSession(sessionId));
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: _agentStatusColor(status, theme),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _sessionTitleFor(provider, sessionId),
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurface,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          _agentStatusText(status),
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                            fontSize: 11,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Icon(
+                          Icons.chevron_right,
+                          size: 16,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
         ],
       ),
     );
+  }
+
+  String _sessionTitleFor(ChatProvider provider, String sessionId) {
+    for (final session in provider.sessions) {
+      if (session.id == sessionId) return session.title;
+    }
+    return '未命名会话';
+  }
+
+  Color _agentStatusColor(AgentStatus status, ThemeData theme) {
+    return switch (status) {
+      AgentStatus.thinking => theme.colorScheme.primary,
+      AgentStatus.streaming => theme.colorScheme.primary,
+      AgentStatus.tooling => Colors.amber,
+      AgentStatus.error => theme.colorScheme.error,
+      AgentStatus.idle => Colors.transparent,
+    };
+  }
+
+  String _agentStatusText(AgentStatus status) {
+    return switch (status) {
+      AgentStatus.thinking => '思考中',
+      AgentStatus.streaming => '回复中',
+      AgentStatus.tooling => '执行工具',
+      AgentStatus.error => '出错',
+      AgentStatus.idle => '',
+    };
   }
 
   Widget _buildInputArea(ThemeData theme) {
