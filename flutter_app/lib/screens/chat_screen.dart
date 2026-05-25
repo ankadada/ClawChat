@@ -66,6 +66,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final List<_PendingAttachmentPreview> _pendingAttachmentPreviews = [];
   final Set<String> _seenMessageAnimationIds = {};
   String? _seenAnimationSessionId;
+  bool _queueExpanded = false;
 
   bool get _isListening => _voiceInput.isListening;
   bool get _isWhisperRecording => _voiceInput.isWhisperRecording;
@@ -2571,47 +2572,118 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     bool isRunning,
   ) {
     final queue = provider.messageQueue;
-    if (queue.isEmpty) return const SizedBox.shrink();
+    if (queue.isEmpty) {
+      _queueExpanded = false;
+      return const SizedBox.shrink();
+    }
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(AppRadii.s),
         border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
       ),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.queue, size: 16, color: theme.colorScheme.primary),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Text(
-              AppStrings.messagesQueued(queue.length),
-              style: theme.textTheme.bodySmall,
-              overflow: TextOverflow.ellipsis,
+          InkWell(
+            onTap: () => setState(() => _queueExpanded = !_queueExpanded),
+            borderRadius: BorderRadius.circular(AppRadii.s),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Row(
+                children: [
+                  Icon(Icons.queue, size: 16, color: theme.colorScheme.primary),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      AppStrings.messagesQueued(queue.length),
+                      style: theme.textTheme.bodySmall,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  Icon(
+                    _queueExpanded ? Icons.expand_less : Icons.expand_more,
+                    size: 20,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                  if (!isRunning)
+                    TextButton(
+                      onPressed: provider.sendNextQueued,
+                      child: const Text(AppStrings.sendQueued),
+                    ),
+                  IconButton(
+                    tooltip: AppStrings.clearMessageQueue,
+                    icon: const Icon(Icons.clear_all, size: 18),
+                    onPressed: () {
+                      provider.clearMessageQueue();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text(AppStrings.messageQueueCleared),
+                          duration: Duration(seconds: 1),
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ),
             ),
           ),
-          if (!isRunning)
-            TextButton(
-              onPressed: provider.sendNextQueued,
-              child: const Text(AppStrings.sendQueued),
-            ),
-          IconButton(
-            tooltip: AppStrings.clearMessageQueue,
-            icon: const Icon(Icons.clear_all, size: 18),
-            onPressed: () {
-              provider.clearMessageQueue();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(AppStrings.messageQueueCleared),
-                  duration: Duration(seconds: 1),
+          if (_queueExpanded)
+            ...queue.map(
+              (message) => Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 4, 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _queuedMessagePreview(message),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (message.attachments.isNotEmpty) ...[
+                      const SizedBox(width: 4),
+                      Icon(
+                        Icons.attach_file,
+                        size: 14,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      Text(
+                        '${message.attachments.length}',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ],
+                    IconButton(
+                      icon: Icon(
+                        Icons.close,
+                        size: 16,
+                        color: theme.colorScheme.error,
+                      ),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      onPressed: () => provider.removeQueuedMessage(message.id),
+                    ),
+                  ],
                 ),
-              );
-            },
-          ),
+              ),
+            ),
         ],
       ),
     );
+  }
+
+  String _queuedMessagePreview(QueuedMessage message) {
+    final text = message.text.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (text.isEmpty) return '附件消息';
+    if (text.length <= 50) return text;
+    return '${text.substring(0, 50)}...';
   }
 
   Widget _buildInputArea(ThemeData theme) {
