@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:encrypt/encrypt.dart' as encrypt_lib;
 
+import '../constants.dart';
 import '../models/provider_profile.dart';
 import 'preferences_service.dart';
 
@@ -34,7 +35,7 @@ class ConfigExportService {
     final export = {
       'version': _currentVersion,
       'exportedAt': DateTime.now().toUtc().toIso8601String(),
-      'appVersion': '2.1.0',
+      'appVersion': AppConstants.version,
       'settings': settings,
       'secrets': secrets,
     };
