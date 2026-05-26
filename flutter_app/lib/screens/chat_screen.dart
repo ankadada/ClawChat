@@ -70,6 +70,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _queueExpanded = false;
   bool _backgroundTasksExpanded = false;
   bool _userHasScrolledUp = false;
+  bool _userIsActivelyScrolling = false;
   bool _agentJustCompleted = false;
   bool _isCompensatingScroll = false;
   bool _scrollCompensationScheduled = false;
@@ -572,7 +573,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
       if (bottomInset > 0 && _scrollController.hasClients) {
-        _scrollController.jumpTo(0);
+        if (!_userHasScrolledUp && _scrollController.offset < 50) {
+          _scrollController.jumpTo(0);
+        }
       }
     });
   }
@@ -642,10 +645,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   bool _handleScrollNotification(ScrollNotification notification) {
     if (!_scrollController.hasClients || _isCompensatingScroll) return false;
-    if (notification is UserScrollNotification &&
-        notification.direction == ScrollDirection.forward) {
-      _updateScrollState(userScrolledAway: true);
-      return false;
+    if (notification is UserScrollNotification) {
+      if (notification.direction == ScrollDirection.idle) {
+        _userIsActivelyScrolling = false;
+      } else {
+        _userIsActivelyScrolling = true;
+        if (notification.direction == ScrollDirection.forward) {
+          _updateScrollState(userScrolledAway: true);
+          return false;
+        }
+      }
     }
     if (notification is ScrollUpdateNotification ||
         notification is ScrollEndNotification ||
@@ -658,6 +667,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _updateScrollState({bool userScrolledAway = false}) {
     if (!_scrollController.hasClients) return;
     final offset = _scrollController.offset;
+    _lastMaxScrollExtent ??= _scrollController.position.maxScrollExtent;
     final shouldShow = _showScrollToBottom ? offset > 120 : offset > 300;
     final atBottom = offset < 50;
     final nextUserHasScrolledUp = atBottom
@@ -694,7 +704,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final position = _scrollController.position;
     final currentMax = position.maxScrollExtent;
     final previousMax = _lastMaxScrollExtent;
-    if (previousMax != null && _userHasScrolledUp && position.pixels > 50) {
+    final provider = context.read<ChatProvider>();
+    final isStreaming = provider.agentStatus == AgentStatus.streaming;
+    if (previousMax != null &&
+        _userHasScrolledUp &&
+        isStreaming &&
+        position.pixels > 50 &&
+        !_userIsActivelyScrolling) {
       final delta = currentMax - previousMax;
       if (delta > 0.5) {
         final target = (position.pixels + delta)
@@ -734,6 +750,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _resetScrollTrackingForSession() {
     _showScrollToBottom = false;
     _userHasScrolledUp = false;
+    _userIsActivelyScrolling = false;
     _agentJustCompleted = false;
     _isCompensatingScroll = false;
     _scrollCompensationScheduled = false;
@@ -942,83 +959,75 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     final itemCount = messages.length +
                         (hasStreaming ? 1 : 0) +
                         (showTyping ? 1 : 0);
-                    _scheduleScrollExtentCompensation();
                     return Stack(
                       children: [
-                        NotificationListener<ScrollMetricsNotification>(
-                          onNotification: (_) {
-                            _scheduleScrollExtentCompensation();
-                            return false;
-                          },
-                          child: NotificationListener<ScrollNotification>(
-                            onNotification: _handleScrollNotification,
-                            child: ListView.builder(
-                              controller: _scrollController,
-                              reverse: true,
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 16, vertical: 12),
-                              itemCount: itemCount,
-                              itemBuilder: (context, index) {
-                                final reversedIndex = itemCount - 1 - index;
-                                if (reversedIndex == messages.length &&
-                                    hasStreaming) {
-                                  return Consumer<ChatProvider>(
-                                    builder: (_, provider, __) {
-                                      _scheduleScrollExtentCompensation();
-                                      return RepaintBoundary(
-                                        child: _buildStreamingBubble(
-                                          provider.streamingText,
-                                          theme,
-                                          maxContentWidth,
-                                          previousRole: messages.isEmpty
-                                              ? null
-                                              : messages.last.role,
-                                        ),
-                                      );
-                                    },
-                                  );
-                                }
-                                if (reversedIndex == messages.length &&
-                                    showTyping) {
-                                  return RepaintBoundary(
-                                    child: _buildTypingIndicatorBubble(
-                                      theme,
-                                      maxContentWidth,
-                                      previousRole: messages.isEmpty
-                                          ? null
-                                          : messages.last.role,
-                                    ),
-                                  );
-                                }
-                                final message = messages[reversedIndex];
-                                final previousRole = reversedIndex > 0
-                                    ? messages[reversedIndex - 1].role
-                                    : null;
-                                final nextRole =
-                                    reversedIndex < messages.length - 1
-                                        ? messages[reversedIndex + 1].role
-                                        : null;
-                                final animationId =
-                                    _messageAnimationId(message);
-                                final animate =
-                                    _seenMessageAnimationIds.add(animationId);
-                                return _AnimatedMessageEntry(
-                                  key: ValueKey(animationId),
-                                  animate: animate,
-                                  child: RepaintBoundary(
-                                    child: _buildMessageBubble(
-                                      message,
-                                      reversedIndex,
-                                      theme,
-                                      maxContentWidth,
-                                      messages: messages,
-                                      previousRole: previousRole,
-                                      nextRole: nextRole,
-                                    ),
+                        NotificationListener<ScrollNotification>(
+                          onNotification: _handleScrollNotification,
+                          child: ListView.builder(
+                            controller: _scrollController,
+                            reverse: true,
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 16, vertical: 12),
+                            itemCount: itemCount,
+                            itemBuilder: (context, index) {
+                              final reversedIndex = itemCount - 1 - index;
+                              if (reversedIndex == messages.length &&
+                                  hasStreaming) {
+                                return Consumer<ChatProvider>(
+                                  builder: (_, provider, __) {
+                                    _scheduleScrollExtentCompensation();
+                                    return RepaintBoundary(
+                                      child: _buildStreamingBubble(
+                                        provider.streamingText,
+                                        theme,
+                                        maxContentWidth,
+                                        previousRole: messages.isEmpty
+                                            ? null
+                                            : messages.last.role,
+                                      ),
+                                    );
+                                  },
+                                );
+                              }
+                              if (reversedIndex == messages.length &&
+                                  showTyping) {
+                                return RepaintBoundary(
+                                  child: _buildTypingIndicatorBubble(
+                                    theme,
+                                    maxContentWidth,
+                                    previousRole: messages.isEmpty
+                                        ? null
+                                        : messages.last.role,
                                   ),
                                 );
-                              },
-                            ),
+                              }
+                              final message = messages[reversedIndex];
+                              final previousRole = reversedIndex > 0
+                                  ? messages[reversedIndex - 1].role
+                                  : null;
+                              final nextRole =
+                                  reversedIndex < messages.length - 1
+                                      ? messages[reversedIndex + 1].role
+                                      : null;
+                              final animationId = _messageAnimationId(message);
+                              final animate =
+                                  _seenMessageAnimationIds.add(animationId);
+                              return _AnimatedMessageEntry(
+                                key: ValueKey(animationId),
+                                animate: animate,
+                                child: RepaintBoundary(
+                                  child: _buildMessageBubble(
+                                    message,
+                                    reversedIndex,
+                                    theme,
+                                    maxContentWidth,
+                                    messages: messages,
+                                    previousRole: previousRole,
+                                    nextRole: nextRole,
+                                  ),
+                                ),
+                              );
+                            },
                           ),
                         ),
                         Positioned(
