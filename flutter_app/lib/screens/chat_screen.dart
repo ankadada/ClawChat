@@ -4,6 +4,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
@@ -68,6 +69,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   String? _seenAnimationSessionId;
   bool _queueExpanded = false;
   bool _backgroundTasksExpanded = false;
+  bool _userHasScrolledUp = false;
+  bool _agentJustCompleted = false;
+  bool _isCompensatingScroll = false;
+  bool _scrollCompensationScheduled = false;
+  double? _lastMaxScrollExtent;
+  String? _trackedAgentSessionId;
+  bool _trackedAgentWasActive = false;
 
   bool get _isListening => _voiceInput.isListening;
   bool get _isWhisperRecording => _voiceInput.isWhisperRecording;
@@ -596,6 +604,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _pendingAttachments.clear();
       _pendingAttachmentPreviews.clear();
       _lastSessionId = currentId;
+      _resetScrollTrackingForSession();
       final draft = provider.getDraft(currentId);
       if (_inputController.text != draft) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -627,16 +636,120 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _handleScroll() {
+    if (!_scrollController.hasClients || _isCompensatingScroll) return;
+    _updateScrollState();
+  }
+
+  bool _handleScrollNotification(ScrollNotification notification) {
+    if (!_scrollController.hasClients || _isCompensatingScroll) return false;
+    if (notification is UserScrollNotification &&
+        notification.direction == ScrollDirection.forward) {
+      _updateScrollState(userScrolledAway: true);
+      return false;
+    }
+    if (notification is ScrollUpdateNotification ||
+        notification is ScrollEndNotification ||
+        notification is UserScrollNotification) {
+      _updateScrollState();
+    }
+    return false;
+  }
+
+  void _updateScrollState({bool userScrolledAway = false}) {
     if (!_scrollController.hasClients) return;
     final offset = _scrollController.offset;
     final shouldShow = _showScrollToBottom ? offset > 120 : offset > 300;
-    if (shouldShow == _showScrollToBottom) return;
-    setState(() => _showScrollToBottom = shouldShow);
+    final atBottom = offset < 50;
+    final nextUserHasScrolledUp = atBottom
+        ? false
+        : (userScrolledAway && offset > 100)
+            ? true
+            : _userHasScrolledUp;
+    final nextAgentJustCompleted = atBottom ? false : _agentJustCompleted;
+    if (shouldShow == _showScrollToBottom &&
+        nextUserHasScrolledUp == _userHasScrolledUp &&
+        nextAgentJustCompleted == _agentJustCompleted) {
+      return;
+    }
+    setState(() {
+      _showScrollToBottom = shouldShow;
+      _userHasScrolledUp = nextUserHasScrolledUp;
+      _agentJustCompleted = nextAgentJustCompleted;
+    });
+  }
+
+  void _scheduleScrollExtentCompensation() {
+    if (_scrollCompensationScheduled) return;
+    _scrollCompensationScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollCompensationScheduled = false;
+      _compensateScrollExtentChange();
+    });
+  }
+
+  void _compensateScrollExtentChange() {
+    if (!mounted || !_scrollController.hasClients || _isCompensatingScroll) {
+      return;
+    }
+    final position = _scrollController.position;
+    final currentMax = position.maxScrollExtent;
+    final previousMax = _lastMaxScrollExtent;
+    if (previousMax != null && _userHasScrolledUp && position.pixels > 50) {
+      final delta = currentMax - previousMax;
+      if (delta > 0.5) {
+        final target = (position.pixels + delta)
+            .clamp(position.minScrollExtent, currentMax)
+            .toDouble();
+        _isCompensatingScroll = true;
+        _scrollController.jumpTo(target);
+        _isCompensatingScroll = false;
+      }
+    }
+    _lastMaxScrollExtent = currentMax;
+    _updateScrollState();
+  }
+
+  void _trackAgentCompletion({
+    required String? sessionId,
+    required bool isActive,
+    required bool completed,
+  }) {
+    if (sessionId != _trackedAgentSessionId) {
+      _trackedAgentSessionId = sessionId;
+      _trackedAgentWasActive = isActive;
+      _agentJustCompleted = false;
+      return;
+    }
+    if (_trackedAgentWasActive &&
+        completed &&
+        _userHasScrolledUp &&
+        _scrollController.hasClients &&
+        _scrollController.offset >= 50) {
+      _agentJustCompleted = true;
+      _showScrollToBottom = true;
+    }
+    _trackedAgentWasActive = isActive;
+  }
+
+  void _resetScrollTrackingForSession() {
+    _showScrollToBottom = false;
+    _userHasScrolledUp = false;
+    _agentJustCompleted = false;
+    _isCompensatingScroll = false;
+    _scrollCompensationScheduled = false;
+    _lastMaxScrollExtent = null;
+    _trackedAgentSessionId = null;
+    _trackedAgentWasActive = false;
   }
 
   void _scrollToBottom() {
     HapticFeedback.lightImpact();
     if (!_scrollController.hasClients) return;
+    setState(() {
+      _showScrollToBottom = false;
+      _userHasScrolledUp = false;
+      _agentJustCompleted = false;
+    });
     _scrollController.animateTo(
       0,
       duration: const Duration(milliseconds: 260),
@@ -802,6 +915,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     final hasStreaming = data.hasStreaming;
                     final showTyping =
                         data.status == AgentStatus.thinking && !hasStreaming;
+                    final agentActive = hasStreaming ||
+                        showTyping ||
+                        data.status == AgentStatus.thinking ||
+                        data.status == AgentStatus.streaming ||
+                        data.status == AgentStatus.tooling;
+                    _trackAgentCompletion(
+                      sessionId: data.sessionId,
+                      isActive: agentActive,
+                      completed:
+                          !agentActive && data.status == AgentStatus.idle,
+                    );
 
                     // Sync draft when session changes via Selector rebuild
                     final currentId = data.sessionId;
@@ -818,69 +942,84 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     final itemCount = messages.length +
                         (hasStreaming ? 1 : 0) +
                         (showTyping ? 1 : 0);
+                    _scheduleScrollExtentCompensation();
                     return Stack(
                       children: [
-                        ListView.builder(
-                          controller: _scrollController,
-                          reverse: true,
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 12),
-                          itemCount: itemCount,
-                          itemBuilder: (context, index) {
-                            final reversedIndex = itemCount - 1 - index;
-                            if (reversedIndex == messages.length &&
-                                hasStreaming) {
-                              return Consumer<ChatProvider>(
-                                builder: (_, provider, __) => RepaintBoundary(
-                                  child: _buildStreamingBubble(
-                                    provider.streamingText,
-                                    theme,
-                                    maxContentWidth,
-                                    previousRole: messages.isEmpty
-                                        ? null
-                                        : messages.last.role,
-                                  ),
-                                ),
-                              );
-                            }
-                            if (reversedIndex == messages.length &&
-                                showTyping) {
-                              return RepaintBoundary(
-                                child: _buildTypingIndicatorBubble(
-                                  theme,
-                                  maxContentWidth,
-                                  previousRole: messages.isEmpty
-                                      ? null
-                                      : messages.last.role,
-                                ),
-                              );
-                            }
-                            final message = messages[reversedIndex];
-                            final previousRole = reversedIndex > 0
-                                ? messages[reversedIndex - 1].role
-                                : null;
-                            final nextRole = reversedIndex < messages.length - 1
-                                ? messages[reversedIndex + 1].role
-                                : null;
-                            final animationId = _messageAnimationId(message);
-                            final animate =
-                                _seenMessageAnimationIds.add(animationId);
-                            return _AnimatedMessageEntry(
-                              key: ValueKey(animationId),
-                              animate: animate,
-                              child: RepaintBoundary(
-                                child: _buildMessageBubble(
-                                  message,
-                                  reversedIndex,
-                                  theme,
-                                  maxContentWidth,
-                                  messages: messages,
-                                  previousRole: previousRole,
-                                  nextRole: nextRole,
-                                ),
-                              ),
-                            );
+                        NotificationListener<ScrollMetricsNotification>(
+                          onNotification: (_) {
+                            _scheduleScrollExtentCompensation();
+                            return false;
                           },
+                          child: NotificationListener<ScrollNotification>(
+                            onNotification: _handleScrollNotification,
+                            child: ListView.builder(
+                              controller: _scrollController,
+                              reverse: true,
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 16, vertical: 12),
+                              itemCount: itemCount,
+                              itemBuilder: (context, index) {
+                                final reversedIndex = itemCount - 1 - index;
+                                if (reversedIndex == messages.length &&
+                                    hasStreaming) {
+                                  return Consumer<ChatProvider>(
+                                    builder: (_, provider, __) {
+                                      _scheduleScrollExtentCompensation();
+                                      return RepaintBoundary(
+                                        child: _buildStreamingBubble(
+                                          provider.streamingText,
+                                          theme,
+                                          maxContentWidth,
+                                          previousRole: messages.isEmpty
+                                              ? null
+                                              : messages.last.role,
+                                        ),
+                                      );
+                                    },
+                                  );
+                                }
+                                if (reversedIndex == messages.length &&
+                                    showTyping) {
+                                  return RepaintBoundary(
+                                    child: _buildTypingIndicatorBubble(
+                                      theme,
+                                      maxContentWidth,
+                                      previousRole: messages.isEmpty
+                                          ? null
+                                          : messages.last.role,
+                                    ),
+                                  );
+                                }
+                                final message = messages[reversedIndex];
+                                final previousRole = reversedIndex > 0
+                                    ? messages[reversedIndex - 1].role
+                                    : null;
+                                final nextRole =
+                                    reversedIndex < messages.length - 1
+                                        ? messages[reversedIndex + 1].role
+                                        : null;
+                                final animationId =
+                                    _messageAnimationId(message);
+                                final animate =
+                                    _seenMessageAnimationIds.add(animationId);
+                                return _AnimatedMessageEntry(
+                                  key: ValueKey(animationId),
+                                  animate: animate,
+                                  child: RepaintBoundary(
+                                    child: _buildMessageBubble(
+                                      message,
+                                      reversedIndex,
+                                      theme,
+                                      maxContentWidth,
+                                      messages: messages,
+                                      previousRole: previousRole,
+                                      nextRole: nextRole,
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
                         ),
                         Positioned(
                           right: 16,
@@ -934,6 +1073,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Widget _buildScrollToBottomButton(ThemeData theme) {
+    final showCompletionNotice = _agentJustCompleted && _showScrollToBottom;
     return IgnorePointer(
       ignoring: !_showScrollToBottom,
       child: AnimatedOpacity(
@@ -944,14 +1084,48 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           scale: _showScrollToBottom ? 1 : 0.92,
           duration: const Duration(milliseconds: 220),
           curve: Curves.easeOutCubic,
-          child: FloatingActionButton.small(
-            heroTag: 'chat-scroll-to-bottom',
-            tooltip: AppStrings.scrollToBottom,
-            onPressed: _scrollToBottom,
-            backgroundColor: theme.colorScheme.surfaceContainerHighest,
-            foregroundColor: theme.colorScheme.onSurface,
-            child: const Icon(Icons.keyboard_arrow_down),
-          ),
+          child: showCompletionNotice
+              ? Material(
+                  color: theme.colorScheme.primary,
+                  borderRadius: BorderRadius.circular(999),
+                  elevation: 4,
+                  child: InkWell(
+                    onTap: _scrollToBottom,
+                    borderRadius: BorderRadius.circular(999),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 9,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.keyboard_arrow_down,
+                            size: 18,
+                            color: theme.colorScheme.onPrimary,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            'AI 回复完成 ↓',
+                            style: theme.textTheme.labelMedium?.copyWith(
+                              color: theme.colorScheme.onPrimary,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              : FloatingActionButton.small(
+                  heroTag: 'chat-scroll-to-bottom',
+                  tooltip: AppStrings.scrollToBottom,
+                  onPressed: _scrollToBottom,
+                  backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                  foregroundColor: theme.colorScheme.onSurface,
+                  child: const Icon(Icons.keyboard_arrow_down),
+                ),
         ),
       ),
     );
