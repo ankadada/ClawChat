@@ -705,10 +705,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final currentMax = position.maxScrollExtent;
     final previousMax = _lastMaxScrollExtent;
     final provider = context.read<ChatProvider>();
-    final isStreaming = provider.agentStatus == AgentStatus.streaming;
+    final isAgentActive = provider.agentStatus == AgentStatus.streaming ||
+        provider.agentStatus == AgentStatus.thinking ||
+        provider.agentStatus == AgentStatus.tooling;
     if (previousMax != null &&
         _userHasScrolledUp &&
-        isStreaming &&
+        isAgentActive &&
         position.pixels > 50 &&
         !_userIsActivelyScrolling) {
       final delta = currentMax - previousMax;
@@ -761,16 +763,26 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _scrollToBottom() {
     HapticFeedback.lightImpact();
+    debugPrint(
+      '[SCROLL] _scrollToBottom called, offset='
+      '${_scrollController.hasClients ? _scrollController.offset : 'no-client'}',
+    );
     if (!_scrollController.hasClients) return;
-    setState(() {
-      _showScrollToBottom = false;
-      _userHasScrolledUp = false;
-      _agentJustCompleted = false;
-    });
-    _scrollController.animateTo(
-      0,
-      duration: const Duration(milliseconds: 260),
-      curve: Curves.easeOutCubic,
+    _userHasScrolledUp = false;
+    _userIsActivelyScrolling = false;
+    _agentJustCompleted = false;
+    unawaited(
+      _scrollController
+          .animateTo(
+        0,
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOutCubic,
+      )
+          .then((_) {
+        if (mounted) {
+          setState(() => _showScrollToBottom = false);
+        }
+      }).catchError((_) {}),
     );
   }
 
@@ -959,6 +971,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     final itemCount = messages.length +
                         (hasStreaming ? 1 : 0) +
                         (showTyping ? 1 : 0);
+                    if (_userHasScrolledUp && agentActive) {
+                      _scheduleScrollExtentCompensation();
+                    }
                     return Stack(
                       children: [
                         NotificationListener<ScrollNotification>(
@@ -975,7 +990,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   hasStreaming) {
                                 return Consumer<ChatProvider>(
                                   builder: (_, provider, __) {
-                                    _scheduleScrollExtentCompensation();
                                     return RepaintBoundary(
                                       child: _buildStreamingBubble(
                                         provider.streamingText,
