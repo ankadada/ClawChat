@@ -571,6 +571,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     // Only scroll to bottom if keyboard actually appeared
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      _lastMaxScrollExtent = null;
       final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
       if (bottomInset > 0 && _scrollController.hasClients) {
         if (!_userHasScrolledUp && _scrollController.offset < 50) {
@@ -705,12 +706,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final currentMax = position.maxScrollExtent;
     final previousMax = _lastMaxScrollExtent;
     final provider = context.read<ChatProvider>();
-    final isAgentActive = provider.agentStatus == AgentStatus.streaming ||
-        provider.agentStatus == AgentStatus.thinking ||
-        provider.agentStatus == AgentStatus.tooling;
+    final isStreaming = provider.agentStatus == AgentStatus.streaming;
     if (previousMax != null &&
         _userHasScrolledUp &&
-        isAgentActive &&
+        isStreaming &&
         position.pixels > 50 &&
         !_userIsActivelyScrolling) {
       final delta = currentMax - previousMax;
@@ -971,7 +970,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     final itemCount = messages.length +
                         (hasStreaming ? 1 : 0) +
                         (showTyping ? 1 : 0);
-                    if (_userHasScrolledUp && agentActive) {
+                    if (_userHasScrolledUp && hasStreaming) {
                       _scheduleScrollExtentCompensation();
                     }
                     return Stack(
