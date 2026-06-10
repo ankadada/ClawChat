@@ -41,7 +41,8 @@ class AgentComplete extends AgentEvent {
 
 class AgentError extends AgentEvent {
   final String message;
-  AgentError(this.message);
+  final Object? cause;
+  AgentError(this.message, {this.cause});
 }
 
 class AgentService {
@@ -123,12 +124,12 @@ class AgentService {
           } else if (event is StreamDone) {
             response = event.response;
           } else if (event is StreamError) {
-            yield AgentError(event.message);
+            yield AgentError(event.message, cause: event.cause);
             return;
           }
         }
       } catch (e) {
-        yield AgentError('LLM request failed: $e');
+        yield AgentError('LLM request failed: $e', cause: e);
         return;
       }
 
@@ -257,7 +258,8 @@ class AgentService {
     Map<String, dynamic> toolInput,
   ) async {
     if (!_tools.hasTool(toolName)) {
-      return _ToolResult(toolUseId, 'Tool error: Unknown tool: $toolName', true);
+      return _ToolResult(
+          toolUseId, 'Tool error: Unknown tool: $toolName', true);
     }
 
     final request = ToolApprovalRequest(

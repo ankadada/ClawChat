@@ -56,7 +56,7 @@ void main() {
     });
 
     test('redacts multiple keys in same body', () async {
-      final input = 'Keys: sk-aaaaaaaaaa and api-bbbbbbbbbb found';
+      const input = 'Keys: sk-aaaaaaaaaa and api-bbbbbbbbbb found';
       final result = await sanitizedErrorBody(input);
       expect(result, isNot(contains('sk-aaaaaaaaaa')));
       expect(result, isNot(contains('api-bbbbbbbbbb')));
@@ -136,6 +136,52 @@ void main() {
     });
   });
 
+  group('LlmService Anthropic invalid encrypted content handling', () {
+    test('throws EncryptedContentError for invalid_encrypted_content 400',
+        () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      server.listen((request) async {
+        await utf8.decoder.bind(request).join();
+        request.response.statusCode = 400;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(jsonEncode({
+          'type': 'error',
+          'error': {
+            'type': 'invalid_request_error',
+            'code': 'invalid_encrypted_content',
+            'message':
+                'The encrypted content lite...dhmz could not be verified.',
+          },
+        }));
+        await request.response.close();
+      });
+
+      final service = LlmService(LlmConfig.anthropic(
+        apiKey: 'sk-test',
+        model: 'claude-sonnet-4-20250514',
+        baseUrl: 'http://127.0.0.1:${server.port}',
+      ));
+
+      try {
+        await expectLater(
+          service.chat(
+            system: '',
+            messages: const [
+              {'role': 'user', 'content': 'hi'},
+            ],
+            tools: const [],
+          ),
+          throwsA(isA<EncryptedContentError>()
+              .having((e) => e.code, 'code', 'invalid_encrypted_content')
+              .having((e) => e.statusCode, 'statusCode', 400)),
+        );
+      } finally {
+        service.dispose();
+        await server.close(force: true);
+      }
+    });
+  });
+
   group('LlmConfig equality', () {
     test('ContentBlock.toJson produces correct text block', () {
       const block = ContentBlock(type: 'text', text: 'hello');
@@ -207,6 +253,13 @@ void main() {
   });
 
   group('LlmService request body compatibility', () {
+    test('modelIdFromDisplay preserves slash-prefixed raw model ids', () {
+      const models = ['gpt-5.5', 'codex/gpt-5.5'];
+
+      expect(LlmService.modelIdFromDisplay(models[0]), 'gpt-5.5');
+      expect(LlmService.modelIdFromDisplay(models[1]), 'codex/gpt-5.5');
+    });
+
     test('strips Anthropic preset display suffix from request model', () async {
       final body = await captureAnthropicBody(
         model: 'claude-sonnet-4-20250514${LlmService.presetModelSuffix}',
@@ -627,6 +680,28 @@ void main() {
   });
 
   group('LlmService streaming compatibility', () {
+    test('returns sanitized EncryptedContentError for Anthropic SSE error',
+        () async {
+      final events = await collectAnthropicStreamEvents([
+        sseData({
+          'type': 'error',
+          'error': {
+            'type': 'invalid_request_error',
+            'code': 'invalid_encrypted_content',
+            'message': 'The encrypted content ${'x' * 800}',
+          },
+        }),
+      ]);
+
+      final error = events.whereType<StreamError>().single;
+      expect(error.cause, isA<EncryptedContentError>());
+      expect((error.cause as EncryptedContentError).code,
+          'invalid_encrypted_content');
+      expect(error.message, contains('invalid_encrypted_content'));
+      expect(error.message.length, lessThan(620));
+      expect(error.message, endsWith('...'));
+    });
+
     test(
         'accepts Anthropic stream ending without final delimiter or stop event',
         () async {

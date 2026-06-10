@@ -70,6 +70,8 @@ class AppStrings {
   static const clearQueueBeforeRegenerate = '请先清空消息队列再重新生成';
   static String contextCompactedNotice(int retainedCount) =>
       '对话上下文已压缩（保留最近 $retainedCount 条消息）';
+  static const encryptedContentRecoveryNotice = '检测到缓存上下文失效，已自动恢复对话上下文';
+  static const encryptedContentRecoveryFailed = '自动恢复上下文失败，请重新发送消息';
   static const inputHint = '输入消息...';
   static const toolApprovalTitle = '工具执行确认';
   static const toolApprovalArguments = '参数';

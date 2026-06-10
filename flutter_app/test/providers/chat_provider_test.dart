@@ -1,9 +1,12 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/models/chat_models.dart';
+import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
+import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -22,78 +25,103 @@ List<Map<String, dynamic>> truncateToFit(List<Map<String, dynamic>> messages) {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  const pathProviderChannel = MethodChannel('plugins.flutter.io/path_provider');
+  const secureStorageChannel =
+      MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+  const nativeChannel = MethodChannel(AppConstants.channelName);
+  late Directory tempDir;
+  late Map<String, String> secureStorage;
+
+  Future<void> installPlatformMocks() async {
+    SharedPreferences.setMockInitialValues({});
+    PreferencesService.resetForTesting();
+    secureStorage = {};
+    tempDir = await Directory.systemTemp.createTemp('clawchat_provider_test_');
+
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(pathProviderChannel, (call) async {
+      if (call.method == 'getApplicationDocumentsDirectory') {
+        return tempDir.path;
+      }
+      return null;
+    });
+    messenger.setMockMethodCallHandler(secureStorageChannel, (call) async {
+      final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+      final key = args['key']?.toString();
+      switch (call.method) {
+        case 'read':
+          return key == null ? null : secureStorage[key];
+        case 'write':
+          if (key != null) {
+            secureStorage[key] = args['value']?.toString() ?? '';
+          }
+          return null;
+        case 'delete':
+          if (key != null) secureStorage.remove(key);
+          return null;
+        case 'deleteAll':
+          secureStorage.clear();
+          return null;
+        case 'containsKey':
+          return key != null && secureStorage.containsKey(key);
+        case 'readAll':
+          return Map<String, String>.from(secureStorage);
+      }
+      return null;
+    });
+    messenger.setMockMethodCallHandler(nativeChannel, (call) async {
+      switch (call.method) {
+        case 'consumePendingNavigateToSession':
+          return null;
+        case 'runInProot':
+          return '';
+        case 'readRootfsFile':
+          return null;
+        case 'writeRootfsFile':
+          return true;
+      }
+      return true;
+    });
+  }
+
+  Future<void> clearPlatformMocks() async {
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(pathProviderChannel, null);
+    messenger.setMockMethodCallHandler(secureStorageChannel, null);
+    messenger.setMockMethodCallHandler(nativeChannel, null);
+    PreferencesService.resetForTesting();
+    if (await tempDir.exists()) {
+      await tempDir.delete(recursive: true);
+    }
+  }
+
+  void configureAnthropicProfile({
+    required String baseUrl,
+  }) {
+    final profile = ProviderProfile.defaults().copyWith(
+      id: 'profile',
+      apiKey: 'sk-test',
+      apiFormat: ProviderProfile.anthropicFormat,
+      baseUrl: baseUrl,
+      model: 'claude-sonnet-4-20250514',
+    );
+    secureStorage['provider_profiles'] = jsonEncode([profile.toJson()]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'profile',
+      'context_length': 100000,
+    });
+  }
 
   group('alternative navigation', () {
-    const pathProviderChannel =
-        MethodChannel('plugins.flutter.io/path_provider');
-    const secureStorageChannel =
-        MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
-    const nativeChannel = MethodChannel(AppConstants.channelName);
-
-    late Directory tempDir;
-    late Map<String, String> secureStorage;
-
     setUp(() async {
-      SharedPreferences.setMockInitialValues({});
-      PreferencesService.resetForTesting();
-      secureStorage = {};
-      tempDir = await Directory.systemTemp.createTemp('clawchat_alt_nav_test_');
-
-      final messenger =
-          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-      messenger.setMockMethodCallHandler(pathProviderChannel, (call) async {
-        if (call.method == 'getApplicationDocumentsDirectory') {
-          return tempDir.path;
-        }
-        return null;
-      });
-      messenger.setMockMethodCallHandler(secureStorageChannel, (call) async {
-        final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
-        final key = args['key']?.toString();
-        switch (call.method) {
-          case 'read':
-            return key == null ? null : secureStorage[key];
-          case 'write':
-            if (key != null) {
-              secureStorage[key] = args['value']?.toString() ?? '';
-            }
-            return null;
-          case 'delete':
-            if (key != null) secureStorage.remove(key);
-            return null;
-          case 'deleteAll':
-            secureStorage.clear();
-            return null;
-          case 'containsKey':
-            return key != null && secureStorage.containsKey(key);
-          case 'readAll':
-            return Map<String, String>.from(secureStorage);
-        }
-        return null;
-      });
-      messenger.setMockMethodCallHandler(nativeChannel, (call) async {
-        switch (call.method) {
-          case 'runInProot':
-            return '';
-          case 'readRootfsFile':
-            return null;
-          case 'writeRootfsFile':
-            return true;
-        }
-        return true;
-      });
+      await installPlatformMocks();
     });
 
     tearDown(() async {
-      final messenger =
-          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-      messenger.setMockMethodCallHandler(pathProviderChannel, null);
-      messenger.setMockMethodCallHandler(secureStorageChannel, null);
-      messenger.setMockMethodCallHandler(nativeChannel, null);
-      PreferencesService.resetForTesting();
-      if (await tempDir.exists()) {
-        await tempDir.delete(recursive: true);
-      }
+      await clearPlatformMocks();
     });
 
     test('switches 2 to 1 to 2 to 1 without reordering versions', () async {
@@ -138,6 +166,218 @@ void main() {
       expect(message.alternatives, ['v1']);
 
       await Future<void>.delayed(const Duration(milliseconds: 20));
+    });
+  });
+
+  group('encrypted content recovery', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('persists sanitized history so the next send does not recover again',
+        () async {
+      var requestCount = 0;
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            requestCount++;
+            final serialized = messages.toString();
+            if (serialized.contains('reasoning_content')) {
+              return StreamError(
+                'encrypted',
+                cause: const EncryptedContentError(
+                  'Anthropic API error: invalid_encrypted_content: encrypted',
+                  code: 'invalid_encrypted_content',
+                ),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final timestamp = DateTime(2026, 1, 2, 3, 4, 5);
+      final session = await provider.createSession();
+      session.messages.add(ChatMessage.systemNotice('before recovery'));
+      session.messages.add(ChatMessage(
+        role: 'assistant',
+        content: [
+          TextContent('cached', reasoningContent: 'hidden reasoning'),
+          ImageContent(
+            data: 'abc',
+            mediaType: 'image/png',
+            filename: 'screenshot.png',
+          ),
+        ],
+        timestamp: timestamp,
+        inputTokens: 11,
+        outputTokens: 22,
+        alternatives: ['previous answer'],
+        activeAlternative: -1,
+      ));
+
+      await provider.sendMessage('first');
+      expect(provider.errorMessage, isNull);
+      expect(requestCount, 2);
+      expect(provider.currentSession!.toApiMessages().toString(),
+          isNot(contains('reasoning_content')));
+      expect(
+        provider.currentSession!.messages.any((m) =>
+            m.isSystemNotice && m.textContent == '检测到缓存上下文失效，已自动恢复对话上下文'),
+        isTrue,
+      );
+      expect(provider.currentSession!.messages.first.isSystemNotice, isTrue);
+      expect(provider.currentSession!.messages.first.textContent,
+          'before recovery');
+      final sanitizedAssistant = provider.currentSession!.messages.firstWhere(
+        (m) => m.role == 'assistant' && !m.isSystemNotice,
+      );
+      expect(sanitizedAssistant.timestamp, timestamp);
+      expect(sanitizedAssistant.inputTokens, 11);
+      expect(sanitizedAssistant.outputTokens, 22);
+      expect(sanitizedAssistant.alternatives, ['previous answer']);
+      expect(sanitizedAssistant.activeAlternative, -1);
+      expect(
+        sanitizedAssistant.content
+            .whereType<TextContent>()
+            .single
+            .reasoningContent,
+        isNull,
+      );
+      expect(
+        sanitizedAssistant.content.whereType<ImageContent>().single.filename,
+        'screenshot.png',
+      );
+
+      await provider.sendMessage('second');
+      expect(provider.errorMessage, isNull);
+      expect(requestCount, 3);
+    });
+
+    test('reports sanitized retry failure with retry details', () async {
+      var requestCount = 0;
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            return StreamError(
+              'encrypted',
+              cause: const EncryptedContentError(
+                'Anthropic API error: invalid_encrypted_content: encrypted',
+                code: 'invalid_encrypted_content',
+              ),
+            );
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.add(ChatMessage(
+        role: 'assistant',
+        content: [TextContent('cached', reasoningContent: 'hidden')],
+      ));
+
+      await provider.sendMessage('first');
+
+      expect(requestCount, 2);
+      expect(provider.errorMessage, contains('自动恢复上下文失败'));
+      expect(
+        provider.errorMessage,
+        contains('sanitized retry also failed:'),
+      );
+    });
+
+    test(
+        'does not retry when provider recovery sanitization leaves no messages',
+        () async {
+      var requestCount = 0;
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            return StreamError(
+              'encrypted',
+              cause: const EncryptedContentError(
+                'Anthropic API error: invalid_encrypted_content: encrypted',
+                code: 'invalid_encrypted_content',
+              ),
+            );
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.createSession();
+
+      await provider.sendMessage(
+        '',
+        attachments: [
+          ToolUseContent(
+            id: 'orphan',
+            name: 'bash',
+            input: const {'cmd': 'pwd'},
+          ),
+        ],
+      );
+
+      expect(requestCount, 1);
+      expect(provider.errorMessage, contains('自动恢复上下文失败'));
+    });
+
+    test('returns failed recovery error when sanitization leaves no messages',
+        () async {
+      final provider = ChatProvider();
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final messages = [
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'orphan',
+              'name': 'bash',
+              'input': {'cmd': 'pwd'},
+            },
+          ],
+        },
+      ];
+
+      final recoveryMessages = ChatContextUtils.sanitizeMessages(messages);
+      expect(recoveryMessages, isEmpty);
+      final error = provider.encryptedRecoveryEmptyErrorForTesting(
+        const EncryptedContentError(
+          'Anthropic API error: invalid_encrypted_content: encrypted',
+          code: 'invalid_encrypted_content',
+        ),
+        recoveryMessages,
+      );
+      expect(error, contains('自动恢复上下文失败'));
     });
   });
 
@@ -388,4 +628,30 @@ void main() {
       expect(result.length, greaterThanOrEqualTo(2));
     });
   });
+}
+
+class _ScriptedLlmService extends LlmService {
+  final StreamEvent Function(List<Map<String, dynamic>> messages) onMessages;
+
+  _ScriptedLlmService(
+    super.config, {
+    required this.onMessages,
+  });
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    final event = onMessages(messages);
+    if (event is StreamDone) {
+      final text = event.response.content
+          .where((block) => block.type == 'text')
+          .map((block) => block.text ?? '')
+          .join();
+      if (text.isNotEmpty) yield TextDelta(text);
+    }
+    yield event;
+  }
 }

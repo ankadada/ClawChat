@@ -21,13 +21,19 @@ import '../services/skill_service.dart';
 import '../services/memory_service.dart';
 import '../l10n/app_strings.dart';
 
+typedef LlmServiceFactory = LlmService Function(
+  LlmConfig config, {
+  bool Function()? isInBackground,
+});
+
 class ChatProvider extends ChangeNotifier {
   static const int maxQueuedMessages = 3;
 
   List<SessionSummary> sessions = [];
   ChatSession? currentSession;
 
-  final SessionStorage _storage = SessionStorage();
+  final SessionStorage _storage;
+  final LlmServiceFactory _llmServiceFactory;
   late final ToolRegistry _tools;
   final _uuid = const Uuid();
 
@@ -365,7 +371,11 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
-  ChatProvider() {
+  ChatProvider({
+    SessionStorage? storage,
+    LlmServiceFactory? llmServiceFactory,
+  })  : _storage = storage ?? SessionStorage(),
+        _llmServiceFactory = llmServiceFactory ?? LlmService.new {
     NativeBridge.setAgentStopRequestedHandler(
       ({String? sessionId}) => cancelAgent(sessionId: sessionId),
     );
@@ -775,7 +785,7 @@ class ChatProvider extends ChangeNotifier {
       final llmConfig = _buildLlmConfig(_prefs, activeSession);
       if (state.cachedLlm == null || state.cachedLlmConfig != llmConfig) {
         state.cachedLlm?.dispose();
-        state.cachedLlm = LlmService(
+        state.cachedLlm = _llmServiceFactory(
           llmConfig,
           isInBackground: () => _appInBackground,
         );
@@ -818,7 +828,6 @@ class ChatProvider extends ChangeNotifier {
         _agentServiceThinkingText,
       ));
 
-      state.agentCompleter = Completer<void>();
       final fullApiMessages = activeSession.toApiMessages();
       final apiMessages = _truncateToFit(fullApiMessages);
       if (apiMessages.length < fullApiMessages.length) {
@@ -831,134 +840,74 @@ class ChatProvider extends ChangeNotifier {
       state.initialApiMsgCount = initialApiMsgCount;
       state.partialAgentResponseSaved = false;
       try {
-        state.agentSubscription = state.agent!.runAgentLoop(apiMessages).listen(
-          (event) {
-            switch (event) {
-              case AgentThinking():
-                state.status = AgentStatus.thinking;
-                state.streamBuffer = StringBuffer();
-                notifyListeners();
-                unawaited(_startAgentServiceForState(
-                  state,
-                  _agentServiceThinkingText,
-                ));
-
-              case AgentTextDelta(:final text):
-                state.status = AgentStatus.streaming;
-                state.streamBuffer.write(text);
-                state.streamThrottle ??=
-                    Timer(const Duration(milliseconds: 50), () {
-                  state.streamingText = state.streamBuffer.toString();
-                  state.streamThrottle = null;
-                  notifyListeners();
-                  unawaited(_startAgentServiceForState(
-                    state,
-                    _agentServiceStreamingText,
-                  ));
-                });
-
-              case AgentToolStart(:final toolName):
-                state.status = AgentStatus.tooling;
-                notifyListeners();
-                unawaited(_startAgentServiceForState(
-                  state,
-                  _agentServiceToolingText,
-                ));
-                unawaited(_updateAgentNativeStatusForState(
-                  state,
-                  'tooling',
-                  toolName: toolName,
-                ));
-
-              case AgentToolDone():
-                notifyListeners();
-
-              case AgentIterationDone(:final messages):
-                state.streamThrottle?.cancel();
-                state.streamThrottle = null;
-                state.streamingText = '';
-                state.streamBuffer = StringBuffer();
-                _appendNewAgentMessages(
-                  state,
-                  activeSession,
-                  messages,
-                  state.initialApiMsgCount,
-                );
-                state.initialApiMsgCount = messages.length;
-                _syncCurrentSessionReference(activeSession);
-                unawaited(_storage.saveSession(activeSession).then((_) {
-                  if (!_disposed) notifyListeners();
-                }));
-                notifyListeners();
-
-              case AgentComplete(
-                  :final finalText,
-                  :final inputTokens,
-                  :final outputTokens,
-                ):
-                state.streamThrottle?.cancel();
-                state.streamThrottle = null;
-                state.streamingText = state.streamBuffer.toString();
-                state.streamBuffer = StringBuffer();
-                state.status = AgentStatus.idle;
-                state.streamingText = '';
-                _appendNewAgentMessages(
-                  state,
-                  activeSession,
-                  state.agent!.messages,
-                  state.initialApiMsgCount,
-                );
-                state.initialApiMsgCount = state.agent!.messages.length;
-                // Store token usage on the last assistant message
-                for (int i = activeSession.messages.length - 1; i >= 0; i--) {
-                  if (activeSession.messages[i].role == 'assistant') {
-                    activeSession.messages[i].inputTokens = inputTokens;
-                    activeSession.messages[i].outputTokens = outputTokens;
-                    break;
-                  }
-                }
-                _syncCurrentSessionReference(activeSession);
-                _storage.saveSession(activeSession).then((_) {
-                  if (!_disposed) notifyListeners();
-                });
-                final c = state.agentCompleter;
-                state.agentCompletionFinalizing = true;
-                unawaited(_finishAgentComplete(state, finalText, c));
-
-              case AgentError(:final message):
-                state.streamThrottle?.cancel();
-                state.streamThrottle = null;
-                state.streamBuffer = StringBuffer();
-                state.status = AgentStatus.error;
-                state.errorMessage = message;
-                notifyListeners();
-                final c = state.agentCompleter;
-                if (c != null && !c.isCompleted) c.complete();
-                unawaited(_stopAgentServiceForState(state));
-            }
-          },
-          onError: (Object e) {
-            state.status = AgentStatus.error;
-            state.errorMessage = '$e';
-            state.streamThrottle?.cancel();
-            state.streamThrottle = null;
-            notifyListeners();
-            if (!state.agentCompletionFinalizing) {
-              final c = state.agentCompleter;
-              if (c != null && !c.isCompleted) c.complete();
-              unawaited(_stopAgentServiceForState(state));
-            }
-          },
-          onDone: () {
-            if (!state.agentCompletionFinalizing) {
-              final c = state.agentCompleter;
-              if (c != null && !c.isCompleted) c.complete();
-              unawaited(_stopAgentServiceForState(state));
-            }
-          },
-          cancelOnError: false,
+        var runResult = await _runAgentForState(
+          state,
+          activeSession,
+          apiMessages,
         );
-        await state.agentCompleter!.future;
+        if (runResult is EncryptedContentError) {
+          final originalError = runResult;
+          final recoveryMessages = _truncateToFit(
+            ChatContextUtils.sanitizeMessages(activeSession.toApiMessages()),
+          );
+          final emptyRecoveryError = _encryptedRecoveryEmptyError(
+            originalError,
+            recoveryMessages,
+          );
+          if (emptyRecoveryError != null) {
+            state.status = AgentStatus.error;
+            state.errorMessage = emptyRecoveryError;
+            notifyListeners();
+          } else {
+            state.agent = AgentService(
+              llm: llm,
+              tools: _tools,
+              systemPrompt: fullPrompt,
+              toolPolicy: ToolPolicy(
+                onApprovalRequired: (request) => _requestToolApproval(
+                  state,
+                  request,
+                ),
+              ),
+              maxIterations: _prefs.agentMaxIterations,
+              privacyMode: _prefs.privacyMode,
+              envVars: _prefs.envVars,
+            );
+            state.status = AgentStatus.thinking;
+            state.streamingText = '';
+            state.errorMessage = null;
+            state.partialAgentResponseSaved = false;
+            notifyListeners();
+            unawaited(_startAgentServiceForState(
+              state,
+              _agentServiceThinkingText,
+            ));
+
+            runResult = await _runAgentForState(
+              state,
+              activeSession,
+              recoveryMessages,
+            );
+            if (runResult != null || state.status == AgentStatus.error) {
+              final recoveryError = runResult is EncryptedContentError
+                  ? 'sanitized retry also failed: ${runResult.message}'
+                  : state.errorMessage;
+              state.status = AgentStatus.error;
+              state.errorMessage = [
+                originalError.message,
+                AppStrings.encryptedContentRecoveryFailed,
+                if (recoveryError?.isNotEmpty == true) recoveryError!,
+              ].join('\n');
+              notifyListeners();
+            } else {
+              _persistSanitizedMessages(activeSession);
+              _appendEncryptedContentRecoveryNotice(activeSession);
+              await _storage.saveSession(activeSession);
+              _syncCurrentSessionReference(activeSession);
+              notifyListeners();
+            }
+          }
+        }
       } catch (e) {
         state.status = AgentStatus.error;
         state.errorMessage = '$e';
@@ -1456,6 +1405,174 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
+  Future<Object?> _runAgentForState(
+    AgentState state,
+    ChatSession activeSession,
+    List<Map<String, dynamic>> apiMessages,
+  ) async {
+    final completer = Completer<void>();
+    state.agentCompleter = completer;
+    state.agentCompletionFinalizing = false;
+    state.initialApiMsgCount = apiMessages.length;
+    Object? errorCause;
+    bool isCurrentRun() => identical(state.agentCompleter, completer);
+    void completeRun() {
+      if (!completer.isCompleted) completer.complete();
+    }
+
+    late final StreamSubscription<AgentEvent> subscription;
+    subscription = state.agent!.runAgentLoop(apiMessages).listen(
+      (event) {
+        if (!isCurrentRun()) return;
+        switch (event) {
+          case AgentThinking():
+            state.status = AgentStatus.thinking;
+            state.streamBuffer = StringBuffer();
+            notifyListeners();
+            unawaited(_startAgentServiceForState(
+              state,
+              _agentServiceThinkingText,
+            ));
+
+          case AgentTextDelta(:final text):
+            state.status = AgentStatus.streaming;
+            state.streamBuffer.write(text);
+            state.streamThrottle ??=
+                Timer(const Duration(milliseconds: 50), () {
+              state.streamingText = state.streamBuffer.toString();
+              state.streamThrottle = null;
+              notifyListeners();
+              unawaited(_startAgentServiceForState(
+                state,
+                _agentServiceStreamingText,
+              ));
+            });
+
+          case AgentToolStart(:final toolName):
+            state.status = AgentStatus.tooling;
+            notifyListeners();
+            unawaited(_startAgentServiceForState(
+              state,
+              _agentServiceToolingText,
+            ));
+            unawaited(_updateAgentNativeStatusForState(
+              state,
+              'tooling',
+              toolName: toolName,
+            ));
+
+          case AgentToolDone():
+            notifyListeners();
+
+          case AgentIterationDone(:final messages):
+            state.streamThrottle?.cancel();
+            state.streamThrottle = null;
+            state.streamingText = '';
+            state.streamBuffer = StringBuffer();
+            _appendNewAgentMessages(
+              state,
+              activeSession,
+              messages,
+              state.initialApiMsgCount,
+            );
+            state.initialApiMsgCount = messages.length;
+            _syncCurrentSessionReference(activeSession);
+            unawaited(_storage.saveSession(activeSession).then((_) {
+              if (!_disposed) notifyListeners();
+            }));
+            notifyListeners();
+
+          case AgentComplete(
+              :final finalText,
+              :final inputTokens,
+              :final outputTokens,
+            ):
+            state.streamThrottle?.cancel();
+            state.streamThrottle = null;
+            state.streamingText = state.streamBuffer.toString();
+            state.streamBuffer = StringBuffer();
+            state.status = AgentStatus.idle;
+            state.streamingText = '';
+            _appendNewAgentMessages(
+              state,
+              activeSession,
+              state.agent!.messages,
+              state.initialApiMsgCount,
+            );
+            state.initialApiMsgCount = state.agent!.messages.length;
+            // Store token usage on the last assistant message
+            for (int i = activeSession.messages.length - 1; i >= 0; i--) {
+              if (activeSession.messages[i].role == 'assistant') {
+                activeSession.messages[i].inputTokens = inputTokens;
+                activeSession.messages[i].outputTokens = outputTokens;
+                break;
+              }
+            }
+            _syncCurrentSessionReference(activeSession);
+            _storage.saveSession(activeSession).then((_) {
+              if (!_disposed) notifyListeners();
+            });
+            state.agentCompletionFinalizing = true;
+            unawaited(_finishAgentComplete(state, finalText, completer));
+
+          case AgentError(:final message, :final cause):
+            state.streamThrottle?.cancel();
+            state.streamThrottle = null;
+            state.streamBuffer = StringBuffer();
+            errorCause = cause;
+            if (cause is EncryptedContentError) {
+              state.status = AgentStatus.thinking;
+              state.errorMessage = null;
+            } else {
+              state.status = AgentStatus.error;
+              state.errorMessage = message;
+            }
+            notifyListeners();
+            completeRun();
+            if (cause is! EncryptedContentError) {
+              unawaited(_stopAgentServiceForState(state));
+            }
+        }
+      },
+      onError: (Object e) {
+        if (!isCurrentRun()) return;
+        errorCause = e;
+        state.streamThrottle?.cancel();
+        state.streamThrottle = null;
+        if (e is EncryptedContentError) {
+          state.status = AgentStatus.thinking;
+          state.errorMessage = null;
+        } else {
+          state.status = AgentStatus.error;
+          state.errorMessage = '$e';
+        }
+        notifyListeners();
+        if (!state.agentCompletionFinalizing) {
+          completeRun();
+          if (e is! EncryptedContentError) {
+            unawaited(_stopAgentServiceForState(state));
+          }
+        }
+      },
+      onDone: () {
+        if (!isCurrentRun()) return;
+        if (!state.agentCompletionFinalizing) {
+          completeRun();
+          if (errorCause is! EncryptedContentError) {
+            unawaited(_stopAgentServiceForState(state));
+          }
+        }
+      },
+      cancelOnError: false,
+    );
+    state.agentSubscription = subscription;
+    await completer.future;
+    if (identical(state.agentSubscription, subscription)) {
+      state.agentSubscription = null;
+    }
+    return errorCause;
+  }
+
   void _appendContextCompactionNotice(ChatSession session, int retainedCount) {
     final text = AppStrings.contextCompactedNotice(retainedCount);
     if (session.messages.isNotEmpty) {
@@ -1463,6 +1580,152 @@ class ChatProvider extends ChangeNotifier {
       if (last.isSystemNotice && last.textContent == text) return;
     }
     session.messages.add(ChatMessage.systemNotice(text));
+  }
+
+  void _appendEncryptedContentRecoveryNotice(ChatSession session) {
+    const text = AppStrings.encryptedContentRecoveryNotice;
+    if (session.messages.isNotEmpty) {
+      final last = session.messages.last;
+      if (last.isSystemNotice && last.textContent == text) return;
+    }
+    session.messages.add(ChatMessage.systemNotice(text));
+  }
+
+  @visibleForTesting
+  String? encryptedRecoveryEmptyErrorForTesting(
+    EncryptedContentError originalError,
+    List<Map<String, dynamic>> recoveryMessages,
+  ) {
+    return _encryptedRecoveryEmptyError(originalError, recoveryMessages);
+  }
+
+  String? _encryptedRecoveryEmptyError(
+    EncryptedContentError originalError,
+    List<Map<String, dynamic>> recoveryMessages,
+  ) {
+    if (recoveryMessages.isNotEmpty) return null;
+    return [
+      originalError.message,
+      AppStrings.encryptedContentRecoveryFailed,
+    ].join('\n');
+  }
+
+  void _persistSanitizedMessages(ChatSession session) {
+    final sanitizedContentByIndex = <int, List<MessageContent>>{};
+    final toolUseIds = <String>{};
+    final toolResultIds = <String>{};
+
+    for (var i = 0; i < session.messages.length; i++) {
+      final msg = session.messages[i];
+      if (msg.isSystemNotice) continue;
+      final sanitizedContent = _sanitizeMessageContentForRecovery(msg.content);
+      sanitizedContentByIndex[i] = sanitizedContent;
+      for (final content in sanitizedContent) {
+        if (content is ToolUseContent) {
+          toolUseIds.add(content.id);
+        } else if (content is ToolResultContent) {
+          toolResultIds.add(content.toolUseId);
+        }
+      }
+    }
+
+    final pairedToolIds = toolUseIds.intersection(toolResultIds);
+    final retainedMessages = <ChatMessage>[];
+    for (var i = 0; i < session.messages.length; i++) {
+      final msg = session.messages[i];
+      if (msg.isSystemNotice) {
+        retainedMessages.add(msg);
+        continue;
+      }
+
+      final sanitizedContent = sanitizedContentByIndex[i] ?? const [];
+      final pairedContent = sanitizedContent.where((content) {
+        if (content is ToolUseContent) {
+          return pairedToolIds.contains(content.id);
+        }
+        if (content is ToolResultContent) {
+          return pairedToolIds.contains(content.toolUseId);
+        }
+        return true;
+      }).toList();
+      if (pairedContent.isEmpty) continue;
+      msg.content = pairedContent;
+      retainedMessages.add(msg);
+    }
+
+    session.messages
+      ..clear()
+      ..addAll(retainedMessages);
+  }
+
+  List<MessageContent> _sanitizeMessageContentForRecovery(
+    List<MessageContent> content,
+  ) {
+    final sanitized = <MessageContent>[];
+    for (final item in content) {
+      switch (item) {
+        case TextContent(:final text):
+          sanitized.add(TextContent(text));
+        case ImageContent(
+            :final data,
+            :final mediaType,
+            :final filename,
+          ):
+          sanitized.add(ImageContent(
+            data: data,
+            mediaType: mediaType,
+            filename: filename,
+          ));
+        case ToolUseContent(
+            :final id,
+            :final name,
+            :final input,
+            :final output,
+            :final isExecuting,
+            :final isError,
+          ):
+          final sanitizedTool = ToolUseContent(
+            id: id,
+            name: name,
+            input: _sanitizeRecoveryMap(input),
+            output: output,
+            isExecuting: isExecuting,
+            isError: isError,
+          );
+          sanitized.add(sanitizedTool);
+        case ToolResultContent(
+            :final toolUseId,
+            :final output,
+            :final isError,
+          ):
+          sanitized.add(ToolResultContent(
+            toolUseId: toolUseId,
+            output: output,
+            isError: isError,
+          ));
+      }
+    }
+    return sanitized;
+  }
+
+  Map<String, dynamic> _sanitizeRecoveryMap(Map<dynamic, dynamic> value) {
+    final clean = <String, dynamic>{};
+    for (final entry in value.entries) {
+      final key = entry.key;
+      if (key is! String || _isUnsafeRecoveryMetadataKey(key)) continue;
+      clean[key] = _sanitizeRecoveryValue(entry.value);
+    }
+    return clean;
+  }
+
+  dynamic _sanitizeRecoveryValue(Object? value) {
+    if (value is Map) return _sanitizeRecoveryMap(value);
+    if (value is List) return value.map(_sanitizeRecoveryValue).toList();
+    return value;
+  }
+
+  bool _isUnsafeRecoveryMetadataKey(String key) {
+    return ChatContextUtils.unsafeMetadataKeys.contains(key);
   }
 
   void _appendNewAgentMessages(
@@ -1478,74 +1741,8 @@ class ChatProvider extends ChangeNotifier {
     final newMessages = agentMessages.sublist(initialApiMsgCount);
 
     for (final msg in newMessages) {
-      final role = msg['role'] as String;
-      final content = msg['content'];
-
-      List<MessageContent> contentList;
-      if (content is String) {
-        contentList = [
-          TextContent(
-            content,
-            reasoningContent: role == 'assistant'
-                ? msg['reasoning_content'] as String?
-                : null,
-          ),
-        ];
-      } else if (content is List) {
-        contentList = content.map<MessageContent>((item) {
-          if (item is Map<String, dynamic>) {
-            switch (item['type']) {
-              case 'text':
-                return TextContent(
-                  item['text'] as String,
-                  reasoningContent: item['reasoning_content'] as String?,
-                );
-              case 'image':
-                final source = item['source'];
-                final sourceMap =
-                    source is Map ? source : const <String, dynamic>{};
-                return ImageContent(
-                  data: (sourceMap['data'] ?? item['data'] ?? '') as String,
-                  mediaType: (sourceMap['media_type'] ??
-                      item['media_type'] ??
-                      'image/png') as String,
-                  filename: item['filename'] as String?,
-                );
-              case 'tool_use':
-                return ToolUseContent(
-                  id: item['id'] as String,
-                  name: item['name'] as String,
-                  input: Map<String, dynamic>.from(item['input'] ?? {}),
-                );
-              case 'tool_result':
-                final rawContent = item['content'];
-                final String output;
-                if (rawContent is String) {
-                  output = rawContent;
-                } else if (rawContent is List) {
-                  output = rawContent.map((e) => e.toString()).join('\n');
-                } else {
-                  output = rawContent?.toString() ?? '';
-                }
-                return ToolResultContent(
-                  toolUseId: item['tool_use_id'] as String,
-                  output: output,
-                  isError: item['is_error'] as bool? ?? false,
-                );
-              default:
-                return TextContent(item.toString());
-            }
-          }
-          return TextContent(item.toString());
-        }).toList();
-      } else {
-        continue;
-      }
-
-      session.messages.add(ChatMessage(
-        role: role,
-        content: contentList,
-      ));
+      final chatMessage = _chatMessageFromApiMessage(msg);
+      if (chatMessage != null) session.messages.add(chatMessage);
     }
 
     // If we have pending alternatives from a regeneration, attach them to the last assistant message
@@ -1568,6 +1765,68 @@ class ChatProvider extends ChangeNotifier {
       }
       state.pendingAlternatives = null;
     }
+  }
+
+  ChatMessage? _chatMessageFromApiMessage(Map<String, dynamic> msg) {
+    final role = msg['role'] as String?;
+    if (role == null) return null;
+    final content = msg['content'];
+
+    List<MessageContent> contentList;
+    if (content is String) {
+      contentList = [TextContent(content)];
+    } else if (content is List) {
+      contentList = content.map<MessageContent>((item) {
+        if (item is Map<String, dynamic>) {
+          switch (item['type']) {
+            case 'text':
+              return TextContent(
+                item['text'] as String? ?? '',
+                reasoningContent: item['reasoning_content'] as String?,
+              );
+            case 'image':
+              final source = item['source'];
+              final sourceMap =
+                  source is Map ? source : const <String, dynamic>{};
+              return ImageContent(
+                data: (sourceMap['data'] ?? item['data'] ?? '') as String,
+                mediaType: (sourceMap['media_type'] ??
+                    item['media_type'] ??
+                    'image/png') as String,
+                filename: item['filename'] as String?,
+              );
+            case 'tool_use':
+              return ToolUseContent(
+                id: item['id'] as String,
+                name: item['name'] as String,
+                input: Map<String, dynamic>.from(item['input'] ?? {}),
+              );
+            case 'tool_result':
+              final rawContent = item['content'];
+              final String output;
+              if (rawContent is String) {
+                output = rawContent;
+              } else if (rawContent is List) {
+                output = rawContent.map((e) => e.toString()).join('\n');
+              } else {
+                output = rawContent?.toString() ?? '';
+              }
+              return ToolResultContent(
+                toolUseId: item['tool_use_id'] as String,
+                output: output,
+                isError: item['is_error'] as bool? ?? false,
+              );
+            default:
+              return TextContent(item.toString());
+          }
+        }
+        return TextContent(item.toString());
+      }).toList();
+    } else {
+      return null;
+    }
+
+    return ChatMessage(role: role, content: contentList);
   }
 }
 

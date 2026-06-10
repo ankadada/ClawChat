@@ -14,6 +14,21 @@ enum _OpenAICompatibleProvider {
   generic,
 }
 
+class EncryptedContentError implements Exception {
+  final String message;
+  final String? code;
+  final int? statusCode;
+
+  const EncryptedContentError(
+    this.message, {
+    this.code,
+    this.statusCode,
+  });
+
+  @override
+  String toString() => message;
+}
+
 class LlmConfig {
   final ApiFormat format;
   final String apiKey;
@@ -185,7 +200,8 @@ class StreamDone extends StreamEvent {
 
 class StreamError extends StreamEvent {
   final String message;
-  StreamError(this.message);
+  final Object? cause;
+  StreamError(this.message, {this.cause});
 }
 
 class LlmService {
@@ -389,6 +405,37 @@ class LlmService {
       '[REDACTED]',
     );
     return sanitized;
+  }
+
+  static Exception _anthropicApiException(int statusCode, String body) {
+    final sanitizedBody = _sanitizeErrorBody(body);
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map) {
+        final error = decoded['error'];
+        if (error is Map) {
+          final code = error['code']?.toString();
+          final message = error['message']?.toString() ?? sanitizedBody;
+          if (code == 'invalid_encrypted_content') {
+            return EncryptedContentError(
+              'Anthropic API error ($statusCode): ${_sanitizeErrorBody(message)}',
+              code: code,
+              statusCode: statusCode,
+            );
+          }
+        }
+      }
+    } catch (_) {
+      // Fall through to the generic sanitized error.
+    }
+    if (sanitizedBody.contains('invalid_encrypted_content')) {
+      return EncryptedContentError(
+        'Anthropic API error ($statusCode): $sanitizedBody',
+        code: 'invalid_encrypted_content',
+        statusCode: statusCode,
+      );
+    }
+    return Exception('Anthropic API error ($statusCode): $sanitizedBody');
   }
 
   static const Duration _requestTimeout = Duration(seconds: 120);
@@ -642,8 +689,7 @@ class LlmService {
         body: jsonEncode(body),
       );
       if (response.statusCode != 200) {
-        throw Exception(
-            'Anthropic API error (${response.statusCode}): ${_sanitizeErrorBody(response.body)}');
+        throw _anthropicApiException(response.statusCode, response.body);
       }
       return _parseAnthropicResponse(jsonDecode(response.body));
     });
@@ -666,8 +712,7 @@ class LlmService {
         final response = await _client.send(request);
         if (response.statusCode != 200) {
           final errorBody = await response.stream.bytesToString();
-          throw Exception(
-              'Anthropic API error (${response.statusCode}): ${_sanitizeErrorBody(errorBody)}');
+          throw _anthropicApiException(response.statusCode, errorBody);
         }
         return response;
       });
@@ -841,7 +886,19 @@ class LlmService {
           case 'error':
             final error = event['error'] as Map<String, dynamic>;
             streamFailed = true;
-            yield StreamError(error['message'] as String? ?? 'Unknown error');
+            final code = error['code']?.toString();
+            final message = _sanitizeErrorBody(
+              error['message'] as String? ?? 'Unknown error',
+            );
+            if (code == 'invalid_encrypted_content') {
+              final cause = EncryptedContentError(
+                'Anthropic API error: invalid_encrypted_content: $message',
+                code: code,
+              );
+              yield StreamError(cause.message, cause: cause);
+            } else {
+              yield StreamError(message);
+            }
             return;
         }
       } catch (_) {
@@ -867,7 +924,11 @@ class LlmService {
         if (streamFailed) return;
       }
     } catch (e) {
-      yield StreamError('Anthropic stream interrupted after retries: $e');
+      if (e is EncryptedContentError) {
+        yield StreamError(e.message, cause: e);
+      } else {
+        yield StreamError('Anthropic stream interrupted after retries: $e');
+      }
       return;
     }
 
@@ -939,18 +1000,20 @@ class LlmService {
     final content = (json['content'] as List)
         .where((block) => block['type'] != 'thinking')
         .map<ContentBlock?>((block) {
-      if (block['type'] == 'text') {
-        return ContentBlock(type: 'text', text: block['text']);
-      } else if (block['type'] == 'tool_use') {
-        return ContentBlock(
-          type: 'tool_use',
-          toolUseId: block['id'],
-          toolName: block['name'],
-          toolInput: Map<String, dynamic>.from(block['input']),
-        );
-      }
-      return null;
-    }).whereType<ContentBlock>().toList();
+          if (block['type'] == 'text') {
+            return ContentBlock(type: 'text', text: block['text']);
+          } else if (block['type'] == 'tool_use') {
+            return ContentBlock(
+              type: 'tool_use',
+              toolUseId: block['id'],
+              toolName: block['name'],
+              toolInput: Map<String, dynamic>.from(block['input']),
+            );
+          }
+          return null;
+        })
+        .whereType<ContentBlock>()
+        .toList();
     return LlmResponse(stopReason: stopReason, content: content);
   }
 
