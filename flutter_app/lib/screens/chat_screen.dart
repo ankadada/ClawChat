@@ -420,7 +420,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             }
           },
           localeId: 'zh_CN',
-          listenMode: stt.ListenMode.dictation,
+          listenOptions: stt.SpeechListenOptions(
+            listenMode: stt.ListenMode.dictation,
+          ),
         );
       } catch (e) {
         debugPrint('Speech listen failed: $e');
@@ -1058,8 +1060,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           // Compare view
           Consumer<ChatProvider>(
             builder: (_, provider, __) {
-              if (provider.compareResults == null)
+              if (provider.compareResults == null) {
                 return const SizedBox.shrink();
+              }
               return CompareView(
                 results: provider.compareResults!,
                 isComparing: provider.isComparing,
@@ -1908,6 +1911,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _showSystemPromptDialog() async {
     final prefs = PreferencesService();
     await prefs.init();
+    if (!mounted) return;
     final controller = TextEditingController(
         text: prefs.systemPrompt ?? AppConstants.defaultSystemPrompt);
 
@@ -2044,194 +2048,216 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          title: const Text(AppStrings.switchModel),
-          content: SizedBox(
-            width: double.maxFinite,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  AppStrings.providerProfiles,
-                  style: Theme.of(ctx).textTheme.titleSmall,
-                ),
-                const SizedBox(height: 8),
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxHeight: 240),
-                  child: SingleChildScrollView(
-                    child: Column(
-                      children: [
-                        for (final profile in profiles)
-                          Padding(
-                            padding: const EdgeInsets.only(bottom: 8),
-                            child: DecoratedBox(
-                              decoration: BoxDecoration(
-                                color: profile.id == selectedProfileId
-                                    ? Theme.of(ctx)
-                                        .colorScheme
-                                        .primary
-                                        .withAlpha(18)
-                                    : Theme.of(ctx).colorScheme.surface,
-                                borderRadius: BorderRadius.circular(AppRadii.s),
-                                border: Border.all(
+        builder: (ctx, setDialogState) {
+          final maxDialogHeight = math.min(
+            MediaQuery.sizeOf(ctx).height * 0.72,
+            560.0,
+          );
+          return AlertDialog(
+            title: const Text(AppStrings.switchModel),
+            content: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: 520,
+                maxHeight: maxDialogHeight,
+              ),
+              child: SingleChildScrollView(
+                child: SizedBox(
+                  width: double.maxFinite,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        AppStrings.providerProfiles,
+                        style: Theme.of(ctx).textTheme.titleSmall,
+                      ),
+                      const SizedBox(height: 8),
+                      Column(
+                        children: [
+                          for (final profile in profiles)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
                                   color: profile.id == selectedProfileId
                                       ? Theme.of(ctx)
                                           .colorScheme
                                           .primary
-                                          .withAlpha(150)
-                                      : Theme.of(ctx)
-                                          .colorScheme
-                                          .outline
-                                          .withAlpha(45),
+                                          .withAlpha(18)
+                                      : Theme.of(ctx).colorScheme.surface,
+                                  borderRadius:
+                                      BorderRadius.circular(AppRadii.s),
+                                  border: Border.all(
+                                    color: profile.id == selectedProfileId
+                                        ? Theme.of(ctx)
+                                            .colorScheme
+                                            .primary
+                                            .withAlpha(150)
+                                        : Theme.of(ctx)
+                                            .colorScheme
+                                            .outline
+                                            .withAlpha(45),
+                                  ),
                                 ),
-                              ),
-                              child: RadioListTile<String>(
-                                isThreeLine: profile.apiKey.trim().isEmpty,
-                                value: profile.id,
-                                groupValue: selectedProfileId,
-                                onChanged: (value) {
-                                  if (value == null) return;
-                                  setDialogState(() {
-                                    selectedProfileId = value;
-                                    availableModels = [];
-                                  });
-                                },
-                                title: Text(
-                                  profile.displayName,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                subtitle: Text(
-                                  profile.apiKey.trim().isEmpty
-                                      ? '${profile.apiFormat == ProviderProfile.openaiFormat ? AppStrings.openaiCompatible : 'Anthropic'} · ${profile.effectiveModel}\n${AppStrings.apiKeyRequiredToUse}'
-                                      : '${profile.apiFormat == ProviderProfile.openaiFormat ? AppStrings.openaiCompatible : 'Anthropic'} · ${profile.effectiveModel}',
-                                  maxLines:
-                                      profile.apiKey.trim().isEmpty ? 2 : 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                                secondary: Icon(
-                                  profile.apiKey.trim().isEmpty
-                                      ? Icons.warning_amber_outlined
-                                      : profile.apiFormat ==
-                                              ProviderProfile.openaiFormat
-                                          ? Icons.api
-                                          : Icons.auto_awesome,
-                                  color: profile.apiKey.trim().isEmpty
-                                      ? Theme.of(ctx).colorScheme.error
-                                      : null,
+                                child: RadioListTile<String>(
+                                  isThreeLine: profile.apiKey.trim().isEmpty,
+                                  value: profile.id,
+                                  groupValue: selectedProfileId,
+                                  onChanged: (value) {
+                                    if (value == null) return;
+                                    setDialogState(() {
+                                      selectedProfileId = value;
+                                      availableModels = [];
+                                    });
+                                  },
+                                  title: Text(
+                                    profile.displayName,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  subtitle: Text(
+                                    profile.apiKey.trim().isEmpty
+                                        ? '${profile.apiFormat == ProviderProfile.openaiFormat ? AppStrings.openaiCompatible : 'Anthropic'} · ${profile.effectiveModel}\n${AppStrings.apiKeyRequiredToUse}'
+                                        : '${profile.apiFormat == ProviderProfile.openaiFormat ? AppStrings.openaiCompatible : 'Anthropic'} · ${profile.effectiveModel}',
+                                    maxLines:
+                                        profile.apiKey.trim().isEmpty ? 2 : 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  secondary: Icon(
+                                    profile.apiKey.trim().isEmpty
+                                        ? Icons.warning_amber_outlined
+                                        : profile.apiFormat ==
+                                                ProviderProfile.openaiFormat
+                                            ? Icons.api
+                                            : Icons.auto_awesome,
+                                    color: profile.apiKey.trim().isEmpty
+                                        ? Theme.of(ctx).colorScheme.error
+                                        : null,
+                                  ),
                                 ),
                               ),
                             ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      if (loading)
+                        const SizedBox(
+                          height: 56,
+                          child: Center(child: CircularProgressIndicator()),
+                        )
+                      else if (availableModels.isNotEmpty)
+                        DropdownButtonFormField<String>(
+                          value:
+                              availableModels.any((m) => m == controller.text)
+                                  ? controller.text
+                                  : null,
+                          decoration: InputDecoration(
+                            labelText: AppStrings.selectModel,
+                            hintText: selectedProfile().effectiveModel,
                           ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                if (loading)
-                  const Padding(
-                    padding: EdgeInsets.all(16),
-                    child: Center(child: CircularProgressIndicator()),
-                  )
-                else if (availableModels.isNotEmpty)
-                  DropdownButtonFormField<String>(
-                    value: availableModels.any((m) => m == controller.text)
-                        ? controller.text
-                        : null,
-                    decoration: InputDecoration(
-                      labelText: AppStrings.selectModel,
-                      hintText: selectedProfile().effectiveModel,
-                    ),
-                    isExpanded: true,
-                    items: [
-                      const DropdownMenuItem(
-                          value: '', child: Text(AppStrings.useGlobalDefault)),
-                      ...availableModels.map((m) => DropdownMenuItem(
-                            value: m,
-                            child: Text(m, overflow: TextOverflow.ellipsis),
-                          )),
+                          isExpanded: true,
+                          items: [
+                            const DropdownMenuItem(
+                              value: '',
+                              child: Text(AppStrings.useGlobalDefault),
+                            ),
+                            ...availableModels.map((m) => DropdownMenuItem(
+                                  value: m,
+                                  child:
+                                      Text(m, overflow: TextOverflow.ellipsis),
+                                )),
+                          ],
+                          onChanged: (v) => controller.text = v ?? '',
+                        )
+                      else
+                        TextField(
+                          controller: controller,
+                          decoration: InputDecoration(
+                            labelText: AppStrings.modelName,
+                            hintText: selectedProfile().effectiveModel,
+                            helperText: AppStrings.leaveEmptyForDefault,
+                          ),
+                        ),
+                      const SizedBox(height: 12),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton.icon(
+                          icon: const Icon(Icons.refresh, size: 18),
+                          label: const Text(AppStrings.fetchModelsButton),
+                          onPressed: () async {
+                            final profile = selectedProfile();
+                            if (profile.apiKey.trim().isEmpty) {
+                              await redirectToProfileSettings(ctx, profile);
+                              return;
+                            }
+                            setDialogState(() => loading = true);
+                            try {
+                              availableModels = await LlmService.fetchModels(
+                                apiFormat: profile.apiFormat,
+                                apiKey: profile.apiKey,
+                                baseUrl: profile.baseUrl.trim().isEmpty
+                                    ? null
+                                    : profile.baseUrl,
+                              );
+                              if (availableModels
+                                      .any(LlmService.isPresetModel) &&
+                                  mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      AppStrings.modelFetchPresetNotice,
+                                    ),
+                                  ),
+                                );
+                              }
+                            } catch (e) {
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      AppStrings.modelFetchFailed(
+                                        _briefError(e),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              }
+                            }
+                            setDialogState(() => loading = false);
+                          },
+                        ),
+                      ),
                     ],
-                    onChanged: (v) => controller.text = v ?? '',
-                  )
-                else
-                  TextField(
-                    controller: controller,
-                    decoration: InputDecoration(
-                      labelText: AppStrings.modelName,
-                      hintText: selectedProfile().effectiveModel,
-                      helperText: AppStrings.leaveEmptyForDefault,
-                    ),
                   ),
-                const SizedBox(height: 8),
-                TextButton.icon(
-                  icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text(AppStrings.fetchModelsButton),
-                  onPressed: () async {
-                    final profile = selectedProfile();
-                    if (profile.apiKey.trim().isEmpty) {
-                      await redirectToProfileSettings(ctx, profile);
-                      return;
-                    }
-                    setDialogState(() => loading = true);
-                    try {
-                      availableModels = await LlmService.fetchModels(
-                        apiFormat: profile.apiFormat,
-                        apiKey: profile.apiKey,
-                        baseUrl: profile.baseUrl.trim().isEmpty
-                            ? null
-                            : profile.baseUrl,
-                      );
-                      if (availableModels.any(LlmService.isPresetModel) &&
-                          mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text(AppStrings.modelFetchPresetNotice),
-                          ),
-                        );
-                      }
-                    } catch (e) {
-                      if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text(
-                              AppStrings.modelFetchFailed(_briefError(e)),
-                            ),
-                          ),
-                        );
-                      }
-                    }
-                    setDialogState(() => loading = false);
-                  },
                 ),
-              ],
+              ),
             ),
-          ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text(AppStrings.cancel)),
-            FilledButton(
-              onPressed: () async {
-                final selected = selectedProfile();
-                if (selected.apiKey.trim().isEmpty) {
-                  await redirectToProfileSettings(ctx, selected);
-                  return;
-                }
-                if (selected.id != prefs.activeProfileId) {
-                  await provider.switchProfile(selected.id);
-                }
-                await provider.updateSessionModel(
-                  model: controller.text.trim().isEmpty
-                      ? null
-                      : controller.text.trim(),
-                );
-                if (ctx.mounted) Navigator.pop(ctx);
-              },
-              child: const Text(AppStrings.confirm),
-            ),
-          ],
-        ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text(AppStrings.cancel)),
+              FilledButton(
+                onPressed: () async {
+                  final selected = selectedProfile();
+                  if (selected.apiKey.trim().isEmpty) {
+                    await redirectToProfileSettings(ctx, selected);
+                    return;
+                  }
+                  if (selected.id != prefs.activeProfileId) {
+                    await provider.switchProfile(selected.id);
+                  }
+                  await provider.updateSessionModel(
+                    model: controller.text.trim().isEmpty
+                        ? null
+                        : controller.text.trim(),
+                  );
+                  if (ctx.mounted) Navigator.pop(ctx);
+                },
+                child: const Text(AppStrings.confirm),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -2601,6 +2627,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _showCompareDialog() async {
     final prefs = PreferencesService();
     await prefs.init();
+    if (!mounted) return;
 
     List<String> availableModels = [];
     final selectedModels = <String>{};
@@ -2625,9 +2652,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   controller: textController,
                   maxLines: 3,
                   minLines: 1,
-                  decoration: InputDecoration(
+                  decoration: const InputDecoration(
                     hintText: AppStrings.inputHint,
-                    border: const OutlineInputBorder(),
+                    border: OutlineInputBorder(),
                   ),
                 ),
                 const SizedBox(height: 12),
