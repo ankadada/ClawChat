@@ -2136,8 +2136,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   )
                 else if (availableModels.isNotEmpty)
                   DropdownButtonFormField<String>(
-                    value: availableModels.any((m) =>
-                            LlmService.modelIdFromDisplay(m) == controller.text)
+                    value: availableModels.any((m) => m == controller.text)
                         ? controller.text
                         : null,
                     decoration: InputDecoration(
@@ -2149,7 +2148,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       const DropdownMenuItem(
                           value: '', child: Text(AppStrings.useGlobalDefault)),
                       ...availableModels.map((m) => DropdownMenuItem(
-                            value: LlmService.modelIdFromDisplay(m),
+                            value: m,
                             child: Text(m, overflow: TextOverflow.ellipsis),
                           )),
                     ],

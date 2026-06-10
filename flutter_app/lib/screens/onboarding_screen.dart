@@ -66,7 +66,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         _fetchingModels = false;
         _manualModelInput = models.isEmpty;
         if (models.isNotEmpty && _modelController.text.isEmpty) {
-          _modelController.text = LlmService.modelIdFromDisplay(models.first);
+          _modelController.text = models.first;
         }
       });
     } catch (_) {
@@ -363,9 +363,9 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     )
                   : (_availableModels.isNotEmpty && !_manualModelInput)
                       ? DropdownButtonFormField<String>(
-                          value: _availableModels.any((model) =>
-                                  LlmService.modelIdFromDisplay(model) ==
-                                  _modelController.text)
+                          value: _availableModels.any(
+                            (model) => model == _modelController.text,
+                          )
                               ? _modelController.text
                               : null,
                           decoration: const InputDecoration(
@@ -374,7 +374,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                           ),
                           items: [
                             ..._availableModels.map((m) => DropdownMenuItem(
-                                  value: LlmService.modelIdFromDisplay(m),
+                                  value: m,
                                   child:
                                       Text(m, overflow: TextOverflow.ellipsis),
                                 )),
@@ -393,10 +393,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                         )
                       : TextField(
                           controller: _modelController,
-                          decoration: InputDecoration(
+                          decoration: const InputDecoration(
                             labelText: AppStrings.modelName,
                             hintText: AppConstants.defaultModel,
-                            prefixIcon: const Icon(Icons.smart_toy),
+                            prefixIcon: Icon(Icons.smart_toy),
                           ),
                         ),
             ),
@@ -477,9 +477,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       apiFormat: _apiFormat,
       apiKey: _apiKeyController.text.trim(),
       baseUrl: _baseUrlController.text.trim(),
-      model: _modelController.text.trim().isNotEmpty
-          ? LlmService.modelIdFromDisplay(_modelController.text.trim())
-          : '',
+      model: _modelController.text.trim(),
     );
     try {
       await _prefs.updateActiveProfile(profile);

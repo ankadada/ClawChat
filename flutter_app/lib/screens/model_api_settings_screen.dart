@@ -331,7 +331,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         _fetchingModels = false;
         _manualModelInput = models.isEmpty;
         if (models.isNotEmpty && _modelController.text.isEmpty) {
-          _modelController.text = LlmService.modelIdFromDisplay(models.first);
+          _modelController.text = models.first;
           _scheduleSave();
         }
       });
@@ -612,9 +612,9 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
                     )
                   : (_availableModels.isNotEmpty && !_manualModelInput)
                       ? DropdownButtonFormField<String>(
-                          value: _availableModels.any((m) =>
-                                  LlmService.modelIdFromDisplay(m) ==
-                                  _modelController.text)
+                          value: _availableModels.any(
+                            (m) => m == _modelController.text,
+                          )
                               ? _modelController.text
                               : null,
                           decoration: const InputDecoration(
@@ -623,7 +623,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
                           items: [
                             ..._availableModels.map(
                               (m) => DropdownMenuItem(
-                                value: LlmService.modelIdFromDisplay(m),
+                                value: m,
                                 child: Text(
                                   m,
                                   overflow: TextOverflow.ellipsis,
@@ -647,7 +647,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
                       : TextField(
                           controller: _modelController,
                           onChanged: (_) => _scheduleSave(),
-                          decoration: InputDecoration(
+                          decoration: const InputDecoration(
                             labelText: AppStrings.model,
                             hintText: AppConstants.defaultModel,
                           ),
@@ -694,7 +694,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(AppStrings.contextLength),
+            const Text(AppStrings.contextLength),
             const SizedBox(height: 8),
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
