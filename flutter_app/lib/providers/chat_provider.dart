@@ -923,8 +923,12 @@ class ChatProvider extends ChangeNotifier {
         estimator: estimator,
         toolDefinitions: toolDefinitions,
       );
-      final truncation = _truncateToFit(
+      final compressedMessages = _compressOldToolResults(
         summaryResult.messages,
+        estimator: estimator,
+      );
+      final truncation = _truncateToFit(
+        compressedMessages,
         maxTokens: finalTokenBudget,
         estimator: estimator,
         preserveLastMessages: 2,
@@ -1443,8 +1447,12 @@ class ChatProvider extends ChangeNotifier {
       // Compare is a one-shot inspection — results live in compareResults only.
       // If we persisted, the next real sendMessage would break role alternation
       // (two consecutive user messages without an assistant reply between them).
-      final compareMessages = _truncateToFit(
+      final compressedCompareMessages = _compressOldToolResults(
         comparePayloadMessages,
+        estimator: compareEstimator,
+      );
+      final compareMessages = _truncateToFit(
+        compressedCompareMessages,
         maxTokens: _resolveContextTokenBudget(
           llmConfig: compareBudgetConfig,
           systemPrompt: compareSystemPrompt,
@@ -1582,6 +1590,17 @@ class ChatProvider extends ChangeNotifier {
       estimator: estimator,
       autoCompact: _prefs.autoCompact,
       preserveLastMessages: preserveLastMessages,
+    );
+  }
+
+  List<Map<String, dynamic>> _compressOldToolResults(
+    List<Map<String, dynamic>> messages, {
+    required TokenEstimator estimator,
+  }) {
+    if (!_prefs.autoCompact) return messages;
+    return ChatContextUtils.compressOldToolResults(
+      messages,
+      estimator: estimator,
     );
   }
 

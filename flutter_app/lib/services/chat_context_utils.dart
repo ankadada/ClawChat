@@ -444,6 +444,64 @@ class ChatContextUtils {
         .messages;
   }
 
+  static List<Map<String, dynamic>> compressOldToolResults(
+    List<Map<String, dynamic>> messages, {
+    required TokenEstimator estimator,
+    int protectedTurnCount = 2,
+    int compressionThresholdTokens = 500,
+    int previewCharLimit = 200,
+  }) {
+    if (messages.isEmpty) return const [];
+    final protectedStart = _protectedToolResultStart(
+      messages,
+      protectedTurnCount,
+    );
+    final toolNames = _toolNamesById(messages);
+    final result = <Map<String, dynamic>>[];
+    for (var i = 0; i < messages.length; i++) {
+      final message = messages[i];
+      final content = message['content'];
+      if (content is! List) {
+        result.add(Map<String, dynamic>.from(message));
+        continue;
+      }
+
+      final blocks = <Object?>[];
+      for (final item in content) {
+        if (item is! Map) {
+          blocks.add(item);
+          continue;
+        }
+        final block = Map<String, dynamic>.from(item);
+        if (i < protectedStart &&
+            block['type'] == 'tool_result' &&
+            estimator.estimateBlock(block) > compressionThresholdTokens) {
+          final toolUseId = block['tool_use_id']?.toString() ?? '';
+          final toolName = toolNames[toolUseId] ?? 'unknown';
+          final status = block['is_error'] == true ? 'error' : 'success';
+          final preview = _previewToolResultContent(
+            block['content'] ?? block['output'],
+            previewCharLimit,
+          );
+          blocks.add({
+            ...block,
+            'content':
+                '[Tool result truncated — tool: $toolName, id: $toolUseId, '
+                    'status: $status, preview: $preview]',
+          });
+        } else {
+          blocks.add(block);
+        }
+      }
+
+      result.add({
+        ...message,
+        'content': blocks,
+      });
+    }
+    return result;
+  }
+
   static ContextCompactionPlan planCompaction(
     List<Map<String, dynamic>> messages, {
     required int maxTokens,
@@ -547,6 +605,63 @@ class ChatContextUtils {
     return content.every(
       (block) => block is Map && block['type'] == 'tool_result',
     );
+  }
+
+  static int _protectedToolResultStart(
+    List<Map<String, dynamic>> messages,
+    int protectedTurnCount,
+  ) {
+    if (protectedTurnCount <= 0) return messages.length;
+    final turns = _turnRanges(messages);
+    final turnsWithToolResults = turns
+        .where((turn) =>
+            messages.sublist(turn.start, turn.end).any(hasToolResultContent))
+        .toList();
+    if (turnsWithToolResults.isEmpty) return messages.length;
+    if (turnsWithToolResults.length <= protectedTurnCount) return 0;
+    return turnsWithToolResults[
+            turnsWithToolResults.length - protectedTurnCount]
+        .start;
+  }
+
+  static Map<String, String> _toolNamesById(
+    List<Map<String, dynamic>> messages,
+  ) {
+    final names = <String, String>{};
+    for (final message in messages) {
+      final content = message['content'];
+      if (content is! List) continue;
+      for (final block in content) {
+        if (block is! Map || block['type'] != 'tool_use') continue;
+        final id = block['id'];
+        final name = block['name'];
+        if (id is String && id.isNotEmpty && name is String) {
+          names[id] = name;
+        }
+      }
+    }
+    return names;
+  }
+
+  static String _previewToolResultContent(Object? value, int limit) {
+    final raw = switch (value) {
+      null => '',
+      String text => text,
+      _ => _stringifyForPreview(value),
+    };
+    final normalized = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalized.isEmpty || limit <= 0) return '';
+    final runes = normalized.runes.toList();
+    if (runes.length <= limit) return normalized;
+    return '${String.fromCharCodes(runes.take(limit))}...';
+  }
+
+  static String _stringifyForPreview(Object? value) {
+    try {
+      return jsonEncode(value);
+    } catch (_) {
+      return value.toString();
+    }
   }
 
   static int _adjustTailStartForToolPairs(

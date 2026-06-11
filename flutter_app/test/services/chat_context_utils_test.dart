@@ -577,6 +577,176 @@ void main() {
     });
   });
 
+  group('compressOldToolResults', () {
+    const estimator = TokenEstimator();
+
+    List<Map<String, dynamic>> toolTurn(
+      String prompt,
+      String toolId,
+      String toolName,
+      String result, {
+      bool isError = false,
+    }) {
+      return [
+        {'role': 'user', 'content': prompt},
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': toolId,
+              'name': toolName,
+              'input': {'cmd': 'run $toolName'},
+            },
+          ],
+        },
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': toolId,
+              'content': result,
+              if (isError) 'is_error': true,
+            },
+          ],
+        },
+        {'role': 'assistant', 'content': 'done $prompt'},
+      ];
+    }
+
+    test('keeps tool results in the latest two user turns intact', () {
+      final messages = [
+        ...toolTurn('old', 'call_old', 'bash', 'old ${'x' * 3000}'),
+        ...toolTurn('middle', 'call_mid', 'grep', 'middle ${'x' * 3000}'),
+        ...toolTurn('latest', 'call_new', 'cat', 'latest ${'x' * 3000}'),
+      ];
+
+      final result = ChatContextUtils.compressOldToolResults(
+        messages,
+        estimator: estimator,
+      );
+      final serialized = result.toString();
+
+      expect(serialized, contains('Tool result truncated'));
+      expect(serialized, contains('tool: bash'));
+      expect(serialized, isNot(contains('old ${'x' * 3000}')));
+      expect(serialized, contains('middle ${'x' * 3000}'));
+      expect(serialized, contains('latest ${'x' * 3000}'));
+    });
+
+    test('does not count current text-only user turn against protection', () {
+      final messages = [
+        ...toolTurn('old', 'call_old', 'bash', 'old ${'x' * 3000}'),
+        ...toolTurn('middle', 'call_mid', 'grep', 'middle ${'x' * 3000}'),
+        ...toolTurn('latest', 'call_new', 'cat', 'latest ${'x' * 3000}'),
+        {'role': 'user', 'content': 'new prompt'},
+      ];
+
+      final result = ChatContextUtils.compressOldToolResults(
+        messages,
+        estimator: estimator,
+      );
+      final serialized = result.toString();
+
+      expect(serialized, contains('tool: bash'));
+      expect(serialized, isNot(contains('old ${'x' * 3000}')));
+      expect(serialized, contains('middle ${'x' * 3000}'));
+      expect(serialized, contains('latest ${'x' * 3000}'));
+      expect(serialized, contains('new prompt'));
+    });
+
+    test('does not compress small old tool results below threshold', () {
+      final messages = [
+        ...toolTurn('old', 'call_old', 'bash', 'small result'),
+        ...toolTurn('middle', 'call_mid', 'grep', 'middle ${'x' * 3000}'),
+        ...toolTurn('latest', 'call_new', 'cat', 'latest ${'x' * 3000}'),
+      ];
+
+      final result = ChatContextUtils.compressOldToolResults(
+        messages,
+        estimator: estimator,
+      );
+
+      expect(result.toString(), contains('small result'));
+      expect(result.toString(), isNot(contains('tool: bash')));
+    });
+
+    test('placeholder includes tool name, id, status, and preview', () {
+      final messages = [
+        ...toolTurn(
+          'old',
+          'call_old',
+          'web_fetch',
+          'first line\nsecond line ${'x' * 3000}',
+          isError: true,
+        ),
+        ...toolTurn('middle', 'call_mid', 'grep', 'middle ${'x' * 3000}'),
+        ...toolTurn('latest', 'call_new', 'cat', 'latest ${'x' * 3000}'),
+      ];
+
+      final result = ChatContextUtils.compressOldToolResults(
+        messages,
+        estimator: estimator,
+        previewCharLimit: 22,
+      );
+      final toolResultMessage = result.firstWhere(
+        (message) => ChatContextUtils.hasToolResultContent(message),
+      );
+      final block =
+          (toolResultMessage['content'] as List).single as Map<String, dynamic>;
+
+      expect(block['tool_use_id'], 'call_old');
+      expect(block['is_error'], isTrue);
+      expect(
+        block['content'],
+        '[Tool result truncated — tool: web_fetch, id: call_old, '
+        'status: error, preview: first line second line...]',
+      );
+    });
+
+    test('preserves tool_use_id pairing after compression', () {
+      final messages = [
+        ...toolTurn('old', 'call_old', 'bash', 'old ${'x' * 3000}'),
+        ...toolTurn('middle', 'call_mid', 'grep', 'middle ${'x' * 3000}'),
+        ...toolTurn('latest', 'call_new', 'cat', 'latest ${'x' * 3000}'),
+      ];
+
+      final result = ChatContextUtils.compressOldToolResults(
+        messages,
+        estimator: estimator,
+      );
+
+      expect(
+        result.any((message) =>
+            ChatContextUtils.hasToolUseContent(message) &&
+            message.toString().contains('call_old')),
+        isTrue,
+      );
+      expect(
+        result.any((message) =>
+            ChatContextUtils.hasToolResultContent(message) &&
+            message.toString().contains('call_old')),
+        isTrue,
+      );
+    });
+
+    test('handles empty old tool results without adding noise', () {
+      final messages = [
+        ...toolTurn('old', 'call_old', 'bash', ''),
+        ...toolTurn('middle', 'call_mid', 'grep', 'middle ${'x' * 3000}'),
+        ...toolTurn('latest', 'call_new', 'cat', 'latest ${'x' * 3000}'),
+      ];
+
+      final result = ChatContextUtils.compressOldToolResults(
+        messages,
+        estimator: estimator,
+      );
+
+      expect(result.toString(), isNot(contains('tool: bash')));
+    });
+  });
+
   group('planCompaction', () {
     const estimator = TokenEstimator();
 

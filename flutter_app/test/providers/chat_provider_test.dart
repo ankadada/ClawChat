@@ -505,6 +505,107 @@ void main() {
       );
     });
 
+    test('sendMessage compresses old large tool results in payload only',
+        () async {
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      final oldOutput = 'old-output-${'x' * 3000}';
+      final middleOutput = 'middle-output-${'y' * 3000}';
+      final latestOutput = 'latest-output-${'z' * 3000}';
+      session.messages.addAll([
+        ChatMessage.user('old tool prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [
+            ToolUseContent(
+              id: 'call_old',
+              name: 'bash',
+              input: const {'cmd': 'cat old.txt'},
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(toolUseId: 'call_old', output: oldOutput),
+          ],
+        ),
+        ChatMessage(role: 'assistant', content: [TextContent('old done')]),
+        ChatMessage.user('middle tool prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [
+            ToolUseContent(
+              id: 'call_middle',
+              name: 'grep',
+              input: const {'cmd': 'grep middle'},
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(toolUseId: 'call_middle', output: middleOutput),
+          ],
+        ),
+        ChatMessage(role: 'assistant', content: [TextContent('middle done')]),
+        ChatMessage.user('latest tool prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [
+            ToolUseContent(
+              id: 'call_latest',
+              name: 'cat',
+              input: const {'cmd': 'cat latest.txt'},
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(toolUseId: 'call_latest', output: latestOutput),
+          ],
+        ),
+        ChatMessage(role: 'assistant', content: [TextContent('latest done')]),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(1));
+      final payload = observedMessages.single.toString();
+      expect(payload, contains('Tool result truncated'));
+      expect(payload, contains('tool: bash'));
+      expect(payload, contains('id: call_old'));
+      expect(payload, isNot(contains(oldOutput)));
+      expect(payload, contains(middleOutput));
+      expect(payload, contains(latestOutput));
+      expect(
+        provider.currentSession!.toApiMessages().toString(),
+        contains(oldOutput),
+      );
+    });
+
     test('large system prompt truncates history more aggressively', () async {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
@@ -1222,6 +1323,107 @@ void main() {
         final serialized = messages.toString();
         expect(serialized, isNot(contains('old-compare')));
         expect(serialized, contains('compare prompt'));
+      }
+    });
+
+    test('sendCompare compresses old large tool results', () async {
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+          onChat: (messages) {
+            observedMessages.add(messages);
+            return const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            );
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      final oldOutput = 'compare-old-output-${'x' * 3000}';
+      final middleOutput = 'compare-middle-output-${'y' * 3000}';
+      final latestOutput = 'compare-latest-output-${'z' * 3000}';
+      session.messages.addAll([
+        ChatMessage.user('old compare tool prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [
+            ToolUseContent(
+              id: 'call_old',
+              name: 'bash',
+              input: const {'cmd': 'cat old.txt'},
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(toolUseId: 'call_old', output: oldOutput),
+          ],
+        ),
+        ChatMessage(role: 'assistant', content: [TextContent('old done')]),
+        ChatMessage.user('middle compare tool prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [
+            ToolUseContent(
+              id: 'call_middle',
+              name: 'grep',
+              input: const {'cmd': 'grep middle'},
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(toolUseId: 'call_middle', output: middleOutput),
+          ],
+        ),
+        ChatMessage(role: 'assistant', content: [TextContent('middle done')]),
+        ChatMessage.user('latest compare tool prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [
+            ToolUseContent(
+              id: 'call_latest',
+              name: 'cat',
+              input: const {'cmd': 'cat latest.txt'},
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(toolUseId: 'call_latest', output: latestOutput),
+          ],
+        ),
+        ChatMessage(role: 'assistant', content: [TextContent('latest done')]),
+      ]);
+
+      await provider.sendCompare('compare prompt', ['model-a', 'model-b']);
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(2));
+      for (final messages in observedMessages) {
+        final payload = messages.toString();
+        expect(payload, contains('Tool result truncated'));
+        expect(payload, contains('tool: bash'));
+        expect(payload, isNot(contains(oldOutput)));
+        expect(payload, contains(middleOutput));
+        expect(payload, contains(latestOutput));
       }
     });
 
