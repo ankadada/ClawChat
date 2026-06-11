@@ -34,6 +34,23 @@ void main() {
       expect(tokens, greaterThan(estimator.estimateText('printf hello')));
     });
 
+    test('estimates tool definitions from serialized schema', () {
+      final tokens = estimator.estimateToolDefinitions([
+        {
+          'name': 'bash',
+          'description': 'Run a shell command',
+          'input_schema': {
+            'type': 'object',
+            'properties': {
+              'cmd': {'type': 'string'},
+            },
+          },
+        },
+      ]);
+
+      expect(tokens, greaterThan(estimator.estimateText('bash')));
+    });
+
     test('estimates image blocks with conservative defaults and dimensions',
         () {
       expect(estimator.estimateImage({'type': 'image'}), 1500);
@@ -105,6 +122,29 @@ void main() {
       final base = estimator.estimateText('a' * 100);
 
       expect(clamped.estimateText('a' * 100), base * 4);
+    });
+
+    test('diagnoses message token categories', () {
+      final diagnostics = estimator.diagnoseMessages([
+        {
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': 'hello'},
+            {'type': 'image'},
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'call_1',
+              'content': 'done',
+            },
+          ],
+        },
+      ]);
+
+      expect(diagnostics.totalTokens, greaterThan(0));
+      expect(diagnostics.textTokens, greaterThan(0));
+      expect(diagnostics.imageTokens, greaterThanOrEqualTo(1500));
+      expect(diagnostics.toolTokens, greaterThan(0));
+      expect(diagnostics.largestBlockTokens, greaterThanOrEqualTo(1500));
     });
   });
 

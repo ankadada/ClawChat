@@ -8,6 +8,9 @@ import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
+import 'package:clawchat/services/token_calibration_service.dart';
+import 'package:clawchat/services/tools/tool_policy.dart';
+import 'package:clawchat/services/tools/tool_registry.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -701,6 +704,236 @@ void main() {
         expect(serialized, contains('compare prompt'));
       }
     });
+
+    test('successful send updates token calibration', () async {
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+            usage: LlmUsage(inputTokens: 22000, outputTokens: 50),
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      for (var i = 0; i < 12; i++) {
+        session.messages.add(ChatMessage.user('history-$i ${'x' * 4000}'));
+      }
+      await provider.sendMessage('calibrate');
+
+      expect(provider.errorMessage, isNull);
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(TokenCalibrationService.storageKey);
+      expect(raw, isNotNull);
+      final stored = jsonDecode(raw!) as Map<String, dynamic>;
+      final entry = stored.values.single as Map<String, dynamic>;
+      expect(entry['multiplier'] as double, greaterThan(1.0));
+      expect(entry['sampleCount'], 1);
+    });
+
+    test('encrypted recovery does not update token calibration', () async {
+      var requestCount = 0;
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamError(
+                'encrypted',
+                cause: const EncryptedContentError(
+                  'Anthropic API error: invalid_encrypted_content: encrypted',
+                  code: 'invalid_encrypted_content',
+                ),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+              usage: LlmUsage(inputTokens: 22000, outputTokens: 50),
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      for (var i = 0; i < 12; i++) {
+        session.messages.add(ChatMessage.user('history-$i ${'x' * 4000}'));
+      }
+      await provider.sendMessage('recover');
+
+      expect(provider.errorMessage, isNull);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(TokenCalibrationService.storageKey), isNull);
+    });
+
+    test('tool-call agent loops do not update token calibration', () async {
+      var requestCount = 0;
+      final tools = ToolRegistry()..register(_EchoTool(), risk: ToolRisk.safe);
+      final provider = ChatProvider(
+        toolRegistry: tools,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'call_1',
+                      toolName: 'echo',
+                      toolInput: {'text': 'hi'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'ok')],
+                usage: LlmUsage(inputTokens: 22000, outputTokens: 50),
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      for (var i = 0; i < 12; i++) {
+        session.messages.add(ChatMessage.user('history-$i ${'x' * 4000}'));
+      }
+      await provider.sendMessage('use tool');
+
+      expect(provider.errorMessage, isNull);
+      expect(requestCount, 2);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(TokenCalibrationService.storageKey), isNull);
+    });
+
+    test('next send uses persisted calibration multiplier', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+        TokenCalibrationService.storageKey: jsonEncode({
+          'anthropic|127.0.0.1|profile|claude-sonnet-4-20250514': {
+            'multiplier': 2.0,
+            'sampleCount': 3,
+            'updatedAtMillis': 1,
+          },
+        }),
+      });
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-calibrated-${'x' * 30000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'x' * 30000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(1));
+      final serialized = observedMessages.single.toString();
+      expect(serialized, isNot(contains('old-calibrated')));
+      expect(serialized, isNot(contains('old reply')));
+      expect(serialized, contains('new prompt'));
+    });
+
+    test('tool definitions are subtracted from message budget', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final observedTools = <int>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+          onTools: (tools) => observedTools.add(tools.length),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-tools-${'中' * 17000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 17000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedTools.single, greaterThan(0));
+      final serialized = observedMessages.single.toString();
+      expect(serialized, isNot(contains('old-tools')));
+      expect(serialized, isNot(contains('old reply')));
+      expect(serialized, contains('new prompt'));
+    });
   });
 
   group('charCount - string content', () {
@@ -954,12 +1187,17 @@ void main() {
 
 class _ScriptedLlmService extends LlmService {
   final StreamEvent Function(List<Map<String, dynamic>> messages) onMessages;
+  final List<StreamEvent> Function(List<Map<String, dynamic>> messages)?
+      onMessageEvents;
   final LlmResponse Function(List<Map<String, dynamic>> messages)? onChat;
+  final void Function(List<ToolDefinition> tools)? onTools;
 
   _ScriptedLlmService(
     super.config, {
     required this.onMessages,
+    this.onMessageEvents,
     this.onChat,
+    this.onTools,
   });
 
   @override
@@ -968,8 +1206,16 @@ class _ScriptedLlmService extends LlmService {
     required List<Map<String, dynamic>> messages,
     required List<ToolDefinition> tools,
   }) async {
+    onTools?.call(tools);
     final handler = onChat;
     if (handler != null) return handler(messages);
+    final eventsHandler = onMessageEvents;
+    if (eventsHandler != null) {
+      for (final event in eventsHandler(messages)) {
+        if (event is StreamDone) return event.response;
+        if (event is StreamError) throw Exception(event.message);
+      }
+    }
     final event = onMessages(messages);
     if (event is StreamDone) return event.response;
     if (event is StreamError) throw Exception(event.message);
@@ -985,6 +1231,21 @@ class _ScriptedLlmService extends LlmService {
     required List<Map<String, dynamic>> messages,
     required List<ToolDefinition> tools,
   }) async* {
+    onTools?.call(tools);
+    final eventsHandler = onMessageEvents;
+    if (eventsHandler != null) {
+      for (final event in eventsHandler(messages)) {
+        if (event is StreamDone) {
+          final text = event.response.content
+              .where((block) => block.type == 'text')
+              .map((block) => block.text ?? '')
+              .join();
+          if (text.isNotEmpty) yield TextDelta(text);
+        }
+        yield event;
+      }
+      return;
+    }
     final event = onMessages(messages);
     if (event is StreamDone) {
       final text = event.response.content
@@ -994,5 +1255,26 @@ class _ScriptedLlmService extends LlmService {
       if (text.isNotEmpty) yield TextDelta(text);
     }
     yield event;
+  }
+}
+
+class _EchoTool extends Tool {
+  @override
+  String get name => 'echo';
+
+  @override
+  String get description => 'Echo text';
+
+  @override
+  Map<String, dynamic> get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'text': {'type': 'string'},
+        },
+      };
+
+  @override
+  Future<String> execute(Map<String, dynamic> input) async {
+    return input['text']?.toString() ?? '';
   }
 }

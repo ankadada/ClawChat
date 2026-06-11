@@ -36,7 +36,15 @@ class AgentComplete extends AgentEvent {
   final String finalText;
   final int? inputTokens;
   final int? outputTokens;
-  AgentComplete(this.finalText, {this.inputTokens, this.outputTokens});
+  final LlmUsage? usage;
+  final bool hadToolCalls;
+  AgentComplete(
+    this.finalText, {
+    this.inputTokens,
+    this.outputTokens,
+    this.usage,
+    this.hadToolCalls = false,
+  });
 }
 
 class AgentError extends AgentEvent {
@@ -94,6 +102,7 @@ class AgentService {
     final toolDefs = _tools.getToolDefinitions();
     final effectiveMaxIterations = maxIterations.clamp(1, 99).toInt();
     int iteration = 0;
+    var hadToolCalls = false;
 
     while (!_cancelled) {
       iteration++;
@@ -153,12 +162,15 @@ class AgentService {
           finalText,
           inputTokens: response.inputTokens,
           outputTokens: response.outputTokens,
+          usage: response.usage,
+          hadToolCalls: hadToolCalls,
         );
         return;
       }
 
       final toolBlocks =
           response.content.where((b) => b.type == 'tool_use').toList();
+      if (toolBlocks.isNotEmpty) hadToolCalls = true;
       final toolResults = <Map<String, dynamic>>[];
 
       for (final block in toolBlocks) {

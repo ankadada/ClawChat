@@ -501,6 +501,51 @@ void main() {
       ]);
     });
 
+    test('parses Anthropic non-stream usage including cache fields', () async {
+      final response = await anthropicChatResponseWithBody({
+        'stop_reason': 'end_turn',
+        'content': [
+          {'type': 'text', 'text': 'ok'}
+        ],
+        'usage': {
+          'input_tokens': 100,
+          'output_tokens': 20,
+          'cache_read_input_tokens': 30,
+          'cache_creation_input_tokens': 40,
+        },
+      });
+
+      expect(response.inputTokens, 100);
+      expect(response.outputTokens, 20);
+      expect(response.usage?.cacheReadInputTokens, 30);
+      expect(response.usage?.cacheCreationInputTokens, 40);
+      expect(response.usage?.totalInputTokens, 170);
+    });
+
+    test('parses OpenAI non-stream usage including cached tokens', () async {
+      final response = await openAiChatResponseWithBody({
+        'choices': [
+          {
+            'message': {'content': 'ok'},
+            'finish_reason': 'stop',
+          }
+        ],
+        'usage': {
+          'prompt_tokens': 100,
+          'completion_tokens': 20,
+          'prompt_tokens_details': {
+            'cached_tokens': 30,
+          },
+        },
+      });
+
+      expect(response.inputTokens, 100);
+      expect(response.outputTokens, 20);
+      expect(response.usage?.cacheReadInputTokens, 30);
+      expect(response.usage?.cacheCreationInputTokens, isNull);
+      expect(response.usage?.totalInputTokens, 100);
+    });
+
     test('strips assistant reasoning_content from Anthropic request bodies',
         () async {
       final captured = await captureAnthropicRequest(
@@ -709,7 +754,11 @@ void main() {
         sseData({
           'type': 'message_start',
           'message': {
-            'usage': {'input_tokens': 1},
+            'usage': {
+              'input_tokens': 1,
+              'cache_read_input_tokens': 2,
+              'cache_creation_input_tokens': 3,
+            },
           },
         }),
         sseData({
@@ -733,6 +782,8 @@ void main() {
       expect(done.response.content.single.text, 'ok');
       expect(done.response.inputTokens, 1);
       expect(done.response.outputTokens, 1);
+      expect(done.response.usage?.cacheReadInputTokens, 2);
+      expect(done.response.usage?.cacheCreationInputTokens, 3);
     });
 
     test('accepts OpenAI stream ending without final delimiter or done marker',
@@ -756,6 +807,9 @@ void main() {
           'usage': {
             'prompt_tokens': 1,
             'completion_tokens': 1,
+            'prompt_tokens_details': {
+              'cached_tokens': 2,
+            },
           },
         }, delimiter: false),
       ]);
@@ -766,6 +820,58 @@ void main() {
       expect(done.response.stopReason, 'end_turn');
       expect(done.response.inputTokens, 1);
       expect(done.response.outputTokens, 1);
+      expect(done.response.usage?.cacheReadInputTokens, 2);
+    });
+
+    test('retries OpenAI stream without stream_options when unsupported',
+        () async {
+      LlmService.clearStreamUsageUnsupportedHostsForTesting();
+      final bodies = <Map<String, dynamic>>[];
+      final events = await collectOpenAiStreamEventsWithHandler(
+        (request) async {
+          if (bodies.length == 1) {
+            request.response.statusCode = 400;
+            request.response.headers.contentType = ContentType.json;
+            request.response.write(jsonEncode({
+              'error': {
+                'message': 'unknown field: stream_options.include_usage',
+              },
+            }));
+            await request.response.close();
+            return;
+          }
+
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {'content': 'ok'},
+                'finish_reason': null,
+              }
+            ],
+          }));
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {},
+                'finish_reason': 'stop',
+              }
+            ],
+          }, delimiter: false));
+          await request.response.close();
+        },
+        onRequestBody: bodies.add,
+      );
+
+      expect(events.whereType<StreamError>(), isEmpty);
+      expect(events.whereType<StreamDone>().single.response.content.single.text,
+          'ok');
+      expect(bodies, hasLength(2));
+      expect(bodies.first, contains('stream_options'));
+      expect(bodies.last, isNot(contains('stream_options')));
+
+      final nextBodies = await captureOpenAiStreamBodies();
+      expect(nextBodies.single, isNot(contains('stream_options')));
+      LlmService.clearStreamUsageUnsupportedHostsForTesting();
     });
 
     test('captures OpenAI streaming reasoning_content without displaying it',
@@ -1194,6 +1300,37 @@ Future<CapturedLlmRequest> captureAnthropicRequest({
   }
 }
 
+Future<LlmResponse> anthropicChatResponseWithBody(
+  Map<String, dynamic> responseBody,
+) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    await utf8.decoder.bind(request).join();
+    request.response.statusCode = 200;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode(responseBody));
+    await request.response.close();
+  });
+
+  final service = LlmService(LlmConfig.anthropic(
+    apiKey: 'sk-test',
+    model: 'claude-sonnet-4-20250514',
+    baseUrl: 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    return await service.chat(
+      system: '',
+      messages: const [
+        {'role': 'user', 'content': 'hi'},
+      ],
+      tools: const [],
+    );
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
+}
+
 Future<Map<String, dynamic>> captureOpenAiBody({
   required String model,
 }) async =>
@@ -1237,6 +1374,37 @@ Future<CapturedLlmRequest> captureOpenAiRequest({
   try {
     await service.chat(system: system, messages: messages, tools: const []);
     return await capturedRequest.future;
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
+}
+
+Future<LlmResponse> openAiChatResponseWithBody(
+  Map<String, dynamic> responseBody,
+) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    await utf8.decoder.bind(request).join();
+    request.response.statusCode = 200;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode(responseBody));
+    await request.response.close();
+  });
+
+  final service = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: 'gpt-test',
+    baseUrl: 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    return await service.chat(
+      system: '',
+      messages: const [
+        {'role': 'user', 'content': 'hi'},
+      ],
+      tools: const [],
+    );
   } finally {
     service.dispose();
     await server.close(force: true);
@@ -1303,11 +1471,15 @@ Future<List<StreamEvent>> collectOpenAiStreamEvents(
 }
 
 Future<List<StreamEvent>> collectOpenAiStreamEventsWithHandler(
-  Future<void> Function(HttpRequest request) handleRequest,
-) async {
+  Future<void> Function(HttpRequest request) handleRequest, {
+  void Function(Map<String, dynamic> body)? onRequestBody,
+}) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.listen((request) async {
-    await utf8.decoder.bind(request).join();
+    final body = await utf8.decoder.bind(request).join();
+    if (onRequestBody != null) {
+      onRequestBody(jsonDecode(body) as Map<String, dynamic>);
+    }
     request.response.statusCode = 200;
     request.response.headers.contentType =
         ContentType('text', 'event-stream', charset: 'utf-8');
@@ -1331,4 +1503,31 @@ Future<List<StreamEvent>> collectOpenAiStreamEventsWithHandler(
     service.dispose();
     await server.close(force: true);
   }
+}
+
+Future<List<Map<String, dynamic>>> captureOpenAiStreamBodies() async {
+  final bodies = <Map<String, dynamic>>[];
+  await collectOpenAiStreamEventsWithHandler(
+    (request) async {
+      request.response.write(sseData({
+        'choices': [
+          {
+            'delta': {'content': 'ok'},
+            'finish_reason': null,
+          }
+        ],
+      }));
+      request.response.write(sseData({
+        'choices': [
+          {
+            'delta': {},
+            'finish_reason': 'stop',
+          }
+        ],
+      }, delimiter: false));
+      await request.response.close();
+    },
+    onRequestBody: bodies.add,
+  );
+  return bodies;
 }

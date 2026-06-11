@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'api_validator.dart';
 
 enum ApiFormat { anthropic, openai }
@@ -99,17 +100,99 @@ class LlmConfig {
   }
 }
 
+class LlmUsage {
+  final int? inputTokens;
+  final int? outputTokens;
+  final int? cacheReadInputTokens;
+  final int? cacheCreationInputTokens;
+  final bool inputTokensIncludeCache;
+
+  const LlmUsage({
+    this.inputTokens,
+    this.outputTokens,
+    this.cacheReadInputTokens,
+    this.cacheCreationInputTokens,
+    this.inputTokensIncludeCache = false,
+  });
+
+  bool get hasValues =>
+      inputTokens != null ||
+      outputTokens != null ||
+      cacheReadInputTokens != null ||
+      cacheCreationInputTokens != null;
+
+  int? get totalInputTokens {
+    final input = inputTokens;
+    if (input == null) return null;
+    if (inputTokensIncludeCache) return input;
+    return input +
+        (cacheReadInputTokens ?? 0) +
+        (cacheCreationInputTokens ?? 0);
+  }
+
+  static LlmUsage? fromAnthropic(Map<String, dynamic>? usage) {
+    if (usage == null) return null;
+    final parsed = LlmUsage(
+      inputTokens: _intValue(usage['input_tokens']),
+      outputTokens: _intValue(usage['output_tokens']),
+      cacheReadInputTokens: _intValue(usage['cache_read_input_tokens']),
+      cacheCreationInputTokens: _intValue(usage['cache_creation_input_tokens']),
+    );
+    return parsed.hasValues ? parsed : null;
+  }
+
+  static LlmUsage? fromOpenAI(Map<String, dynamic>? usage) {
+    if (usage == null) return null;
+    final details = usage['prompt_tokens_details'];
+    final detailsMap =
+        details is Map ? Map<String, dynamic>.from(details) : null;
+    final parsed = LlmUsage(
+      inputTokens: _intValue(usage['prompt_tokens']),
+      outputTokens: _intValue(usage['completion_tokens']),
+      cacheReadInputTokens: _intValue(detailsMap?['cached_tokens']),
+      inputTokensIncludeCache: true,
+    );
+    return parsed.hasValues ? parsed : null;
+  }
+
+  static int? _intValue(Object? value) {
+    if (value is int) return value;
+    if (value is num) return value.round();
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+}
+
 class LlmResponse {
   final String stopReason;
   final List<ContentBlock> content;
-  final int? inputTokens;
-  final int? outputTokens;
+  final LlmUsage? usage;
+
+  int? get inputTokens => usage?.inputTokens;
+  int? get outputTokens => usage?.outputTokens;
+
   const LlmResponse({
     required this.stopReason,
     required this.content,
-    this.inputTokens,
-    this.outputTokens,
+    this.usage,
   });
+
+  factory LlmResponse.withTokenCounts({
+    required String stopReason,
+    required List<ContentBlock> content,
+    int? inputTokens,
+    int? outputTokens,
+  }) {
+    final usage = LlmUsage(
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
+    );
+    return LlmResponse(
+      stopReason: stopReason,
+      content: content,
+      usage: usage.hasValues ? usage : null,
+    );
+  }
 }
 
 class ContentBlock {
@@ -220,6 +303,9 @@ class LlmService {
   };
 
   static const presetModelSuffix = ' (preset)';
+  static const streamUsageUnsupportedHostsPrefsKey =
+      'stream_usage_unsupported_hosts';
+  static final Set<String> _streamUsageUnsupportedHosts = {};
   static const _anthropicPresetModelIds = [
     'claude-sonnet-4-20250514',
     'claude-opus-4-20250514',
@@ -346,6 +432,10 @@ class LlmService {
     return _anthropicPresetModelIds
         .map((id) => '$id$presetModelSuffix')
         .toList();
+  }
+
+  static void clearStreamUsageUnsupportedHostsForTesting() {
+    _streamUsageUnsupportedHosts.clear();
   }
 
   static String _joinBaseUrl(String baseUrl, String path) {
@@ -728,6 +818,8 @@ class LlmService {
     bool isThinkingBlock = false;
     int? inputTokens;
     int? outputTokens;
+    int? cacheReadInputTokens;
+    int? cacheCreationInputTokens;
     bool streamFailed = false;
     int textSkipRemaining = 0;
     int toolInputSkipRemaining = 0;
@@ -788,7 +880,13 @@ class LlmService {
             if (message != null) {
               final usage = message['usage'] as Map<String, dynamic>?;
               if (usage != null) {
-                inputTokens = usage['input_tokens'] as int?;
+                final parsedUsage = LlmUsage.fromAnthropic(usage);
+                inputTokens = parsedUsage?.inputTokens ?? inputTokens;
+                cacheReadInputTokens =
+                    parsedUsage?.cacheReadInputTokens ?? cacheReadInputTokens;
+                cacheCreationInputTokens =
+                    parsedUsage?.cacheCreationInputTokens ??
+                        cacheCreationInputTokens;
               }
             }
             break;
@@ -875,7 +973,13 @@ class LlmService {
             stopReason = delta['stop_reason'] as String? ?? 'end_turn';
             final usage = event['usage'] as Map<String, dynamic>?;
             if (usage != null) {
-              outputTokens = usage['output_tokens'] as int?;
+              final parsedUsage = LlmUsage.fromAnthropic(usage);
+              outputTokens = parsedUsage?.outputTokens ?? outputTokens;
+              cacheReadInputTokens =
+                  parsedUsage?.cacheReadInputTokens ?? cacheReadInputTokens;
+              cacheCreationInputTokens =
+                  parsedUsage?.cacheCreationInputTokens ??
+                      cacheCreationInputTokens;
             }
             break;
 
@@ -939,11 +1043,16 @@ class LlmService {
       return;
     }
 
+    final usage = LlmUsage(
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
+      cacheReadInputTokens: cacheReadInputTokens,
+      cacheCreationInputTokens: cacheCreationInputTokens,
+    );
     yield StreamDone(LlmResponse(
       stopReason: stopReason,
       content: collectedBlocks,
-      inputTokens: inputTokens,
-      outputTokens: outputTokens,
+      usage: usage.hasValues ? usage : null,
     ));
   }
 
@@ -1014,7 +1123,14 @@ class LlmService {
         })
         .whereType<ContentBlock>()
         .toList();
-    return LlmResponse(stopReason: stopReason, content: content);
+    final usage = LlmUsage.fromAnthropic(
+      json['usage'] is Map ? Map<String, dynamic>.from(json['usage']) : null,
+    );
+    return LlmResponse(
+      stopReason: stopReason,
+      content: content,
+      usage: usage,
+    );
   }
 
   // ── OpenAI ─────────────────────────────────────────────────────
@@ -1064,7 +1180,14 @@ class LlmService {
   ) async* {
     final url = _joinEndpointUrl(config.baseUrl, '/v1/chat/completions');
     _validateApiHost(url);
-    var body = _buildOpenAIBody(system, messages, tools, stream: true);
+    var includeUsage = await _supportsOpenAIStreamUsage();
+    var body = _buildOpenAIBody(
+      system,
+      messages,
+      tools,
+      stream: true,
+      includeStreamUsage: includeUsage,
+    );
 
     Future<http.StreamedResponse> openStream() {
       return _retryWithBackoff(() async {
@@ -1074,9 +1197,36 @@ class LlmService {
         final response = await _client.send(request);
         if (response.statusCode == 400) {
           final errorBody = await response.stream.bytesToString();
+          if (includeUsage && _isStreamUsageUnsupportedError(errorBody)) {
+            await _markOpenAIStreamUsageUnsupported();
+            includeUsage = false;
+            body = _buildOpenAIBody(
+              system,
+              messages,
+              tools,
+              stream: true,
+              includeStreamUsage: false,
+            );
+            final retryReq = http.Request('POST', Uri.parse(url));
+            retryReq.headers.addAll(_openaiHeaders());
+            retryReq.body = jsonEncode(body);
+            final retryResp = await _client.send(retryReq);
+            if (retryResp.statusCode != 200) {
+              final retryErr = await retryResp.stream.bytesToString();
+              throw Exception(
+                  'OpenAI API error (${retryResp.statusCode}): ${_sanitizeErrorBody(retryErr)}');
+            }
+            return retryResp;
+          }
           if (_tryTokenKeyFallback(errorBody) ||
               _tryReasoningContentFallback(errorBody)) {
-            body = _buildOpenAIBody(system, messages, tools, stream: true);
+            body = _buildOpenAIBody(
+              system,
+              messages,
+              tools,
+              stream: true,
+              includeStreamUsage: includeUsage,
+            );
             final retryReq = http.Request('POST', Uri.parse(url));
             retryReq.headers.addAll(_openaiHeaders());
             retryReq.body = jsonEncode(body);
@@ -1108,6 +1258,7 @@ class LlmService {
     bool receivedDone = false;
     int? inputTokens;
     int? outputTokens;
+    int? cacheReadInputTokens;
     int textSkipRemaining = 0;
     int reasoningSkipRemaining = 0;
     int emittedTextLength = 0;
@@ -1125,8 +1276,11 @@ class LlmService {
         // Parse usage from streaming chunk (OpenAI sends it in final chunk)
         final usage = event['usage'] as Map<String, dynamic>?;
         if (usage != null) {
-          inputTokens = usage['prompt_tokens'] as int?;
-          outputTokens = usage['completion_tokens'] as int?;
+          final parsedUsage = LlmUsage.fromOpenAI(usage);
+          inputTokens = parsedUsage?.inputTokens ?? inputTokens;
+          outputTokens = parsedUsage?.outputTokens ?? outputTokens;
+          cacheReadInputTokens =
+              parsedUsage?.cacheReadInputTokens ?? cacheReadInputTokens;
         }
 
         final choices = event['choices'] as List?;
@@ -1291,11 +1445,15 @@ class LlmService {
       _ => stopReason,
     };
 
+    final usage = LlmUsage(
+      inputTokens: inputTokens,
+      outputTokens: outputTokens,
+      cacheReadInputTokens: cacheReadInputTokens,
+    );
     yield StreamDone(LlmResponse(
       stopReason: mappedStopReason,
       content: collectedBlocks,
-      inputTokens: inputTokens,
-      outputTokens: outputTokens,
+      usage: usage.hasValues ? usage : null,
     ));
   }
 
@@ -1304,6 +1462,7 @@ class LlmService {
     List<Map<String, dynamic>> messages,
     List<ToolDefinition> tools, {
     required bool stream,
+    bool includeStreamUsage = true,
   }) {
     final openaiMessages = <Map<String, dynamic>>[
       {'role': 'system', 'content': system},
@@ -1323,7 +1482,8 @@ class LlmService {
         tokenLimitKey: config.maxTokens,
       'messages': openaiMessages,
       'stream': stream,
-      if (stream) 'stream_options': {'include_usage': true},
+      if (stream && includeStreamUsage)
+        'stream_options': {'include_usage': true},
     };
     if (config.temperature != null &&
         !_isReasoningModel(config.model) &&
@@ -1353,6 +1513,61 @@ class LlmService {
         m.contains('reasoner') ||
         RegExp(r'(^|[/:._-])r1($|[/:._-])').hasMatch(m) ||
         m.contains('reasoning');
+  }
+
+  Future<bool> _supportsOpenAIStreamUsage() async {
+    final host = _normalizedBaseUrlHost(config.baseUrl);
+    if (host.isEmpty) return true;
+    if (_streamUsageUnsupportedHosts.contains(host)) return false;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final unsupported =
+          prefs.getStringList(streamUsageUnsupportedHostsPrefsKey) ?? const [];
+      _streamUsageUnsupportedHosts.addAll(unsupported);
+      return !unsupported.contains(host);
+    } catch (_) {
+      return true;
+    }
+  }
+
+  Future<void> _markOpenAIStreamUsageUnsupported() async {
+    final host = _normalizedBaseUrlHost(config.baseUrl);
+    if (host.isEmpty) return;
+    _streamUsageUnsupportedHosts.add(host);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final unsupported =
+          prefs.getStringList(streamUsageUnsupportedHostsPrefsKey) ?? const [];
+      if (unsupported.contains(host)) return;
+      await prefs.setStringList(
+        streamUsageUnsupportedHostsPrefsKey,
+        [...unsupported, host],
+      );
+    } catch (_) {
+      // SharedPreferences may be unavailable in pure Dart tests; the in-memory
+      // cache still prevents repeat failures for this process.
+    }
+  }
+
+  static String _normalizedBaseUrlHost(String baseUrl) {
+    final uri = Uri.tryParse(baseUrl.trim());
+    final host = uri?.host;
+    if (host != null && host.isNotEmpty) return host.toLowerCase();
+    return '';
+  }
+
+  bool _isStreamUsageUnsupportedError(String errorBody) {
+    final lower = errorBody.toLowerCase();
+    if (!lower.contains('stream_options') && !lower.contains('include_usage')) {
+      return false;
+    }
+    return lower.contains('unknown') ||
+        lower.contains('unsupported') ||
+        lower.contains('unrecognized') ||
+        lower.contains('invalid') ||
+        lower.contains('extra') ||
+        lower.contains('not permitted') ||
+        lower.contains('not supported');
   }
 
   bool _tryTokenKeyFallback(String errorBody) {
@@ -1864,6 +2079,13 @@ class LlmService {
       _ => finishReason,
     };
 
-    return LlmResponse(stopReason: mappedStopReason, content: blocks);
+    final usage = LlmUsage.fromOpenAI(
+      json['usage'] is Map ? Map<String, dynamic>.from(json['usage']) : null,
+    );
+    return LlmResponse(
+      stopReason: mappedStopReason,
+      content: blocks,
+      usage: usage,
+    );
   }
 }

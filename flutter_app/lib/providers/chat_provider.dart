@@ -16,6 +16,7 @@ import '../services/session_storage.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
 import '../services/tool_call_expansion_state.dart';
+import '../services/token_calibration_service.dart';
 import '../services/preferences_service.dart';
 import '../services/skill_service.dart';
 import '../services/memory_service.dart';
@@ -25,6 +26,47 @@ typedef LlmServiceFactory = LlmService Function(
   LlmConfig config, {
   bool Function()? isInBackground,
 });
+
+class _PendingTokenCalibration {
+  final String key;
+  final int estimatedInputTokens;
+  final int rawEstimatedInputTokens;
+  final int estimatedImageTokens;
+  final int rawEstimatedImageTokens;
+  final int estimatedToolTokens;
+  final int rawEstimatedToolTokens;
+  final int largestBlockTokens;
+  final int rawLargestBlockTokens;
+
+  const _PendingTokenCalibration({
+    required this.key,
+    required this.estimatedInputTokens,
+    required this.rawEstimatedInputTokens,
+    required this.estimatedImageTokens,
+    required this.rawEstimatedImageTokens,
+    required this.estimatedToolTokens,
+    required this.rawEstimatedToolTokens,
+    required this.largestBlockTokens,
+    required this.rawLargestBlockTokens,
+  });
+
+  TokenCalibrationSample toSample(LlmUsage? usage) {
+    return TokenCalibrationSample(
+      key: key,
+      estimatedInputTokens: estimatedInputTokens,
+      rawEstimatedInputTokens: rawEstimatedInputTokens,
+      actualInputTokens: usage?.inputTokens,
+      estimatedImageTokens: estimatedImageTokens,
+      rawEstimatedImageTokens: rawEstimatedImageTokens,
+      estimatedToolTokens: estimatedToolTokens,
+      rawEstimatedToolTokens: rawEstimatedToolTokens,
+      largestBlockTokens: largestBlockTokens,
+      rawLargestBlockTokens: rawLargestBlockTokens,
+      cacheReadTokens: usage?.cacheReadInputTokens,
+      cacheCreationTokens: usage?.cacheCreationInputTokens,
+    );
+  }
+}
 
 class ChatProvider extends ChangeNotifier {
   static const int maxQueuedMessages = 3;
@@ -91,7 +133,8 @@ class ChatProvider extends ChangeNotifier {
   Completer<bool>? _approvalCompleter;
   Timer? _approvalTimeout;
   bool _appInBackground = false;
-  final TokenEstimator _tokenEstimator = const TokenEstimator();
+  final TokenCalibrationService _tokenCalibration = TokenCalibrationService();
+  final Map<String, _PendingTokenCalibration> _pendingTokenCalibration = {};
 
   static const _backgroundApprovalTimeout = Duration(seconds: 15);
   static const _agentServiceThinkingText = 'AI 正在思考...';
@@ -375,6 +418,7 @@ class ChatProvider extends ChangeNotifier {
   ChatProvider({
     SessionStorage? storage,
     LlmServiceFactory? llmServiceFactory,
+    ToolRegistry? toolRegistry,
   })  : _storage = storage ?? SessionStorage(),
         _llmServiceFactory = llmServiceFactory ?? LlmService.new {
     NativeBridge.setAgentStopRequestedHandler(
@@ -383,7 +427,7 @@ class ChatProvider extends ChangeNotifier {
     NativeBridge.setNavigateToSessionHandler((sessionId) {
       unawaited(selectSession(sessionId));
     });
-    _tools = ToolRegistry.withDefaults(prefs: _prefs);
+    _tools = toolRegistry ?? ToolRegistry.withDefaults(prefs: _prefs);
     _init();
   }
 
@@ -404,6 +448,7 @@ class ChatProvider extends ChangeNotifier {
   Future<void> _init() async {
     try {
       await _prefs.init();
+      await _tokenCalibration.init();
       _prefsInitialized = true;
       await _storage.init();
       sessions = await _storage.getSessionsSummary();
@@ -426,6 +471,7 @@ class ChatProvider extends ChangeNotifier {
   Future<void> _ensurePrefs() async {
     if (!_prefsInitialized) {
       await _prefs.init();
+      await _tokenCalibration.init();
       _prefsInitialized = true;
     }
   }
@@ -830,13 +876,18 @@ class ChatProvider extends ChangeNotifier {
       ));
 
       final fullApiMessages = activeSession.toApiMessages();
+      final toolDefinitions = _toolDefinitionsForBudget(llmConfig);
+      final estimator = _tokenEstimatorFor(llmConfig);
       final tokenBudget = _resolveContextTokenBudget(
         llmConfig: llmConfig,
         systemPrompt: fullPrompt,
+        estimator: estimator,
+        toolDefinitions: toolDefinitions,
       );
       final truncation = _truncateToFit(
         fullApiMessages,
         maxTokens: tokenBudget,
+        estimator: estimator,
         preserveLastMessages: 2,
       );
       final apiMessages = truncation.messages;
@@ -854,6 +905,13 @@ class ChatProvider extends ChangeNotifier {
       final initialApiMsgCount = apiMessages.length;
       state.initialApiMsgCount = initialApiMsgCount;
       state.partialAgentResponseSaved = false;
+      _pendingTokenCalibration[state.sessionId] = _buildPendingTokenCalibration(
+        llmConfig: llmConfig,
+        estimator: estimator,
+        messages: apiMessages,
+        systemPrompt: fullPrompt,
+        toolDefinitions: toolDefinitions,
+      );
       try {
         var runResult = await _runAgentForState(
           state,
@@ -862,9 +920,11 @@ class ChatProvider extends ChangeNotifier {
         );
         if (runResult is EncryptedContentError) {
           final originalError = runResult;
+          _pendingTokenCalibration.remove(state.sessionId);
           final recoveryTruncation = _truncateToFit(
             ChatContextUtils.sanitizeMessages(activeSession.toApiMessages()),
             maxTokens: tokenBudget,
+            estimator: estimator,
             preserveLastMessages: 2,
           );
           final recoveryMessages = recoveryTruncation.messages;
@@ -931,6 +991,7 @@ class ChatProvider extends ChangeNotifier {
         state.errorMessage = '$e';
         notifyListeners();
       } finally {
+        _pendingTokenCalibration.remove(state.sessionId);
         state.agentSubscription = null;
         state.agentCompleter = null;
         state.partialAgentResponseSaved = false;
@@ -1292,6 +1353,17 @@ class ChatProvider extends ChangeNotifier {
           _prefs.systemPrompt ??
           AppConstants.defaultSystemPrompt;
       final fullPrompt = basePrompt + skillIndex + memoryPrompt;
+      const compareEstimator = TokenEstimator();
+      const compareToolDefinitions = <Map<String, dynamic>>[];
+      final compareBudgetConfig = LlmConfig(
+        format: format,
+        apiKey: apiKey,
+        model: compareModels.first,
+        baseUrl: baseUrl,
+        maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
+        thinkingBudget: _prefs.thinkingBudget,
+        temperature: _prefs.temperature,
+      );
       // Don't persist the user message to session.messages in compare mode.
       // Compare is a one-shot inspection — results live in compareResults only.
       // If we persisted, the next real sendMessage would break role alternation
@@ -1303,17 +1375,12 @@ class ChatProvider extends ChangeNotifier {
             {'role': 'user', 'content': comparePrompt},
           ],
           maxTokens: _resolveContextTokenBudget(
-            llmConfig: LlmConfig(
-              format: format,
-              apiKey: apiKey,
-              model: compareModels.first,
-              baseUrl: baseUrl,
-              maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
-              thinkingBudget: _prefs.thinkingBudget,
-              temperature: _prefs.temperature,
-            ),
+            llmConfig: compareBudgetConfig,
             systemPrompt: fullPrompt,
+            estimator: compareEstimator,
+            toolDefinitions: compareToolDefinitions,
           ),
+          estimator: compareEstimator,
         ).messages,
       ];
       notifyListeners();
@@ -1436,12 +1503,13 @@ class ChatProvider extends ChangeNotifier {
   ContextTruncationResult _truncateToFit(
     List<Map<String, dynamic>> messages, {
     required int maxTokens,
+    required TokenEstimator estimator,
     int preserveLastMessages = 2,
   }) {
     return ChatContextUtils.truncateToFit(
       messages,
       maxTokens: maxTokens,
-      estimator: _tokenEstimator,
+      estimator: estimator,
       autoCompact: _prefs.autoCompact,
       preserveLastMessages: preserveLastMessages,
     );
@@ -1450,24 +1518,96 @@ class ChatProvider extends ChangeNotifier {
   int _resolveContextTokenBudget({
     required LlmConfig llmConfig,
     required String systemPrompt,
+    required TokenEstimator estimator,
+    required List<Map<String, dynamic>> toolDefinitions,
   }) {
-    final systemTokens = _tokenEstimator.estimateText(systemPrompt);
+    final systemTokens = estimator.estimateText(systemPrompt);
+    final toolDefinitionTokens =
+        estimator.estimateToolDefinitions(toolDefinitions);
     final configuredOutputReserve = llmConfig.maxTokens +
         (llmConfig.thinkingBudget > 0 ? llmConfig.thinkingBudget : 0);
     final maxOutputReserve = (_prefs.contextTokenBudget * 0.5).floor();
     final outputReserve = math.min(configuredOutputReserve, maxOutputReserve);
     const safetyMargin = 1024;
-    final budget =
-        _prefs.contextTokenBudget - systemTokens - outputReserve - safetyMargin;
+    final budget = _prefs.contextTokenBudget -
+        systemTokens -
+        toolDefinitionTokens -
+        outputReserve -
+        safetyMargin;
     if (budget <= 0) {
       debugPrint(
         'Context token budget exhausted: context=${_prefs.contextTokenBudget}, '
-        'system=$systemTokens, outputReserve=$outputReserve, '
+        'system=$systemTokens, tools=$toolDefinitionTokens, '
+        'outputReserve=$outputReserve, '
         'safetyMargin=$safetyMargin.',
       );
       return 0;
     }
     return budget;
+  }
+
+  TokenEstimator _tokenEstimatorFor(LlmConfig llmConfig) {
+    return TokenEstimator(
+      calibrationMultiplier:
+          _tokenCalibration.multiplierFor(_tokenCalibrationKey(llmConfig)),
+    );
+  }
+
+  _PendingTokenCalibration _buildPendingTokenCalibration({
+    required LlmConfig llmConfig,
+    required TokenEstimator estimator,
+    required List<Map<String, dynamic>> messages,
+    required String systemPrompt,
+    required List<Map<String, dynamic>> toolDefinitions,
+  }) {
+    final messageDiagnostics = estimator.diagnoseMessages(messages);
+    final systemTokens = estimator.estimateText(systemPrompt);
+    final toolDefinitionTokens =
+        estimator.estimateToolDefinitions(toolDefinitions);
+    const rawEstimator = TokenEstimator();
+    final rawMessageDiagnostics = rawEstimator.diagnoseMessages(messages);
+    final rawSystemTokens = rawEstimator.estimateText(systemPrompt);
+    final rawToolDefinitionTokens =
+        rawEstimator.estimateToolDefinitions(toolDefinitions);
+    return _PendingTokenCalibration(
+      key: _tokenCalibrationKey(llmConfig),
+      estimatedInputTokens:
+          messageDiagnostics.totalTokens + systemTokens + toolDefinitionTokens,
+      rawEstimatedInputTokens: rawMessageDiagnostics.totalTokens +
+          rawSystemTokens +
+          rawToolDefinitionTokens,
+      estimatedImageTokens: messageDiagnostics.imageTokens,
+      rawEstimatedImageTokens: rawMessageDiagnostics.imageTokens,
+      estimatedToolTokens: messageDiagnostics.toolTokens + toolDefinitionTokens,
+      rawEstimatedToolTokens:
+          rawMessageDiagnostics.toolTokens + rawToolDefinitionTokens,
+      largestBlockTokens: messageDiagnostics.largestBlockTokens,
+      rawLargestBlockTokens: rawMessageDiagnostics.largestBlockTokens,
+    );
+  }
+
+  String _tokenCalibrationKey(LlmConfig llmConfig) {
+    final format = llmConfig.format.name;
+    final host = _normalizedBaseUrlHost(llmConfig.baseUrl);
+    final profileId = _prefs.activeProfileId;
+    final modelId = LlmService.modelIdFromDisplay(llmConfig.model);
+    return '$format|$host|$profileId|$modelId';
+  }
+
+  String _normalizedBaseUrlHost(String baseUrl) {
+    final trimmed = baseUrl.trim().replaceFirst(RegExp(r'/+$'), '');
+    final uri = Uri.tryParse(trimmed);
+    final host = uri?.host;
+    if (host != null && host.isNotEmpty) return host.toLowerCase();
+    return trimmed.toLowerCase();
+  }
+
+  List<Map<String, dynamic>> _toolDefinitionsForBudget(LlmConfig llmConfig) {
+    final definitions = _tools.getToolDefinitions();
+    if (llmConfig.format == ApiFormat.anthropic) {
+      return definitions.map((tool) => tool.toAnthropicJson()).toList();
+    }
+    return definitions.map((tool) => tool.toOpenAIJson()).toList();
   }
 
   Future<Object?> _runAgentForState(
@@ -1551,6 +1691,8 @@ class ChatProvider extends ChangeNotifier {
               :final finalText,
               :final inputTokens,
               :final outputTokens,
+              :final usage,
+              :final hadToolCalls,
             ):
             state.streamThrottle?.cancel();
             state.streamThrottle = null;
@@ -1572,6 +1714,13 @@ class ChatProvider extends ChangeNotifier {
                 activeSession.messages[i].outputTokens = outputTokens;
                 break;
               }
+            }
+            final pendingCalibration =
+                _pendingTokenCalibration.remove(state.sessionId);
+            if (pendingCalibration != null && !hadToolCalls) {
+              _tokenCalibration.recordSample(
+                pendingCalibration.toSample(usage),
+              );
             }
             _syncCurrentSessionReference(activeSession);
             _storage.saveSession(activeSession).then((_) {

@@ -28,6 +28,77 @@ class TokenEstimator {
     return _applyCalibration(_rawEstimateImage(imageBlock));
   }
 
+  int estimateToolDefinitions(List<Map<String, dynamic>> tools) {
+    if (tools.isEmpty) return 0;
+    return _applyCalibration(_estimateJson(tools));
+  }
+
+  TokenEstimatorDiagnostics diagnoseMessages(
+    List<Map<String, dynamic>> messages,
+  ) {
+    var rawTotalTokens = 0;
+    var rawTextTokens = 0;
+    var rawImageTokens = 0;
+    var rawToolTokens = 0;
+    var rawLargestBlockTokens = 0;
+
+    for (final message in messages) {
+      rawTotalTokens += _messageOverhead;
+      rawTextTokens += _messageOverhead;
+      final role = message['role'];
+      if (role is String) {
+        final tokens = _rawEstimateText(role);
+        rawTotalTokens += tokens;
+        rawTextTokens += tokens;
+      }
+      final reasoningContent = message['reasoning_content'];
+      if (reasoningContent is String) {
+        final tokens = _rawEstimateText(reasoningContent);
+        rawTotalTokens += tokens;
+        rawTextTokens += tokens;
+      }
+
+      final content = message['content'];
+      if (content is String) {
+        final tokens = _rawEstimateText(content);
+        rawTotalTokens += tokens;
+        rawTextTokens += tokens;
+      } else if (content is List) {
+        for (final item in content) {
+          if (item is Map) {
+            final block = Map<String, dynamic>.from(item);
+            final tokens = _rawEstimateBlock(block);
+            rawTotalTokens += tokens;
+            rawLargestBlockTokens = math.max(rawLargestBlockTokens, tokens);
+            switch (block['type']) {
+              case 'image':
+                rawImageTokens += tokens;
+                break;
+              case 'tool_use':
+              case 'tool_result':
+                rawToolTokens += tokens;
+                break;
+              default:
+                rawTextTokens += tokens;
+            }
+          } else if (item is String) {
+            final tokens = _rawEstimateText(item);
+            rawTotalTokens += tokens;
+            rawTextTokens += tokens;
+          }
+        }
+      }
+    }
+
+    return TokenEstimatorDiagnostics(
+      totalTokens: _applyCalibration(rawTotalTokens),
+      textTokens: _applyCalibration(rawTextTokens),
+      imageTokens: _applyCalibration(rawImageTokens),
+      toolTokens: _applyCalibration(rawToolTokens),
+      largestBlockTokens: _applyCalibration(rawLargestBlockTokens),
+    );
+  }
+
   int _rawEstimateMessages(List<Map<String, dynamic>> messages) {
     var total = 0;
     for (final message in messages) {
@@ -196,6 +267,22 @@ class TokenEstimator {
   static const _blockOverhead = 3;
   static const _anthropicMaxImageEdge = 1568;
   static const _anthropicMaxImageTokens = 1568;
+}
+
+class TokenEstimatorDiagnostics {
+  final int totalTokens;
+  final int textTokens;
+  final int imageTokens;
+  final int toolTokens;
+  final int largestBlockTokens;
+
+  const TokenEstimatorDiagnostics({
+    required this.totalTokens,
+    required this.textTokens,
+    required this.imageTokens,
+    required this.toolTokens,
+    required this.largestBlockTokens,
+  });
 }
 
 class ContextTruncationResult {
