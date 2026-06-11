@@ -78,6 +78,10 @@ class AppStrings {
     int estimatedTokens,
   ) =>
       '对话上下文已压缩（清理了 $droppedBlockCount 个不完整的工具调用，保留约 $estimatedTokens tokens）';
+  static const contextSummaryGenerating = '正在整理上下文...';
+  static String contextSummaryCompactedNotice(int count) =>
+      '对话上下文已压缩为摘要（覆盖 $count 条旧消息）';
+  static const contextSummaryFailed = '上下文摘要生成失败，已使用截断上下文继续';
   static const encryptedContentRecoveryNotice = '检测到缓存上下文失效，已自动恢复对话上下文';
   static const encryptedContentRecoveryFailed = '自动恢复上下文失败，请重新发送消息';
   static const inputHint = '输入消息...';

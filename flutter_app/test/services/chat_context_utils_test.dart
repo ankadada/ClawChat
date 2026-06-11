@@ -576,4 +576,99 @@ void main() {
       ]);
     });
   });
+
+  group('planCompaction', () {
+    const estimator = TokenEstimator();
+
+    test('splits by recent user turns rather than individual messages', () {
+      final messages = [
+        {'role': 'user', 'content': 'old question ${'中' * 1200}'},
+        {'role': 'assistant', 'content': 'old answer ${'中' * 1200}'},
+        {'role': 'user', 'content': 'middle question ${'中' * 1200}'},
+        {'role': 'assistant', 'content': 'middle answer ${'中' * 1200}'},
+        {'role': 'user', 'content': 'latest question'},
+        {'role': 'assistant', 'content': 'latest answer'},
+      ];
+
+      final plan = ChatContextUtils.planCompaction(
+        messages,
+        maxTokens: 2500,
+        estimator: estimator,
+      );
+
+      expect(plan.needsSummary, isTrue);
+      expect(plan.headForSummary.first['content'], contains('old question'));
+      expect(plan.recentTail.first['content'], 'latest question');
+      expect(plan.recentTail.last['content'], 'latest answer');
+      expect(plan.summaryBudget, greaterThanOrEqualTo(256));
+      expect(plan.headDigest, isNotEmpty);
+    });
+
+    test('pulls tool_use into tail when matching tool_result is preserved', () {
+      final messages = [
+        {'role': 'user', 'content': 'old ${'中' * 1600}'},
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'call_1',
+              'name': 'bash',
+              'input': {'cmd': 'cat file'},
+            },
+          ],
+        },
+        {'role': 'user', 'content': 'real user message after tool call'},
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'call_1',
+              'content': 'result',
+            },
+          ],
+        },
+        {'role': 'assistant', 'content': 'done'},
+      ];
+
+      final plan = ChatContextUtils.planCompaction(
+        messages,
+        maxTokens: 900,
+        estimator: estimator,
+      );
+
+      expect(plan.needsSummary, isTrue);
+      expect(
+        plan.recentTail.any(ChatContextUtils.hasToolUseContent),
+        isTrue,
+      );
+      expect(
+        plan.recentTail.any(ChatContextUtils.hasToolResultContent),
+        isTrue,
+      );
+    });
+
+    test('digest is stable for equivalent map key order', () {
+      final a = [
+        {
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': 'hello'},
+          ],
+        },
+      ];
+      final b = [
+        {
+          'content': [
+            {'text': 'hello', 'type': 'text'},
+          ],
+          'role': 'user',
+        },
+      ];
+
+      expect(ChatContextUtils.digestMessages(a),
+          ChatContextUtils.digestMessages(b));
+    });
+  });
 }

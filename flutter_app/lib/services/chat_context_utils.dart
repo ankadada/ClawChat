@@ -307,6 +307,26 @@ class ContextTruncationResult {
   });
 }
 
+class ContextCompactionPlan {
+  final List<Map<String, dynamic>> headForSummary;
+  final List<Map<String, dynamic>> recentTail;
+  final int headEstimatedTokens;
+  final int tailEstimatedTokens;
+  final int summaryBudget;
+  final bool needsSummary;
+  final String headDigest;
+
+  const ContextCompactionPlan({
+    required this.headForSummary,
+    required this.recentTail,
+    required this.headEstimatedTokens,
+    required this.tailEstimatedTokens,
+    required this.summaryBudget,
+    required this.needsSummary,
+    required this.headDigest,
+  });
+}
+
 class _ToolCleanupResult {
   final List<Map<String, dynamic>> messages;
   final int droppedMessageCount;
@@ -316,6 +336,16 @@ class _ToolCleanupResult {
     required this.messages,
     required this.droppedMessageCount,
     required this.droppedBlockCount,
+  });
+}
+
+class _TurnRange {
+  final int start;
+  final int end;
+
+  const _TurnRange({
+    required this.start,
+    required this.end,
   });
 }
 
@@ -480,6 +510,159 @@ class ChatContextUtils {
 
   static bool _isUnsafeMetadataKey(String key) {
     return unsafeMetadataKeys.contains(key);
+  }
+
+  static ContextCompactionPlan planCompaction(
+    List<Map<String, dynamic>> messages, {
+    required int maxTokens,
+    required TokenEstimator estimator,
+    double summaryRatio = 0.12,
+    int minSummaryTokens = 256,
+    int maxSummaryTokens = 800,
+  }) {
+    final totalTokens = estimator.estimateMessages(messages);
+    final summaryBudget = totalTokens > maxTokens
+        ? (maxTokens * summaryRatio)
+            .floor()
+            .clamp(minSummaryTokens, maxSummaryTokens)
+            .toInt()
+        : 0;
+    if (messages.isEmpty || totalTokens <= maxTokens || maxTokens <= 0) {
+      return ContextCompactionPlan(
+        headForSummary: const [],
+        recentTail: List<Map<String, dynamic>>.from(messages),
+        headEstimatedTokens: 0,
+        tailEstimatedTokens: totalTokens,
+        summaryBudget: summaryBudget,
+        needsSummary: false,
+        headDigest: digestMessages(const []),
+      );
+    }
+
+    final recentTailBudget = math.max(0, maxTokens - summaryBudget);
+    final turns = _turnRanges(messages);
+    var tailStart = messages.length;
+    var tailTokens = 0;
+
+    if (turns.isEmpty) {
+      tailStart = math.max(0, messages.length - 2);
+      final candidate = messages.sublist(tailStart);
+      tailTokens = estimator.estimateMessages(candidate);
+    } else {
+      for (var i = turns.length - 1; i >= 0; i--) {
+        final candidateStart = turns[i].start;
+        final candidate = messages.sublist(candidateStart);
+        final candidateTokens = estimator.estimateMessages(candidate);
+        if (tailStart == messages.length ||
+            candidateTokens <= recentTailBudget ||
+            tailTokens == 0) {
+          tailStart = candidateStart;
+          tailTokens = candidateTokens;
+          if (candidateTokens > recentTailBudget && i != turns.length - 1) {
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+    }
+
+    tailStart = _adjustTailStartForToolPairs(messages, tailStart);
+    final head = messages.sublist(0, tailStart);
+    final tail = messages.sublist(tailStart);
+    final cleanup = _dropUnpairedToolMessagesWithStats(tail);
+    final recentTail = cleanup.messages;
+    final tailEstimatedTokens = estimator.estimateMessages(recentTail);
+    final headEstimatedTokens = estimator.estimateMessages(head);
+    return ContextCompactionPlan(
+      headForSummary: head,
+      recentTail: recentTail,
+      headEstimatedTokens: headEstimatedTokens,
+      tailEstimatedTokens: tailEstimatedTokens,
+      summaryBudget: summaryBudget,
+      needsSummary: head.isNotEmpty,
+      headDigest: digestMessages(head),
+    );
+  }
+
+  static String digestMessages(List<Map<String, dynamic>> messages) {
+    final normalized = messages.map(_normalizeForDigest).toList();
+    final encoded = jsonEncode(normalized);
+    return _fnv1a64Hex(encoded);
+  }
+
+  static List<_TurnRange> _turnRanges(List<Map<String, dynamic>> messages) {
+    final starts = <int>[];
+    for (var i = 0; i < messages.length; i++) {
+      final message = messages[i];
+      if (message['role'] == 'user' && !_isPureToolResultMessage(message)) {
+        starts.add(i);
+      }
+    }
+    final ranges = <_TurnRange>[];
+    for (var i = 0; i < starts.length; i++) {
+      ranges.add(_TurnRange(
+        start: starts[i],
+        end: i + 1 < starts.length ? starts[i + 1] : messages.length,
+      ));
+    }
+    return ranges;
+  }
+
+  static bool _isPureToolResultMessage(Map<String, dynamic> message) {
+    final content = message['content'];
+    if (content is! List || content.isEmpty) return false;
+    return content.every(
+      (block) => block is Map && block['type'] == 'tool_result',
+    );
+  }
+
+  static int _adjustTailStartForToolPairs(
+    List<Map<String, dynamic>> messages,
+    int tailStart,
+  ) {
+    if (tailStart <= 0 || tailStart >= messages.length) return tailStart;
+    final tailToolResults = <String>{};
+    for (final message in messages.sublist(tailStart)) {
+      tailToolResults.addAll(_toolResultIds(message));
+    }
+    if (tailToolResults.isEmpty) return tailStart;
+
+    for (var i = tailStart - 1; i >= 0; i--) {
+      final toolUseIds = _toolUseIds(messages[i]);
+      if (toolUseIds.intersection(tailToolResults).isNotEmpty) {
+        tailStart = i;
+        tailToolResults.addAll(_toolResultIds(messages[i]));
+      }
+    }
+    return tailStart;
+  }
+
+  static Object? _normalizeForDigest(Object? value) {
+    if (value is Map) {
+      final entries = value.entries
+          .where((entry) => entry.key is String)
+          .map((entry) => MapEntry(entry.key as String, entry.value))
+          .toList()
+        ..sort((a, b) => a.key.compareTo(b.key));
+      return {
+        for (final entry in entries) entry.key: _normalizeForDigest(entry.value)
+      };
+    }
+    if (value is List) {
+      return value.map(_normalizeForDigest).toList();
+    }
+    return value;
+  }
+
+  static String _fnv1a64Hex(String input) {
+    const mask = 0xffffffffffffffff;
+    var hash = 0xcbf29ce484222325;
+    for (final byte in utf8.encode(input)) {
+      hash ^= byte;
+      hash = (hash * 0x100000001b3) & mask;
+    }
+    return hash.toRadixString(16).padLeft(16, '0');
   }
 
   static List<Map<String, dynamic>> _dropUnpairedToolMessages(

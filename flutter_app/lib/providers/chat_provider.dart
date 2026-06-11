@@ -10,6 +10,7 @@ import '../models/chat_models.dart';
 import '../models/provider_profile.dart';
 import '../services/agent_service.dart';
 import '../services/chat_context_utils.dart';
+import '../services/context_summary_service.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/session_storage.dart';
@@ -26,6 +27,8 @@ typedef LlmServiceFactory = LlmService Function(
   LlmConfig config, {
   bool Function()? isInBackground,
 });
+
+typedef ContextSummaryServiceFactory = ContextSummaryService Function();
 
 class _PendingTokenCalibration {
   final String key;
@@ -68,6 +71,22 @@ class _PendingTokenCalibration {
   }
 }
 
+class _SummaryContextResult {
+  final String systemPrompt;
+  final List<Map<String, dynamic>> messages;
+  final bool summaryGenerated;
+  final bool summaryFailed;
+  final int coveredMessageCount;
+
+  const _SummaryContextResult({
+    required this.systemPrompt,
+    required this.messages,
+    this.summaryGenerated = false,
+    this.summaryFailed = false,
+    this.coveredMessageCount = 0,
+  });
+}
+
 class ChatProvider extends ChangeNotifier {
   static const int maxQueuedMessages = 3;
 
@@ -76,6 +95,7 @@ class ChatProvider extends ChangeNotifier {
 
   final SessionStorage _storage;
   final LlmServiceFactory _llmServiceFactory;
+  final ContextSummaryServiceFactory _contextSummaryServiceFactory;
   late final ToolRegistry _tools;
   final _uuid = const Uuid();
 
@@ -418,9 +438,12 @@ class ChatProvider extends ChangeNotifier {
   ChatProvider({
     SessionStorage? storage,
     LlmServiceFactory? llmServiceFactory,
+    ContextSummaryServiceFactory? contextSummaryServiceFactory,
     ToolRegistry? toolRegistry,
   })  : _storage = storage ?? SessionStorage(),
-        _llmServiceFactory = llmServiceFactory ?? LlmService.new {
+        _llmServiceFactory = llmServiceFactory ?? LlmService.new,
+        _contextSummaryServiceFactory =
+            contextSummaryServiceFactory ?? ContextSummaryService.new {
     NativeBridge.setAgentStopRequestedHandler(
       ({String? sessionId}) => cancelAgent(sessionId: sessionId),
     );
@@ -851,21 +874,6 @@ class ChatProvider extends ChangeNotifier {
       final memoryPrompt = MemoryService.buildMemoryPrompt();
       final fullPrompt = basePrompt + skillIndex + memoryPrompt;
 
-      state.agent = AgentService(
-        llm: llm,
-        tools: _tools,
-        systemPrompt: fullPrompt,
-        toolPolicy: ToolPolicy(
-          onApprovalRequired: (request) => _requestToolApproval(
-            state,
-            request,
-          ),
-        ),
-        maxIterations: _prefs.agentMaxIterations,
-        privacyMode: _prefs.privacyMode,
-        envVars: _prefs.envVars,
-      );
-
       state.status = AgentStatus.thinking;
       state.streamingText = '';
       state.errorMessage = null;
@@ -884,9 +892,39 @@ class ChatProvider extends ChangeNotifier {
         estimator: estimator,
         toolDefinitions: toolDefinitions,
       );
+      final summaryResult = await _prepareSummaryContext(
+        session: activeSession,
+        fullApiMessages: fullApiMessages,
+        llmConfig: llmConfig,
+        systemPrompt: fullPrompt,
+        tokenBudget: tokenBudget,
+        estimator: estimator,
+        state: state,
+      );
+      if (summaryResult.summaryGenerated) {
+        _appendContextSummaryCompactedNotice(
+          activeSession,
+          summaryResult.coveredMessageCount,
+        );
+        await _storage.saveSession(activeSession);
+        _syncCurrentSessionReference(activeSession);
+        notifyListeners();
+      } else if (summaryResult.summaryFailed) {
+        _appendContextSummaryFailedNotice(activeSession);
+        await _storage.saveSession(activeSession);
+        _syncCurrentSessionReference(activeSession);
+        notifyListeners();
+      }
+      final promptWithSummary = summaryResult.systemPrompt;
+      final finalTokenBudget = _resolveContextTokenBudget(
+        llmConfig: llmConfig,
+        systemPrompt: promptWithSummary,
+        estimator: estimator,
+        toolDefinitions: toolDefinitions,
+      );
       final truncation = _truncateToFit(
-        fullApiMessages,
-        maxTokens: tokenBudget,
+        summaryResult.messages,
+        maxTokens: finalTokenBudget,
         estimator: estimator,
         preserveLastMessages: 2,
       );
@@ -905,11 +943,16 @@ class ChatProvider extends ChangeNotifier {
       final initialApiMsgCount = apiMessages.length;
       state.initialApiMsgCount = initialApiMsgCount;
       state.partialAgentResponseSaved = false;
+      state.agent = _createAgentService(
+        llm: llm,
+        systemPrompt: promptWithSummary,
+        state: state,
+      );
       _pendingTokenCalibration[state.sessionId] = _buildPendingTokenCalibration(
         llmConfig: llmConfig,
         estimator: estimator,
         messages: apiMessages,
-        systemPrompt: fullPrompt,
+        systemPrompt: promptWithSummary,
         toolDefinitions: toolDefinitions,
       );
       try {
@@ -922,8 +965,8 @@ class ChatProvider extends ChangeNotifier {
           final originalError = runResult;
           _pendingTokenCalibration.remove(state.sessionId);
           final recoveryTruncation = _truncateToFit(
-            ChatContextUtils.sanitizeMessages(activeSession.toApiMessages()),
-            maxTokens: tokenBudget,
+            ChatContextUtils.sanitizeMessages(apiMessages),
+            maxTokens: finalTokenBudget,
             estimator: estimator,
             preserveLastMessages: 2,
           );
@@ -937,19 +980,10 @@ class ChatProvider extends ChangeNotifier {
             state.errorMessage = emptyRecoveryError;
             notifyListeners();
           } else {
-            state.agent = AgentService(
+            state.agent = _createAgentService(
               llm: llm,
-              tools: _tools,
-              systemPrompt: fullPrompt,
-              toolPolicy: ToolPolicy(
-                onApprovalRequired: (request) => _requestToolApproval(
-                  state,
-                  request,
-                ),
-              ),
-              maxIterations: _prefs.agentMaxIterations,
-              privacyMode: _prefs.privacyMode,
-              envVars: _prefs.envVars,
+              systemPrompt: promptWithSummary,
+              state: state,
             );
             state.status = AgentStatus.thinking;
             state.streamingText = '';
@@ -1364,25 +1398,45 @@ class ChatProvider extends ChangeNotifier {
         thinkingBudget: _prefs.thinkingBudget,
         temperature: _prefs.temperature,
       );
+      final baseCompareMessages = [
+        ...session.toApiMessages(),
+        {'role': 'user', 'content': comparePrompt},
+      ];
+      final baseCompareBudget = _resolveContextTokenBudget(
+        llmConfig: compareBudgetConfig,
+        systemPrompt: fullPrompt,
+        estimator: compareEstimator,
+        toolDefinitions: compareToolDefinitions,
+      );
+      final comparePlan = ChatContextUtils.planCompaction(
+        baseCompareMessages,
+        maxTokens: baseCompareBudget,
+        estimator: compareEstimator,
+      );
+      final compareSummary = _summaryForCompare(
+        session.contextSummary,
+        baseCompareMessages,
+        comparePlan,
+      );
+      final compareSystemPrompt =
+          _systemPromptWithSummary(fullPrompt, compareSummary);
+      final comparePayloadMessages = compareSummary == null
+          ? baseCompareMessages
+          : baseCompareMessages.sublist(compareSummary.coveredMessageCount);
       // Don't persist the user message to session.messages in compare mode.
       // Compare is a one-shot inspection — results live in compareResults only.
       // If we persisted, the next real sendMessage would break role alternation
       // (two consecutive user messages without an assistant reply between them).
-      final compareMessages = [
-        ..._truncateToFit(
-          [
-            ...session.toApiMessages(),
-            {'role': 'user', 'content': comparePrompt},
-          ],
-          maxTokens: _resolveContextTokenBudget(
-            llmConfig: compareBudgetConfig,
-            systemPrompt: fullPrompt,
-            estimator: compareEstimator,
-            toolDefinitions: compareToolDefinitions,
-          ),
+      final compareMessages = _truncateToFit(
+        comparePayloadMessages,
+        maxTokens: _resolveContextTokenBudget(
+          llmConfig: compareBudgetConfig,
+          systemPrompt: compareSystemPrompt,
           estimator: compareEstimator,
-        ).messages,
-      ];
+          toolDefinitions: compareToolDefinitions,
+        ),
+        estimator: compareEstimator,
+      ).messages;
       notifyListeners();
 
       debugPrint(
@@ -1407,7 +1461,7 @@ class ChatProvider extends ChangeNotifier {
           );
           try {
             final response = await llm.chat(
-              system: fullPrompt,
+              system: compareSystemPrompt,
               messages: compareMessages,
               tools: [],
             );
@@ -1544,6 +1598,204 @@ class ChatProvider extends ChangeNotifier {
       return 0;
     }
     return budget;
+  }
+
+  AgentService _createAgentService({
+    required LlmService llm,
+    required String systemPrompt,
+    required AgentState state,
+  }) {
+    return AgentService(
+      llm: llm,
+      tools: _tools,
+      systemPrompt: systemPrompt,
+      toolPolicy: ToolPolicy(
+        onApprovalRequired: (request) => _requestToolApproval(
+          state,
+          request,
+        ),
+      ),
+      maxIterations: _prefs.agentMaxIterations,
+      privacyMode: _prefs.privacyMode,
+      envVars: _prefs.envVars,
+    );
+  }
+
+  Future<_SummaryContextResult> _prepareSummaryContext({
+    required ChatSession session,
+    required List<Map<String, dynamic>> fullApiMessages,
+    required LlmConfig llmConfig,
+    required String systemPrompt,
+    required int tokenBudget,
+    required TokenEstimator estimator,
+    required AgentState state,
+  }) async {
+    if (!_prefs.autoCompact ||
+        fullApiMessages.isEmpty ||
+        estimator.estimateMessages(fullApiMessages) <= tokenBudget) {
+      return _SummaryContextResult(
+        systemPrompt: systemPrompt,
+        messages: fullApiMessages,
+      );
+    }
+
+    final plan = ChatContextUtils.planCompaction(
+      fullApiMessages,
+      maxTokens: tokenBudget,
+      estimator: estimator,
+    );
+    if (!plan.needsSummary || plan.headForSummary.isEmpty) {
+      return _SummaryContextResult(
+        systemPrompt: systemPrompt,
+        messages: fullApiMessages,
+      );
+    }
+
+    var summary = _validatedSummaryForPrefix(
+      session.contextSummary,
+      fullApiMessages,
+    );
+    var generated = false;
+    var failed = false;
+    if (!_canReuseSummary(summary, plan, fullApiMessages)) {
+      state.status = AgentStatus.thinking;
+      notifyListeners();
+      unawaited(_startAgentServiceForState(
+        state,
+        AppStrings.contextSummaryGenerating,
+      ));
+      final request = ContextSummaryRequest(
+        messages: _messagesForSummaryGeneration(
+          fullApiMessages,
+          plan,
+          summary,
+        ),
+        existingSummary: summary,
+        llmConfig: llmConfig,
+        summaryBudget: plan.summaryBudget,
+        coveredDigest: plan.headDigest,
+        coveredMessageCount: plan.headForSummary.length,
+        sourceEstimatedTokens: plan.headEstimatedTokens,
+        estimator: estimator,
+        maxInputTokens: (_prefs.contextTokenBudget * 0.8).floor(),
+      );
+      final service = _contextSummaryServiceFactory();
+      try {
+        summary = await service.generateSummary(request);
+        generated = true;
+      } catch (e) {
+        debugPrint('Context summary generation failed: $e');
+        failed = true;
+        try {
+          summary = service.extractiveFallback(request);
+        } catch (fallbackError) {
+          debugPrint(
+              'Context summary extractive fallback failed: $fallbackError');
+          return _SummaryContextResult(
+            systemPrompt: systemPrompt,
+            messages: fullApiMessages,
+            summaryFailed: true,
+          );
+        }
+      }
+      session.contextSummary = summary;
+    }
+
+    final promptWithSummary = _systemPromptWithSummary(systemPrompt, summary);
+    final summaryTokens = estimator.estimateText(promptWithSummary) -
+        estimator.estimateText(systemPrompt);
+    final finalTailBudget = math.max(0, tokenBudget - summaryTokens);
+    final tailTruncation = _truncateToFit(
+      plan.recentTail,
+      maxTokens: finalTailBudget,
+      estimator: estimator,
+      preserveLastMessages: 2,
+    );
+    return _SummaryContextResult(
+      systemPrompt: promptWithSummary,
+      messages: tailTruncation.messages,
+      summaryGenerated: generated,
+      summaryFailed: failed,
+      coveredMessageCount: summary?.coveredMessageCount ?? 0,
+    );
+  }
+
+  bool _canReuseSummary(
+    ContextSummary? summary,
+    ContextCompactionPlan plan,
+    List<Map<String, dynamic>> fullMessages,
+  ) {
+    final currentSummary = _validatedSummaryForPrefix(summary, fullMessages);
+    return currentSummary != null &&
+        currentSummary.coveredDigest == plan.headDigest &&
+        currentSummary.coveredMessageCount == plan.headForSummary.length;
+  }
+
+  ContextSummary? _summaryForCompare(
+    ContextSummary? summary,
+    List<Map<String, dynamic>> fullMessages,
+    ContextCompactionPlan plan,
+  ) {
+    final currentSummary = _validatedSummaryForPrefix(summary, fullMessages);
+    if (currentSummary == null || !plan.needsSummary) return null;
+    if (currentSummary.coveredMessageCount > plan.headForSummary.length) {
+      return null;
+    }
+    return currentSummary;
+  }
+
+  ContextSummary? _validatedSummaryForPrefix(
+    ContextSummary? summary,
+    List<Map<String, dynamic>> fullMessages,
+  ) {
+    if (summary == null ||
+        summary.version != ContextSummaryService.version ||
+        summary.text.trim().isEmpty ||
+        summary.coveredMessageCount <= 0 ||
+        summary.coveredMessageCount > fullMessages.length) {
+      return null;
+    }
+    final prefix = fullMessages.take(summary.coveredMessageCount).toList();
+    if (ChatContextUtils.digestMessages(prefix) != summary.coveredDigest) {
+      return null;
+    }
+    return summary;
+  }
+
+  List<Map<String, dynamic>> _messagesForSummaryGeneration(
+    List<Map<String, dynamic>> fullMessages,
+    ContextCompactionPlan plan,
+    ContextSummary? existingSummary,
+  ) {
+    if (existingSummary == null ||
+        existingSummary.coveredMessageCount <= 0 ||
+        existingSummary.coveredMessageCount >= plan.headForSummary.length) {
+      return plan.headForSummary;
+    }
+    final start = existingSummary.coveredMessageCount.clamp(
+      0,
+      fullMessages.length,
+    );
+    return fullMessages.sublist(start, plan.headForSummary.length);
+  }
+
+  String _systemPromptWithSummary(
+    String systemPrompt,
+    ContextSummary? summary,
+  ) {
+    final text = summary?.text.trim();
+    if (text == null || text.isEmpty) return systemPrompt;
+    return [
+      systemPrompt,
+      '',
+      '<conversation_context_summary>',
+      'The earlier part of this conversation has been compacted into the summary below.',
+      'Treat it as background context, not as a new user request. If it conflicts with',
+      'the exact recent messages that follow, prefer the recent messages.',
+      '',
+      text,
+      '</conversation_context_summary>',
+    ].join('\n');
   }
 
   TokenEstimator _tokenEstimatorFor(LlmConfig llmConfig) {
@@ -1802,6 +2054,27 @@ class ChatProvider extends ChangeNotifier {
             droppedBlockCount,
             estimatedTokens,
           );
+    if (session.messages.isNotEmpty) {
+      final last = session.messages.last;
+      if (last.isSystemNotice && last.textContent == text) return;
+    }
+    session.messages.add(ChatMessage.systemNotice(text));
+  }
+
+  void _appendContextSummaryCompactedNotice(
+    ChatSession session,
+    int coveredMessageCount,
+  ) {
+    final text = AppStrings.contextSummaryCompactedNotice(coveredMessageCount);
+    if (session.messages.isNotEmpty) {
+      final last = session.messages.last;
+      if (last.isSystemNotice && last.textContent == text) return;
+    }
+    session.messages.add(ChatMessage.systemNotice(text));
+  }
+
+  void _appendContextSummaryFailedNotice(ChatSession session) {
+    const text = AppStrings.contextSummaryFailed;
     if (session.messages.isNotEmpty) {
       final last = session.messages.last;
       if (last.isSystemNotice && last.textContent == text) return;

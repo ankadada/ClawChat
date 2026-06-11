@@ -1,5 +1,61 @@
 import 'package:uuid/uuid.dart';
 
+class ContextSummary {
+  final int version;
+  final String text;
+  final int coveredMessageCount;
+  final String coveredDigest;
+  final int sourceEstimatedTokens;
+  final int summaryEstimatedTokens;
+  final DateTime createdAt;
+  final DateTime updatedAt;
+  final String? model;
+  final String? apiFormat;
+
+  const ContextSummary({
+    required this.version,
+    required this.text,
+    required this.coveredMessageCount,
+    required this.coveredDigest,
+    required this.sourceEstimatedTokens,
+    required this.summaryEstimatedTokens,
+    required this.createdAt,
+    required this.updatedAt,
+    this.model,
+    this.apiFormat,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'version': version,
+        'text': text,
+        'coveredMessageCount': coveredMessageCount,
+        'coveredDigest': coveredDigest,
+        'sourceEstimatedTokens': sourceEstimatedTokens,
+        'summaryEstimatedTokens': summaryEstimatedTokens,
+        'createdAt': createdAt.toIso8601String(),
+        'updatedAt': updatedAt.toIso8601String(),
+        if (model != null) 'model': model,
+        if (apiFormat != null) 'apiFormat': apiFormat,
+      };
+
+  factory ContextSummary.fromJson(Map<String, dynamic> json) {
+    return ContextSummary(
+      version: json['version'] as int? ?? 1,
+      text: json['text'] as String? ?? '',
+      coveredMessageCount: json['coveredMessageCount'] as int? ?? 0,
+      coveredDigest: json['coveredDigest'] as String? ?? '',
+      sourceEstimatedTokens: json['sourceEstimatedTokens'] as int? ?? 0,
+      summaryEstimatedTokens: json['summaryEstimatedTokens'] as int? ?? 0,
+      createdAt: DateTime.tryParse(json['createdAt'] as String? ?? '') ??
+          DateTime.now(),
+      updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
+          DateTime.now(),
+      model: json['model'] as String?,
+      apiFormat: json['apiFormat'] as String?,
+    );
+  }
+}
+
 class ChatSession {
   static final _validIdPattern = RegExp(r'^[a-zA-Z0-9_-]+$');
 
@@ -13,6 +69,7 @@ class ChatSession {
   String? apiFormatOverride; // null = use global default
   String? systemPrompt; // null = use global default
   String? folder; // null = ungrouped
+  ContextSummary? contextSummary;
 
   ChatSession({
     required this.id,
@@ -25,6 +82,7 @@ class ChatSession {
     this.apiFormatOverride,
     this.systemPrompt,
     this.folder,
+    this.contextSummary,
   })  : createdAt = createdAt ?? DateTime.now(),
         updatedAt = updatedAt ?? DateTime.now(),
         messages = messages ?? [];
@@ -57,9 +115,11 @@ class ChatSession {
         if (apiFormatOverride != null) 'apiFormatOverride': apiFormatOverride,
         if (systemPrompt != null) 'systemPrompt': systemPrompt,
         if (folder != null) 'folder': folder,
+        if (contextSummary != null) 'contextSummary': contextSummary!.toJson(),
       };
 
   factory ChatSession.fromJson(Map<String, dynamic> json) {
+    final rawSummary = json['contextSummary'];
     return ChatSession(
       id: _sanitizeId(json['id']?.toString()),
       title: json['title'] as String? ?? '新对话',
@@ -75,6 +135,9 @@ class ChatSession {
       apiFormatOverride: json['apiFormatOverride'] as String?,
       systemPrompt: json['systemPrompt'] as String?,
       folder: json['folder'] as String?,
+      contextSummary: rawSummary is Map
+          ? ContextSummary.fromJson(Map<String, dynamic>.from(rawSummary))
+          : null,
     );
   }
 
@@ -94,7 +157,9 @@ class ChatSession {
     String? apiFormatOverride,
     String? systemPrompt,
     String? folder,
+    ContextSummary? contextSummary,
     bool clearFolder = false,
+    bool clearContextSummary = false,
   }) {
     return ChatSession(
       id: id ?? this.id,
@@ -107,6 +172,8 @@ class ChatSession {
       apiFormatOverride: apiFormatOverride ?? this.apiFormatOverride,
       systemPrompt: systemPrompt ?? this.systemPrompt,
       folder: clearFolder ? null : (folder ?? this.folder),
+      contextSummary:
+          clearContextSummary ? null : (contextSummary ?? this.contextSummary),
     );
   }
 }

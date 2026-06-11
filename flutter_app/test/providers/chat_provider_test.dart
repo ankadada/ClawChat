@@ -6,6 +6,7 @@ import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
+import 'package:clawchat/services/context_summary_service.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/token_calibration_service.dart';
@@ -406,6 +407,9 @@ void main() {
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (messages) {
@@ -448,13 +452,16 @@ void main() {
             .where((m) => m.isSystemNotice)
             .map((m) => m.textContent)
             .join('\n'),
-        contains('tokens'),
+        contains('压缩为摘要'),
       );
     });
 
     test('sendMessage reports orphan tool block cleanup separately', () async {
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (messages) {
@@ -505,6 +512,9 @@ void main() {
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (messages) {
@@ -563,6 +573,9 @@ void main() {
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (messages) {
@@ -602,6 +615,9 @@ void main() {
         () async {
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (messages) {
@@ -650,6 +666,438 @@ void main() {
       expect(retryPayload, contains('new prompt'));
     });
 
+    test('does not generate summary when messages fit token budget', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedSystems = <String>[];
+      var summaryCalls = 0;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryCalls++;
+            throw StateError('summary should not be generated');
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('short old prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('short old answer')],
+        ),
+      ]);
+
+      await provider.sendMessage('short new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(summaryCalls, 0);
+      expect(observedSystems, hasLength(1));
+      expect(
+        observedSystems.single,
+        isNot(contains('conversation_context_summary')),
+      );
+    });
+
+    test('overflow generates summary and injects it into system prompt',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedSystems = <String>[];
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      var summaryCalls = 0;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryCalls++;
+            return ContextSummary(
+              version: ContextSummaryService.version,
+              text: '## Goal\nGenerated compact summary',
+              coveredMessageCount: request.coveredMessageCount,
+              coveredDigest: request.coveredDigest,
+              sourceEstimatedTokens: request.sourceEstimatedTokens,
+              summaryEstimatedTokens: 20,
+              createdAt: DateTime.utc(2026),
+              updatedAt: DateTime.utc(2026),
+              model: 'claude',
+              apiFormat: 'anthropic',
+            );
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-summary-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(summaryCalls, 1);
+      expect(provider.currentSession!.contextSummary, isNotNull);
+      expect(observedSystems.single, contains('Generated compact summary'));
+      expect(observedSystems.single, contains('conversation_context_summary'));
+      expect(
+          observedMessages.single.toString(), isNot(contains('old-summary')));
+      expect(observedMessages.single.toString(), contains('new prompt'));
+      expect(
+        provider.currentSession!.messages
+            .where((m) => m.isSystemNotice)
+            .map((m) => m.textContent)
+            .join('\n'),
+        contains('压缩为摘要'),
+      );
+    });
+
+    test('matching summary digest is reused without regeneration', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedSystems = <String>[];
+      var summaryCalls = 0;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryCalls++;
+            throw StateError('should reuse existing summary');
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      final messages = [
+        ChatMessage.user('old-reuse-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ];
+      session.messages.addAll(messages);
+      final apiMessages = session.toApiMessages();
+      final historyBudget = 32768 -
+          const TokenEstimator()
+              .estimateText(AppConstants.defaultSystemPrompt) -
+          1891 -
+          8192 -
+          1024;
+      final plan = ChatContextUtils.planCompaction(
+        apiMessages,
+        maxTokens: historyBudget,
+        estimator: const TokenEstimator(),
+      );
+      session.contextSummary = ContextSummary(
+        version: ContextSummaryService.version,
+        text: '## Goal\nReusable summary',
+        coveredMessageCount: plan.headForSummary.length,
+        coveredDigest: plan.headDigest,
+        sourceEstimatedTokens: plan.headEstimatedTokens,
+        summaryEstimatedTokens: 20,
+        createdAt: DateTime.utc(2026),
+        updatedAt: DateTime.utc(2026),
+      );
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(summaryCalls, 0);
+      expect(observedSystems.single, contains('Reusable summary'));
+    });
+
+    test('rolling update only sends unsummarized head messages', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      ContextSummaryRequest? observedRequest;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            observedRequest = request;
+            return _summaryForRequest(request);
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('covered-old-0 ${'中' * 10000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('covered-old-1 ${'中' * 10000}')],
+        ),
+        ChatMessage.user('incremental-head-0 ${'中' * 10000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('incremental-head-1 ${'中' * 10000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+      final coveredMessages = session.toApiMessages().take(2).toList();
+      session.contextSummary = ContextSummary(
+        version: ContextSummaryService.version,
+        text: '## Goal\nExisting rolling summary',
+        coveredMessageCount: coveredMessages.length,
+        coveredDigest: ChatContextUtils.digestMessages(coveredMessages),
+        sourceEstimatedTokens:
+            const TokenEstimator().estimateMessages(coveredMessages),
+        summaryEstimatedTokens: 20,
+        createdAt: DateTime.utc(2026),
+        updatedAt: DateTime.utc(2026),
+      );
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedRequest, isNotNull);
+      expect(observedRequest!.existingSummary?.text,
+          contains('Existing rolling summary'));
+      final serialized = observedRequest!.messages.toString();
+      expect(serialized, contains('incremental-head-0'));
+      expect(serialized, contains('incremental-head-1'));
+      expect(serialized, isNot(contains('covered-old-0')));
+      expect(serialized, isNot(contains('covered-old-1')));
+    });
+
+    test('stale rolling summary is ignored and rebuilt from changed prefix',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      ContextSummaryRequest? observedRequest;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            observedRequest = request;
+            return _summaryForRequest(request);
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('original-old-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+      ]);
+      final staleDigest =
+          ChatContextUtils.digestMessages([session.toApiMessages().first]);
+      session.contextSummary = ContextSummary(
+        version: ContextSummaryService.version,
+        text: '## Goal\nStale summary',
+        coveredMessageCount: 1,
+        coveredDigest: staleDigest,
+        sourceEstimatedTokens: 100,
+        summaryEstimatedTokens: 20,
+        createdAt: DateTime.utc(2026),
+        updatedAt: DateTime.utc(2026),
+      );
+      session.messages[0] = ChatMessage.user('changed-old-${'中' * 24000}');
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedRequest, isNotNull);
+      expect(observedRequest!.existingSummary, isNull);
+      final serialized = observedRequest!.messages.toString();
+      expect(serialized, contains('changed-old'));
+      expect(serialized, isNot(contains('original-old')));
+    });
+
+    test('summary generation failure falls back and continues', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (_) => throw StateError('summary unavailable'),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-failure-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(provider.currentSession!.contextSummary, isNotNull);
+      expect(
+        provider.currentSession!.messages
+            .where((m) => m.isSystemNotice)
+            .map((m) => m.textContent)
+            .join('\n'),
+        contains('摘要生成失败'),
+      );
+    });
+
+    test('summary and extractive fallback failures use pure P0 truncation',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedSystems = <String>[];
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (_) => throw StateError('summary unavailable'),
+          onExtractive: (_) => throw StateError('extractive unavailable'),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(
+              messages
+                  .map((message) => Map<String, dynamic>.from(message))
+                  .toList(),
+            );
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-double-failure-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(provider.currentSession!.contextSummary, isNull);
+      expect(observedSystems.single,
+          isNot(contains('conversation_context_summary')));
+      expect(observedMessages.single.toString(), contains('new prompt'));
+      expect(
+        provider.currentSession!.messages
+            .where((m) => m.isSystemNotice)
+            .map((m) => m.textContent)
+            .join('\n'),
+        contains('摘要生成失败'),
+      );
+    });
+
     test('sendCompare uses token-aware truncation', () async {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
@@ -657,6 +1105,9 @@ void main() {
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (_) => StreamDone(const LlmResponse(
@@ -705,8 +1156,243 @@ void main() {
       }
     });
 
+    test('valid summary is injected for compare', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedSystems = <String>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+          onChat: (_) => const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          ),
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('compare-covered-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('compare old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+      final compareMessages = [
+        ...session.toApiMessages(),
+        {'role': 'user', 'content': 'compare prompt'},
+      ];
+      final historyBudget = 32768 -
+          const TokenEstimator()
+              .estimateText(AppConstants.defaultSystemPrompt) -
+          8192 -
+          1024;
+      final plan = ChatContextUtils.planCompaction(
+        compareMessages,
+        maxTokens: historyBudget,
+        estimator: const TokenEstimator(),
+      );
+      session.contextSummary = ContextSummary(
+        version: ContextSummaryService.version,
+        text: '## Goal\nValid compare summary',
+        coveredMessageCount: plan.headForSummary.length,
+        coveredDigest: plan.headDigest,
+        sourceEstimatedTokens: plan.headEstimatedTokens,
+        summaryEstimatedTokens: 20,
+        createdAt: DateTime.utc(2026),
+        updatedAt: DateTime.utc(2026),
+      );
+
+      await provider.sendCompare('compare prompt', ['model-a', 'model-b']);
+
+      expect(provider.errorMessage, isNull);
+      expect(observedSystems, hasLength(2));
+      expect(observedSystems.join('\n'), contains('Valid compare summary'));
+      expect(
+        observedSystems.join('\n'),
+        contains('conversation_context_summary'),
+      );
+    });
+
+    test('stale summary is not injected for compare', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedSystems = <String>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+          onChat: (_) => const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          ),
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('compare-head-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+      ]);
+      session.contextSummary = ContextSummary(
+        version: ContextSummaryService.version,
+        text: '## Goal\nStale compare summary',
+        coveredMessageCount: 1,
+        coveredDigest: 'wrong-digest',
+        sourceEstimatedTokens: 100,
+        summaryEstimatedTokens: 20,
+        createdAt: DateTime.utc(2026),
+        updatedAt: DateTime.utc(2026),
+      );
+
+      await provider.sendCompare('compare prompt', ['model-a', 'model-b']);
+
+      expect(provider.errorMessage, isNull);
+      expect(observedSystems, hasLength(2));
+      expect(
+        observedSystems.join('\n'),
+        isNot(contains('Stale compare summary')),
+      );
+      expect(
+        observedSystems.join('\n'),
+        isNot(contains('conversation_context_summary')),
+      );
+    });
+
+    test('new session with only current message does not trigger summary',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedSystems = <String>[];
+      var summaryCalls = 0;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryCalls++;
+            throw StateError('summary should not be generated');
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.createSession();
+
+      await provider.sendMessage('hello');
+
+      expect(provider.errorMessage, isNull);
+      expect(summaryCalls, 0);
+      expect(observedSystems, hasLength(1));
+      expect(
+        observedSystems.single,
+        isNot(contains('conversation_context_summary')),
+      );
+    });
+
+    test('single over-budget current message does not trigger summary',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final observedSystems = <String>[];
+      var summaryCalls = 0;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryCalls++;
+            throw StateError('summary should not be generated');
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(
+              messages
+                  .map((message) => Map<String, dynamic>.from(message))
+                  .toList(),
+            );
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.createSession();
+
+      await provider.sendMessage('single-long-${'中' * 40000}');
+
+      expect(provider.errorMessage, isNull);
+      expect(summaryCalls, 0);
+      expect(observedMessages.single, hasLength(1));
+      expect(observedMessages.single.toString(), contains('single-long'));
+      expect(
+        observedSystems.single,
+        isNot(contains('conversation_context_summary')),
+      );
+    });
+
     test('successful send updates token calibration', () async {
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (_) => StreamDone(const LlmResponse(
@@ -741,6 +1427,9 @@ void main() {
     test('encrypted recovery does not update token calibration', () async {
       var requestCount = 0;
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (_) {
@@ -779,11 +1468,105 @@ void main() {
       expect(prefs.getString(TokenCalibrationService.storageKey), isNull);
     });
 
+    test('encrypted recovery retries summary-aware payload only', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      var requestCount = 0;
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final observedSystems = <String>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamError(
+                'encrypted',
+                cause: const EncryptedContentError(
+                  'Anthropic API error: invalid_encrypted_content: encrypted',
+                  code: 'invalid_encrypted_content',
+                ),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+          onStreamSystem: observedSystems.add,
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('summarized-head-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+      final apiMessages = [
+        ...session.toApiMessages(),
+        {'role': 'user', 'content': 'new prompt'},
+      ];
+      final historyBudget = 32768 -
+          const TokenEstimator()
+              .estimateText(AppConstants.defaultSystemPrompt) -
+          1891 -
+          8192 -
+          1024;
+      final plan = ChatContextUtils.planCompaction(
+        apiMessages,
+        maxTokens: historyBudget,
+        estimator: const TokenEstimator(),
+      );
+      session.contextSummary = ContextSummary(
+        version: ContextSummaryService.version,
+        text: '## Goal\nReusable recovery summary',
+        coveredMessageCount: plan.headForSummary.length,
+        coveredDigest: plan.headDigest,
+        sourceEstimatedTokens: plan.headEstimatedTokens,
+        summaryEstimatedTokens: 20,
+        createdAt: DateTime.utc(2026),
+        updatedAt: DateTime.utc(2026),
+      );
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(2));
+      for (final payload in observedMessages) {
+        final serialized = payload.toString();
+        expect(serialized, isNot(contains('summarized-head')));
+        expect(serialized, contains('new prompt'));
+      }
+      expect(observedSystems, hasLength(2));
+      expect(observedSystems.join('\n'), contains('Reusable recovery summary'));
+    });
+
     test('tool-call agent loops do not update token calibration', () async {
       var requestCount = 0;
       final tools = ToolRegistry()..register(_EchoTool(), risk: ToolRisk.safe);
       final provider = ChatProvider(
         toolRegistry: tools,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (_) => throw UnimplementedError(),
@@ -846,6 +1629,9 @@ void main() {
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (messages) {
@@ -894,6 +1680,9 @@ void main() {
       final observedMessages = <List<Map<String, dynamic>>>[];
       final observedTools = <int>[];
       final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (messages) {
@@ -1191,6 +1980,7 @@ class _ScriptedLlmService extends LlmService {
       onMessageEvents;
   final LlmResponse Function(List<Map<String, dynamic>> messages)? onChat;
   final void Function(List<ToolDefinition> tools)? onTools;
+  final void Function(String system)? onStreamSystem;
 
   _ScriptedLlmService(
     super.config, {
@@ -1198,6 +1988,7 @@ class _ScriptedLlmService extends LlmService {
     this.onMessageEvents,
     this.onChat,
     this.onTools,
+    this.onStreamSystem,
   });
 
   @override
@@ -1206,6 +1997,7 @@ class _ScriptedLlmService extends LlmService {
     required List<Map<String, dynamic>> messages,
     required List<ToolDefinition> tools,
   }) async {
+    onStreamSystem?.call(system);
     onTools?.call(tools);
     final handler = onChat;
     if (handler != null) return handler(messages);
@@ -1231,6 +2023,7 @@ class _ScriptedLlmService extends LlmService {
     required List<Map<String, dynamic>> messages,
     required List<ToolDefinition> tools,
   }) async* {
+    onStreamSystem?.call(system);
     onTools?.call(tools);
     final eventsHandler = onMessageEvents;
     if (eventsHandler != null) {
@@ -1256,6 +2049,45 @@ class _ScriptedLlmService extends LlmService {
     }
     yield event;
   }
+}
+
+class _ScriptedContextSummaryService extends ContextSummaryService {
+  final ContextSummary Function(ContextSummaryRequest request) onGenerate;
+  final ContextSummary Function(ContextSummaryRequest request)? onExtractive;
+
+  _ScriptedContextSummaryService({
+    required this.onGenerate,
+    this.onExtractive,
+  });
+
+  @override
+  Future<ContextSummary> generateSummary(
+    ContextSummaryRequest request,
+  ) async {
+    return onGenerate(request);
+  }
+
+  @override
+  ContextSummary extractiveFallback(ContextSummaryRequest request) {
+    final handler = onExtractive;
+    if (handler != null) return handler(request);
+    return super.extractiveFallback(request);
+  }
+}
+
+ContextSummary _summaryForRequest(ContextSummaryRequest request) {
+  return ContextSummary(
+    version: ContextSummaryService.version,
+    text: '## Goal\nTest summary',
+    coveredMessageCount: request.coveredMessageCount,
+    coveredDigest: request.coveredDigest,
+    sourceEstimatedTokens: request.sourceEstimatedTokens,
+    summaryEstimatedTokens: 20,
+    createdAt: DateTime.utc(2026),
+    updatedAt: DateTime.utc(2026),
+    model: 'claude',
+    apiFormat: 'anthropic',
+  );
 }
 
 class _EchoTool extends Tool {
