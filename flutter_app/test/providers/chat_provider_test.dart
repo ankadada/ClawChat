@@ -140,17 +140,17 @@ void main() {
       });
       await Future<void>.delayed(const Duration(milliseconds: 20));
 
-      provider.currentSession = ChatSession(
-        id: 'alt_nav',
-        messages: [
+      final session = await provider.createSession();
+      session.messages
+        ..clear()
+        ..addAll([
           ChatMessage.user('prompt'),
           ChatMessage(
             role: 'assistant',
             content: [TextContent('v2')],
             alternatives: ['v1'],
           ),
-        ],
-      );
+        ]);
 
       provider.switchAlternative(1, 0);
       var message = provider.currentSession!.messages[1];
@@ -664,6 +664,75 @@ void main() {
       final retryPayload = observedMessages.last.toString();
       expect(retryPayload, isNot(contains('old-cjk')));
       expect(retryPayload, contains('new prompt'));
+    });
+
+    test('encrypted recovery retry uses provider transform cleanup', () async {
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            if (observedMessages.length == 1) {
+              return StreamError(
+                'encrypted',
+                cause: const EncryptedContentError(
+                  'Anthropic API error: invalid_encrypted_content: encrypted',
+                  code: 'invalid_encrypted_content',
+                ),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.add(ChatMessage(
+        role: 'assistant',
+        content: [
+          TextContent('cached', reasoningContent: 'hidden reasoning'),
+          ToolUseContent(
+            id: 'call:1',
+            name: 'bash',
+            input: const {
+              'cmd': 'pwd',
+              'cache_control': {'type': 'ephemeral'},
+              'nested': {'encrypted': 'blob', 'safe': true},
+            },
+          ),
+        ],
+      ));
+      session.messages.add(ChatMessage(
+        role: 'user',
+        content: [
+          ToolResultContent(
+            toolUseId: 'call:1',
+            output: 'done',
+          ),
+        ],
+      ));
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(2));
+      final retryPayload = observedMessages.last.toString();
+      expect(retryPayload, isNot(contains('reasoning_content')));
+      expect(retryPayload, isNot(contains('cache_control')));
+      expect(retryPayload, isNot(contains('encrypted')));
+      expect(retryPayload, contains('call_1'));
+      expect(retryPayload, isNot(contains('call:1')));
     });
 
     test('does not generate summary when messages fit token budget', () async {

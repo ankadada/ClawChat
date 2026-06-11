@@ -13,6 +13,7 @@ import '../services/chat_context_utils.dart';
 import '../services/context_summary_service.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
+import '../services/provider_message_transform.dart';
 import '../services/session_storage.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
@@ -964,8 +965,23 @@ class ChatProvider extends ChangeNotifier {
         if (runResult is EncryptedContentError) {
           final originalError = runResult;
           _pendingTokenCalibration.remove(state.sessionId);
+          final recoveryTransform = const ProviderMessageTransform()
+              .transformCanonical(
+                apiMessages,
+                ProviderTransformOptions(
+                  apiFormat: llmConfig.format == ApiFormat.anthropic
+                      ? 'anthropic'
+                      : 'openai',
+                  modelId: LlmService.modelIdFromDisplay(llmConfig.model),
+                  baseUrl: Uri.tryParse(llmConfig.baseUrl),
+                  mode: ProviderTransformMode.recovery,
+                  supportsImages: true,
+                  supportsReasoningContent: false,
+                ),
+              )
+              .messages;
           final recoveryTruncation = _truncateToFit(
-            ChatContextUtils.sanitizeMessages(apiMessages),
+            recoveryTransform,
             maxTokens: finalTokenBudget,
             estimator: estimator,
             preserveLastMessages: 2,
@@ -2209,23 +2225,9 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Map<String, dynamic> _sanitizeRecoveryMap(Map<dynamic, dynamic> value) {
-    final clean = <String, dynamic>{};
-    for (final entry in value.entries) {
-      final key = entry.key;
-      if (key is! String || _isUnsafeRecoveryMetadataKey(key)) continue;
-      clean[key] = _sanitizeRecoveryValue(entry.value);
-    }
-    return clean;
-  }
-
-  dynamic _sanitizeRecoveryValue(Object? value) {
-    if (value is Map) return _sanitizeRecoveryMap(value);
-    if (value is List) return value.map(_sanitizeRecoveryValue).toList();
-    return value;
-  }
-
-  bool _isUnsafeRecoveryMetadataKey(String key) {
-    return ChatContextUtils.unsafeMetadataKeys.contains(key);
+    return Map<String, dynamic>.from(
+      ProviderMessageTransform.removeUnsafeMetadata(value) as Map,
+    );
   }
 
   void _appendNewAgentMessages(

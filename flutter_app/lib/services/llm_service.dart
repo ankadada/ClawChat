@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'api_validator.dart';
+import 'provider_message_transform.dart';
 
 enum ApiFormat { anthropic, openai }
 
@@ -1062,11 +1063,22 @@ class LlmService {
     List<ToolDefinition> tools, {
     required bool stream,
   }) {
+    const transform = ProviderMessageTransform();
+    final transformedMessages = transform.toProviderPayload(
+      messages,
+      ProviderTransformOptions(
+        apiFormat: 'anthropic',
+        modelId: modelIdFromDisplay(config.model),
+        baseUrl: Uri.tryParse(config.baseUrl),
+        supportsImages: _supportsImages(),
+        supportsReasoningContent: false,
+      ),
+    );
     final body = <String, dynamic>{
       'model': modelIdFromDisplay(config.model),
       'max_tokens': config.maxTokens,
       'system': system,
-      'messages': messages.expand(_convertMessageToAnthropic).toList(),
+      'messages': transformedMessages,
       'stream': stream,
     };
     final thinkingEnabled = config.thinkingBudget > 0;
@@ -1464,12 +1476,20 @@ class LlmService {
     required bool stream,
     bool includeStreamUsage = true,
   }) {
+    const transform = ProviderMessageTransform();
     final openaiMessages = <Map<String, dynamic>>[
       {'role': 'system', 'content': system},
     ];
-    for (final msg in messages) {
-      openaiMessages.addAll(_convertMessageToOpenAI(msg));
-    }
+    openaiMessages.addAll(transform.toProviderPayload(
+      messages,
+      ProviderTransformOptions(
+        apiFormat: 'openai',
+        modelId: modelIdFromDisplay(config.model),
+        baseUrl: Uri.tryParse(config.baseUrl),
+        supportsImages: _supportsImages(),
+        supportsReasoningContent: _needsReasoningContent(),
+      ),
+    ));
     final provider = _detectOpenAICompatibleProvider();
     final thinkingEnabled = config.thinkingBudget > 0 &&
         provider == _OpenAICompatibleProvider.anthropicCompatible;
@@ -1666,6 +1686,26 @@ class LlmService {
     return isKnownDeepSeekReasoning || isDeepSeekReasoningFamily || isBareR1;
   }
 
+  bool _supportsImages() {
+    final model = modelIdFromDisplay(config.model).toLowerCase();
+    // Default to true until ClawChat has a full provider/model capability
+    // registry. Keep known text-only reasoning and coding model families from
+    // sending raw image blocks to providers that reject them.
+    if (model == 'deepseek-reasoner' ||
+        model == 'deepseek-r1' ||
+        model == 'r1' ||
+        model.startsWith('r1-') ||
+        model.contains('deepseek-r1') ||
+        model.contains('deepseek-reasoner') ||
+        model.contains('coder') ||
+        model.contains('codex')) {
+      return false;
+    }
+    return true;
+  }
+
+  @Deprecated('Use ProviderMessageTransform.toProviderPayload instead.')
+  // ignore: unused_element
   List<Map<String, dynamic>> _convertMessageToAnthropic(
     Map<String, dynamic> msg,
   ) {
@@ -1856,6 +1896,8 @@ class LlmService {
     };
   }
 
+  @Deprecated('Use ProviderMessageTransform.toProviderPayload instead.')
+  // ignore: unused_element
   List<Map<String, dynamic>> _convertMessageToOpenAI(Map<String, dynamic> msg) {
     final role = msg['role'] as String;
     final content = msg['content'];

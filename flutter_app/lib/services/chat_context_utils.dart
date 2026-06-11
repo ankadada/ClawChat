@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'provider_message_transform.dart';
+
 class TokenEstimator {
   final double calibrationMultiplier;
 
@@ -350,20 +352,7 @@ class _TurnRange {
 }
 
 class ChatContextUtils {
-  static const unsafeMetadataKeys = {
-    'cache_control',
-    'encrypted',
-    'thinking',
-    'signature',
-    'redacted_thinking',
-  };
-
-  static const _allowedContentTypes = {
-    'text',
-    'image',
-    'tool_use',
-    'tool_result',
-  };
+  static const unsafeMetadataKeys = ProviderMessageTransform.unsafeMetadataKeys;
 
   @Deprecated('Use TokenEstimator.estimateMessage for context budgeting.')
   static int charCount(Map<String, dynamic> msg) {
@@ -443,73 +432,16 @@ class ChatContextUtils {
   static List<Map<String, dynamic>> sanitizeMessages(
     List<Map<String, dynamic>> messages,
   ) {
-    final sanitized = <Map<String, dynamic>>[];
-    for (final msg in messages) {
-      final clean = _sanitizeMessage(msg);
-      if (clean != null) sanitized.add(clean);
-    }
-    return _dropUnpairedToolMessages(sanitized);
-  }
-
-  static Map<String, dynamic>? _sanitizeMessage(Map<String, dynamic> msg) {
-    final role = msg['role'];
-    final content = msg['content'];
-    final clean = <String, dynamic>{};
-    if (role is String) clean['role'] = role;
-
-    if (content is String) {
-      clean['content'] = content;
-    } else if (content is List) {
-      final blocks = <Map<String, dynamic>>[];
-      for (final block in content) {
-        final cleanBlock = _sanitizeContentBlock(block);
-        if (cleanBlock != null) blocks.add(cleanBlock);
-      }
-      if (blocks.isEmpty) return null;
-      clean['content'] = blocks;
-    } else {
-      return null;
-    }
-
-    // Recovery sanitization intentionally strips top-level reasoning_content.
-    // OpenAI-compatible reasoning history is handled by LlmService when needed.
-    return clean;
-  }
-
-  static Map<String, dynamic>? _sanitizeContentBlock(Object? block) {
-    if (block is! Map) return null;
-    final type = block['type'];
-    if (type == 'thinking' || !_allowedContentTypes.contains(type)) {
-      return null;
-    }
-    final clean = <String, dynamic>{};
-    for (final entry in block.entries) {
-      final key = entry.key;
-      if (key is! String || _isUnsafeMetadataKey(key)) continue;
-      clean[key] = _sanitizeValue(entry.value);
-    }
-    clean['type'] = type;
-    return clean;
-  }
-
-  static dynamic _sanitizeValue(Object? value) {
-    if (value is Map) {
-      final clean = <String, dynamic>{};
-      for (final entry in value.entries) {
-        final key = entry.key;
-        if (key is! String || _isUnsafeMetadataKey(key)) continue;
-        clean[key] = _sanitizeValue(entry.value);
-      }
-      return clean;
-    }
-    if (value is List) {
-      return value.map(_sanitizeValue).toList();
-    }
-    return value;
-  }
-
-  static bool _isUnsafeMetadataKey(String key) {
-    return unsafeMetadataKeys.contains(key);
+    return const ProviderMessageTransform()
+        .transformCanonical(
+          messages,
+          const ProviderTransformOptions(
+            apiFormat: 'anthropic',
+            modelId: '',
+            mode: ProviderTransformMode.recovery,
+          ),
+        )
+        .messages;
   }
 
   static ContextCompactionPlan planCompaction(
@@ -663,12 +595,6 @@ class ChatContextUtils {
       hash = (hash * 0x100000001b3) & mask;
     }
     return hash.toRadixString(16).padLeft(16, '0');
-  }
-
-  static List<Map<String, dynamic>> _dropUnpairedToolMessages(
-    List<Map<String, dynamic>> messages,
-  ) {
-    return _dropUnpairedToolMessagesWithStats(messages).messages;
   }
 
   static _ToolCleanupResult _dropUnpairedToolMessagesWithStats(

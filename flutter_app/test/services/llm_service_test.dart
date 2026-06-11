@@ -722,6 +722,248 @@ void main() {
         },
       ]);
     });
+
+    test('builds golden Anthropic payload for mixed multimodal tool history',
+        () async {
+      final captured = await captureAnthropicRequest(
+        model: 'claude-sonnet-4-20250514',
+        system: 'You are concise.',
+        messages: const [
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': 'describe'},
+              {
+                'type': 'image',
+                'source': {
+                  'type': 'base64',
+                  'media_type': 'image/png',
+                  'data': 'abc123',
+                },
+              },
+            ],
+          },
+          {
+            'role': 'assistant',
+            'content': [
+              {
+                'type': 'text',
+                'text': 'thinking answer',
+                'reasoning_content': 'anthropic should strip this',
+              },
+            ],
+            'reasoning_content': 'top level hidden',
+          },
+          {
+            'role': 'assistant',
+            'content': [
+              {
+                'type': 'tool_use',
+                'id': 'call:1',
+                'name': 'bash',
+                'input': {'command': 'pwd'},
+              },
+            ],
+          },
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'tool_result',
+                'tool_use_id': 'call:1',
+                'content': '/root/workspace',
+              },
+            ],
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': 'describe'},
+            {
+              'type': 'image',
+              'source': {
+                'type': 'base64',
+                'media_type': 'image/png',
+                'data': 'abc123',
+              },
+            },
+          ],
+        },
+        {
+          'role': 'assistant',
+          'content': [
+            {'type': 'text', 'text': 'thinking answer'},
+          ],
+        },
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'call_1',
+              'name': 'bash',
+              'input': {'command': 'pwd'},
+            },
+          ],
+        },
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'call_1',
+              'content': '/root/workspace',
+            },
+          ],
+        },
+      ]);
+      expect(jsonDecode(jsonEncode(captured.body)), captured.body);
+    });
+
+    test('builds golden OpenAI payload for mixed multimodal tool history',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'gpt-test',
+        system: 'You are concise.',
+        messages: const [
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': 'describe'},
+              {
+                'type': 'image',
+                'source': {
+                  'type': 'base64',
+                  'media_type': 'image/png',
+                  'data': 'abc123',
+                },
+              },
+            ],
+          },
+          {
+            'role': 'assistant',
+            'content': [
+              {
+                'type': 'tool_use',
+                'id': 'call:1',
+                'name': 'bash',
+                'input': {'command': 'pwd'},
+              },
+            ],
+          },
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'tool_result',
+                'tool_use_id': 'call:1',
+                'content': '/root/workspace',
+              },
+            ],
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': 'You are concise.'},
+        {
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': 'describe'},
+            {
+              'type': 'image_url',
+              'image_url': {'url': 'data:image/png;base64,abc123'},
+            },
+          ],
+        },
+        {
+          'role': 'assistant',
+          'content': '',
+          'tool_calls': [
+            {
+              'id': 'call_1',
+              'type': 'function',
+              'function': {
+                'name': 'bash',
+                'arguments': '{"command":"pwd"}',
+              },
+            },
+          ],
+        },
+        {
+          'role': 'tool',
+          'tool_call_id': 'call_1',
+          'content': '/root/workspace',
+        },
+      ]);
+      expect(jsonDecode(jsonEncode(captured.body)), captured.body);
+    });
+
+    test('builds golden OpenAI payload preserving supported reasoning_content',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'deepseek-reasoner',
+        system: 'You are concise.',
+        messages: const [
+          {
+            'role': 'assistant',
+            'content': [
+              {
+                'type': 'text',
+                'text': 'answer',
+                'reasoning_content': 'block reasoning',
+              },
+            ],
+            'reasoning_content': 'top reasoning',
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': 'You are concise.'},
+        {
+          'role': 'assistant',
+          'content': 'answer',
+          'reasoning_content': 'top reasoning\nblock reasoning',
+        },
+      ]);
+    });
+
+    test('replaces images with text warning for known text-only models',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'codex/gpt-5.5',
+        messages: const [
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': 'inspect'},
+              {
+                'type': 'image',
+                'source': {
+                  'type': 'base64',
+                  'media_type': 'image/png',
+                  'data': 'abc123',
+                },
+              },
+            ],
+          },
+        ],
+      );
+
+      expect(captured.body['messages'], [
+        {'role': 'system', 'content': ''},
+        {
+          'role': 'user',
+          'content':
+              'inspect\n[Attachment omitted: images are not supported by this provider]',
+        },
+      ]);
+    });
   });
 
   group('LlmService streaming compatibility', () {
