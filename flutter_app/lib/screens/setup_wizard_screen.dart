@@ -22,7 +22,10 @@ class _SetupWizardScreenState extends State<SetupWizardScreen> {
   Future<void> _runSetup() async {
     setState(() {
       _started = true;
-      _state = SetupState(step: SetupStep.checkingStatus, message: AppStrings.startingInit);
+      _state = const SetupState(
+        step: SetupStep.checkingStatus,
+        message: AppStrings.startingInit,
+      );
     });
 
     try {

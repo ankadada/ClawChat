@@ -165,6 +165,88 @@ void main() {
     expect(service.terminalFontSize, isNull);
   });
 
+  test('migrates legacy context length into token budget on first read',
+      () async {
+    SharedPreferences.setMockInitialValues({
+      'context_length': 100000,
+    });
+
+    final service = PreferencesService();
+    await service.init();
+
+    expect(service.contextTokenBudget, 32768);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getInt('context_token_budget'), 32768);
+  });
+
+  test('normalizes stored context token budget to valid presets', () async {
+    Future<void> expectNormalized(int stored, int expected) async {
+      SharedPreferences.setMockInitialValues({
+        'context_token_budget': stored,
+      });
+      PreferencesService.resetForTesting();
+
+      final service = PreferencesService();
+      await service.init();
+
+      expect(service.contextTokenBudget, expected);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getInt('context_token_budget'), expected);
+    }
+
+    await expectNormalized(4096, 32768);
+    await expectNormalized(33333, 32768);
+    await expectNormalized(100000, 65536);
+  });
+
+  test('context token budget migration is idempotent after normalization',
+      () async {
+    SharedPreferences.setMockInitialValues({
+      'context_length': 100000,
+    });
+
+    final service = PreferencesService();
+    await service.init();
+    expect(service.contextTokenBudget, 32768);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getInt('context_token_budget'), 32768);
+
+    PreferencesService.resetForTesting();
+    final secondService = PreferencesService();
+    await secondService.init();
+    expect(secondService.contextTokenBudget, 32768);
+    expect(prefs.getInt('context_token_budget'), 32768);
+  });
+
+  test('import settings prefers explicit context token budget', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+
+    service.importAllSettings({
+      'contextLength': 200000,
+      'contextTokenBudget': 32768,
+    });
+
+    expect(service.contextTokenBudget, 32768);
+  });
+
+  test('import settings normalizes context token budget values', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+
+    service.importAllSettings({
+      'contextTokenBudget': 100000,
+    });
+
+    expect(service.contextTokenBudget, 65536);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getInt('context_token_budget'), 65536);
+  });
+
   test('delegates API getters and setters to the active profile', () async {
     final first = ProviderProfile.defaults(name: 'First').copyWith(
       id: 'first',

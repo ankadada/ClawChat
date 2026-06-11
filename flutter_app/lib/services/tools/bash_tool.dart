@@ -116,7 +116,7 @@ class BashTool extends Tool {
         .join('; ');
 
     // Prepend workspace cd for commands that don't explicitly set their own directory
-    final workingDir = '/root/workspace';
+    const workingDir = '/root/workspace';
     final cdPrefix = command.trimLeft().startsWith('cd ') ? '' : 'cd $workingDir 2>/dev/null; ';
     final effectiveCommand = '${envPrefix.isNotEmpty ? "$envPrefix; " : ""}$cdPrefix$command';
 

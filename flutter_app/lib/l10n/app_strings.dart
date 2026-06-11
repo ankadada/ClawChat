@@ -68,8 +68,16 @@ class AppStrings {
   static const clearMessageQueue = '清空队列';
   static const messageQueueCleared = '队列已清空';
   static const clearQueueBeforeRegenerate = '请先清空消息队列再重新生成';
-  static String contextCompactedNotice(int retainedCount) =>
-      '对话上下文已压缩（保留最近 $retainedCount 条消息）';
+  static String contextCompactedNotice(
+    int droppedMessageCount,
+    int estimatedTokens,
+  ) =>
+      '对话上下文已压缩（移除 $droppedMessageCount 条旧消息，保留约 $estimatedTokens tokens）';
+  static String contextToolCallsCleanedNotice(
+    int droppedBlockCount,
+    int estimatedTokens,
+  ) =>
+      '对话上下文已压缩（清理了 $droppedBlockCount 个不完整的工具调用，保留约 $estimatedTokens tokens）';
   static const encryptedContentRecoveryNotice = '检测到缓存上下文失效，已自动恢复对话上下文';
   static const encryptedContentRecoveryFailed = '自动恢复上下文失败，请重新发送消息';
   static const inputHint = '输入消息...';
@@ -265,14 +273,19 @@ class AppStrings {
 
   // ── Advanced LLM config ────────────────────────────────────────────
   static const contextLength = '上下文长度';
+  static const contextTokenBudget = '上下文 Token 预算';
   static const autoCompact = '自动压缩';
-  static const autoCompactSubtitle = '超出上下文长度时自动截断旧消息';
+  static const autoCompactSubtitle = '超出上下文 Token 预算时自动截断旧消息';
   static const temperature = '温度';
   static const temperatureLow = '精确';
   static const temperatureHigh = '创意';
   static const chars50k = '50K 字符';
   static const chars100k = '100K 字符 (默认)';
   static const chars200k = '200K 字符';
+  static const tokens4k = '4K tokens';
+  static const tokens32k = '32K tokens';
+  static const tokens64k = '64K tokens (默认)';
+  static const tokens200k = '200K tokens';
 
   // ── Skills ────────────────────────────────────────────────────────
   static const skills = '技能';

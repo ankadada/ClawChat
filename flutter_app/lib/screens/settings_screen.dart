@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -789,7 +788,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     else
                       ..._envVars.entries.map((e) => ListTile(
                             title: Text(e.key),
-                            subtitle: Text('••••••'),
+                            subtitle: const Text('••••••'),
                             trailing: IconButton(
                               icon: const Icon(Icons.delete_outline),
                               onPressed: () => _deleteEnvVar(e.key),

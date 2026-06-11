@@ -314,7 +314,7 @@ class NativeBridge {
   /// Returns the destination path inside proot.
   static Future<String> importFileToWorkspace(String sourcePath, String destFilename) async {
     final safeName = destFilename.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
-    final destDir = 'root/workspace/uploads';
+    const destDir = 'root/workspace/uploads';
     final destPath = '$destDir/$safeName';
 
     final extension = safeName.split('.').last.toLowerCase();

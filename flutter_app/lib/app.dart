@@ -419,7 +419,7 @@ class _DualPaneLayoutState extends State<DualPaneLayout> {
             children: [
               SizedBox(
                 width: sidebarWidth,
-                child: ChatSessionsScreen(embedded: true),
+                child: const ChatSessionsScreen(embedded: true),
               ),
               _SidebarResizeDivider(
                 onDragUpdate: (delta) {

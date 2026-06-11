@@ -209,7 +209,7 @@ class CodeBlock extends StatelessWidget {
             child: SelectableText.rich(
               TextSpan(
                 children: highlightedSpans,
-                style: TextStyle(
+                style: const TextStyle(
                   fontFamily: _monoFamily,
                   fontFamilyFallback: _monoFallback,
                   fontSize: 12,

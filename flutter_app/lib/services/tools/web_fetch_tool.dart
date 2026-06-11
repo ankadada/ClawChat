@@ -212,7 +212,7 @@ class WebFetchTool extends Tool {
 
   static Future<void> _validatePublicUrl(Uri uri) async {
     if (uri.scheme != 'http' && uri.scheme != 'https') {
-      throw SocketException('Only HTTP and HTTPS URLs are allowed');
+      throw const SocketException('Only HTTP and HTTPS URLs are allowed');
     }
     if (uri.host.isEmpty || _isInternalHostname(uri.host)) {
       throw SocketException(

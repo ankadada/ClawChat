@@ -28,6 +28,7 @@ class AppConstants {
   static const String defaultModel = 'claude-sonnet-4-20250514';
   static const int defaultMaxTokens = 8192;
   static const int defaultContextLength = 100000;
+  static const int defaultContextTokenBudget = 65536;
   static const double defaultTemperature = 0.7;
   static const String defaultSystemPrompt =
       'You are a helpful AI assistant with access to tools. '

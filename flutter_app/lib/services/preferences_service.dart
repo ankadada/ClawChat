@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../constants.dart';
 import '../models/provider_profile.dart';
 
 enum ConflictResolution { merge, replace, skip }
@@ -16,6 +17,7 @@ class PreferencesService {
   static const _keySystemPrompt = 'system_prompt';
   static const _keyThinkingBudget = 'thinking_budget';
   static const _keyContextLength = 'context_length';
+  static const _keyContextTokenBudget = 'context_token_budget';
   static const _keyAutoCompact = 'auto_compact';
   static const _keyTemperature = 'temperature';
   static const _keyEnvVars = 'env_vars';
@@ -44,6 +46,7 @@ class PreferencesService {
   static const int maxAgentMaxIterations = 99;
   static const int defaultMaxConcurrentAgents = 3;
   static const int maxMaxConcurrentAgents = 5;
+  static const _validContextTokenBudgets = [32768, 65536, 200000];
 
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -425,6 +428,38 @@ class PreferencesService {
   int get contextLength => _prefs.getInt(_keyContextLength) ?? 100000;
   set contextLength(int v) => _prefs.setInt(_keyContextLength, v);
 
+  int get contextTokenBudget {
+    final stored = _prefs.getInt(_keyContextTokenBudget);
+    if (stored != null) {
+      final normalized = _normalizeContextTokenBudget(stored);
+      if (normalized != stored) {
+        _prefs.setInt(_keyContextTokenBudget, normalized);
+      }
+      return normalized;
+    }
+    final legacy = _prefs.getInt(_keyContextLength);
+    if (legacy == null) return AppConstants.defaultContextTokenBudget;
+    final migrated = _normalizeContextTokenBudget(legacy ~/ 3);
+    _prefs.setInt(_keyContextTokenBudget, migrated);
+    return migrated;
+  }
+
+  set contextTokenBudget(int v) =>
+      _prefs.setInt(_keyContextTokenBudget, _normalizeContextTokenBudget(v));
+
+  static int _normalizeContextTokenBudget(int value) {
+    var nearest = _validContextTokenBudgets.first;
+    var nearestDistance = (value - nearest).abs();
+    for (final budget in _validContextTokenBudgets.skip(1)) {
+      final distance = (value - budget).abs();
+      if (distance < nearestDistance) {
+        nearest = budget;
+        nearestDistance = distance;
+      }
+    }
+    return nearest;
+  }
+
   bool get autoCompact => _prefs.getBool(_keyAutoCompact) ?? true;
   set autoCompact(bool v) => _prefs.setBool(_keyAutoCompact, v);
 
@@ -589,6 +624,7 @@ class PreferencesService {
       'themeMode': themeMode,
       'fontScale': fontScale,
       'contextLength': contextLength,
+      'contextTokenBudget': contextTokenBudget,
       'autoCompact': autoCompact,
       'agentMaxIterations': agentMaxIterations,
       'maxConcurrentAgents': maxConcurrentAgents,
@@ -618,8 +654,17 @@ class PreferencesService {
     final importedFontScale = _finiteDouble(settings['fontScale']);
     if (importedFontScale != null) fontScale = importedFontScale;
 
-    final importedContextLength = _intValue(settings['contextLength']);
-    if (importedContextLength != null) contextLength = importedContextLength;
+    final importedContextTokenBudget =
+        _intValue(settings['contextTokenBudget']);
+    if (importedContextTokenBudget != null) {
+      contextTokenBudget = importedContextTokenBudget;
+    } else {
+      final importedContextLength = _intValue(settings['contextLength']);
+      if (importedContextLength != null) {
+        contextLength = importedContextLength;
+        contextTokenBudget = importedContextLength ~/ 3;
+      }
+    }
 
     if (settings['autoCompact'] is bool) {
       autoCompact = settings['autoCompact'] as bool;

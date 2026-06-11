@@ -12,15 +12,19 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-const int _maxContextChars = 100000; // ~25k tokens
+const int _maxContextTokens = 25000;
 
-int charCount(Map<String, dynamic> msg) => ChatContextUtils.charCount(msg);
+int charCount(Map<String, dynamic> msg) {
+  // ignore: deprecated_member_use_from_same_package
+  return ChatContextUtils.charCount(msg);
+}
 
 List<Map<String, dynamic>> truncateToFit(List<Map<String, dynamic>> messages) {
   return ChatContextUtils.truncateToFit(
     messages,
-    maxChars: _maxContextChars,
-  );
+    maxTokens: _maxContextTokens,
+    estimator: const TokenEstimator(),
+  ).messages;
 }
 
 void main() {
@@ -111,7 +115,7 @@ void main() {
     secureStorage['provider_profiles'] = jsonEncode([profile.toJson()]);
     SharedPreferences.setMockInitialValues({
       'active_provider_profile_id': 'profile',
-      'context_length': 100000,
+      'context_token_budget': 65536,
     });
   }
 
@@ -381,6 +385,324 @@ void main() {
     });
   });
 
+  group('token-aware context budgeting', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('sendMessage uses token budget instead of raw character length',
+        () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-short-cjk-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(1));
+      final serialized = observedMessages.single.toString();
+      expect(serialized, isNot(contains('old-short-cjk')));
+      expect(serialized, contains('new prompt'));
+      expect(
+        provider.currentSession!.messages
+            .where((m) => m.isSystemNotice)
+            .map((m) => m.textContent)
+            .join('\n'),
+        contains('tokens'),
+      );
+    });
+
+    test('sendMessage reports orphan tool block cleanup separately', () async {
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.add(ChatMessage(
+        role: 'assistant',
+        content: [
+          TextContent('kept text'),
+          ToolUseContent(
+            id: 'orphan',
+            name: 'bash',
+            input: const {'cmd': 'pwd'},
+          ),
+        ],
+      ));
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(1));
+      expect(observedMessages.single.toString(), isNot(contains('orphan')));
+      expect(
+        provider.currentSession!.messages
+            .where((m) => m.isSystemNotice)
+            .map((m) => m.textContent)
+            .join('\n'),
+        contains('清理了 1 个不完整的工具调用'),
+      );
+    });
+
+    test('large system prompt truncates history more aggressively', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      Future<int> sentMessageCountForSystemPrompt(String systemPrompt) async {
+        final session = await provider.createSession();
+        session.systemPrompt = systemPrompt;
+        session.messages.addAll([
+          ChatMessage.user('old-1 ${'中' * 4000}'),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('old-2 ${'中' * 4000}')],
+          ),
+          ChatMessage.user('mid-1 ${'中' * 4000}'),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('mid-2 ${'中' * 4000}')],
+          ),
+          ChatMessage.user('recent prompt'),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('recent reply')],
+          ),
+        ]);
+
+        await provider.sendMessage('new prompt');
+
+        expect(provider.errorMessage, isNull);
+        return observedMessages.last.length;
+      }
+
+      final smallPromptCount = await sentMessageCountForSystemPrompt('small');
+      final largePromptCount =
+          await sentMessageCountForSystemPrompt('large ${'中' * 20000}');
+
+      expect(largePromptCount, lessThan(smallPromptCount));
+    });
+
+    test('image-heavy history contributes to token budget', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      for (var i = 0; i < 20; i++) {
+        session.messages.add(ChatMessage.userContent([
+          ImageContent(
+            data: 'old-image-$i',
+            mediaType: 'image/png',
+          ),
+        ]));
+      }
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(1));
+      final serialized = observedMessages.single.toString();
+      expect(serialized, isNot(contains('old-image-0')));
+      expect(serialized, contains('new prompt'));
+    });
+
+    test('encrypted recovery retry also uses token budget truncation',
+        () async {
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            if (observedMessages.length == 1) {
+              return StreamError(
+                'encrypted',
+                cause: const EncryptedContentError(
+                  'Anthropic API error: invalid_encrypted_content: encrypted',
+                  code: 'invalid_encrypted_content',
+                ),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-cjk-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(2));
+      final retryPayload = observedMessages.last.toString();
+      expect(retryPayload, isNot(contains('old-cjk')));
+      expect(retryPayload, contains('new prompt'));
+    });
+
+    test('sendCompare uses token-aware truncation', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+          onChat: (messages) {
+            observedMessages.add(messages);
+            return LlmResponse(
+              stopReason: 'end_turn',
+              content: [
+                ContentBlock(
+                    type: 'text', text: 'ok ${observedMessages.length}')
+              ],
+            );
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-compare-${'中' * 24000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 24000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('recent reply')],
+        ),
+      ]);
+
+      await provider.sendCompare('compare prompt', ['model-a', 'model-b']);
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(2));
+      for (final messages in observedMessages) {
+        final serialized = messages.toString();
+        expect(serialized, isNot(contains('old-compare')));
+        expect(serialized, contains('compare prompt'));
+      }
+    });
+  });
+
   group('charCount - string content', () {
     test('counts simple string content', () {
       expect(charCount({'role': 'user', 'content': 'hello'}), 5);
@@ -632,11 +954,30 @@ void main() {
 
 class _ScriptedLlmService extends LlmService {
   final StreamEvent Function(List<Map<String, dynamic>> messages) onMessages;
+  final LlmResponse Function(List<Map<String, dynamic>> messages)? onChat;
 
   _ScriptedLlmService(
     super.config, {
     required this.onMessages,
+    this.onChat,
   });
+
+  @override
+  Future<LlmResponse> chat({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async {
+    final handler = onChat;
+    if (handler != null) return handler(messages);
+    final event = onMessages(messages);
+    if (event is StreamDone) return event.response;
+    if (event is StreamError) throw Exception(event.message);
+    return const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'ok')],
+    );
+  }
 
   @override
   Stream<StreamEvent> chatStream({

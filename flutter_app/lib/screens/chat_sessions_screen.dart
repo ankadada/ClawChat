@@ -250,7 +250,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 4),
                       child: FilterChip(
-                        label: Text(AppStrings.allConversations),
+                        label: const Text(AppStrings.allConversations),
                         selected: _selectedFolder == null,
                         showCheckmark: false,
                         selectedColor: theme.colorScheme.primaryContainer,
@@ -283,7 +283,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 4),
                       child: FilterChip(
-                        label: Text(AppStrings.noFolder),
+                        label: const Text(AppStrings.noFolder),
                         selected: _selectedFolder == '__none__',
                         showCheckmark: false,
                         selectedColor: theme.colorScheme.primaryContainer,
@@ -742,6 +742,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
       await provider.moveToFolder(session.id, null);
     } else if (result == '__new__') {
       final controller = TextEditingController();
+      if (!context.mounted) return;
       final folderName = await showDialog<String>(
         context: context,
         builder: (ctx) => AlertDialog(

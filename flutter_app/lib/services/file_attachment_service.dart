@@ -125,7 +125,7 @@ class FileAttachmentService {
     final safeName = sanitizeFileName(file.name);
     final extension = _extensionFor(safeName);
 
-    final destDir = 'root/workspace/uploads';
+    const destDir = 'root/workspace/uploads';
     final destPath = '$destDir/$safeName';
 
     if (_textExtensions.contains(extension)) {

@@ -91,6 +91,7 @@ class ChatProvider extends ChangeNotifier {
   Completer<bool>? _approvalCompleter;
   Timer? _approvalTimeout;
   bool _appInBackground = false;
+  final TokenEstimator _tokenEstimator = const TokenEstimator();
 
   static const _backgroundApprovalTimeout = Duration(seconds: 15);
   static const _agentServiceThinkingText = 'AI 正在思考...';
@@ -829,9 +830,23 @@ class ChatProvider extends ChangeNotifier {
       ));
 
       final fullApiMessages = activeSession.toApiMessages();
-      final apiMessages = _truncateToFit(fullApiMessages);
-      if (apiMessages.length < fullApiMessages.length) {
-        _appendContextCompactionNotice(activeSession, apiMessages.length);
+      final tokenBudget = _resolveContextTokenBudget(
+        llmConfig: llmConfig,
+        systemPrompt: fullPrompt,
+      );
+      final truncation = _truncateToFit(
+        fullApiMessages,
+        maxTokens: tokenBudget,
+        preserveLastMessages: 2,
+      );
+      final apiMessages = truncation.messages;
+      if (truncation.wasTruncated) {
+        _appendContextCompactionNotice(
+          activeSession,
+          truncation.droppedMessageCount,
+          truncation.droppedBlockCount,
+          truncation.estimatedTokens,
+        );
         await _storage.saveSession(activeSession);
         _syncCurrentSessionReference(activeSession);
         notifyListeners();
@@ -847,9 +862,12 @@ class ChatProvider extends ChangeNotifier {
         );
         if (runResult is EncryptedContentError) {
           final originalError = runResult;
-          final recoveryMessages = _truncateToFit(
+          final recoveryTruncation = _truncateToFit(
             ChatContextUtils.sanitizeMessages(activeSession.toApiMessages()),
+            maxTokens: tokenBudget,
+            preserveLastMessages: 2,
           );
+          final recoveryMessages = recoveryTruncation.messages;
           final emptyRecoveryError = _encryptedRecoveryEmptyError(
             originalError,
             recoveryMessages,
@@ -1255,26 +1273,50 @@ class ChatProvider extends ChangeNotifier {
         return;
       }
 
-      final session = currentSession!;
-      // Don't persist the user message to session.messages in compare mode.
-      // Compare is a one-shot inspection — results live in compareResults only.
-      // If we persisted, the next real sendMessage would break role alternation
-      // (two consecutive user messages without an assistant reply between them).
-      final compareMessages = [
-        ..._truncateToFit(session.toApiMessages()),
-        {'role': 'user', 'content': comparePrompt},
-      ];
-      notifyListeners();
-
       _skills = await SkillService.scanSkills();
       await MemoryService.getMemories();
       final skillIndex = SkillService.buildSkillIndex(_skills);
       final memoryPrompt = MemoryService.buildMemoryPrompt();
 
+      final session = currentSession!;
       final formatStr =
           session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
       final format =
           formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
+      final baseUrl = session.baseUrlOverride ??
+          _prefs.baseUrl ??
+          (format == ApiFormat.anthropic
+              ? 'https://api.anthropic.com'
+              : 'https://api.openai.com');
+      final basePrompt = session.systemPrompt ??
+          _prefs.systemPrompt ??
+          AppConstants.defaultSystemPrompt;
+      final fullPrompt = basePrompt + skillIndex + memoryPrompt;
+      // Don't persist the user message to session.messages in compare mode.
+      // Compare is a one-shot inspection — results live in compareResults only.
+      // If we persisted, the next real sendMessage would break role alternation
+      // (two consecutive user messages without an assistant reply between them).
+      final compareMessages = [
+        ..._truncateToFit(
+          [
+            ...session.toApiMessages(),
+            {'role': 'user', 'content': comparePrompt},
+          ],
+          maxTokens: _resolveContextTokenBudget(
+            llmConfig: LlmConfig(
+              format: format,
+              apiKey: apiKey,
+              model: compareModels.first,
+              baseUrl: baseUrl,
+              maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
+              thinkingBudget: _prefs.thinkingBudget,
+              temperature: _prefs.temperature,
+            ),
+            systemPrompt: fullPrompt,
+          ),
+        ).messages,
+      ];
+      notifyListeners();
 
       debugPrint(
         '[COMPARE] Starting model loop for ${compareModels.length} models',
@@ -1287,21 +1329,16 @@ class ChatProvider extends ChangeNotifier {
             format: format,
             apiKey: apiKey,
             model: model,
-            baseUrl: session.baseUrlOverride ??
-                _prefs.baseUrl ??
-                (format == ApiFormat.anthropic
-                    ? 'https://api.anthropic.com'
-                    : 'https://api.openai.com'),
+            baseUrl: baseUrl,
             maxTokens: _prefs.maxTokens ?? AppConstants.defaultMaxTokens,
             thinkingBudget: _prefs.thinkingBudget,
             temperature: _prefs.temperature,
           );
-          final llm = LlmService(config);
+          final llm = _llmServiceFactory(
+            config,
+            isInBackground: () => _appInBackground,
+          );
           try {
-            final basePrompt = session.systemPrompt ??
-                _prefs.systemPrompt ??
-                AppConstants.defaultSystemPrompt;
-            final fullPrompt = basePrompt + skillIndex + memoryPrompt;
             final response = await llm.chat(
               system: fullPrompt,
               messages: compareMessages,
@@ -1396,13 +1433,41 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
-  List<Map<String, dynamic>> _truncateToFit(
-      List<Map<String, dynamic>> messages) {
+  ContextTruncationResult _truncateToFit(
+    List<Map<String, dynamic>> messages, {
+    required int maxTokens,
+    int preserveLastMessages = 2,
+  }) {
     return ChatContextUtils.truncateToFit(
       messages,
-      maxChars: _prefs.contextLength,
+      maxTokens: maxTokens,
+      estimator: _tokenEstimator,
       autoCompact: _prefs.autoCompact,
+      preserveLastMessages: preserveLastMessages,
     );
+  }
+
+  int _resolveContextTokenBudget({
+    required LlmConfig llmConfig,
+    required String systemPrompt,
+  }) {
+    final systemTokens = _tokenEstimator.estimateText(systemPrompt);
+    final configuredOutputReserve = llmConfig.maxTokens +
+        (llmConfig.thinkingBudget > 0 ? llmConfig.thinkingBudget : 0);
+    final maxOutputReserve = (_prefs.contextTokenBudget * 0.5).floor();
+    final outputReserve = math.min(configuredOutputReserve, maxOutputReserve);
+    const safetyMargin = 1024;
+    final budget =
+        _prefs.contextTokenBudget - systemTokens - outputReserve - safetyMargin;
+    if (budget <= 0) {
+      debugPrint(
+        'Context token budget exhausted: context=${_prefs.contextTokenBudget}, '
+        'system=$systemTokens, outputReserve=$outputReserve, '
+        'safetyMargin=$safetyMargin.',
+      );
+      return 0;
+    }
+    return budget;
   }
 
   Future<Object?> _runAgentForState(
@@ -1573,8 +1638,21 @@ class ChatProvider extends ChangeNotifier {
     return errorCause;
   }
 
-  void _appendContextCompactionNotice(ChatSession session, int retainedCount) {
-    final text = AppStrings.contextCompactedNotice(retainedCount);
+  void _appendContextCompactionNotice(
+    ChatSession session,
+    int droppedMessageCount,
+    int droppedBlockCount,
+    int estimatedTokens,
+  ) {
+    final text = droppedMessageCount > 0
+        ? AppStrings.contextCompactedNotice(
+            droppedMessageCount,
+            estimatedTokens,
+          )
+        : AppStrings.contextToolCallsCleanedNotice(
+            droppedBlockCount,
+            estimatedTokens,
+          );
     if (session.messages.isNotEmpty) {
       final last = session.messages.last;
       if (last.isSystemNotice && last.textContent == text) return;

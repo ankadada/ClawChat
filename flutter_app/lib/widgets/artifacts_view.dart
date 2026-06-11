@@ -44,7 +44,7 @@ class _ArtifactsViewState extends State<ArtifactsView> {
   }
 
   String _sandboxHtml(String html) {
-    final csp = '<meta http-equiv="Content-Security-Policy" '
+    const csp = '<meta http-equiv="Content-Security-Policy" '
         'content="default-src \'none\'; style-src \'unsafe-inline\'; '
         'script-src \'unsafe-inline\'; img-src data:;">';
     return html.contains(RegExp(r'<head[\s>]'))

@@ -37,7 +37,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
   bool _fetchingModels = false;
   bool _manualModelInput = false;
   int _thinkingLevel = 0;
-  int _contextLength = AppConstants.defaultContextLength;
+  int _contextTokenBudget = AppConstants.defaultContextTokenBudget;
   double _temperature = AppConstants.defaultTemperature;
   bool _autoCompact = true;
   Timer? _saveDebounce;
@@ -45,7 +45,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
   bool _hasPendingSave = false;
   bool _showSaved = false;
 
-  static const _validContextLengths = [50000, 100000, 200000];
+  static const _validContextTokenBudgets = [32768, 65536, 200000];
   static const _thinkingBudgets = [0, 4096, 10000, 20000, 32000];
   static const _thinkingLabels = [
     AppStrings.thinkingOff,
@@ -80,10 +80,11 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
       _activeProfileId = activeProfileId;
       _editingProfileId = editingProfile.id;
       _loadProfileIntoForm(editingProfile);
-      final contextLength = _prefs.contextLength;
-      _contextLength = _validContextLengths.contains(contextLength)
-          ? contextLength
-          : AppConstants.defaultContextLength;
+      final contextTokenBudget = _prefs.contextTokenBudget;
+      _contextTokenBudget =
+          _validContextTokenBudgets.contains(contextTokenBudget)
+              ? contextTokenBudget
+              : AppConstants.defaultContextTokenBudget;
       _autoCompact = _prefs.autoCompact;
       _loading = false;
     });
@@ -157,7 +158,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         return false;
       }
     }
-    _prefs.contextLength = _contextLength;
+    _prefs.contextTokenBudget = _contextTokenBudget;
     _prefs.autoCompact = _autoCompact;
 
     if (!showIndicator || !mounted) return true;
@@ -694,26 +695,29 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(AppStrings.contextLength),
+            const Text(AppStrings.contextTokenBudget),
             const SizedBox(height: 8),
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: SegmentedButton<int>(
                 segments: const [
-                  ButtonSegment(value: 50000, label: Text(AppStrings.chars50k)),
                   ButtonSegment(
-                    value: 100000,
-                    label: Text(AppStrings.chars100k),
+                    value: 32768,
+                    label: Text(AppStrings.tokens32k),
+                  ),
+                  ButtonSegment(
+                    value: 65536,
+                    label: Text(AppStrings.tokens64k),
                   ),
                   ButtonSegment(
                     value: 200000,
-                    label: Text(AppStrings.chars200k),
+                    label: Text(AppStrings.tokens200k),
                   ),
                 ],
-                selected: {_contextLength},
+                selected: {_contextTokenBudget},
                 onSelectionChanged: (v) {
                   HapticFeedback.lightImpact();
-                  setState(() => _contextLength = v.first);
+                  setState(() => _contextTokenBudget = v.first);
                   _scheduleSave();
                 },
               ),
