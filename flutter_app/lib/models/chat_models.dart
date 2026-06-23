@@ -269,13 +269,8 @@ class ChatMessage {
   }
 
   factory ChatMessage.toolResults(List<Map<String, dynamic>> results) {
-    final content = results
-        .map((r) => ToolResultContent(
-              toolUseId: r['tool_use_id'] as String,
-              output: r['content'] as String,
-              isError: r['is_error'] as bool? ?? false,
-            ))
-        .toList();
+    final content =
+        results.map((r) => ToolResultContent.fromToolResultJson(r)).toList();
     return ChatMessage(role: 'user', content: content.cast<MessageContent>());
   }
 
@@ -380,11 +375,7 @@ class ChatMessage {
                   input: Map<String, dynamic>.from(c['input'] ?? {}),
                 );
               case 'tool_result':
-                return ToolResultContent(
-                  toolUseId: c['tool_use_id'] as String,
-                  output: c['output'] as String,
-                  isError: c['is_error'] as bool? ?? false,
-                );
+                return ToolResultContent.fromToolResultJson(c);
               default:
                 return TextContent(c.toString());
             }
@@ -507,20 +498,51 @@ class ToolUseContent extends MessageContent {
 
 class ToolResultContent extends MessageContent {
   final String toolUseId;
-  final String output;
+  final ToolResultPayload payload;
   final bool isError;
 
   ToolResultContent({
     required this.toolUseId,
-    required this.output,
+    String? output,
+    String? forLlm,
+    String? summary,
+    Map<String, dynamic>? metadata,
+    ToolResultPayload? payload,
     this.isError = false,
-  });
+  }) : payload = payload ??
+            ToolResultPayload(
+              forUser: output ?? '',
+              forLlm: forLlm,
+              summary: summary,
+              metadata: metadata ?? const {},
+            );
+
+  factory ToolResultContent.fromToolResultJson(Map<dynamic, dynamic> json) {
+    return ToolResultContent(
+      toolUseId: json['tool_use_id']?.toString() ?? '',
+      output: ToolResultPayload.stringifyContent(
+        json['output'] ?? json['content'] ?? '',
+      ),
+      forLlm: json.containsKey('for_llm')
+          ? ToolResultPayload.stringifyContent(json['for_llm'])
+          : null,
+      summary: json['summary']?.toString(),
+      metadata: ToolResultPayload.metadataFromJson(json['metadata']),
+      isError: json['is_error'] as bool? ?? false,
+    );
+  }
+
+  String get output => payload.forUser;
+  String get llmOutput => payload.forLlm ?? payload.forUser;
+  String? get forLlm => payload.forLlm;
+  String? get summary => payload.summary;
+  Map<String, dynamic> get metadata => payload.metadata;
 
   @override
   Map<String, dynamic> toApiJson() => {
         'type': 'tool_result',
         'tool_use_id': toolUseId,
-        'content': output,
+        'content': llmOutput,
         if (isError) 'is_error': true,
       };
 
@@ -529,6 +551,56 @@ class ToolResultContent extends MessageContent {
         'type': 'tool_result',
         'tool_use_id': toolUseId,
         'output': output,
+        if (payload.forLlm != null) 'for_llm': payload.forLlm,
+        if (payload.summary != null) 'summary': payload.summary,
+        if (payload.metadata.isNotEmpty) 'metadata': payload.metadata,
         'is_error': isError,
       };
+}
+
+class ToolResultPayload {
+  final String forUser;
+  final String? forLlm;
+  final String? summary;
+  final Map<String, dynamic> metadata;
+
+  const ToolResultPayload({
+    required this.forUser,
+    this.forLlm,
+    this.summary,
+    this.metadata = const {},
+  });
+
+  ToolResultPayload copyWith({
+    String? forUser,
+    String? forLlm,
+    String? summary,
+    Map<String, dynamic>? metadata,
+    bool clearForLlm = false,
+    bool clearSummary = false,
+  }) {
+    return ToolResultPayload(
+      forUser: forUser ?? this.forUser,
+      forLlm: clearForLlm ? null : (forLlm ?? this.forLlm),
+      summary: clearSummary ? null : (summary ?? this.summary),
+      metadata: metadata ?? this.metadata,
+    );
+  }
+
+  String get llmOutput => forLlm ?? forUser;
+
+  static Map<String, dynamic> metadataFromJson(Object? value) {
+    if (value is! Map) return const {};
+    return {
+      for (final entry in value.entries)
+        if (entry.key is String) entry.key as String: entry.value,
+    };
+  }
+
+  static String stringifyContent(Object? value) {
+    if (value == null) return '';
+    if (value is String) return value;
+    if (value is Iterable) return value.map((e) => e.toString()).join('\n');
+    return value.toString();
+  }
 }

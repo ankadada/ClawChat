@@ -1817,7 +1817,9 @@ class LlmService {
       return {
         'type': 'tool_result',
         'tool_use_id': block['tool_use_id'],
-        'content': _stringContent(block['content'] ?? block['output']),
+        'content': _stringContent(
+          block['for_llm'] ?? block['content'] ?? block['output'],
+        ),
         if (block['is_error'] == true) 'is_error': true,
       };
     }
@@ -1940,9 +1942,9 @@ class LlmService {
           final result = {
             'role': 'tool',
             'tool_call_id': item['tool_use_id'],
-            'content': item['content'] is String
-                ? item['content']
-                : jsonEncode(item['content']),
+            'content': _stringContent(
+              item['for_llm'] ?? item['content'] ?? item['output'],
+            ),
           };
           return result;
         }).toList();

@@ -263,9 +263,12 @@ class ProviderMessageTransform {
         return null;
       }
       return {
-        ...block,
         'type': 'tool_result',
         'tool_use_id': _scrubToolId(id, toolIdMap, assignedToolIds),
+        'content': _stringContent(
+          block['for_llm'] ?? block['content'] ?? block['output'],
+        ),
+        if (block['is_error'] == true) 'is_error': true,
       };
     }
 
@@ -379,7 +382,9 @@ class ProviderMessageTransform {
       return {
         'type': 'tool_result',
         'tool_use_id': block['tool_use_id'],
-        'content': _stringContent(block['content'] ?? block['output']),
+        'content': _stringContent(
+          block['for_llm'] ?? block['content'] ?? block['output'],
+        ),
         if (block['is_error'] == true) 'is_error': true,
       };
     }
@@ -502,9 +507,9 @@ class ProviderMessageTransform {
           return {
             'role': 'tool',
             'tool_call_id': item['tool_use_id'],
-            'content': item['content'] is String
-                ? item['content']
-                : jsonEncode(item['content']),
+            'content': _stringContent(
+              item['for_llm'] ?? item['content'] ?? item['output'],
+            ),
           };
         }).toList();
       }

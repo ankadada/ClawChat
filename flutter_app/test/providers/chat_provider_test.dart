@@ -2083,6 +2083,73 @@ void main() {
       expect(prefs.getString(TokenCalibrationService.storageKey), isNull);
     });
 
+    test('tool calls persist ForUser while next LLM request receives ForLLM',
+        () async {
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final tools = ToolRegistry()
+        ..register(
+          _DualTrackTool(),
+          risk: ToolRisk.safe,
+        );
+      final provider = ChatProvider(
+        toolRegistry: tools,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (messages) {
+            observedMessages.add((jsonDecode(jsonEncode(messages)) as List)
+                .map((message) => Map<String, dynamic>.from(message as Map))
+                .toList());
+            if (observedMessages.length == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'call_1',
+                      toolName: 'dual_track',
+                      toolInput: {'text': 'hi'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'ok')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('use tool');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(2));
+      final secondRequest = observedMessages.last.toString();
+      expect(secondRequest, contains('compact for llm'));
+      expect(secondRequest, isNot(contains('FULL USER OUTPUT')));
+
+      final toolResult = provider.currentSession!.messages
+          .expand((message) => message.toolResults)
+          .single;
+      expect(toolResult.output, contains('FULL USER OUTPUT'));
+      expect(toolResult.llmOutput, contains('compact for llm'));
+      expect(toolResult.toApiJson()['content'], contains('compact for llm'));
+    });
+
     test('next send uses persisted calibration multiplier', () async {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
@@ -2576,5 +2643,42 @@ class _EchoTool extends Tool {
   @override
   Future<String> execute(Map<String, dynamic> input) async {
     return input['text']?.toString() ?? '';
+  }
+}
+
+class _DualTrackTool extends Tool {
+  @override
+  String get name => 'dual_track';
+
+  @override
+  String get description => 'Returns distinct user and LLM tracks';
+
+  @override
+  Map<String, dynamic> get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'text': {'type': 'string'},
+        },
+      };
+
+  @override
+  Future<String> execute(Map<String, dynamic> input) async {
+    throw UnimplementedError('executeResult is used by AgentService');
+  }
+
+  @override
+  Future<ToolResultPayload> executeResult(Map<String, dynamic> input) async {
+    return const ToolResultPayload(
+      forUser: 'FULL USER OUTPUT with detailed logs',
+      forLlm: 'compact for llm',
+      summary: 'dual track summary',
+      metadata: {
+        'toolName': 'dual_track',
+        'originalChars': 35,
+        'llmChars': 15,
+        'truncated': false,
+        'status': 'success',
+      },
+    );
   }
 }

@@ -362,7 +362,11 @@ class ContextSummaryService {
           'input': _truncate(jsonEncode(input), _maxToolInputChars),
         };
       case 'tool_result':
-        final content = block['content'] ?? block['output'] ?? '';
+        final content = block['summary'] ??
+            block['for_llm'] ??
+            block['content'] ??
+            block['output'] ??
+            '';
         return {
           'type': 'tool_result',
           'tool_use_id': block['tool_use_id']?.toString() ?? '',
@@ -439,7 +443,9 @@ class ContextSummaryService {
             final type = block['type'];
             if (type == 'text') return block['text']?.toString() ?? '';
             if (type == 'tool_result') {
-              return block['content']?.toString() ??
+              return block['summary']?.toString() ??
+                  block['for_llm']?.toString() ??
+                  block['content']?.toString() ??
                   block['output']?.toString() ??
                   '';
             }
@@ -467,8 +473,13 @@ class ContextSummaryService {
           'Tool ${block['name'] ?? 'unknown'} called with ${_truncate(jsonEncode(block['input'] ?? {}), 180)}',
         );
       } else if (block['type'] == 'tool_result') {
+        final content = block['summary'] ??
+            block['for_llm'] ??
+            block['content'] ??
+            block['output'] ??
+            '';
         descriptions.add(
-          'Tool result ${block['is_error'] == true ? '(error)' : ''}: ${_truncate((block['content'] ?? block['output'] ?? '').toString(), 180)}',
+          'Tool result ${block['is_error'] == true ? '(error)' : ''}: ${_truncate(content.toString(), 180)}',
         );
       }
     }

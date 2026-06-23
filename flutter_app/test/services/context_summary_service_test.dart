@@ -4,6 +4,7 @@ import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
 import 'package:clawchat/services/context_summary_service.dart';
 import 'package:clawchat/services/llm_service.dart';
+import 'package:clawchat/services/tools/tool_result_formatter.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -114,6 +115,62 @@ void main() {
     final content = (projected.single['content'] as List).single as Map;
     expect((content['content'] as String).length, lessThan(1400));
     expect(content['content'], contains('truncated'));
+  });
+
+  test('safe projection prefers summary and ForLLM over full output', () {
+    final projected = ContextSummaryService.safeProjectMessages([
+      {
+        'role': 'user',
+        'content': [
+          {
+            'type': 'tool_result',
+            'tool_use_id': 'call_1',
+            'summary': 'summary projection',
+            'for_llm': 'compact model projection',
+            'content': 'legacy compact projection',
+            'output': 'FULL OUTPUT THAT MUST NOT LEAK',
+          },
+          {
+            'type': 'tool_result',
+            'tool_use_id': 'call_2',
+            'for_llm': 'compact model projection 2',
+            'output': 'FULL OUTPUT 2 THAT MUST NOT LEAK',
+          },
+        ],
+      },
+    ]);
+
+    final blocks = projected.single['content'] as List;
+    expect(blocks.first['content'], 'summary projection');
+    expect(blocks.last['content'], 'compact model projection 2');
+    expect(projected.toString(), isNot(contains('FULL OUTPUT')));
+  });
+
+  test('safe projection uses sanitized tool summary without raw output', () {
+    final rawBase64 = 'a' * 900;
+    final payload = ToolResultFormatter.generic(
+      toolName: 'generic_tool',
+      output: 'preview $rawBase64 tail',
+    );
+
+    final projected = ContextSummaryService.safeProjectMessages([
+      {
+        'role': 'user',
+        'content': [
+          {
+            'type': 'tool_result',
+            'tool_use_id': 'call_1',
+            'summary': payload.summary,
+            'for_llm': payload.forLlm,
+            'output': payload.forUser,
+          },
+        ],
+      },
+    ]);
+
+    final serialized = projected.toString();
+    expect(serialized, contains('[base64 omitted'));
+    expect(serialized, isNot(contains(rawBase64)));
   });
 
   test('safe projection recursively removes unsafe tool input metadata', () {

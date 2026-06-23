@@ -1,9 +1,11 @@
 import '../../services/llm_service.dart';
+import '../../models/chat_models.dart';
 import '../preferences_service.dart';
 import 'bash_tool.dart';
 import 'env_var_tool.dart';
 import 'phone_intent_tool.dart';
 import 'read_file_tool.dart';
+import 'tool_result_formatter.dart';
 import 'tool_policy.dart';
 import 'write_file_tool.dart';
 import 'web_fetch_tool.dart';
@@ -16,6 +18,15 @@ abstract class Tool {
   Map<String, dynamic> get inputSchema;
 
   Future<String> execute(Map<String, dynamic> input);
+
+  Future<ToolResultPayload> executeResult(Map<String, dynamic> input) async {
+    final output = await execute(input);
+    return ToolResultFormatter.format(
+      toolName: name,
+      input: input,
+      output: output,
+    );
+  }
 
   ToolDefinition toDefinition() => ToolDefinition(
         name: name,
@@ -65,10 +76,27 @@ class ToolRegistry {
   }
 
   Future<String> executeTool(String name, Map<String, dynamic> input) async {
+    final payload = await executeToolResult(name, input);
+    return payload.forUser;
+  }
+
+  Future<ToolResultPayload> executeToolResult(
+    String name,
+    Map<String, dynamic> input,
+  ) async {
     final tool = _tools[name];
     if (tool == null) throw Exception('Unknown tool: $name');
-    final output = await tool.execute(input);
-    return sanitizeToolOutput(output);
+    final payload = await tool.executeResult(input);
+    final sanitizedForUser = sanitizeToolOutput(payload.forUser);
+    final sanitizedForLlm =
+        payload.forLlm == null ? null : sanitizeToolOutput(payload.forLlm!);
+    final sanitizedSummary =
+        payload.summary == null ? null : sanitizeToolOutput(payload.summary!);
+    return payload.copyWith(
+      forUser: sanitizedForUser,
+      forLlm: sanitizedForLlm,
+      summary: sanitizedSummary,
+    );
   }
 
   static String sanitizeToolOutput(String output) {

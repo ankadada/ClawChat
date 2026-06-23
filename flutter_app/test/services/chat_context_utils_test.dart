@@ -146,6 +146,29 @@ void main() {
       expect(diagnostics.toolTokens, greaterThan(0));
       expect(diagnostics.largestBlockTokens, greaterThanOrEqualTo(1500));
     });
+
+    test('estimates tool_result blocks from ForLLM projection', () {
+      final withFullOutput = estimator.estimateBlock({
+        'type': 'tool_result',
+        'tool_use_id': 'call_1',
+        'content': 'safe compact result',
+        'for_llm': 'safe compact result',
+        'output': 'FULL ${'x' * 5000}',
+      });
+      final compactOnly = estimator.estimateBlock({
+        'type': 'tool_result',
+        'tool_use_id': 'call_1',
+        'content': 'safe compact result',
+      });
+      final legacyFull = estimator.estimateBlock({
+        'type': 'tool_result',
+        'tool_use_id': 'call_1',
+        'content': 'FULL ${'x' * 5000}',
+      });
+
+      expect(withFullOutput, compactOnly);
+      expect(withFullOutput, lessThan(legacyFull));
+    });
   });
 
   group('truncateToFit token-aware behavior', () {
@@ -586,6 +609,7 @@ void main() {
       String toolName,
       String result, {
       bool isError = false,
+      String? forLlm,
     }) {
       return [
         {'role': 'user', 'content': prompt},
@@ -606,7 +630,9 @@ void main() {
             {
               'type': 'tool_result',
               'tool_use_id': toolId,
-              'content': result,
+              'content': forLlm ?? result,
+              if (forLlm != null) 'output': result,
+              if (forLlm != null) 'for_llm': forLlm,
               if (isError) 'is_error': true,
             },
           ],
@@ -633,6 +659,64 @@ void main() {
       expect(serialized, isNot(contains('old ${'x' * 3000}')));
       expect(serialized, contains('middle ${'x' * 3000}'));
       expect(serialized, contains('latest ${'x' * 3000}'));
+    });
+
+    test('skips P3 compression for new dual-track tool results', () {
+      final messages = [
+        ...toolTurn(
+          'old',
+          'call_old',
+          'bash',
+          'full output ${'x' * 3000}',
+          forLlm: 'compact result',
+        ),
+        ...toolTurn('middle', 'call_mid', 'grep', 'middle ${'x' * 3000}'),
+        ...toolTurn('latest', 'call_new', 'cat', 'latest ${'x' * 3000}'),
+      ];
+
+      final result = ChatContextUtils.compressOldToolResults(
+        messages,
+        estimator: estimator,
+      );
+      final oldResult = result
+          .where(ChatContextUtils.hasToolResultContent)
+          .map((message) => message['content'] as List)
+          .expand((content) => content)
+          .whereType<Map>()
+          .firstWhere((block) => block['tool_use_id'] == 'call_old');
+
+      expect(oldResult['for_llm'], 'compact result');
+      expect(oldResult['content'], 'compact result');
+      expect(oldResult['output'], contains('full output'));
+    });
+
+    test('legacy P3 fallback compresses legacy content', () {
+      final messages = [
+        ...toolTurn(
+          'old',
+          'call_old',
+          'bash',
+          'legacy full ${'x' * 3000}',
+        ),
+        ...toolTurn('middle', 'call_mid', 'grep', 'middle ${'x' * 3000}'),
+        ...toolTurn('latest', 'call_new', 'cat', 'latest ${'x' * 3000}'),
+      ];
+
+      final result = ChatContextUtils.compressOldToolResults(
+        messages,
+        estimator: estimator,
+      );
+      final oldResult = result
+          .where(ChatContextUtils.hasToolResultContent)
+          .map((message) => message['content'] as List)
+          .expand((content) => content)
+          .whereType<Map>()
+          .firstWhere((block) => block['tool_use_id'] == 'call_old');
+
+      expect(oldResult['content'], contains('Tool result truncated'));
+      expect(
+          oldResult['content'], isNot(contains('legacy full ${'x' * 3000}')));
+      expect(oldResult, isNot(contains('output')));
     });
 
     test('does not count current text-only user turn against protection', () {

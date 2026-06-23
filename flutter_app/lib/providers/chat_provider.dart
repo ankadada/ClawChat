@@ -2524,12 +2524,15 @@ class ChatProvider extends ChangeNotifier {
           sanitized.add(sanitizedTool);
         case ToolResultContent(
             :final toolUseId,
-            :final output,
+            :final payload,
             :final isError,
           ):
           sanitized.add(ToolResultContent(
             toolUseId: toolUseId,
-            output: output,
+            output: payload.forUser,
+            forLlm: payload.forLlm,
+            summary: payload.summary,
+            metadata: _sanitizeRecoveryMap(payload.metadata),
             isError: isError,
           ));
       }
@@ -2617,20 +2620,7 @@ class ChatProvider extends ChangeNotifier {
                 input: Map<String, dynamic>.from(item['input'] ?? {}),
               );
             case 'tool_result':
-              final rawContent = item['content'];
-              final String output;
-              if (rawContent is String) {
-                output = rawContent;
-              } else if (rawContent is List) {
-                output = rawContent.map((e) => e.toString()).join('\n');
-              } else {
-                output = rawContent?.toString() ?? '';
-              }
-              return ToolResultContent(
-                toolUseId: item['tool_use_id'] as String,
-                output: output,
-                isError: item['is_error'] as bool? ?? false,
-              );
+              return ToolResultContent.fromToolResultJson(item);
             default:
               return TextContent(item.toString());
           }

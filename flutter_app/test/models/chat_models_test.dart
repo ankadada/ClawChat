@@ -116,6 +116,92 @@ void main() {
     });
   });
 
+  group('ToolResultContent dual-track payload', () {
+    test('round-trips new JSON while preserving ForUser output', () {
+      final content = ToolResultContent(
+        toolUseId: 'call_1',
+        output: 'full user-visible output',
+        forLlm: '{"output":"compact"}',
+        summary: 'compact summary',
+        metadata: const {
+          'toolName': 'bash',
+          'originalChars': 24,
+        },
+      );
+
+      final restored = ToolResultContent.fromToolResultJson(content.toJson());
+
+      expect(restored.output, 'full user-visible output');
+      expect(restored.llmOutput, '{"output":"compact"}');
+      expect(restored.summary, 'compact summary');
+      expect(restored.metadata['toolName'], 'bash');
+      expect(restored.toJson(), {
+        'type': 'tool_result',
+        'tool_use_id': 'call_1',
+        'output': 'full user-visible output',
+        'for_llm': '{"output":"compact"}',
+        'summary': 'compact summary',
+        'metadata': {
+          'toolName': 'bash',
+          'originalChars': 24,
+        },
+        'is_error': false,
+      });
+    });
+
+    test('loads legacy output and API-like content fields', () {
+      final legacy = ToolResultContent.fromToolResultJson({
+        'type': 'tool_result',
+        'tool_use_id': 'call_legacy',
+        'output': 'legacy output',
+      });
+      final apiLike = ToolResultContent.fromToolResultJson({
+        'type': 'tool_result',
+        'tool_use_id': 'call_api',
+        'content': ['line 1', 'line 2'],
+      });
+
+      expect(legacy.output, 'legacy output');
+      expect(legacy.llmOutput, 'legacy output');
+      expect(apiLike.output, 'line 1\nline 2');
+      expect(apiLike.llmOutput, 'line 1\nline 2');
+    });
+
+    test('toApiJson sends ForLLM while toJson keeps ForUser', () {
+      final message = ChatMessage.toolResults([
+        {
+          'type': 'tool_result',
+          'tool_use_id': 'call_1',
+          'content': 'compact for model',
+          'output': 'complete user output',
+          'for_llm': 'compact for model',
+          'summary': 'short summary',
+        },
+      ]);
+
+      expect(message.toApiJson(), {
+        'role': 'user',
+        'content': [
+          {
+            'type': 'tool_result',
+            'tool_use_id': 'call_1',
+            'content': 'compact for model',
+          },
+        ],
+      });
+      expect(message.toJson()['content'], [
+        {
+          'type': 'tool_result',
+          'tool_use_id': 'call_1',
+          'output': 'complete user output',
+          'for_llm': 'compact for model',
+          'summary': 'short summary',
+          'is_error': false,
+        },
+      ]);
+    });
+  });
+
   group('ChatMessage alternatives', () {
     test('textContent follows active alternative without mutating latest text',
         () {

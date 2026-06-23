@@ -166,6 +166,57 @@ void main() {
       ]);
     });
 
+    test('tool_result canonical projection keeps only ForLLM fields', () {
+      final result = transform.transformCanonical(
+        [
+          {
+            'role': 'assistant',
+            'content': [
+              {
+                'type': 'tool_use',
+                'id': 'call_1',
+                'name': 'bash',
+                'input': {'cmd': 'pwd'},
+              },
+            ],
+          },
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'tool_result',
+                'tool_use_id': 'call_1',
+                'content': 'compact content',
+                'output': 'FULL OUTPUT THAT MUST NOT LEAK',
+                'for_llm': 'safe compact payload',
+                'summary': 'summary only',
+                'metadata': {
+                  'raw': 'FULL OUTPUT THAT MUST NOT LEAK',
+                  'safe': 'kept only outside provider payload',
+                },
+              },
+            ],
+          },
+        ],
+        const ProviderTransformOptions(
+          apiFormat: 'anthropic',
+          modelId: 'claude',
+        ),
+      );
+
+      final serialized = result.messages.toString();
+      expect(serialized, contains('safe compact payload'));
+      expect(serialized, isNot(contains('FULL OUTPUT THAT MUST NOT LEAK')));
+      expect(serialized, isNot(contains('metadata')));
+      expect(result.messages.last['content'], [
+        {
+          'type': 'tool_result',
+          'tool_use_id': 'call_1',
+          'content': 'safe compact payload',
+        },
+      ]);
+    });
+
     test('avoids collisions when scrubbed tool ids match', () {
       final result = transform.transformCanonical(
         [
@@ -492,6 +543,67 @@ void main() {
           'content': '/root/workspace',
         },
       ]);
+    });
+
+    test('provider payloads use ForLLM and exclude full output', () {
+      final messages = [
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'call_1',
+              'name': 'bash',
+              'input': {'command': 'cat huge.log'},
+            },
+          ],
+        },
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'call_1',
+              'content': 'legacy compact',
+              'for_llm': 'structured compact result',
+              'output': 'FULL OUTPUT THAT MUST NOT LEAK',
+              'metadata': {'raw': 'FULL OUTPUT THAT MUST NOT LEAK'},
+            },
+          ],
+        },
+      ];
+
+      final anthropicPayload = transform.toProviderPayload(
+        messages,
+        const ProviderTransformOptions(
+          apiFormat: 'anthropic',
+          modelId: 'claude',
+        ),
+      );
+      final openAiPayload = transform.toProviderPayload(
+        messages,
+        const ProviderTransformOptions(
+          apiFormat: 'openai',
+          modelId: 'gpt-test',
+        ),
+      );
+
+      expect(
+          anthropicPayload.toString(), contains('structured compact result'));
+      expect(openAiPayload.toString(), contains('structured compact result'));
+      expect(
+        anthropicPayload.toString(),
+        isNot(contains('FULL OUTPUT THAT MUST NOT LEAK')),
+      );
+      expect(
+        openAiPayload.toString(),
+        isNot(contains('FULL OUTPUT THAT MUST NOT LEAK')),
+      );
+      expect(openAiPayload.last, {
+        'role': 'tool',
+        'tool_call_id': 'call_1',
+        'content': 'structured compact result',
+      });
     });
   });
 }

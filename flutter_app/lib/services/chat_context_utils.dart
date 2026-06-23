@@ -3,6 +3,19 @@ import 'dart:math' as math;
 
 import 'provider_message_transform.dart';
 
+Object? _toolResultContentForLlm(Map<dynamic, dynamic> block) {
+  return block['for_llm'] ?? block['content'] ?? block['output'];
+}
+
+Map<String, dynamic> _toolResultForLlmBlock(Map<String, dynamic> block) {
+  return {
+    'type': 'tool_result',
+    'tool_use_id': block['tool_use_id'],
+    'content': _toolResultContentForLlm(block),
+    if (block['is_error'] == true) 'is_error': true,
+  };
+}
+
 class TokenEstimator {
   final double calibrationMultiplier;
 
@@ -162,8 +175,9 @@ class TokenEstimator {
             (reasoning is String ? _rawEstimateText(reasoning) : 0);
       case 'image':
         return _rawEstimateImage(block);
-      case 'tool_use':
       case 'tool_result':
+        return _blockOverhead + _estimateJson(_toolResultForLlmBlock(block));
+      case 'tool_use':
         return _blockOverhead + _estimateJson(block);
       default:
         return _blockOverhead + _estimateJson(block);
@@ -475,12 +489,13 @@ class ChatContextUtils {
         final block = Map<String, dynamic>.from(item);
         if (i < protectedStart &&
             block['type'] == 'tool_result' &&
+            block['for_llm'] == null &&
             estimator.estimateBlock(block) > compressionThresholdTokens) {
           final toolUseId = block['tool_use_id']?.toString() ?? '';
           final toolName = toolNames[toolUseId] ?? 'unknown';
           final status = block['is_error'] == true ? 'error' : 'success';
           final preview = _previewToolResultContent(
-            block['content'] ?? block['output'],
+            _toolResultContentForLlm(block),
             previewCharLimit,
           );
           blocks.add({

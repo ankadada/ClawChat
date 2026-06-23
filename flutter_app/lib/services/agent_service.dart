@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../models/chat_models.dart';
 import 'llm_service.dart';
 import 'privacy_filter.dart';
 import 'tools/tool_policy.dart';
@@ -120,9 +121,9 @@ class AgentService {
       try {
         await for (final event in _llm.chatStream(
           system: _systemPrompt,
-          // Keep [messages] raw for UI/session storage; only the LLM payload
-          // receives masked tool outputs.
-          messages: _filterHistoryMessages(messages),
+          // Keep [messages] raw for UI/session storage; the LLM receives only
+          // the safe tool-result projection.
+          messages: _messagesForLlm(messages),
           tools: toolDefs,
         )) {
           if (_cancelled) return;
@@ -193,12 +194,7 @@ class AgentService {
         for (final r in results) {
           if (r == null) continue;
           yield AgentToolDone(r.id, r.output, isError: r.isError);
-          toolResults.add({
-            'type': 'tool_result',
-            'tool_use_id': r.id,
-            'content': r.output,
-            if (r.isError) 'is_error': true,
-          });
+          toolResults.add(r.toJson());
         }
       } else {
         for (final block in toolBlocks) {
@@ -212,12 +208,7 @@ class AgentService {
               await _executeToolWithPolicy(toolUseId, toolName, toolInput);
           yield AgentToolDone(result.id, result.output,
               isError: result.isError);
-          toolResults.add({
-            'type': 'tool_result',
-            'tool_use_id': result.id,
-            'content': result.output,
-            if (result.isError) 'is_error': true,
-          });
+          toolResults.add(result.toJson());
         }
       }
 
@@ -230,31 +221,35 @@ class AgentService {
     }
   }
 
-  List<Map<String, dynamic>> _filterHistoryMessages(
+  List<Map<String, dynamic>> _messagesForLlm(
     List<Map<String, dynamic>> messages,
   ) {
-    if (!privacyMode || envVars.isEmpty) return messages;
     return messages.map((msg) {
       final content = msg['content'];
       if (content is! List) return msg;
 
       var changed = false;
-      final filteredContent = content.map((block) {
-        if (block is Map && block['type'] == 'tool_result') {
-          final value = block['content'];
-          if (value is String) {
-            final masked = PrivacyFilter.maskEnvVarValues(value, envVars);
-            if (masked != value) {
+      final filteredContent = content
+          .map((block) {
+            if (block is Map && block['type'] == 'tool_result') {
+              final id = block['tool_use_id']?.toString();
+              if (id == null || id.isEmpty) {
+                changed = true;
+                return null;
+              }
               changed = true;
-              return {
-                ...Map<String, dynamic>.from(block),
-                'content': masked,
+              final projected = <String, dynamic>{
+                'type': 'tool_result',
+                'tool_use_id': id,
+                'content': _safeToolResultContent(block),
+                if (block['is_error'] == true) 'is_error': true,
               };
+              return projected;
             }
-          }
-        }
-        return block;
-      }).toList();
+            return block;
+          })
+          .where((block) => block != null)
+          .toList();
 
       if (!changed) return msg;
       return {
@@ -264,14 +259,31 @@ class AgentService {
     }).toList();
   }
 
+  String _safeToolResultContent(Map<dynamic, dynamic> block) {
+    final raw = ToolResultPayload.stringifyContent(
+      block['for_llm'] ?? block['content'] ?? block['output'],
+    );
+    if (!privacyMode || envVars.isEmpty) return raw;
+    return PrivacyFilter.maskEnvVarValues(raw, envVars);
+  }
+
   Future<_ToolResult> _executeToolWithPolicy(
     String toolUseId,
     String toolName,
     Map<String, dynamic> toolInput,
   ) async {
     if (!_tools.hasTool(toolName)) {
+      const output = 'Tool error: Unknown tool';
       return _ToolResult(
-          toolUseId, 'Tool error: Unknown tool: $toolName', true);
+        toolUseId,
+        ToolResultPayload(
+          forUser: '$output: $toolName',
+          forLlm: '$output: $toolName',
+          summary: '$output: $toolName',
+          metadata: const {'toolName': 'unknown', 'status': 'error'},
+        ),
+        true,
+      );
     }
 
     final request = ToolApprovalRequest(
@@ -283,23 +295,50 @@ class AgentService {
     if (!approved) {
       return _ToolResult(
         toolUseId,
-        'tool execution denied by user: $toolName',
+        ToolResultPayload(
+          forUser: 'tool execution denied by user: $toolName',
+          forLlm: 'tool execution denied by user: $toolName',
+          summary: 'tool execution denied by user: $toolName',
+          metadata: {'toolName': toolName, 'status': 'error'},
+        ),
         true,
       );
     }
 
     try {
-      final output = await _tools.executeTool(toolName, toolInput);
-      return _ToolResult(toolUseId, output, false);
+      final payload = await _tools.executeToolResult(toolName, toolInput);
+      return _ToolResult(toolUseId, payload, false);
     } catch (e) {
-      return _ToolResult(toolUseId, 'Tool error: $e', true);
+      return _ToolResult(
+        toolUseId,
+        ToolResultPayload(
+          forUser: 'Tool error: $e',
+          forLlm: 'Tool error: $e',
+          summary: 'Tool error: $e',
+          metadata: {'toolName': toolName, 'status': 'error'},
+        ),
+        true,
+      );
     }
   }
 }
 
 class _ToolResult {
   final String id;
-  final String output;
+  final ToolResultPayload payload;
   final bool isError;
-  _ToolResult(this.id, this.output, this.isError);
+  _ToolResult(this.id, this.payload, this.isError);
+
+  String get output => payload.forUser;
+
+  Map<String, dynamic> toJson() => {
+        'type': 'tool_result',
+        'tool_use_id': id,
+        'content': payload.llmOutput,
+        'output': payload.forUser,
+        if (payload.forLlm != null) 'for_llm': payload.forLlm,
+        if (payload.summary != null) 'summary': payload.summary,
+        if (payload.metadata.isNotEmpty) 'metadata': payload.metadata,
+        if (isError) 'is_error': true,
+      };
 }
