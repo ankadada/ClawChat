@@ -18,6 +18,7 @@ class TokenCalibrationSample {
   final int? cacheReadTokens;
   final int? cacheCreationTokens;
   final bool isRecovery;
+  final String? skipReasonOverride;
 
   const TokenCalibrationSample({
     required this.key,
@@ -33,6 +34,7 @@ class TokenCalibrationSample {
     this.cacheReadTokens,
     this.cacheCreationTokens,
     this.isRecovery = false,
+    this.skipReasonOverride,
   });
 
   int? get totalInputTokens {
@@ -172,6 +174,8 @@ class TokenCalibrationService {
   }
 
   String? _skipReason(TokenCalibrationSample sample) {
+    final skipReasonOverride = sample.skipReasonOverride;
+    if (skipReasonOverride != null) return skipReasonOverride;
     final totalInputTokens = sample.totalInputTokens;
     if (totalInputTokens == null) return 'missing_actual_tokens';
     if (sample.rawEstimatedInputTokens < 512) return 'estimate_too_small';

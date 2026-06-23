@@ -78,6 +78,23 @@ void main() {
       expect((nested['image'] as Map)['data'], '[redacted]');
     });
 
+    test('redacts secret-shaped values under non-sensitive keys', () {
+      final service = RuntimeDebugEventService();
+
+      service.record(RuntimeDebugEvent(
+        type: 'safe',
+        sessionId: 's1',
+        data: {
+          'note': 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234567890',
+        },
+      ));
+
+      final data = service.recent().single.data;
+      expect(data['note'], contains('[redacted: bearer_token]'));
+      expect(data['note'].toString(),
+          isNot(contains('abcdefghijklmnopqrstuvwxyz')));
+    });
+
     test('non-positive capacity stores no events', () {
       final service = RuntimeDebugEventService(capacity: 0);
 

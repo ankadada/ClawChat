@@ -63,6 +63,26 @@ void main() {
       expect('[REDACTED]'.allMatches(result).length, 2);
     });
 
+    test('redacts broad sensitive values from API error messages', () async {
+      const bearer = 'abcdefghijklmnopqrstuvwxyz1234567890';
+      const githubPat = 'github_pat_abcdefghijklmnopqrstuvwxyz123456';
+      const body = 'Authorization: Bearer $bearer\n'
+          'password=hunter2\n'
+          'github token $githubPat\n'
+          'client_secret=client-secret-value';
+
+      final error = await openAiChatError(400, body);
+
+      expect(error, contains('[redacted: bearer_token]'));
+      expect(error, contains('password=[redacted: password]'));
+      expect(error, contains('[redacted: token]'));
+      expect(error, contains('client_secret=[redacted: secret]'));
+      expect(error, isNot(contains(bearer)));
+      expect(error, isNot(contains('hunter2')));
+      expect(error, isNot(contains(githubPat)));
+      expect(error, isNot(contains('client-secret-value')));
+    });
+
     test('handles empty body', () async {
       expect(await sanitizedErrorBody(''), '');
     });
@@ -355,6 +375,36 @@ void main() {
       ]);
       expect(captured.body['max_tokens'], 8192);
       expect(jsonDecode(jsonEncode(captured.body)), captured.body);
+    });
+
+    test('redacts secrets from system prompts in request bodies', () async {
+      final anthropic = await captureAnthropicRequest(
+        model: 'claude-sonnet-4-20250514',
+        system:
+            'Use api_key=sk-proj-abcdefghijklmnopqrstuvwxyz123456 carefully.',
+        messages: const [
+          {'role': 'user', 'content': 'hi'},
+        ],
+        baseUrlForPort: (port) => 'http://127.0.0.1:$port/v1/messages',
+      );
+      final openai = await captureOpenAiRequest(
+        model: 'gpt-test',
+        system:
+            'Use api_key=sk-proj-abcdefghijklmnopqrstuvwxyz123456 carefully.',
+        messages: const [
+          {'role': 'user', 'content': 'hi'},
+        ],
+        baseUrlForPort: (port) => 'http://127.0.0.1:$port/v1/chat/completions',
+      );
+
+      expect(anthropic.body['system'], contains('[redacted: api_key]'));
+      expect(anthropic.body['system'], isNot(contains('sk-proj-')));
+      expect(
+        openai.body['messages'].first['content'],
+        contains('[redacted: api_key]'),
+      );
+      expect(openai.body['messages'].first['content'],
+          isNot(contains('sk-proj-')));
     });
 
     test(

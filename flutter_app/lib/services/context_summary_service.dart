@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import '../models/chat_models.dart';
 import 'chat_context_utils.dart';
+import 'llm_content_sanitizer.dart';
 import 'llm_service.dart';
 
 class ContextSummaryRequest {
@@ -74,8 +75,9 @@ class ContextSummaryService {
       if (text.isEmpty) {
         throw StateError('Context summary response was empty.');
       }
+      final sanitizedText = _sanitizeText(text);
       final fittedText = _fitSummaryTextToBudget(
-        text,
+        sanitizedText,
         request.estimator,
         request.summaryBudget,
       );
@@ -112,7 +114,7 @@ class ContextSummaryService {
     final buffer = StringBuffer();
     if (existingSummary != null && existingSummary.text.trim().isNotEmpty) {
       buffer.writeln('Existing rolling summary:');
-      buffer.writeln(existingSummary.text.trim());
+      buffer.writeln(_sanitizeText(existingSummary.text.trim()));
       buffer.writeln();
       buffer.writeln('New earlier conversation to merge into the summary:');
     } else {
@@ -130,7 +132,7 @@ class ContextSummaryService {
     final existing = existingSummary?.text.trim();
     if (existing != null && existing.isNotEmpty) {
       lines.add('## Existing Summary');
-      lines.add(_truncate(existing, _maxExtractiveChars));
+      lines.add(_truncate(_sanitizeText(existing), _maxExtractiveChars));
     }
     final userLines = <String>[];
     final assistantLines = <String>[];
@@ -139,7 +141,7 @@ class ContextSummaryService {
 
     for (final message in messages) {
       final role = message['role'];
-      final text = _messageText(message);
+      final text = _sanitizeText(_messageText(message));
       final paths = _filePathPattern
           .allMatches(text)
           .map((match) => match.group(0))
@@ -212,13 +214,14 @@ class ContextSummaryService {
 
   ContextSummary _buildSummary(ContextSummaryRequest request, String text) {
     final now = DateTime.now();
+    final sanitizedText = _sanitizeText(text).trim();
     return ContextSummary(
       version: version,
-      text: text.trim(),
+      text: sanitizedText,
       coveredMessageCount: request.coveredMessageCount,
       coveredDigest: request.coveredDigest,
       sourceEstimatedTokens: request.sourceEstimatedTokens,
-      summaryEstimatedTokens: request.estimator.estimateText(text.trim()),
+      summaryEstimatedTokens: request.estimator.estimateText(sanitizedText),
       createdAt: request.existingSummary?.createdAt ?? now,
       updatedAt: now,
       model: LlmService.modelIdFromDisplay(request.llmConfig.model),
@@ -284,7 +287,7 @@ class ContextSummaryService {
     final buffer = StringBuffer();
     if (existingSummary != null && existingSummary.text.trim().isNotEmpty) {
       buffer.writeln('Existing rolling summary:');
-      buffer.writeln(existingSummary.text.trim());
+      buffer.writeln(_sanitizeText(existingSummary.text.trim()));
       buffer.writeln();
       buffer.writeln('New earlier conversation to merge into the summary:');
     } else {
@@ -347,7 +350,10 @@ class ContextSummaryService {
       case 'text':
         final text = block['text'];
         if (text is! String || text.trim().isEmpty) return null;
-        return {'type': 'text', 'text': _truncatePlainText(text, maxTextChars)};
+        return {
+          'type': 'text',
+          'text': _truncatePlainText(_sanitizeText(text), maxTextChars),
+        };
       case 'image':
         return {
           'type': 'image',
@@ -355,7 +361,8 @@ class ContextSummaryService {
           'media_type': _imageMediaType(block),
         };
       case 'tool_use':
-        final input = _removeUnsafeMetadata(block['input'] ?? {});
+        final input =
+            _sanitizeObject(_removeUnsafeMetadata(block['input'] ?? {}));
         return {
           'type': 'tool_use',
           'name': block['name']?.toString() ?? 'unknown_tool',
@@ -370,7 +377,8 @@ class ContextSummaryService {
         return {
           'type': 'tool_result',
           'tool_use_id': block['tool_use_id']?.toString() ?? '',
-          'content': _truncate(content.toString(), _maxToolResultChars),
+          'content':
+              _truncate(_sanitizeText(content.toString()), _maxToolResultChars),
           if (block['is_error'] == true) 'is_error': true,
         };
       default:
@@ -379,8 +387,11 @@ class ContextSummaryService {
   }
 
   static String _truncatePlainText(String text, int? maxTextChars) {
-    if (maxTextChars == null || text.length <= maxTextChars) return text;
-    return _truncate(text, maxTextChars);
+    final sanitized = _sanitizeText(text);
+    if (maxTextChars == null || sanitized.length <= maxTextChars) {
+      return sanitized;
+    }
+    return _truncate(sanitized, maxTextChars);
   }
 
   static String _fitTextToTokenBudget(
@@ -435,7 +446,7 @@ class ContextSummaryService {
 
   static String _messageText(Map<String, dynamic> message) {
     final content = message['content'];
-    if (content is String) return content;
+    if (content is String) return _sanitizeText(content);
     if (content is List) {
       return content
           .whereType<Map>()
@@ -469,8 +480,12 @@ class ContextSummaryService {
     final descriptions = <String>[];
     for (final block in content.whereType<Map>()) {
       if (block['type'] == 'tool_use') {
+        final inputPreview = _truncate(
+          _sanitizeText(jsonEncode(_sanitizeObject(block['input'] ?? {}))),
+          180,
+        );
         descriptions.add(
-          'Tool ${block['name'] ?? 'unknown'} called with ${_truncate(jsonEncode(block['input'] ?? {}), 180)}',
+          'Tool ${block['name'] ?? 'unknown'} called with $inputPreview',
         );
       } else if (block['type'] == 'tool_result') {
         final content = block['summary'] ??
@@ -478,12 +493,22 @@ class ContextSummaryService {
             block['content'] ??
             block['output'] ??
             '';
+        final preview = _truncate(_sanitizeText(content.toString()), 180);
+        final status = block['is_error'] == true ? '(error)' : '';
         descriptions.add(
-          'Tool result ${block['is_error'] == true ? '(error)' : ''}: ${_truncate(content.toString(), 180)}',
+          'Tool result $status: $preview',
         );
       }
     }
     return descriptions;
+  }
+
+  static String _sanitizeText(String text) {
+    return const LlmContentSanitizer().sanitizeText(text).text;
+  }
+
+  static Object? _sanitizeObject(Object? value) {
+    return const LlmContentSanitizer().sanitizeObject(value).value;
   }
 
   static String _truncate(String text, int maxChars) {

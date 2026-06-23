@@ -203,6 +203,95 @@ void main() {
     expect(serialized, isNot(contains('secret')));
   });
 
+  test('safe projection redacts secrets from text tool input and result', () {
+    final projected = ContextSummaryService.safeProjectMessages([
+      {
+        'role': 'user',
+        'content': 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz',
+      },
+      {
+        'role': 'assistant',
+        'content': [
+          {
+            'type': 'tool_use',
+            'id': 'call_1',
+            'name': 'web_fetch',
+            'input': {
+              'url': 'https://example.test?token=query-secret',
+              'headers': {
+                'Authorization':
+                    'Bearer header-secret-abcdefghijklmnopqrstuvwxyz',
+              },
+            },
+          },
+        ],
+      },
+      {
+        'role': 'user',
+        'content': [
+          {
+            'type': 'tool_result',
+            'tool_use_id': 'call_1',
+            'for_llm': 'api_key=sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+            'output': 'FULL OUTPUT sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+          },
+        ],
+      },
+    ]);
+
+    final serialized = projected.toString();
+    expect(serialized, contains('[redacted: bearer_token]'));
+    expect(serialized, contains('[redacted: token]'));
+    expect(serialized, contains('[redacted: authorization]'));
+    expect(serialized, contains('[redacted: api_key]'));
+    expect(serialized, isNot(contains('abcdefghijklmnopqrstuvwxyz')));
+    expect(serialized, isNot(contains('query-secret')));
+  });
+
+  test('extractive fallback redacts secrets', () {
+    final service = ContextSummaryService(
+      llmFactory: (config) => _FakeLlmService(config),
+    );
+
+    final summary = service.extractiveFallback(request(messages: [
+      {
+        'role': 'user',
+        'content': 'Use api_key=sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+      },
+      {
+        'role': 'assistant',
+        'content': [
+          {
+            'type': 'tool_use',
+            'id': 'call_1',
+            'name': 'bash',
+            'input': {'command': 'echo password=hunter2'},
+          },
+        ],
+      },
+    ]));
+
+    expect(summary.text, contains('[redacted: api_key]'));
+    expect(summary.text, contains('[redacted: password]'));
+    expect(summary.text, isNot(contains('sk-proj-')));
+    expect(summary.text, isNot(contains('hunter2')));
+  });
+
+  test('sanitizes generated summary before persistence', () async {
+    final service = ContextSummaryService(
+      llmFactory: (config) => _FakeLlmService(
+        config,
+        responseText:
+            '## Goal\nLeaked api_key=sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+      ),
+    );
+
+    final summary = await service.generateSummary(request());
+
+    expect(summary.text, contains('[redacted: api_key]'));
+    expect(summary.text, isNot(contains('sk-proj-')));
+  });
+
   test('generates summary with LLM config capped to summary budget', () async {
     LlmConfig? observedConfig;
     final service = ContextSummaryService(

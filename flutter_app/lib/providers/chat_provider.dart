@@ -11,6 +11,7 @@ import '../models/provider_profile.dart';
 import '../services/agent_service.dart';
 import '../services/chat_context_utils.dart';
 import '../services/context_summary_service.dart';
+import '../services/llm_content_sanitizer.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/provider_message_transform.dart';
@@ -47,6 +48,7 @@ class _PendingTokenCalibration {
   final int rawEstimatedToolTokens;
   final int largestBlockTokens;
   final int rawLargestBlockTokens;
+  final String? skipReasonOverride;
 
   const _PendingTokenCalibration({
     required this.key,
@@ -58,6 +60,7 @@ class _PendingTokenCalibration {
     required this.rawEstimatedToolTokens,
     required this.largestBlockTokens,
     required this.rawLargestBlockTokens,
+    this.skipReasonOverride,
   });
 
   TokenCalibrationSample toSample(LlmUsage? usage) {
@@ -74,6 +77,7 @@ class _PendingTokenCalibration {
       rawLargestBlockTokens: rawLargestBlockTokens,
       cacheReadTokens: usage?.cacheReadInputTokens,
       cacheCreationTokens: usage?.cacheCreationInputTokens,
+      skipReasonOverride: skipReasonOverride,
     );
   }
 }
@@ -1984,6 +1988,11 @@ class ChatProvider extends ChangeNotifier {
     final rawSystemTokens = rawEstimator.estimateText(systemPrompt);
     final rawToolDefinitionTokens =
         rawEstimator.estimateToolDefinitions(toolDefinitions);
+    const sanitizer = LlmContentSanitizer();
+    final sensitiveStats = sanitizer
+        .sanitizeObject(messages)
+        .stats
+        .merge(sanitizer.sanitizeText(systemPrompt).stats);
     return _PendingTokenCalibration(
       key: _tokenCalibrationKey(llmConfig),
       estimatedInputTokens:
@@ -1998,6 +2007,8 @@ class ChatProvider extends ChangeNotifier {
           rawMessageDiagnostics.toolTokens + rawToolDefinitionTokens,
       largestBlockTokens: messageDiagnostics.largestBlockTokens,
       rawLargestBlockTokens: rawMessageDiagnostics.largestBlockTokens,
+      skipReasonOverride:
+          sensitiveStats.hasRedactions ? 'sensitive_data_redacted' : null,
     );
   }
 
@@ -2082,6 +2093,17 @@ class ChatProvider extends ChangeNotifier {
     String sessionId,
     ProviderTransformResult result,
   ) {
+    if (result.sensitiveDataStats.hasRedactions) {
+      _recordRuntimeEvent(
+        sessionId,
+        'llm.sensitive_data_redacted',
+        {
+          'stage': 'provider_payload',
+          'totalCount': result.sensitiveDataStats.totalCount,
+          'countByType': result.sensitiveDataStats.toJson(),
+        },
+      );
+    }
     if (result.warnings.isEmpty) return;
     _recordRuntimeEvent(
       sessionId,

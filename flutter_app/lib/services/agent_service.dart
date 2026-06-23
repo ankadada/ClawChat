@@ -1,5 +1,6 @@
 import 'dart:async';
 import '../models/chat_models.dart';
+import 'llm_content_sanitizer.dart';
 import 'llm_service.dart';
 import 'privacy_filter.dart';
 import 'tools/tool_policy.dart';
@@ -263,8 +264,9 @@ class AgentService {
     final raw = ToolResultPayload.stringifyContent(
       block['for_llm'] ?? block['content'] ?? block['output'],
     );
-    if (!privacyMode || envVars.isEmpty) return raw;
-    return PrivacyFilter.maskEnvVarValues(raw, envVars);
+    final sanitized = const LlmContentSanitizer().sanitizeText(raw).text;
+    if (!privacyMode || envVars.isEmpty) return sanitized;
+    return PrivacyFilter.maskEnvVarValues(sanitized, envVars);
   }
 
   Future<_ToolResult> _executeToolWithPolicy(

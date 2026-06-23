@@ -1,5 +1,6 @@
 import '../../services/llm_service.dart';
 import '../../models/chat_models.dart';
+import '../llm_content_sanitizer.dart';
 import '../preferences_service.dart';
 import 'bash_tool.dart';
 import 'env_var_tool.dart';
@@ -86,32 +87,11 @@ class ToolRegistry {
   ) async {
     final tool = _tools[name];
     if (tool == null) throw Exception('Unknown tool: $name');
-    final payload = await tool.executeResult(input);
-    final sanitizedForUser = sanitizeToolOutput(payload.forUser);
-    final sanitizedForLlm =
-        payload.forLlm == null ? null : sanitizeToolOutput(payload.forLlm!);
-    final sanitizedSummary =
-        payload.summary == null ? null : sanitizeToolOutput(payload.summary!);
-    return payload.copyWith(
-      forUser: sanitizedForUser,
-      forLlm: sanitizedForLlm,
-      summary: sanitizedSummary,
-    );
+    return tool.executeResult(input);
   }
 
   static String sanitizeToolOutput(String output) {
-    var sanitized = output.replaceAllMapped(
-      RegExp(r'(sk-|key-|api-|token[=:]\s*)[a-zA-Z0-9_-]{20,}'),
-      (match) => '${match.group(1)}[REDACTED]',
-    );
-    sanitized = sanitized.replaceAllMapped(
-      RegExp(
-        r'(password|passwd|secret)[=:]\s*\S+',
-        caseSensitive: false,
-      ),
-      (match) => '${match.group(1)}=[REDACTED]',
-    );
-    return sanitized;
+    return const LlmContentSanitizer().sanitizeText(output).text;
   }
 
   bool hasTool(String name) => _tools.containsKey(name);

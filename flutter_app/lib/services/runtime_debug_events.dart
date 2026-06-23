@@ -1,3 +1,5 @@
+import 'llm_content_sanitizer.dart';
+
 class RuntimeDebugEvent {
   final DateTime timestamp;
   final String type;
@@ -86,7 +88,8 @@ class RuntimeDebugEventService {
 
   static Map<String, Object?> sanitizeData(Map<String, Object?> data) {
     return data.map((key, value) {
-      if (_isSensitiveKey(key)) {
+      final sensitiveType = LlmContentSanitizer.sensitiveTypeForKey(key);
+      if (sensitiveType != null || _isSensitiveKey(key)) {
         return MapEntry(key, '[redacted]');
       }
       return MapEntry(key, _sanitizeValue(value));
@@ -103,14 +106,20 @@ class RuntimeDebugEventService {
     if (value == null || value is num || value is bool) return value;
     if (value is DateTime) return value.toIso8601String();
     if (value is Enum) return value.name;
-    if (value is String) return _truncateString(value);
+    if (value is String) {
+      return _truncateString(
+        const LlmContentSanitizer().sanitizeText(value).text,
+      );
+    }
     if (value is Iterable) {
       return value.take(20).map((item) => _sanitizeValue(item)).toList();
     }
     if (value is Map) {
       return value.map((key, nestedValue) {
         final stringKey = key.toString();
-        if (_isSensitiveKey(stringKey)) {
+        final sensitiveType =
+            LlmContentSanitizer.sensitiveTypeForKey(stringKey);
+        if (sensitiveType != null || _isSensitiveKey(stringKey)) {
           return MapEntry(stringKey, '[redacted]');
         }
         return MapEntry(stringKey, _sanitizeValue(nestedValue));

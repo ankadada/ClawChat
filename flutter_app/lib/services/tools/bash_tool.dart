@@ -15,19 +15,19 @@ class BashTool extends Tool {
 
   @override
   Map<String, dynamic> get inputSchema => {
-    'type': 'object',
-    'properties': {
-      'command': {
-        'type': 'string',
-        'description': 'The bash command to execute',
-      },
-      'timeout': {
-        'type': 'integer',
-        'description': 'Timeout in seconds (default: 120)',
-      },
-    },
-    'required': ['command'],
-  };
+        'type': 'object',
+        'properties': {
+          'command': {
+            'type': 'string',
+            'description': 'The bash command to execute',
+          },
+          'timeout': {
+            'type': 'integer',
+            'description': 'Timeout in seconds (default: 120)',
+          },
+        },
+        'required': ['command'],
+      };
 
   // NOTE: This blocklist is defense-in-depth only, NOT a complete security
   // solution. Determined attackers can bypass these patterns through encoding,
@@ -35,7 +35,8 @@ class BashTool extends Tool {
   // security control. A proper solution requires user confirmation for
   // sensitive operations.
   static final _blockedPatterns = RegExp(
-    r'rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?/(?!root/workspace/)' r'|'
+    r'rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?/(?!root/workspace/)'
+    r'|'
     r'mkfs\s|'
     r'dd\s+if=/dev/|'
     r':\s*\(\s*\)\s*\{[^}]*\|[^}]*\}|'
@@ -47,7 +48,7 @@ class BashTool extends Tool {
     r'python.*-c.*import\s+os|'
     r'eval\s*\(|'
     r'exec\s*>/dev/tcp|'
-    r'base64\s+(-d|--decode).*\|\s*(sh|bash)|'  // base64 decode piped to shell
+    r'base64\s+(-d|--decode).*\|\s*(sh|bash)|' // base64 decode piped to shell
     r'python[23]?\s+-c\s|'
     r'perl\s+-e\s|'
     r'ruby\s+-e\s|'
@@ -56,9 +57,9 @@ class BashTool extends Tool {
     r'\bsource\s+/dev/tcp|'
     r'\.\s+/dev/tcp|'
     r'bash\s+-i\s|'
-    r'\beval\s|'                                  // eval command (shell built-in)
-    r'printf\s.*\|\s*(sh|bash)\b|'                 // printf piped to shell
-    r'echo\s.*\|\s*(sh|bash)\b',                  // echo piped to shell
+    r'\beval\s|' // eval command (shell built-in)
+    r'printf\s.*\|\s*(sh|bash)\b|' // printf piped to shell
+    r'echo\s.*\|\s*(sh|bash)\b', // echo piped to shell
     caseSensitive: false,
   );
 
@@ -88,12 +89,6 @@ class BashTool extends Tool {
     return false;
   }
 
-  static String _sanitizeOutput(String output) {
-    return output
-        .replaceAll(RegExp(r'(sk-|key-|api-|token[=:]\s*)[a-zA-Z0-9_-]{20,}'), r'$1[REDACTED]')
-        .replaceAll(RegExp(r'(password|passwd|secret)[=:]\s*\S+', caseSensitive: false), r'$1=[REDACTED]');
-  }
-
   @override
   Future<String> execute(Map<String, dynamic> input) async {
     final command = input['command'] as String;
@@ -117,8 +112,11 @@ class BashTool extends Tool {
 
     // Prepend workspace cd for commands that don't explicitly set their own directory
     const workingDir = '/root/workspace';
-    final cdPrefix = command.trimLeft().startsWith('cd ') ? '' : 'cd $workingDir 2>/dev/null; ';
-    final effectiveCommand = '${envPrefix.isNotEmpty ? "$envPrefix; " : ""}$cdPrefix$command';
+    final cdPrefix = command.trimLeft().startsWith('cd ')
+        ? ''
+        : 'cd $workingDir 2>/dev/null; ';
+    final effectiveCommand =
+        '${envPrefix.isNotEmpty ? "$envPrefix; " : ""}$cdPrefix$command';
 
     try {
       final output = await NativeBridge.runInProot(
@@ -126,11 +124,11 @@ class BashTool extends Tool {
         timeout: timeout,
         mountStorage: false,
       );
-      final sanitized = _sanitizeOutput(output);
-      if (sanitized.length > 50000) {
-        return '${sanitized.substring(0, 50000)}\n\n[Output truncated, original length: ${sanitized.length} chars]';
+      if (output.length > 50000) {
+        return '${output.substring(0, 50000)}\n\n'
+            '[Output truncated, original length: ${output.length} chars]';
       }
-      return sanitized;
+      return output;
     } catch (e) {
       return 'Error: $e';
     }

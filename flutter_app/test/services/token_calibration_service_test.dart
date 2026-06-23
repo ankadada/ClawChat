@@ -27,6 +27,7 @@ void main() {
     int? cacheReadTokens,
     int? cacheCreationTokens,
     bool isRecovery = false,
+    String? skipReasonOverride,
   }) {
     return TokenCalibrationSample(
       key: key,
@@ -42,6 +43,7 @@ void main() {
       cacheReadTokens: cacheReadTokens,
       cacheCreationTokens: cacheCreationTokens,
       isRecovery: isRecovery,
+      skipReasonOverride: skipReasonOverride,
     );
   }
 
@@ -65,6 +67,19 @@ void main() {
 
       expect(result.updated, isFalse);
       expect(result.skipReason, 'missing_actual_tokens');
+      expect(service.multiplierFor('anthropic|api.example.test|profile|model'),
+          1.0);
+    });
+
+    test('honors explicit skip reason before recording sample', () async {
+      final service = await createService();
+
+      final result = service.recordSample(
+        sample(skipReasonOverride: 'sensitive_data_redacted'),
+      );
+
+      expect(result.updated, isFalse);
+      expect(result.skipReason, 'sensitive_data_redacted');
       expect(service.multiplierFor('anthropic|api.example.test|profile|model'),
           1.0);
     });

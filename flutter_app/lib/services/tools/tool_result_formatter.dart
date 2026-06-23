@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import '../../models/chat_models.dart';
+import '../llm_content_sanitizer.dart';
 
 class ToolResultFormatter {
   static const int defaultLlmCharLimit = 12000;
@@ -38,7 +39,7 @@ class ToolResultFormatter {
     int limit = defaultLlmCharLimit,
   }) {
     final sanitized = _sanitizeForLlm(output);
-    final fitted = _headTail(sanitized, limit);
+    final fitted = _headTail(sanitized.text, limit);
     final forLlm = _encodeEnvelope({
       'tool': toolName,
       'status': isError ? 'error' : 'success',
@@ -55,8 +56,9 @@ class ToolResultFormatter {
         original: output,
         forLlm: forLlm,
         truncated: fitted.truncated,
-        omittedReason: _omissionReason(sanitized, fitted),
+        omittedReason: _omissionReason(sanitized.text, fitted),
         status: isError ? 'error' : 'success',
+        sensitiveStats: sanitized.stats,
       ),
     );
   }
@@ -67,12 +69,13 @@ class ToolResultFormatter {
     bool isError = false,
   }) {
     final sanitized = _sanitizeForLlm(output);
-    final fitted = _headTail(sanitized, bashLlmCharLimit);
+    final fitted = _headTail(sanitized.text, bashLlmCharLimit);
     final command = input['command']?.toString() ?? '';
+    final sanitizedCommand = _sanitizeText(command);
     final forLlm = _encodeEnvelope({
       'tool': 'bash',
       'status': isError ? 'error' : 'success',
-      'command': command,
+      'command': sanitizedCommand.text,
       'output': fitted.text,
       if (fitted.truncated) 'truncated': true,
       if (fitted.omittedChars > 0) 'omitted_chars': fitted.omittedChars,
@@ -80,14 +83,16 @@ class ToolResultFormatter {
     return ToolResultPayload(
       forUser: output,
       forLlm: forLlm,
-      summary: 'bash ${isError ? 'failed' : 'completed'}: $command',
+      summary:
+          'bash ${isError ? 'failed' : 'completed'}: ${sanitizedCommand.text}',
       metadata: _metadata(
         toolName: 'bash',
         original: output,
         forLlm: forLlm,
         truncated: fitted.truncated,
-        omittedReason: _omissionReason(sanitized, fitted),
+        omittedReason: _omissionReason(sanitized.text, fitted),
         status: isError ? 'error' : 'success',
+        sensitiveStats: sanitized.stats.merge(sanitizedCommand.stats),
       ),
     );
   }
@@ -98,12 +103,13 @@ class ToolResultFormatter {
     bool isError = false,
   }) {
     final sanitized = _sanitizeForLlm(output);
-    final fitted = _headTail(sanitized, readFileLlmCharLimit);
+    final fitted = _headTail(sanitized.text, readFileLlmCharLimit);
     final path = input['path']?.toString() ?? '';
+    final sanitizedPath = _sanitizeText(path);
     final forLlm = _encodeEnvelope({
       'tool': 'read_file',
       'status': isError ? 'error' : 'success',
-      'path': path,
+      'path': sanitizedPath.text,
       if (input['offset'] != null) 'offset': input['offset'],
       if (input['limit'] != null) 'limit': input['limit'],
       'content': fitted.text,
@@ -115,14 +121,16 @@ class ToolResultFormatter {
     return ToolResultPayload(
       forUser: output,
       forLlm: forLlm,
-      summary: 'read_file ${isError ? 'failed' : 'read'}: $path',
+      summary:
+          'read_file ${isError ? 'failed' : 'read'}: ${sanitizedPath.text}',
       metadata: _metadata(
         toolName: 'read_file',
         original: output,
         forLlm: forLlm,
         truncated: fitted.truncated,
-        omittedReason: _omissionReason(sanitized, fitted),
+        omittedReason: _omissionReason(sanitized.text, fitted),
         status: isError ? 'error' : 'success',
+        sensitiveStats: sanitized.stats.merge(sanitizedPath.stats),
       ),
     );
   }
@@ -133,12 +141,13 @@ class ToolResultFormatter {
     bool isError = false,
   }) {
     final sanitized = _sanitizeForLlm(_stripNoisyHtml(output));
-    final fitted = _headTail(sanitized, webFetchLlmCharLimit);
+    final fitted = _headTail(sanitized.text, webFetchLlmCharLimit);
     final url = input['url']?.toString() ?? '';
+    final sanitizedUrl = _sanitizeText(url);
     final forLlm = _encodeEnvelope({
       'tool': 'web_fetch',
       'status': isError ? 'error' : 'success',
-      'url': url,
+      'url': sanitizedUrl.text,
       'content': fitted.text,
       if (fitted.truncated) 'truncated': true,
       if (fitted.omittedChars > 0) 'omitted_chars': fitted.omittedChars,
@@ -146,14 +155,16 @@ class ToolResultFormatter {
     return ToolResultPayload(
       forUser: output,
       forLlm: forLlm,
-      summary: 'web_fetch ${isError ? 'failed' : 'fetched'}: $url',
+      summary:
+          'web_fetch ${isError ? 'failed' : 'fetched'}: ${sanitizedUrl.text}',
       metadata: _metadata(
         toolName: 'web_fetch',
         original: output,
         forLlm: forLlm,
         truncated: fitted.truncated,
-        omittedReason: _omissionReason(sanitized, fitted),
+        omittedReason: _omissionReason(sanitized.text, fitted),
         status: isError ? 'error' : 'success',
+        sensitiveStats: sanitized.stats.merge(sanitizedUrl.stats),
       ),
     );
   }
@@ -164,21 +175,28 @@ class ToolResultFormatter {
     bool isError = false,
   }) {
     final path = input['path']?.toString() ?? '';
+    final sanitizedPath = _sanitizeText(path);
+    final sanitized = _sanitizeForLlm(output);
+    final fitted = _headTail(sanitized.text, 2000);
     final payload = _encodeEnvelope({
       'tool': 'write_file',
       'status': isError ? 'error' : 'success',
-      'path': path,
-      'message': _headTail(_sanitizeForLlm(output), 2000).text,
+      'path': sanitizedPath.text,
+      'message': fitted.text,
     });
     return ToolResultPayload(
       forUser: output,
       forLlm: payload,
-      summary: 'write_file ${isError ? 'failed' : 'wrote'}: $path',
+      summary:
+          'write_file ${isError ? 'failed' : 'wrote'}: ${sanitizedPath.text}',
       metadata: _metadata(
         toolName: 'write_file',
         original: output,
         forLlm: payload,
+        truncated: fitted.truncated,
+        omittedReason: _omissionReason(sanitized.text, fitted),
         status: isError ? 'error' : 'success',
+        sensitiveStats: sanitized.stats.merge(sanitizedPath.stats),
       ),
     );
   }
@@ -190,22 +208,31 @@ class ToolResultFormatter {
   }) {
     final name = input['name']?.toString() ?? '';
     final action = input['action']?.toString() ?? 'set';
+    final sanitizedName = _sanitizeText(name);
+    final sanitizedAction = _sanitizeText(action);
+    final sanitized = _sanitizeForLlm(output);
+    final fitted = _headTail(sanitized.text, 2000);
     final payload = _encodeEnvelope({
       'tool': 'set_env_var',
       'status': isError ? 'error' : 'success',
-      'name': name,
-      'action': action,
-      'message': _headTail(_sanitizeForLlm(output), 2000).text,
+      'name': sanitizedName.text,
+      'action': sanitizedAction.text,
+      'message': fitted.text,
     });
     return ToolResultPayload(
       forUser: output,
       forLlm: payload,
-      summary: 'set_env_var $action: $name',
+      summary: 'set_env_var ${sanitizedAction.text}: ${sanitizedName.text}',
       metadata: _metadata(
         toolName: 'set_env_var',
         original: output,
         forLlm: payload,
+        truncated: fitted.truncated,
+        omittedReason: _omissionReason(sanitized.text, fitted),
         status: isError ? 'error' : 'success',
+        sensitiveStats: sanitized.stats
+            .merge(sanitizedName.stats)
+            .merge(sanitizedAction.stats),
       ),
     );
   }
@@ -215,7 +242,8 @@ class ToolResultFormatter {
     required String output,
     bool isError = false,
   }) {
-    final fitted = _headTail(_sanitizeForLlm(output), 4000);
+    final sanitized = _sanitizeForLlm(output);
+    final fitted = _headTail(sanitized.text, 4000);
     final payload = _encodeEnvelope({
       'tool': 'generate_image',
       'status': isError ? 'error' : 'success',
@@ -232,7 +260,9 @@ class ToolResultFormatter {
         original: output,
         forLlm: payload,
         truncated: fitted.truncated,
+        omittedReason: _omissionReason(sanitized.text, fitted),
         status: isError ? 'error' : 'success',
+        sensitiveStats: sanitized.stats,
       ),
     );
   }
@@ -248,6 +278,7 @@ class ToolResultFormatter {
     bool truncated = false,
     String? omittedReason,
     String? status,
+    SensitiveDataStats sensitiveStats = const SensitiveDataStats(),
   }) {
     return {
       'toolName': toolName,
@@ -256,11 +287,23 @@ class ToolResultFormatter {
       'truncated': truncated,
       if (omittedReason != null) 'omittedReason': omittedReason,
       if (status != null) 'status': status,
+      if (sensitiveStats.hasRedactions)
+        'sensitiveRedactions': sensitiveStats.totalCount,
+      if (sensitiveStats.hasRedactions)
+        'sensitiveRedactionTypes': sensitiveStats.toJson(),
     };
   }
 
-  static String _sanitizeForLlm(String text) {
-    return _compressLongLines(_omitBase64(text));
+  static SanitizedText _sanitizeForLlm(String text) {
+    final sanitized = const LlmContentSanitizer().sanitizeText(text);
+    return SanitizedText(
+      text: _compressLongLines(_omitBase64(sanitized.text)),
+      stats: sanitized.stats,
+    );
+  }
+
+  static SanitizedText _sanitizeText(String text) {
+    return const LlmContentSanitizer().sanitizeText(text);
   }
 
   static String _omitBase64(String text) {

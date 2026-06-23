@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'llm_content_sanitizer.dart';
+
 enum ProviderTransformMode { normal, recovery, compare }
 
 class ProviderTransformOptions {
@@ -29,12 +31,14 @@ class ProviderTransformResult {
   final List<String> warnings;
   final int droppedBlockCount;
   final Map<String, String> toolIdMap;
+  final SensitiveDataStats sensitiveDataStats;
 
   const ProviderTransformResult({
     required this.messages,
     this.warnings = const [],
     this.droppedBlockCount = 0,
     this.toolIdMap = const {},
+    this.sensitiveDataStats = const SensitiveDataStats(),
   });
 }
 
@@ -64,6 +68,7 @@ class ProviderMessageTransform {
     final warnings = <String>[];
     final toolIdMap = <String, String>{};
     final assignedToolIds = <String>{};
+    final sensitiveStats = SensitiveDataStatsBuilder();
     var droppedBlockCount = 0;
     final transformed = <Map<String, dynamic>>[];
 
@@ -74,6 +79,7 @@ class ProviderMessageTransform {
         warnings,
         toolIdMap,
         assignedToolIds,
+        sensitiveStats,
       );
       if (clean == null) {
         droppedBlockCount++;
@@ -92,6 +98,7 @@ class ProviderMessageTransform {
       warnings: warnings,
       droppedBlockCount: droppedBlockCount,
       toolIdMap: toolIdMap,
+      sensitiveDataStats: sensitiveStats.build(),
     );
   }
 
@@ -136,6 +143,7 @@ class ProviderMessageTransform {
     List<String> warnings,
     Map<String, String> toolIdMap,
     Set<String> assignedToolIds,
+    SensitiveDataStatsBuilder sensitiveStats,
   ) {
     final role = msg['role'];
     final toolCalls = msg['tool_calls'];
@@ -145,7 +153,7 @@ class ProviderMessageTransform {
     final content = msg['content'];
     if (content is String) {
       if (content.isEmpty && toolCalls is! List) return null;
-      clean['content'] = content;
+      clean['content'] = _sanitizeText(content, sensitiveStats);
     } else if (content is List) {
       final blocks = <Map<String, dynamic>>[];
       for (final item in content) {
@@ -155,6 +163,7 @@ class ProviderMessageTransform {
           warnings,
           toolIdMap,
           assignedToolIds,
+          sensitiveStats,
         );
         if (block == null) continue;
         blocks.add(block);
@@ -170,7 +179,7 @@ class ProviderMessageTransform {
         role == 'assistant';
     final reasoning = msg['reasoning_content'];
     if (shouldKeepReasoning && reasoning is String) {
-      clean['reasoning_content'] = reasoning;
+      clean['reasoning_content'] = _sanitizeText(reasoning, sensitiveStats);
     }
 
     if (toolCalls is List && !options.isRecovery) {
@@ -179,6 +188,7 @@ class ProviderMessageTransform {
                 toolCall,
                 toolIdMap,
                 assignedToolIds,
+                sensitiveStats,
               ))
           .whereType<Map<String, dynamic>>()
           .toList();
@@ -203,6 +213,7 @@ class ProviderMessageTransform {
     List<String> warnings,
     Map<String, String> toolIdMap,
     Set<String> assignedToolIds,
+    SensitiveDataStatsBuilder sensitiveStats,
   ) {
     if (value is! Map) return null;
     final block = removeUnsafeMetadata(value);
@@ -217,13 +228,16 @@ class ProviderMessageTransform {
       if (text.isEmpty) return null;
       final clean = <String, dynamic>{
         'type': 'text',
-        'text': text,
+        'text': _sanitizeText(text, sensitiveStats),
       };
       final shouldKeepReasoning = !options.isRecovery &&
           options.supportsReasoningContent &&
           block['reasoning_content'] is String;
       if (shouldKeepReasoning) {
-        clean['reasoning_content'] = block['reasoning_content'];
+        clean['reasoning_content'] = _sanitizeText(
+          block['reasoning_content'] as String,
+          sensitiveStats,
+        );
       }
       return clean;
     }
@@ -237,7 +251,7 @@ class ProviderMessageTransform {
               '[Attachment omitted: images are not supported by this provider]',
         };
       }
-      return Map<String, dynamic>.from(block);
+      return _sanitizeImageLikeBlock(block, sensitiveStats);
     }
 
     if (type == 'tool_use') {
@@ -252,7 +266,10 @@ class ProviderMessageTransform {
         'type': 'tool_use',
         'id': _scrubToolId(id, toolIdMap, assignedToolIds),
         'name': name,
-        'input': removeUnsafeMetadata(block['input'] ?? {}),
+        'input': _sanitizeObject(
+          removeUnsafeMetadata(block['input'] ?? {}),
+          sensitiveStats,
+        ),
       };
     }
 
@@ -265,8 +282,11 @@ class ProviderMessageTransform {
       return {
         'type': 'tool_result',
         'tool_use_id': _scrubToolId(id, toolIdMap, assignedToolIds),
-        'content': _stringContent(
-          block['for_llm'] ?? block['content'] ?? block['output'],
+        'content': _sanitizeText(
+          _stringContent(
+            block['for_llm'] ?? block['content'] ?? block['output'],
+          ),
+          sensitiveStats,
         ),
         if (block['is_error'] == true) 'is_error': true,
       };
@@ -411,6 +431,28 @@ class ProviderMessageTransform {
         'data': data,
       },
     };
+  }
+
+  Map<String, dynamic> _sanitizeImageLikeBlock(
+    Map<String, dynamic> block,
+    SensitiveDataStatsBuilder sensitiveStats,
+  ) {
+    final clean = Map<String, dynamic>.from(block);
+    final imageUrl = clean['image_url'];
+    if (imageUrl is Map && imageUrl['url'] is String) {
+      clean['image_url'] = {
+        ...Map<String, dynamic>.from(imageUrl),
+        'url': _sanitizeText(imageUrl['url'] as String, sensitiveStats),
+      };
+    }
+    final source = clean['source'];
+    if (source is Map && source['url'] is String) {
+      clean['source'] = {
+        ...Map<String, dynamic>.from(source),
+        'url': _sanitizeText(source['url'] as String, sensitiveStats),
+      };
+    }
+    return clean;
   }
 
   Map<String, dynamic>? _openAIImageBlockToAnthropic(
@@ -619,6 +661,7 @@ class ProviderMessageTransform {
     Object? toolCall,
     Map<String, String> toolIdMap,
     Set<String> assignedToolIds,
+    SensitiveDataStatsBuilder sensitiveStats,
   ) {
     if (toolCall is! Map) return null;
     final function = toolCall['function'];
@@ -632,8 +675,14 @@ class ProviderMessageTransform {
       'function': {
         'name': functionMap['name'],
         'arguments': functionMap['arguments'] is String
-            ? functionMap['arguments']
-            : jsonEncode(functionMap['arguments'] ?? {}),
+            ? _sanitizeText(
+                functionMap['arguments'] as String,
+                sensitiveStats,
+              )
+            : jsonEncode(_sanitizeObject(
+                functionMap['arguments'] ?? {},
+                sensitiveStats,
+              )),
       },
     };
   }
@@ -801,6 +850,24 @@ class ProviderMessageTransform {
     if (content == null) return '';
     if (content is String) return content;
     return jsonEncode(content);
+  }
+
+  static String _sanitizeText(
+    String text,
+    SensitiveDataStatsBuilder sensitiveStats,
+  ) {
+    final sanitized = const LlmContentSanitizer().sanitizeText(text);
+    sensitiveStats.add(sanitized.stats);
+    return sanitized.text;
+  }
+
+  static Object? _sanitizeObject(
+    Object? value,
+    SensitiveDataStatsBuilder sensitiveStats,
+  ) {
+    final sanitized = const LlmContentSanitizer().sanitizeObject(value);
+    sensitiveStats.add(sanitized.stats);
+    return sanitized.value;
   }
 
   static bool _isUnsafeMetadataKey(String key) {

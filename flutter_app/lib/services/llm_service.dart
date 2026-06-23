@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'api_validator.dart';
+import 'llm_content_sanitizer.dart';
 import 'provider_message_transform.dart';
 
 enum ApiFormat { anthropic, openai }
@@ -499,7 +500,7 @@ class LlmService {
       RegExp(r'(sk-|key-|api-)[a-zA-Z0-9_-]{10,}'),
       '[REDACTED]',
     );
-    return sanitized;
+    return const LlmContentSanitizer().sanitizeText(sanitized).text;
   }
 
   static Exception _anthropicApiException(int statusCode, String body) {
@@ -1068,6 +1069,7 @@ class LlmService {
     required bool stream,
   }) {
     const transform = ProviderMessageTransform();
+    final safeSystem = _sanitizeForLlmPayload(system);
     final transformedMessages = transform.toProviderPayload(
       messages,
       ProviderTransformOptions(
@@ -1081,7 +1083,7 @@ class LlmService {
     final body = <String, dynamic>{
       'model': modelIdFromDisplay(config.model),
       'max_tokens': config.maxTokens,
-      'system': system,
+      'system': safeSystem,
       'messages': transformedMessages,
       'stream': stream,
     };
@@ -1481,8 +1483,9 @@ class LlmService {
     bool includeStreamUsage = true,
   }) {
     const transform = ProviderMessageTransform();
+    final safeSystem = _sanitizeForLlmPayload(system);
     final openaiMessages = <Map<String, dynamic>>[
-      {'role': 'system', 'content': system},
+      {'role': 'system', 'content': safeSystem},
     ];
     openaiMessages.addAll(transform.toProviderPayload(
       messages,
@@ -1524,6 +1527,10 @@ class LlmService {
       };
     }
     return body;
+  }
+
+  static String _sanitizeForLlmPayload(String text) {
+    return const LlmContentSanitizer().sanitizeText(text).text;
   }
 
   static bool _isReasoningModel(String model) {

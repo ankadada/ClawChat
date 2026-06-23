@@ -940,6 +940,42 @@ void main() {
       expect(events.recent(sessionId: 'session'), isEmpty);
     });
 
+    test('provider transform preflight records sensitive redaction stats',
+        () async {
+      final events = RuntimeDebugEventService();
+      final provider = ChatProvider(runtimeDebugEvents: events);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      provider.recordProviderTransformWarningsBestEffortForTesting(
+        sessionId: 'session',
+        messages: const [
+          {
+            'role': 'user',
+            'content': 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456',
+          },
+        ],
+        options: const ProviderTransformOptions(
+          apiFormat: 'anthropic',
+          modelId: 'model',
+        ),
+      );
+
+      final event = events
+          .recent(sessionId: 'session')
+          .singleWhere((event) => event.type == 'llm.sensitive_data_redacted');
+      expect(event.data['stage'], 'provider_payload');
+      expect(event.data['totalCount'], 1);
+      expect(event.data.toString(), contains('bearer_token'));
+      expect(
+        event.data.toString(),
+        isNot(contains('abcdefghijklmnopqrstuvwxyz')),
+      );
+    });
+
     test('does not generate summary when messages fit token budget', () async {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
@@ -1890,6 +1926,47 @@ void main() {
           .single;
       expect(calibrationEvent.data['reason'], 'missing_actual_tokens');
       expect(calibrationEvent.data['estimatedInputTokens'], greaterThan(0));
+    });
+
+    test('sensitive redactions skip token calibration', () async {
+      final events = RuntimeDebugEventService();
+      final provider = ChatProvider(
+        runtimeDebugEvents: events,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+            usage: LlmUsage(inputTokens: 22000, outputTokens: 50),
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      for (var i = 0; i < 12; i++) {
+        session.messages.add(ChatMessage.user('history-$i ${'x' * 4000}'));
+      }
+      await provider.sendMessage(
+        'please use api_key=sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+      );
+
+      expect(provider.errorMessage, isNull);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(TokenCalibrationService.storageKey), isNull);
+      final calibrationEvent = events
+          .recent(sessionId: session.id)
+          .where((event) => event.type == 'token.calibration.skipped')
+          .single;
+      expect(calibrationEvent.data['reason'], 'sensitive_data_redacted');
+      expect(calibrationEvent.data.toString(), isNot(contains('sk-proj-')));
     });
 
     test('encrypted recovery does not update token calibration', () async {

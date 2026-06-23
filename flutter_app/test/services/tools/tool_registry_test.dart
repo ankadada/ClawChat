@@ -24,25 +24,28 @@ void main() {
   group('ToolRegistry output sanitizer', () {
     test('redacts secret-shaped values from direct sanitizer calls', () {
       final sanitized = ToolRegistry.sanitizeToolOutput(
-        'key-abcdefghijklmnopqrstuvwxyz secret=super-secret-value',
+        'sk-abcdefghijklmnopqrstuvwxyz secret=super-secret-value',
       );
 
-      expect(sanitized, contains('key-[REDACTED]'));
-      expect(sanitized, contains('secret=[REDACTED]'));
+      expect(sanitized, contains('[redacted: api_key]'));
+      expect(sanitized, contains('[redacted: secret]'));
       expect(sanitized, isNot(contains('abcdefghijklmnopqrstuvwxyz')));
       expect(sanitized, isNot(contains('super-secret-value')));
     });
 
-    test('sanitizes every executed tool output', () async {
+    test('preserves executed tool ForUser and redacts model-facing output',
+        () async {
       final registry = ToolRegistry()..register(_SecretEchoTool());
 
-      final sanitized = await registry.executeTool('secret_echo', const {});
+      final output = await registry.executeTool('secret_echo', const {});
+      final payload = await registry.executeToolResult('secret_echo', const {});
 
-      expect(sanitized, contains('token=[REDACTED]'));
-      expect(sanitized, contains('password=[REDACTED]'));
-      expect(sanitized, contains('sk-[REDACTED]'));
-      expect(sanitized, isNot(contains('abcdefghijklmnopqrstuvwxyz')));
-      expect(sanitized, isNot(contains('hunter2')));
+      expect(output, contains('token=abcdefghijklmnopqrstuvwxyz'));
+      expect(output, contains('password: hunter2'));
+      expect(payload.forUser, output);
+      expect(payload.forLlm, contains('token=[redacted: token]'));
+      expect(payload.forLlm, contains('password: [redacted: password]'));
+      expect(payload.forLlm, isNot(contains('hunter2')));
     });
   });
 }

@@ -117,6 +117,67 @@ void main() {
       expect(withReasoning.messages.toString(), contains('reasoning_content'));
     });
 
+    test('redacts secrets from final canonical payload fields', () {
+      final result = transform.transformCanonical(
+        [
+          {
+            'role': 'assistant',
+            'reasoning_content':
+                'internal password=hunter2 should not leave process',
+            'content': [
+              {
+                'type': 'text',
+                'text':
+                    'Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456',
+                'reasoning_content':
+                    'api_key=sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+              },
+              {
+                'type': 'tool_use',
+                'id': 'call_1',
+                'name': 'web_fetch',
+                'input': {
+                  'url': 'https://example.test?token=query-secret',
+                  'headers': {
+                    'Authorization':
+                        'Bearer header-secret-abcdefghijklmnopqrstuvwxyz',
+                  },
+                },
+              },
+            ],
+          },
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'tool_result',
+                'tool_use_id': 'call_1',
+                'for_llm': 'github_pat_abcdefghijklmnopqrstuvwxyz1234567890',
+                'output':
+                    'FULL github_pat_abcdefghijklmnopqrstuvwxyz1234567890',
+              },
+            ],
+          },
+        ],
+        const ProviderTransformOptions(
+          apiFormat: 'openai',
+          modelId: 'deepseek-reasoner',
+          supportsReasoningContent: true,
+        ),
+      );
+
+      final serialized = result.messages.toString();
+      expect(serialized, contains('[redacted: bearer_token]'));
+      expect(serialized, contains('[redacted: password]'));
+      expect(serialized, contains('[redacted: api_key]'));
+      expect(serialized, contains('[redacted: token]'));
+      expect(serialized, contains('[redacted: authorization]'));
+      expect(serialized, isNot(contains('hunter2')));
+      expect(serialized, isNot(contains('github_pat_')));
+      expect(serialized, isNot(contains('query-secret')));
+      expect(result.sensitiveDataStats.totalCount, greaterThanOrEqualTo(5));
+    });
+
     test('scrubs tool ids consistently across use and result blocks', () {
       final result = transform.transformCanonical(
         [
@@ -385,7 +446,8 @@ void main() {
                 'type': 'function',
                 'function': {
                   'name': 'bash',
-                  'arguments': '{"cmd":"pwd"}',
+                  'arguments':
+                      '{"cmd":"pwd","api_key":"sk-proj-abcdefghijklmnopqrstuvwxyz123456"}',
                 },
               },
             ],
@@ -407,12 +469,13 @@ void main() {
               'type': 'function',
               'function': {
                 'name': 'bash',
-                'arguments': '{"cmd":"pwd"}',
+                'arguments': '{"cmd":"pwd","api_key":"[redacted: api_key]"}',
               },
             },
           ],
         },
       ]);
+      expect(result.sensitiveDataStats.countByType['api_key'], 1);
     });
   });
 
@@ -604,6 +667,62 @@ void main() {
         'tool_call_id': 'call_1',
         'content': 'structured compact result',
       });
+    });
+
+    test('converted provider payloads do not contain secrets', () {
+      final messages = [
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'call_1',
+              'name': 'bash',
+              'input': {
+                'command': 'echo ok',
+                'api_key': 'sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+              },
+            },
+          ],
+        },
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'call_1',
+              'content':
+                  'Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456',
+            },
+          ],
+        },
+      ];
+
+      final anthropicPayload = transform.toProviderPayload(
+        messages,
+        const ProviderTransformOptions(
+          apiFormat: 'anthropic',
+          modelId: 'claude',
+        ),
+      );
+      final openAiPayload = transform.toProviderPayload(
+        messages,
+        const ProviderTransformOptions(
+          apiFormat: 'openai',
+          modelId: 'gpt-test',
+        ),
+      );
+
+      expect(anthropicPayload.toString(), contains('[redacted: api_key]'));
+      expect(anthropicPayload.toString(), contains('[redacted: bearer_token]'));
+      expect(openAiPayload.toString(), contains('[redacted: api_key]'));
+      expect(openAiPayload.toString(), contains('[redacted: bearer_token]'));
+      expect(anthropicPayload.toString(), isNot(contains('sk-proj-')));
+      expect(openAiPayload.toString(), isNot(contains('sk-proj-')));
+      expect(anthropicPayload.toString(),
+          isNot(contains('abcdefghijklmnopqrstuvwxyz')));
+      expect(openAiPayload.toString(),
+          isNot(contains('abcdefghijklmnopqrstuvwxyz')));
     });
   });
 }

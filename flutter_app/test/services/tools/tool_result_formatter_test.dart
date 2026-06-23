@@ -80,5 +80,45 @@ void main() {
       expect(payload.metadata['toolName'], 'bash');
       expect(payload.metadata['status'], 'success');
     });
+
+    test('redacts secrets from ForLLM and summary but preserves ForUser', () {
+      const secret = 'sk-proj-abcdefghijklmnopqrstuvwxyz123456';
+      const output = 'api_key=$secret\npassword=hunter2';
+
+      final payload = ToolResultFormatter.generic(
+        toolName: 'secret_tool',
+        output: output,
+      );
+
+      expect(payload.forUser, output);
+      expect(payload.forLlm, contains('[redacted: api_key]'));
+      expect(payload.forLlm, contains('[redacted: password]'));
+      expect(payload.forLlm, isNot(contains(secret)));
+      expect(payload.forLlm, isNot(contains('hunter2')));
+      expect(payload.summary, isNot(contains(secret)));
+      expect(payload.summary, isNot(contains('hunter2')));
+      expect(payload.metadata['sensitiveRedactions'], 2);
+      expect(payload.metadata['sensitiveRedactionTypes'], {
+        'api_key': 1,
+        'password': 1,
+      });
+    });
+
+    test('redacts secrets from model-facing tool input envelope fields', () {
+      final payload = ToolResultFormatter.bash(
+        input: const {
+          'command':
+              'curl -H "Authorization: Bearer abcdefghijklmnopqrstuvwxyz"',
+        },
+        output: 'ok',
+      );
+      final decoded = jsonDecode(payload.forLlm!) as Map<String, dynamic>;
+
+      expect(decoded['output'], 'ok');
+      expect(decoded['command'], contains('[redacted: bearer_token]'));
+      expect(decoded['command'], isNot(contains('abcdefghijklmnopqrstuvwxyz')));
+      expect(payload.summary, contains('[redacted: bearer_token]'));
+      expect(payload.metadata['sensitiveRedactions'], 1);
+    });
   });
 }
