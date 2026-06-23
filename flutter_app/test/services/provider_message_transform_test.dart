@@ -1,3 +1,4 @@
+import 'package:clawchat/models/model_capabilities.dart';
 import 'package:clawchat/services/provider_message_transform.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -89,7 +90,7 @@ void main() {
         const ProviderTransformOptions(
           apiFormat: 'openai',
           modelId: 'gpt-test',
-          supportsReasoningContent: false,
+          capabilities: ModelCapabilities(supportsReasoningContent: false),
         ),
       );
       final withReasoning = transform.transformCanonical(
@@ -108,7 +109,7 @@ void main() {
         const ProviderTransformOptions(
           apiFormat: 'openai',
           modelId: 'deepseek-reasoner',
-          supportsReasoningContent: true,
+          capabilities: ModelCapabilities(supportsReasoningContent: true),
         ),
       );
 
@@ -162,7 +163,7 @@ void main() {
         const ProviderTransformOptions(
           apiFormat: 'openai',
           modelId: 'deepseek-reasoner',
-          supportsReasoningContent: true,
+          capabilities: ModelCapabilities(supportsReasoningContent: true),
         ),
       );
 
@@ -395,7 +396,7 @@ void main() {
         const ProviderTransformOptions(
           apiFormat: 'openai',
           modelId: 'text-only',
-          supportsImages: false,
+          capabilities: ModelCapabilities(supportsImages: false),
         ),
       );
 

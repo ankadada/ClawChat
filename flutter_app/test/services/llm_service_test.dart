@@ -2,10 +2,18 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:clawchat/models/model_capabilities.dart';
+import 'package:clawchat/services/model_capability_registry.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+    CapabilityRegistry.instance.clearRuntimeOverridesForTesting();
+  });
+
   group('LlmService error sanitization', () {
     test('returns short body unchanged', () async {
       const msg = 'Rate limit exceeded. Please retry after 60s.';
@@ -375,6 +383,28 @@ void main() {
       ]);
       expect(captured.body['max_tokens'], 8192);
       expect(jsonDecode(jsonEncode(captured.body)), captured.body);
+    });
+
+    test('omits OpenAI tool definitions when capabilities disable tools',
+        () async {
+      final captured = await captureOpenAiRequest(
+        model: 'gpt-test',
+        capabilityRegistry: const _NoToolsCapabilityRegistry(),
+        tools: const [
+          ToolDefinition(
+            name: 'echo',
+            description: 'Echo text',
+            inputSchema: {
+              'type': 'object',
+              'properties': {
+                'text': {'type': 'string'},
+              },
+            },
+          ),
+        ],
+      );
+
+      expect(captured.body, isNot(contains('tools')));
     });
 
     test('redacts secrets from system prompts in request bodies', () async {
@@ -1632,7 +1662,9 @@ Future<CapturedLlmRequest> captureOpenAiRequest({
   required String model,
   String system = '',
   List<Map<String, dynamic>> messages = const [],
+  List<ToolDefinition> tools = const [],
   String Function(int port)? baseUrlForPort,
+  CapabilityRegistry capabilityRegistry = CapabilityRegistry.instance,
 }) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   final capturedRequest = Completer<CapturedLlmRequest>();
@@ -1657,14 +1689,16 @@ Future<CapturedLlmRequest> captureOpenAiRequest({
     await request.response.close();
   });
 
-  final service = LlmService(LlmConfig.openai(
-    apiKey: 'sk-test',
-    model: model,
-    baseUrl:
-        baseUrlForPort?.call(server.port) ?? 'http://127.0.0.1:${server.port}',
-  ));
+  final service = LlmService(
+      LlmConfig.openai(
+        apiKey: 'sk-test',
+        model: model,
+        baseUrl: baseUrlForPort?.call(server.port) ??
+            'http://127.0.0.1:${server.port}',
+      ),
+      capabilityRegistry: capabilityRegistry);
   try {
-    await service.chat(system: system, messages: messages, tools: const []);
+    await service.chat(system: system, messages: messages, tools: tools);
     return await capturedRequest.future;
   } finally {
     service.dispose();
@@ -1700,6 +1734,34 @@ Future<LlmResponse> openAiChatResponseWithBody(
   } finally {
     service.dispose();
     await server.close(force: true);
+  }
+}
+
+class _NoToolsCapabilityRegistry extends CapabilityRegistry {
+  const _NoToolsCapabilityRegistry();
+
+  @override
+  ResolvedModelProfile resolve({
+    required ApiFormat apiFormat,
+    required String baseUrl,
+    required String model,
+  }) {
+    return ResolvedModelProfile(
+      modelId: CapabilityRegistry.modelIdFromDisplay(model),
+      providerKey: '${apiFormat.name}|127.0.0.1',
+      provider: const ProviderCapabilities(
+        apiFormat: ApiFormat.openai,
+        kind: ProviderKind.genericOpenAICompatible,
+        systemPromptMode: SystemPromptMode.systemMessage,
+        defaultTokenLimitParameter: TokenLimitParameter.maxTokens,
+        streamingUsageMode: StreamingUsageMode.openAIStreamOptions,
+      ),
+      capabilities: const ModelCapabilities(
+        supportsTools: false,
+        supportsStreamingUsage: true,
+        streamingUsageMode: StreamingUsageMode.openAIStreamOptions,
+      ),
+    );
   }
 }
 

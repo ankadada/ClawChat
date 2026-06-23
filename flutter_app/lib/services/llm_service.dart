@@ -3,19 +3,12 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import '../models/model_capabilities.dart';
 import 'api_validator.dart';
 import 'llm_content_sanitizer.dart';
+import 'model_capability_registry.dart';
 import 'provider_message_transform.dart';
-
-enum ApiFormat { anthropic, openai }
-
-enum _OpenAICompatibleProvider {
-  anthropicCompatible,
-  openaiNative,
-  maxCompletionTokensProvider,
-  generic,
-}
+export '../models/model_capabilities.dart' show ApiFormat;
 
 class EncryptedContentError implements Exception {
   final String message;
@@ -293,6 +286,7 @@ class LlmService {
   final LlmConfig config;
   final http.Client _client;
   final bool Function()? _isInBackground;
+  final CapabilityRegistry _capabilityRegistry;
 
   static const _allowedApiHosts = {
     'api.anthropic.com',
@@ -306,16 +300,19 @@ class LlmService {
 
   static const presetModelSuffix = ' (preset)';
   static const streamUsageUnsupportedHostsPrefsKey =
-      'stream_usage_unsupported_hosts';
-  static final Set<String> _streamUsageUnsupportedHosts = {};
+      CapabilityRegistry.streamUsageUnsupportedHostsPrefsKey;
   static const _anthropicPresetModelIds = [
     'claude-sonnet-4-20250514',
     'claude-opus-4-20250514',
     'claude-haiku-4-20250514',
   ];
 
-  LlmService(this.config, {bool Function()? isInBackground})
-      : _isInBackground = isInBackground,
+  LlmService(
+    this.config, {
+    bool Function()? isInBackground,
+    CapabilityRegistry capabilityRegistry = CapabilityRegistry.instance,
+  })  : _capabilityRegistry = capabilityRegistry,
+        _isInBackground = isInBackground,
         _client = _createPinnedClient();
 
   /// Creates an HTTP client that rejects bad TLS certificates (self-signed,
@@ -425,9 +422,7 @@ class LlmService {
   static bool isPresetModel(String model) => model.endsWith(presetModelSuffix);
 
   static String modelIdFromDisplay(String model) {
-    return isPresetModel(model)
-        ? model.substring(0, model.length - presetModelSuffix.length)
-        : model;
+    return CapabilityRegistry.modelIdFromDisplay(model);
   }
 
   static List<String> _anthropicPresetModels() {
@@ -437,7 +432,7 @@ class LlmService {
   }
 
   static void clearStreamUsageUnsupportedHostsForTesting() {
-    _streamUsageUnsupportedHosts.clear();
+    CapabilityRegistry.instance.clearStreamUsageUnsupportedHostsForTesting();
   }
 
   static String _joinBaseUrl(String baseUrl, String path) {
@@ -486,9 +481,18 @@ class LlmService {
   /// is no longer needed to avoid connection pool leaks.
   void dispose() => _client.close();
 
-  bool get supportsImagesForTransform => _supportsImages();
+  ResolvedModelProfile get resolvedModelProfile =>
+      _capabilityRegistry.resolve(
+        apiFormat: config.format,
+        baseUrl: config.baseUrl,
+        model: config.model,
+      );
 
-  bool get supportsReasoningContentForTransform => _needsReasoningContent();
+  bool get supportsImagesForTransform =>
+      resolvedModelProfile.capabilities.supportsImages;
+
+  bool get supportsReasoningContentForTransform =>
+      resolvedModelProfile.capabilities.supportsReasoningContent;
 
   /// Sanitize error response bodies to prevent leaking sensitive data
   /// (e.g. API keys) in exception messages.
@@ -1069,6 +1073,7 @@ class LlmService {
     required bool stream,
   }) {
     const transform = ProviderMessageTransform();
+    final capabilities = resolvedModelProfile.capabilities;
     final safeSystem = _sanitizeForLlmPayload(system);
     final transformedMessages = transform.toProviderPayload(
       messages,
@@ -1076,8 +1081,7 @@ class LlmService {
         apiFormat: 'anthropic',
         modelId: modelIdFromDisplay(config.model),
         baseUrl: Uri.tryParse(config.baseUrl),
-        supportsImages: _supportsImages(),
-        supportsReasoningContent: false,
+        capabilities: capabilities.copyWith(supportsReasoningContent: false),
       ),
     );
     final body = <String, dynamic>{
@@ -1089,11 +1093,11 @@ class LlmService {
     };
     final thinkingEnabled = config.thinkingBudget > 0;
     if (config.temperature != null &&
-        !_isReasoningModel(config.model) &&
+        capabilities.acceptsTemperature &&
         !thinkingEnabled) {
       body['temperature'] = config.temperature;
     }
-    if (tools.isNotEmpty) {
+    if (capabilities.supportsTools && tools.isNotEmpty) {
       body['tools'] = tools.map((t) => t.toAnthropicJson()).toList();
     }
     if (thinkingEnabled) {
@@ -1198,7 +1202,8 @@ class LlmService {
   ) async* {
     final url = _joinEndpointUrl(config.baseUrl, '/v1/chat/completions');
     _validateApiHost(url);
-    var includeUsage = await _supportsOpenAIStreamUsage();
+    var includeUsage =
+        await _capabilityRegistry.supportsOpenAIStreamUsage(resolvedModelProfile);
     var body = _buildOpenAIBody(
       system,
       messages,
@@ -1216,7 +1221,8 @@ class LlmService {
         if (response.statusCode == 400) {
           final errorBody = await response.stream.bytesToString();
           if (includeUsage && _isStreamUsageUnsupportedError(errorBody)) {
-            await _markOpenAIStreamUsageUnsupported();
+            await _capabilityRegistry
+                .markOpenAIStreamUsageUnsupported(config.baseUrl);
             includeUsage = false;
             body = _buildOpenAIBody(
               system,
@@ -1483,6 +1489,7 @@ class LlmService {
     bool includeStreamUsage = true,
   }) {
     const transform = ProviderMessageTransform();
+    final capabilities = resolvedModelProfile.capabilities;
     final safeSystem = _sanitizeForLlmPayload(system);
     final openaiMessages = <Map<String, dynamic>>[
       {'role': 'system', 'content': safeSystem},
@@ -1493,14 +1500,12 @@ class LlmService {
         apiFormat: 'openai',
         modelId: modelIdFromDisplay(config.model),
         baseUrl: Uri.tryParse(config.baseUrl),
-        supportsImages: _supportsImages(),
-        supportsReasoningContent: _needsReasoningContent(),
+        capabilities: capabilities,
       ),
     ));
-    final provider = _detectOpenAICompatibleProvider();
     final thinkingEnabled = config.thinkingBudget > 0 &&
-        provider == _OpenAICompatibleProvider.anthropicCompatible;
-    final tokenLimitKey = _openAITokenLimitKey(provider);
+        resolvedModelProfile.provider.kind == ProviderKind.anthropicCompatible;
+    final tokenLimitKey = capabilities.tokenLimitParameter.requestKey;
     final body = <String, dynamic>{
       'model': modelIdFromDisplay(config.model),
       if (thinkingEnabled)
@@ -1513,11 +1518,11 @@ class LlmService {
         'stream_options': {'include_usage': true},
     };
     if (config.temperature != null &&
-        !_isReasoningModel(config.model) &&
+        capabilities.acceptsTemperature &&
         !thinkingEnabled) {
       body['temperature'] = config.temperature;
     }
-    if (tools.isNotEmpty) {
+    if (capabilities.supportsTools && tools.isNotEmpty) {
       body['tools'] = tools.map((t) => t.toOpenAIJson()).toList();
     }
     if (thinkingEnabled) {
@@ -1531,60 +1536,6 @@ class LlmService {
 
   static String _sanitizeForLlmPayload(String text) {
     return const LlmContentSanitizer().sanitizeText(text).text;
-  }
-
-  static bool _isReasoningModel(String model) {
-    final m = model.toLowerCase();
-    return m.startsWith('o1') ||
-        m.startsWith('o3') ||
-        m.startsWith('o4') ||
-        m.contains('gpt-5') ||
-        m.contains('deepseek-reasoner') ||
-        m.contains('deepseek-r1') ||
-        m.contains('reasoner') ||
-        RegExp(r'(^|[/:._-])r1($|[/:._-])').hasMatch(m) ||
-        m.contains('reasoning');
-  }
-
-  Future<bool> _supportsOpenAIStreamUsage() async {
-    final host = _normalizedBaseUrlHost(config.baseUrl);
-    if (host.isEmpty) return true;
-    if (_streamUsageUnsupportedHosts.contains(host)) return false;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final unsupported =
-          prefs.getStringList(streamUsageUnsupportedHostsPrefsKey) ?? const [];
-      _streamUsageUnsupportedHosts.addAll(unsupported);
-      return !unsupported.contains(host);
-    } catch (_) {
-      return true;
-    }
-  }
-
-  Future<void> _markOpenAIStreamUsageUnsupported() async {
-    final host = _normalizedBaseUrlHost(config.baseUrl);
-    if (host.isEmpty) return;
-    _streamUsageUnsupportedHosts.add(host);
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final unsupported =
-          prefs.getStringList(streamUsageUnsupportedHostsPrefsKey) ?? const [];
-      if (unsupported.contains(host)) return;
-      await prefs.setStringList(
-        streamUsageUnsupportedHostsPrefsKey,
-        [...unsupported, host],
-      );
-    } catch (_) {
-      // SharedPreferences may be unavailable in pure Dart tests; the in-memory
-      // cache still prevents repeat failures for this process.
-    }
-  }
-
-  static String _normalizedBaseUrlHost(String baseUrl) {
-    final uri = Uri.tryParse(baseUrl.trim());
-    final host = uri?.host;
-    if (host != null && host.isNotEmpty) return host.toLowerCase();
-    return '';
   }
 
   bool _isStreamUsageUnsupportedError(String errorBody) {
@@ -1607,112 +1558,36 @@ class LlmService {
         !lower.contains('max_completion_tokens')) {
       return false;
     }
-    final current = _tokenKeyOverrides[_tokenKeyOverrideKey] ??
-        _openAITokenLimitKey(_detectOpenAICompatibleProvider());
-    final alternate = current == 'max_completion_tokens'
-        ? 'max_tokens'
-        : 'max_completion_tokens';
-    _tokenKeyOverrides[_tokenKeyOverrideKey] = alternate;
-    _pruneTokenKeyOverrides();
+    final current = resolvedModelProfile.capabilities.tokenLimitParameter;
+    final alternate = current == TokenLimitParameter.maxCompletionTokens
+        ? TokenLimitParameter.maxTokens
+        : TokenLimitParameter.maxCompletionTokens;
+    _capabilityRegistry.markTokenLimitParameterOverride(
+      apiFormat: config.format,
+      baseUrl: config.baseUrl,
+      modelId: modelIdFromDisplay(config.model),
+      parameter: alternate,
+    );
     return true;
-  }
-
-  static final Set<String> _requiresReasoningContent = {};
-
-  bool _needsReasoningContent() {
-    if (_usesOpenAIReasoningContent()) return true;
-    return _requiresReasoningContent.contains(_tokenKeyOverrideKey);
   }
 
   bool _tryReasoningContentFallback(String errorBody) {
     final lower = errorBody.toLowerCase();
     if (!lower.contains('reasoning_content')) return false;
-    _requiresReasoningContent.add(_tokenKeyOverrideKey);
+    _capabilityRegistry.markRequiresReasoningContent(
+      apiFormat: config.format,
+      baseUrl: config.baseUrl,
+      modelId: modelIdFromDisplay(config.model),
+    );
     return true;
   }
-
-  static const int _maxTokenKeyOverrides = 50;
-  static final Map<String, String> _tokenKeyOverrides = {};
 
   static void clearTokenKeyOverrides() {
-    _tokenKeyOverrides.clear();
+    CapabilityRegistry.instance.clearTokenLimitOverrides();
   }
 
-  static void _pruneTokenKeyOverrides() {
-    if (_tokenKeyOverrides.length <= _maxTokenKeyOverrides) return;
-    final removeCount = _tokenKeyOverrides.length ~/ 2;
-    final keysToRemove = _tokenKeyOverrides.keys.take(removeCount).toList();
-    for (final key in keysToRemove) {
-      _tokenKeyOverrides.remove(key);
-    }
-  }
-
-  String get _tokenKeyOverrideKey =>
-      '${config.baseUrl}\n${modelIdFromDisplay(config.model)}';
-
-  String _openAITokenLimitKey(_OpenAICompatibleProvider provider) {
-    final override = _tokenKeyOverrides[_tokenKeyOverrideKey];
-    if (override != null) return override;
-
-    if (_isReasoningModel(config.model)) return 'max_completion_tokens';
-
-    return switch (provider) {
-      _OpenAICompatibleProvider.openaiNative => 'max_completion_tokens',
-      _OpenAICompatibleProvider.anthropicCompatible => 'max_completion_tokens',
-      _OpenAICompatibleProvider.maxCompletionTokensProvider =>
-        'max_completion_tokens',
-      _OpenAICompatibleProvider.generic => 'max_tokens',
-    };
-  }
-
-  _OpenAICompatibleProvider _detectOpenAICompatibleProvider() {
-    final baseUrl = config.baseUrl.toLowerCase();
-    if (baseUrl.contains('anthropic') || baseUrl.contains('claude')) {
-      return _OpenAICompatibleProvider.anthropicCompatible;
-    }
-    if (baseUrl.contains('openai.com')) {
-      return _OpenAICompatibleProvider.openaiNative;
-    }
-    if (baseUrl.contains('openrouter') ||
-        baseUrl.contains('groq.com') ||
-        baseUrl.contains('litellm')) {
-      return _OpenAICompatibleProvider.maxCompletionTokensProvider;
-    }
-    return _OpenAICompatibleProvider.generic;
-  }
-
-  bool _usesOpenAIReasoningContent() {
-    final model = modelIdFromDisplay(config.model).toLowerCase();
-    if (config.baseUrl.toLowerCase().contains('openai.com')) return false;
-    if (_detectOpenAICompatibleProvider() ==
-        _OpenAICompatibleProvider.anthropicCompatible) {
-      return false;
-    }
-    final isKnownDeepSeekReasoning =
-        model == 'deepseek-reasoner' || model == 'deepseek-r1';
-    final isDeepSeekReasoningFamily = model.contains('deepseek') &&
-        (model.contains('reasoner') ||
-            RegExp(r'(^|[/:._-])r1($|[/:._-])').hasMatch(model));
-    final isBareR1 = model == 'r1' || model.startsWith('r1-');
-    return isKnownDeepSeekReasoning || isDeepSeekReasoningFamily || isBareR1;
-  }
-
-  bool _supportsImages() {
-    final model = modelIdFromDisplay(config.model).toLowerCase();
-    // Default to true until ClawChat has a full provider/model capability
-    // registry. Keep known text-only reasoning and coding model families from
-    // sending raw image blocks to providers that reject them.
-    if (model == 'deepseek-reasoner' ||
-        model == 'deepseek-r1' ||
-        model == 'r1' ||
-        model.startsWith('r1-') ||
-        model.contains('deepseek-r1') ||
-        model.contains('deepseek-reasoner') ||
-        model.contains('coder') ||
-        model.contains('codex')) {
-      return false;
-    }
-    return true;
+  static void clearReasoningContentOverridesForTesting() {
+    CapabilityRegistry.instance.clearReasoningContentOverrides();
   }
 
   @Deprecated('Use ProviderMessageTransform.toProviderPayload instead.')
@@ -1917,7 +1792,8 @@ class LlmService {
     final reasoningContent =
         role == 'assistant' ? msg['reasoning_content'] as String? : null;
     final shouldSendReasoningContent =
-        role == 'assistant' && _needsReasoningContent();
+        role == 'assistant' &&
+            resolvedModelProfile.capabilities.supportsReasoningContent;
     final topLevelToolCalls = msg['tool_calls'] as List?;
 
     if (content is String) {

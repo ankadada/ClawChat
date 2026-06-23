@@ -7,12 +7,14 @@ export '../models/agent_state.dart' show AgentStatus, QueuedMessage;
 import '../constants.dart';
 import '../models/agent_state.dart';
 import '../models/chat_models.dart';
+import '../models/model_capabilities.dart';
 import '../models/provider_profile.dart';
 import '../services/agent_service.dart';
 import '../services/chat_context_utils.dart';
 import '../services/context_summary_service.dart';
 import '../services/llm_content_sanitizer.dart';
 import '../services/llm_service.dart';
+import '../services/model_capability_registry.dart';
 import '../services/native_bridge.dart';
 import '../services/provider_message_transform.dart';
 import '../services/runtime_debug_events.dart';
@@ -902,10 +904,15 @@ class ChatProvider extends ChangeNotifier {
       ));
 
       final fullApiMessages = activeSession.toApiMessages();
-      final toolDefinitions = _toolDefinitionsForBudget(llmConfig);
+      final capabilities = llm.resolvedModelProfile.capabilities;
+      final toolDefinitions = _toolDefinitionsForBudget(
+        llmConfig,
+        capabilities: capabilities,
+      );
       final estimator = _tokenEstimatorFor(llmConfig);
       final tokenBudget = _resolveContextTokenBudget(
         llmConfig: llmConfig,
+        capabilities: capabilities,
         systemPrompt: fullPrompt,
         estimator: estimator,
         toolDefinitions: toolDefinitions,
@@ -918,6 +925,7 @@ class ChatProvider extends ChangeNotifier {
         tokenBudget: tokenBudget,
         estimator: estimator,
         state: state,
+        capabilities: capabilities,
       );
       if (summaryResult.summaryGenerated) {
         _appendContextSummaryCompactedNotice(
@@ -936,6 +944,7 @@ class ChatProvider extends ChangeNotifier {
       final promptWithSummary = summaryResult.systemPrompt;
       final finalTokenBudget = _resolveContextTokenBudget(
         llmConfig: llmConfig,
+        capabilities: capabilities,
         systemPrompt: promptWithSummary,
         estimator: estimator,
         toolDefinitions: toolDefinitions,
@@ -972,8 +981,7 @@ class ChatProvider extends ChangeNotifier {
               llmConfig.format == ApiFormat.anthropic ? 'anthropic' : 'openai',
           modelId: LlmService.modelIdFromDisplay(llmConfig.model),
           baseUrl: Uri.tryParse(llmConfig.baseUrl),
-          supportsImages: llm.supportsImagesForTransform,
-          supportsReasoningContent: llm.supportsReasoningContentForTransform,
+          capabilities: capabilities,
         ),
       );
       final initialApiMsgCount = apiMessages.length;
@@ -1019,8 +1027,10 @@ class ChatProvider extends ChangeNotifier {
               modelId: LlmService.modelIdFromDisplay(llmConfig.model),
               baseUrl: Uri.tryParse(llmConfig.baseUrl),
               mode: ProviderTransformMode.recovery,
-              supportsImages: true,
-              supportsReasoningContent: false,
+              capabilities: capabilities.copyWith(
+                supportsImages: true,
+                supportsReasoningContent: false,
+              ),
             ),
           );
           _recordProviderTransformWarning(
@@ -1490,12 +1500,18 @@ class ChatProvider extends ChangeNotifier {
         thinkingBudget: _prefs.thinkingBudget,
         temperature: _prefs.temperature,
       );
+      final compareCapabilities = _capabilitiesForCompareModels(
+        format: format,
+        baseUrl: baseUrl,
+        models: compareModels,
+      );
       final baseCompareMessages = [
         ...session.toApiMessages(),
         {'role': 'user', 'content': comparePrompt},
       ];
       final baseCompareBudget = _resolveContextTokenBudget(
         llmConfig: compareBudgetConfig,
+        capabilities: compareCapabilities,
         systemPrompt: fullPrompt,
         estimator: compareEstimator,
         toolDefinitions: compareToolDefinitions,
@@ -1528,6 +1544,7 @@ class ChatProvider extends ChangeNotifier {
         compressedCompareMessages,
         maxTokens: _resolveContextTokenBudget(
           llmConfig: compareBudgetConfig,
+          capabilities: compareCapabilities,
           systemPrompt: compareSystemPrompt,
           estimator: compareEstimator,
           toolDefinitions: compareToolDefinitions,
@@ -1697,26 +1714,30 @@ class ChatProvider extends ChangeNotifier {
 
   int _resolveContextTokenBudget({
     required LlmConfig llmConfig,
+    required ModelCapabilities capabilities,
     required String systemPrompt,
     required TokenEstimator estimator,
     required List<Map<String, dynamic>> toolDefinitions,
   }) {
+    final effectiveContextTokenBudget = _effectiveContextTokenBudget(
+      capabilities,
+    );
     final systemTokens = estimator.estimateText(systemPrompt);
     final toolDefinitionTokens =
         estimator.estimateToolDefinitions(toolDefinitions);
     final configuredOutputReserve = llmConfig.maxTokens +
         (llmConfig.thinkingBudget > 0 ? llmConfig.thinkingBudget : 0);
-    final maxOutputReserve = (_prefs.contextTokenBudget * 0.5).floor();
+    final maxOutputReserve = (effectiveContextTokenBudget * 0.5).floor();
     final outputReserve = math.min(configuredOutputReserve, maxOutputReserve);
     const safetyMargin = 1024;
-    final budget = _prefs.contextTokenBudget -
+    final budget = effectiveContextTokenBudget -
         systemTokens -
         toolDefinitionTokens -
         outputReserve -
         safetyMargin;
     if (budget <= 0) {
       debugPrint(
-        'Context token budget exhausted: context=${_prefs.contextTokenBudget}, '
+        'Context token budget exhausted: context=$effectiveContextTokenBudget, '
         'system=$systemTokens, tools=$toolDefinitionTokens, '
         'outputReserve=$outputReserve, '
         'safetyMargin=$safetyMargin.',
@@ -1724,6 +1745,32 @@ class ChatProvider extends ChangeNotifier {
       return 0;
     }
     return budget;
+  }
+
+  int _effectiveContextTokenBudget(ModelCapabilities capabilities) {
+    final maxContextTokens = capabilities.maxContextTokens;
+    if (maxContextTokens == null) return _prefs.contextTokenBudget;
+    return math.min(_prefs.contextTokenBudget, maxContextTokens);
+  }
+
+  ModelCapabilities _capabilitiesForCompareModels({
+    required ApiFormat format,
+    required String baseUrl,
+    required List<String> models,
+  }) {
+    if (models.isEmpty) return const ModelCapabilities();
+    final resolved = models
+        .map((model) => CapabilityRegistry.instance
+            .resolve(apiFormat: format, baseUrl: baseUrl, model: model)
+            .capabilities)
+        .toList();
+    final knownWindows = resolved
+        .map((capabilities) => capabilities.maxContextTokens)
+        .whereType<int>()
+        .toList();
+    if (knownWindows.isEmpty) return resolved.first;
+    knownWindows.sort();
+    return resolved.first.copyWith(maxContextTokens: knownWindows.first);
   }
 
   AgentService _createAgentService({
@@ -1743,6 +1790,7 @@ class ChatProvider extends ChangeNotifier {
       ),
       maxIterations: _prefs.agentMaxIterations,
       privacyMode: _prefs.privacyMode,
+      supportsTools: llm.resolvedModelProfile.capabilities.supportsTools,
       envVars: _prefs.envVars,
     );
   }
@@ -1755,6 +1803,7 @@ class ChatProvider extends ChangeNotifier {
     required int tokenBudget,
     required TokenEstimator estimator,
     required AgentState state,
+    required ModelCapabilities capabilities,
   }) async {
     if (!_prefs.autoCompact ||
         fullApiMessages.isEmpty ||
@@ -1809,7 +1858,8 @@ class ChatProvider extends ChangeNotifier {
         coveredMessageCount: plan.headForSummary.length,
         sourceEstimatedTokens: plan.headEstimatedTokens,
         estimator: estimator,
-        maxInputTokens: (_prefs.contextTokenBudget * 0.8).floor(),
+        maxInputTokens: (_effectiveContextTokenBudget(capabilities) * 0.8)
+            .floor(),
       );
       final service = _contextSummaryServiceFactory();
       try {
@@ -2202,7 +2252,11 @@ class ChatProvider extends ChangeNotifier {
     return hash.toRadixString(16).padLeft(8, '0');
   }
 
-  List<Map<String, dynamic>> _toolDefinitionsForBudget(LlmConfig llmConfig) {
+  List<Map<String, dynamic>> _toolDefinitionsForBudget(
+    LlmConfig llmConfig, {
+    required ModelCapabilities capabilities,
+  }) {
+    if (!capabilities.supportsTools) return const [];
     final definitions = _tools.getToolDefinitions();
     if (llmConfig.format == ApiFormat.anthropic) {
       return definitions.map((tool) => tool.toAnthropicJson()).toList();

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import '../models/model_capabilities.dart';
 import 'llm_content_sanitizer.dart';
 
 enum ProviderTransformMode { normal, recovery, compare }
@@ -9,21 +10,24 @@ class ProviderTransformOptions {
   final String modelId;
   final Uri? baseUrl;
   final ProviderTransformMode mode;
-  final bool supportsImages;
-  final bool supportsReasoningContent;
+  final ModelCapabilities capabilities;
 
   const ProviderTransformOptions({
     required this.apiFormat,
     required this.modelId,
     this.baseUrl,
     this.mode = ProviderTransformMode.normal,
-    this.supportsImages = true,
-    this.supportsReasoningContent = false,
+    this.capabilities = const ModelCapabilities(),
   });
 
   bool get isAnthropic => apiFormat.toLowerCase() == 'anthropic';
   bool get isOpenAI => apiFormat.toLowerCase() == 'openai';
   bool get isRecovery => mode == ProviderTransformMode.recovery;
+  bool get supportsImages => capabilities.supportsImages;
+  bool get supportsReasoningContent =>
+      capabilities.supportsReasoningContent;
+  bool get supportsTools => capabilities.supportsTools;
+  bool get supportsPromptCache => capabilities.supportsPromptCache;
 }
 
 class ProviderTransformResult {

@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/models/chat_models.dart';
+import 'package:clawchat/models/model_capabilities.dart' as caps;
 import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
@@ -1022,6 +1023,57 @@ void main() {
         observedSystems.single,
         isNot(contains('conversation_context_summary')),
       );
+    });
+
+    test('model context window clamps user context token budget', () async {
+      final profile = ProviderProfile.defaults().copyWith(
+        id: 'profile',
+        apiKey: 'sk-test',
+        apiFormat: ProviderProfile.openaiFormat,
+        baseUrl: 'https://api.openai.com',
+        model: 'gpt-test-8k',
+      );
+      secureStorage['provider_profiles'] = jsonEncode([profile.toJson()]);
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 65536,
+      });
+      ContextSummaryRequest? observedRequest;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            observedRequest = request;
+            return _summaryForRequest(request);
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('old-window-${'中' * 12000}'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('old reply ${'中' * 12000}')],
+        ),
+        ChatMessage.user('recent prompt'),
+      ]);
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedRequest, isNotNull);
+      expect(observedRequest!.maxInputTokens, (8192 * 0.8).floor());
     });
 
     test('overflow generates summary and injects it into system prompt',
@@ -2335,6 +2387,85 @@ void main() {
       expect(serialized, isNot(contains('old reply')));
       expect(serialized, contains('new prompt'));
     });
+
+    test('unsupported tools are not subtracted from message budget', () async {
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 32768,
+      });
+      final tools = ToolRegistry()
+        ..register(_LargeSchemaTool(), risk: ToolRisk.safe);
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        toolRegistry: tools,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            throw StateError('summary should not be generated');
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          resolvedProfile: _resolvedProfileWithCapabilities(
+            const caps.ModelCapabilities(supportsTools: false),
+          ),
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.add(ChatMessage.user('old-no-tools-${'中' * 14000}'));
+
+      await provider.sendMessage('new prompt');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(1));
+      final serialized = observedMessages.single.toString();
+      expect(serialized, contains('old-no-tools'));
+      expect(serialized, contains('new prompt'));
+    });
+
+    test('unsupported tools are not sent through AgentService', () async {
+      final tools = ToolRegistry()..register(_EchoTool(), risk: ToolRisk.safe);
+      final observedTools = <int>[];
+      final provider = ChatProvider(
+        toolRegistry: tools,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          resolvedProfile: _resolvedProfileWithCapabilities(
+            const caps.ModelCapabilities(supportsTools: false),
+          ),
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+          onTools: (tools) => observedTools.add(tools.length),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('hello');
+
+      expect(provider.errorMessage, isNull);
+      expect(observedTools, [0]);
+    });
   });
 
   group('charCount - string content', () {
@@ -2593,6 +2724,7 @@ class _ScriptedLlmService extends LlmService {
   final LlmResponse Function(List<Map<String, dynamic>> messages)? onChat;
   final void Function(List<ToolDefinition> tools)? onTools;
   final void Function(String system)? onStreamSystem;
+  final caps.ResolvedModelProfile? resolvedProfile;
 
   _ScriptedLlmService(
     super.config, {
@@ -2601,7 +2733,12 @@ class _ScriptedLlmService extends LlmService {
     this.onChat,
     this.onTools,
     this.onStreamSystem,
+    this.resolvedProfile,
   });
+
+  @override
+  caps.ResolvedModelProfile get resolvedModelProfile =>
+      resolvedProfile ?? super.resolvedModelProfile;
 
   @override
   Future<LlmResponse> chat({
@@ -2702,6 +2839,23 @@ ContextSummary _summaryForRequest(ContextSummaryRequest request) {
   );
 }
 
+caps.ResolvedModelProfile _resolvedProfileWithCapabilities(
+  caps.ModelCapabilities capabilities,
+) {
+  return caps.ResolvedModelProfile(
+    modelId: 'claude-sonnet-4-20250514',
+    providerKey: 'anthropic|127.0.0.1',
+    provider: const caps.ProviderCapabilities(
+      apiFormat: caps.ApiFormat.anthropic,
+      kind: caps.ProviderKind.anthropicNative,
+      systemPromptMode: caps.SystemPromptMode.topLevel,
+      defaultTokenLimitParameter: caps.TokenLimitParameter.maxTokens,
+      streamingUsageMode: caps.StreamingUsageMode.nativeEvents,
+    ),
+    capabilities: capabilities,
+  );
+}
+
 class _EchoTool extends Tool {
   @override
   String get name => 'echo';
@@ -2714,6 +2868,30 @@ class _EchoTool extends Tool {
         'type': 'object',
         'properties': {
           'text': {'type': 'string'},
+        },
+      };
+
+  @override
+  Future<String> execute(Map<String, dynamic> input) async {
+    return input['text']?.toString() ?? '';
+  }
+}
+
+class _LargeSchemaTool extends Tool {
+  @override
+  String get name => 'large_schema';
+
+  @override
+  String get description => 'Large schema used to exercise tool budgeting';
+
+  @override
+  Map<String, dynamic> get inputSchema => {
+        'type': 'object',
+        'properties': {
+          'text': {
+            'type': 'string',
+            'description': 'x' * 30000,
+          },
         },
       };
 

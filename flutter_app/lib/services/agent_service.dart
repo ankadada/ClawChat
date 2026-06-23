@@ -63,6 +63,7 @@ class AgentService {
   final int maxIterations;
   final bool parallelTools;
   final bool privacyMode;
+  final bool supportsTools;
   final Map<String, String> envVars;
   bool _cancelled = false;
   List<Map<String, dynamic>> _lastMessages = [];
@@ -75,6 +76,7 @@ class AgentService {
     this.maxIterations = 25,
     this.parallelTools = false,
     this.privacyMode = true,
+    this.supportsTools = true,
     this.envVars = const {},
   })  : _llm = llm,
         _tools = tools,
@@ -101,7 +103,8 @@ class AgentService {
   }) async* {
     _cancelled = false;
     _lastMessages = messages;
-    final toolDefs = _tools.getToolDefinitions();
+    final toolDefs =
+        supportsTools ? _tools.getToolDefinitions() : <ToolDefinition>[];
     final effectiveMaxIterations = maxIterations.clamp(1, 99).toInt();
     int iteration = 0;
     var hadToolCalls = false;
