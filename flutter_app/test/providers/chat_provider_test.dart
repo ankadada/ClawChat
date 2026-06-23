@@ -9,6 +9,8 @@ import 'package:clawchat/services/chat_context_utils.dart';
 import 'package:clawchat/services/context_summary_service.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
+import 'package:clawchat/services/provider_message_transform.dart';
+import 'package:clawchat/services/runtime_debug_events.dart';
 import 'package:clawchat/services/token_calibration_service.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:clawchat/services/tools/tool_registry.dart';
@@ -458,7 +460,9 @@ void main() {
 
     test('sendMessage reports orphan tool block cleanup separately', () async {
       final observedMessages = <List<Map<String, dynamic>>>[];
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) => _summaryForRequest(request),
         ),
@@ -503,12 +507,20 @@ void main() {
             .join('\n'),
         contains('清理了 1 个不完整的工具调用'),
       );
+      final truncationEvent = events
+          .recent(sessionId: session.id)
+          .where((event) => event.type == 'context.truncated')
+          .single;
+      expect(truncationEvent.data['droppedBlockCount'], 1);
+      expect(truncationEvent.data['overBudgetAfterTruncation'], isFalse);
     });
 
     test('sendMessage compresses old large tool results in payload only',
         () async {
       final observedMessages = <List<Map<String, dynamic>>>[];
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) => _summaryForRequest(request),
         ),
@@ -604,6 +616,12 @@ void main() {
         provider.currentSession!.toApiMessages().toString(),
         contains(oldOutput),
       );
+      final compressionEvent = events
+          .recent(sessionId: session.id)
+          .where((event) => event.type == 'tool_result.compressed')
+          .single;
+      expect(compressionEvent.data['compressedCount'], 1);
+      expect(compressionEvent.data.toString(), isNot(contains(oldOutput)));
     });
 
     test('large system prompt truncates history more aggressively', () async {
@@ -769,7 +787,9 @@ void main() {
 
     test('encrypted recovery retry uses provider transform cleanup', () async {
       final observedMessages = <List<Map<String, dynamic>>>[];
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) => _summaryForRequest(request),
         ),
@@ -834,6 +854,90 @@ void main() {
       expect(retryPayload, isNot(contains('encrypted')));
       expect(retryPayload, contains('call_1'));
       expect(retryPayload, isNot(contains('call:1')));
+      final recoveryEvents = events
+          .recent(sessionId: session.id)
+          .where((event) =>
+              event.type == 'chat.recovery.invalid_encrypted_content')
+          .toList();
+      expect(recoveryEvents.map((event) => event.data['success']),
+          containsAll([false, true]));
+    });
+
+    test('provider transform warning is recorded for unsupported images',
+        () async {
+      final events = RuntimeDebugEventService();
+      final observedMessages = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        runtimeDebugEvents: events,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            observedMessages.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.modelOverride = 'deepseek-r1';
+
+      await provider.sendMessage('', attachments: [
+        ImageContent(data: 'abc123', mediaType: 'image/png'),
+      ]);
+
+      expect(provider.errorMessage, isNull);
+      expect(observedMessages, hasLength(1));
+      final transformEvent = events
+          .recent(sessionId: session.id)
+          .where((event) => event.type == 'provider.transform.warning')
+          .single;
+      expect(transformEvent.data['warningCount'], greaterThan(0));
+      expect(
+        transformEvent.data['firstWarning'],
+        contains('image content replaced'),
+      );
+      expect(transformEvent.data.toString(), isNot(contains('abc123')));
+    });
+
+    test('provider transform warning preflight failure is best effort',
+        () async {
+      final events = RuntimeDebugEventService();
+      final provider = ChatProvider(
+        runtimeDebugEvents: events,
+        providerTransformPreflight: (_, __) {
+          throw StateError('preflight failed');
+        },
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(
+        () => provider.recordProviderTransformWarningsBestEffortForTesting(
+          sessionId: 'session',
+          messages: const [
+            {'role': 'user', 'content': 'hello'},
+          ],
+          options: const ProviderTransformOptions(
+            apiFormat: 'anthropic',
+            modelId: 'model',
+          ),
+        ),
+        returnsNormally,
+      );
+      expect(events.recent(sessionId: 'session'), isEmpty);
     });
 
     test('does not generate summary when messages fit token budget', () async {
@@ -893,7 +997,9 @@ void main() {
       final observedSystems = <String>[];
       final observedMessages = <List<Map<String, dynamic>>>[];
       var summaryCalls = 0;
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) {
             summaryCalls++;
@@ -959,6 +1065,14 @@ void main() {
             .join('\n'),
         contains('压缩为摘要'),
       );
+      final summaryEvent = events
+          .recent(
+            sessionId: session.id,
+          )
+          .where((event) => event.type == 'context.summary.generated')
+          .single;
+      expect(summaryEvent.data['coveredMessageCount'], greaterThan(0));
+      expect(summaryEvent.data['reused'], isFalse);
     });
 
     test('matching summary digest is reused without regeneration', () async {
@@ -968,7 +1082,9 @@ void main() {
       });
       final observedSystems = <String>[];
       var summaryCalls = 0;
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) {
             summaryCalls++;
@@ -1031,6 +1147,14 @@ void main() {
       expect(provider.errorMessage, isNull);
       expect(summaryCalls, 0);
       expect(observedSystems.single, contains('Reusable summary'));
+      final reusedEvent = events
+          .recent(
+            sessionId: session.id,
+          )
+          .where((event) => event.type == 'context.summary.reused')
+          .single;
+      expect(reusedEvent.data['coveredMessageCount'],
+          session.contextSummary!.coveredMessageCount);
     });
 
     test('rolling update only sends unsummarized head messages', () async {
@@ -1039,7 +1163,9 @@ void main() {
         'context_token_budget': 32768,
       });
       ContextSummaryRequest? observedRequest;
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) {
             observedRequest = request;
@@ -1110,7 +1236,9 @@ void main() {
         'context_token_budget': 32768,
       });
       ContextSummaryRequest? observedRequest;
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) {
             observedRequest = request;
@@ -1161,6 +1289,13 @@ void main() {
       final serialized = observedRequest!.messages.toString();
       expect(serialized, contains('changed-old'));
       expect(serialized, isNot(contains('original-old')));
+      final staleEvent = events
+          .recent(
+            sessionId: session.id,
+          )
+          .where((event) => event.type == 'context.summary.stale')
+          .single;
+      expect(staleEvent.data['reason'], 'digest_mismatch');
     });
 
     test('summary generation failure falls back and continues', () async {
@@ -1168,7 +1303,9 @@ void main() {
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
       });
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (_) => throw StateError('summary unavailable'),
         ),
@@ -1206,6 +1343,13 @@ void main() {
             .join('\n'),
         contains('摘要生成失败'),
       );
+      final failedEvent = events
+          .recent(
+            sessionId: session.id,
+          )
+          .where((event) => event.type == 'context.summary.failed')
+          .single;
+      expect(failedEvent.data['stage'], 'llm');
     });
 
     test('summary and extractive fallback failures use pure P0 truncation',
@@ -1216,7 +1360,9 @@ void main() {
       });
       final observedSystems = <String>[];
       final observedMessages = <List<Map<String, dynamic>>>[];
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (_) => throw StateError('summary unavailable'),
           onExtractive: (_) => throw StateError('extractive unavailable'),
@@ -1266,6 +1412,12 @@ void main() {
             .join('\n'),
         contains('摘要生成失败'),
       );
+      final failedStages = events
+          .recent(sessionId: session.id)
+          .where((event) => event.type == 'context.summary.failed')
+          .map((event) => event.data['stage'])
+          .toList();
+      expect(failedStages, containsAll(['llm', 'extractive']));
     });
 
     test('sendCompare uses token-aware truncation', () async {
@@ -1660,7 +1812,9 @@ void main() {
     });
 
     test('successful send updates token calibration', () async {
+      final events = RuntimeDebugEventService();
       final provider = ChatProvider(
+        runtimeDebugEvents: events,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) => _summaryForRequest(request),
         ),
@@ -1693,6 +1847,49 @@ void main() {
       final entry = stored.values.single as Map<String, dynamic>;
       expect(entry['multiplier'] as double, greaterThan(1.0));
       expect(entry['sampleCount'], 1);
+      final calibrationEvent = events
+          .recent(sessionId: session.id)
+          .where((event) => event.type == 'token.calibration.updated')
+          .single;
+      expect(calibrationEvent.data['keyHash'], isA<String>());
+      expect(calibrationEvent.data['newMultiplier'], greaterThan(1.0));
+      expect(calibrationEvent.data.toString(), isNot(contains('127.0.0.1')));
+    });
+
+    test('successful send records skipped token calibration event', () async {
+      final events = RuntimeDebugEventService();
+      final provider = ChatProvider(
+        runtimeDebugEvents: events,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      for (var i = 0; i < 12; i++) {
+        session.messages.add(ChatMessage.user('history-$i ${'x' * 4000}'));
+      }
+      await provider.sendMessage('calibrate skip');
+
+      expect(provider.errorMessage, isNull);
+      final calibrationEvent = events
+          .recent(sessionId: session.id)
+          .where((event) => event.type == 'token.calibration.skipped')
+          .single;
+      expect(calibrationEvent.data['reason'], 'missing_actual_tokens');
+      expect(calibrationEvent.data['estimatedInputTokens'], greaterThan(0));
     });
 
     test('encrypted recovery does not update token calibration', () async {

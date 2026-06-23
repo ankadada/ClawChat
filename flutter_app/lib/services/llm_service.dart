@@ -485,6 +485,10 @@ class LlmService {
   /// is no longer needed to avoid connection pool leaks.
   void dispose() => _client.close();
 
+  bool get supportsImagesForTransform => _supportsImages();
+
+  bool get supportsReasoningContentForTransform => _needsReasoningContent();
+
   /// Sanitize error response bodies to prevent leaking sensitive data
   /// (e.g. API keys) in exception messages.
   static String _sanitizeErrorBody(String body) {

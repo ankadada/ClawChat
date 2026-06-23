@@ -49,10 +49,24 @@ void main() {
     test('updates multiplier with high alpha for first samples', () async {
       final service = await createService();
 
-      service.recordSample(sample());
+      final result = service.recordSample(sample());
 
       expect(service.multiplierFor('anthropic|api.example.test|profile|model'),
           closeTo(1.06, 0.0001));
+      expect(result.updated, isTrue);
+      expect(result.ratio, 1.2);
+      expect(result.newMultiplier, closeTo(1.06, 0.0001));
+    });
+
+    test('returns skip reason without mutating profiles', () async {
+      final service = await createService();
+
+      final result = service.recordSample(sample(actualInputTokens: null));
+
+      expect(result.updated, isFalse);
+      expect(result.skipReason, 'missing_actual_tokens');
+      expect(service.multiplierFor('anthropic|api.example.test|profile|model'),
+          1.0);
     });
 
     test('uses lower alpha after three samples', () async {

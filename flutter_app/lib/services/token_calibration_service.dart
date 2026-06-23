@@ -45,6 +45,67 @@ class TokenCalibrationSample {
   }
 }
 
+class TokenCalibrationRecordResult {
+  final String key;
+  final bool updated;
+  final String? skipReason;
+  final int estimatedInputTokens;
+  final int rawEstimatedInputTokens;
+  final int? actualInputTokens;
+  final int? totalInputTokens;
+  final double? oldMultiplier;
+  final double? ratio;
+  final double? newMultiplier;
+
+  const TokenCalibrationRecordResult._({
+    required this.key,
+    required this.updated,
+    required this.skipReason,
+    required this.estimatedInputTokens,
+    required this.rawEstimatedInputTokens,
+    required this.actualInputTokens,
+    required this.totalInputTokens,
+    this.oldMultiplier,
+    this.ratio,
+    this.newMultiplier,
+  });
+
+  factory TokenCalibrationRecordResult.updated({
+    required TokenCalibrationSample sample,
+    required double oldMultiplier,
+    required double ratio,
+    required double newMultiplier,
+  }) {
+    return TokenCalibrationRecordResult._(
+      key: sample.key,
+      updated: true,
+      skipReason: null,
+      estimatedInputTokens: sample.estimatedInputTokens,
+      rawEstimatedInputTokens: sample.rawEstimatedInputTokens,
+      actualInputTokens: sample.actualInputTokens,
+      totalInputTokens: sample.totalInputTokens,
+      oldMultiplier: oldMultiplier,
+      ratio: ratio,
+      newMultiplier: newMultiplier,
+    );
+  }
+
+  factory TokenCalibrationRecordResult.skipped({
+    required TokenCalibrationSample sample,
+    required String reason,
+  }) {
+    return TokenCalibrationRecordResult._(
+      key: sample.key,
+      updated: false,
+      skipReason: reason,
+      estimatedInputTokens: sample.estimatedInputTokens,
+      rawEstimatedInputTokens: sample.rawEstimatedInputTokens,
+      actualInputTokens: sample.actualInputTokens,
+      totalInputTokens: sample.totalInputTokens,
+    );
+  }
+}
+
 class TokenCalibrationService {
   static const storageKey = 'token_calibration_profiles';
   static const maxProfiles = 100;
@@ -68,8 +129,14 @@ class TokenCalibrationService {
         .toDouble();
   }
 
-  void recordSample(TokenCalibrationSample sample) {
-    if (_shouldSkipSample(sample)) return;
+  TokenCalibrationRecordResult recordSample(TokenCalibrationSample sample) {
+    final skipReason = _skipReason(sample);
+    if (skipReason != null) {
+      return TokenCalibrationRecordResult.skipped(
+        sample: sample,
+        reason: skipReason,
+      );
+    }
 
     final totalInputTokens = sample.totalInputTokens!;
     final ratio = totalInputTokens / sample.rawEstimatedInputTokens;
@@ -96,27 +163,37 @@ class TokenCalibrationService {
       'ratio=${ratio.toStringAsFixed(3)}, '
       'new=${nextMultiplier.toStringAsFixed(3)}',
     );
+    return TokenCalibrationRecordResult.updated(
+      sample: sample,
+      oldMultiplier: oldMultiplier,
+      ratio: ratio,
+      newMultiplier: nextMultiplier,
+    );
   }
 
-  bool _shouldSkipSample(TokenCalibrationSample sample) {
+  String? _skipReason(TokenCalibrationSample sample) {
     final totalInputTokens = sample.totalInputTokens;
-    if (totalInputTokens == null) return true;
-    if (sample.rawEstimatedInputTokens < 512) return true;
-    if (sample.isRecovery) return true;
+    if (totalInputTokens == null) return 'missing_actual_tokens';
+    if (sample.rawEstimatedInputTokens < 512) return 'estimate_too_small';
+    if (sample.isRecovery) return 'recovery';
 
     final estimated = sample.rawEstimatedInputTokens;
     final cachedTokens =
         (sample.cacheReadTokens ?? 0) + (sample.cacheCreationTokens ?? 0);
     if (cachedTokens > 0 && cachedTokens / totalInputTokens > 0.8) {
-      return true;
+      return 'cache_share_too_high';
     }
-    if (sample.rawEstimatedImageTokens / estimated >= 0.25) return true;
-    if (sample.rawEstimatedToolTokens / estimated >= 0.35) return true;
-    if (sample.rawLargestBlockTokens >= 8000) return true;
+    if (sample.rawEstimatedImageTokens / estimated >= 0.25) {
+      return 'image_share_too_high';
+    }
+    if (sample.rawEstimatedToolTokens / estimated >= 0.35) {
+      return 'tool_share_too_high';
+    }
+    if (sample.rawLargestBlockTokens >= 8000) return 'large_block';
 
     final ratio = totalInputTokens / estimated;
-    if (ratio < 0.35 || ratio > 2.5) return true;
-    return false;
+    if (ratio < 0.35 || ratio > 2.5) return 'ratio_out_of_range';
+    return null;
   }
 
   Map<String, _TokenCalibrationProfile> _loadProfiles() {
