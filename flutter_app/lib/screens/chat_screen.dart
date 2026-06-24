@@ -2750,7 +2750,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         '[COMPARE] Button pressed. selectedModels=$selectedModels, count=${selectedModels.length}',
                       );
                       debugPrint(
-                        '[COMPARE] textController.text="${textController.text}"',
+                        '[COMPARE] textLength=${textController.text.length}',
                       );
                       final selectedModelList = selectedModels.toList();
                       final selectedModelCount = selectedModelList.length;

@@ -478,6 +478,80 @@ void main() {
       ]);
       expect(result.sensitiveDataStats.countByType['api_key'], 1);
     });
+
+    test('converts tool history to text when tools are unsupported', () {
+      final result = transform.transformCanonical(
+        [
+          {
+            'role': 'assistant',
+            'content': [
+              {
+                'type': 'tool_use',
+                'id': 'call:block',
+                'name': 'bash',
+                'input': {
+                  'command': 'echo ok',
+                  'api_key': 'sk-proj-abcdefghijklmnopqrstuvwxyz123456',
+                },
+              },
+            ],
+          },
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'tool_result',
+                'tool_use_id': 'call:block',
+                'for_llm': 'compact safe result',
+                'output': 'FULL OUTPUT THAT MUST NOT LEAK',
+                'is_error': true,
+              },
+            ],
+          },
+          {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [
+              {
+                'id': 'call:top',
+                'type': 'function',
+                'function': {
+                  'name': 'web_fetch',
+                  'arguments':
+                      '{"url":"https://example.test?token=query-secret"}',
+                },
+              },
+            ],
+          },
+          {
+            'role': 'tool',
+            'tool_call_id': 'call:top',
+            'content': 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456',
+          },
+        ],
+        const ProviderTransformOptions(
+          apiFormat: 'openai',
+          modelId: 'gpt-test',
+          capabilities: ModelCapabilities(supportsTools: false),
+        ),
+      );
+
+      expectNoProviderToolSyntax(result.messages);
+      final serialized = result.messages.toString();
+      expect(serialized, contains('[Tool call]'));
+      expect(serialized, contains('id: call_block'));
+      expect(serialized, contains('name: bash'));
+      expect(serialized, contains('status: requested'));
+      expect(serialized, contains('[Tool result]'));
+      expect(serialized, contains('status: error'));
+      expect(serialized, contains('for_llm: compact safe result'));
+      expect(serialized, contains('[redacted: api_key]'));
+      expect(serialized, contains('[redacted: token]'));
+      expect(serialized, contains('[redacted: bearer_token]'));
+      expect(serialized, isNot(contains('FULL OUTPUT THAT MUST NOT LEAK')));
+      expect(serialized, isNot(contains('sk-proj-')));
+      expect(result.messages.last['role'], 'user');
+    });
   });
 
   group('ProviderMessageTransform payload conversion', () {
@@ -725,5 +799,86 @@ void main() {
       expect(openAiPayload.toString(),
           isNot(contains('abcdefghijklmnopqrstuvwxyz')));
     });
+
+    test('provider payloads contain no tool syntax when tools unsupported', () {
+      final messages = [
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'call_1',
+              'name': 'bash',
+              'input': {'command': 'pwd'},
+            },
+          ],
+        },
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'call_1',
+              'for_llm': 'structured compact result',
+              'output': 'FULL OUTPUT THAT MUST NOT LEAK',
+            },
+          ],
+        },
+      ];
+
+      final anthropicPayload = transform.toProviderPayload(
+        messages,
+        const ProviderTransformOptions(
+          apiFormat: 'anthropic',
+          modelId: 'claude',
+          capabilities: ModelCapabilities(supportsTools: false),
+        ),
+      );
+      final openAiPayload = transform.toProviderPayload(
+        messages,
+        const ProviderTransformOptions(
+          apiFormat: 'openai',
+          modelId: 'gpt-test',
+          capabilities: ModelCapabilities(supportsTools: false),
+        ),
+      );
+
+      expectNoProviderToolSyntax(anthropicPayload);
+      expectNoProviderToolSyntax(openAiPayload);
+      expect(anthropicPayload.toString(), contains('[Tool call]'));
+      expect(openAiPayload.toString(), contains('[Tool call]'));
+      expect(
+          anthropicPayload.toString(), contains('structured compact result'));
+      expect(openAiPayload.toString(), contains('structured compact result'));
+      expect(
+        anthropicPayload.toString(),
+        isNot(contains('FULL OUTPUT THAT MUST NOT LEAK')),
+      );
+      expect(
+        openAiPayload.toString(),
+        isNot(contains('FULL OUTPUT THAT MUST NOT LEAK')),
+      );
+    });
   });
+}
+
+void expectNoProviderToolSyntax(Object? value) {
+  if (value is Map) {
+    for (final entry in value.entries) {
+      expect(entry.key, isNot('tool_calls'));
+      expect(entry.key, isNot('tool_call_id'));
+      if (entry.key == 'role') {
+        expect(entry.value, isNot('tool'));
+      }
+      if (entry.key == 'type') {
+        expect(entry.value, isNot('tool_use'));
+        expect(entry.value, isNot('tool_result'));
+      }
+      expectNoProviderToolSyntax(entry.value);
+    }
+  } else if (value is Iterable) {
+    for (final item in value) {
+      expectNoProviderToolSyntax(item);
+    }
+  }
 }

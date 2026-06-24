@@ -12,6 +12,7 @@ class CapabilityRegistry {
   static final Set<String> _streamUsageUnsupportedHosts = {};
   static final Map<String, TokenLimitParameter> _tokenLimitOverrides = {};
   static final Set<String> _requiresReasoningContent = {};
+  static final Set<String> _disablesReasoningContent = {};
 
   const CapabilityRegistry();
 
@@ -39,12 +40,15 @@ class CapabilityRegistry {
     if (tokenOverride != null) {
       capabilities = capabilities.copyWith(tokenLimitParameter: tokenOverride);
     }
-    if (_requiresReasoningContent.contains(compatibilityKey)) {
+    if (_disablesReasoningContent.contains(compatibilityKey)) {
+      capabilities = capabilities.copyWith(supportsReasoningContent: false);
+    } else if (_requiresReasoningContent.contains(compatibilityKey)) {
       capabilities = capabilities.copyWith(supportsReasoningContent: true);
     }
     if (capabilities.streamingUsageMode ==
             StreamingUsageMode.openAIStreamOptions &&
-        _streamUsageUnsupportedHosts.contains(_normalizedBaseUrlHost(baseUrl))) {
+        _streamUsageUnsupportedHosts
+            .contains(_normalizedBaseUrlHost(baseUrl))) {
       capabilities = capabilities.copyWith(
         streamingUsageMode: StreamingUsageMode.none,
         supportsStreamingUsage: false,
@@ -109,11 +113,27 @@ class CapabilityRegistry {
     required String baseUrl,
     required String modelId,
   }) {
-    _requiresReasoningContent.add(_compatibilityKey(
+    final key = _compatibilityKey(
       apiFormat: apiFormat,
       baseUrl: baseUrl,
       modelId: modelIdFromDisplay(modelId),
-    ));
+    );
+    _disablesReasoningContent.remove(key);
+    _requiresReasoningContent.add(key);
+  }
+
+  void markDisablesReasoningContent({
+    required ApiFormat apiFormat,
+    required String baseUrl,
+    required String modelId,
+  }) {
+    final key = _compatibilityKey(
+      apiFormat: apiFormat,
+      baseUrl: baseUrl,
+      modelId: modelIdFromDisplay(modelId),
+    );
+    _requiresReasoningContent.remove(key);
+    _disablesReasoningContent.add(key);
   }
 
   void clearTokenLimitOverrides() {
@@ -122,12 +142,14 @@ class CapabilityRegistry {
 
   void clearReasoningContentOverrides() {
     _requiresReasoningContent.clear();
+    _disablesReasoningContent.clear();
   }
 
   void clearRuntimeOverridesForTesting() {
     _streamUsageUnsupportedHosts.clear();
     _tokenLimitOverrides.clear();
     _requiresReasoningContent.clear();
+    _disablesReasoningContent.clear();
   }
 
   void clearStreamUsageUnsupportedHostsForTesting() {
@@ -168,8 +190,7 @@ class CapabilityRegistry {
     }
 
     final lowerBaseUrl = baseUrl.toLowerCase();
-    if (lowerBaseUrl.contains('anthropic') ||
-        lowerBaseUrl.contains('claude')) {
+    if (lowerBaseUrl.contains('anthropic') || lowerBaseUrl.contains('claude')) {
       return const ProviderCapabilities(
         apiFormat: ApiFormat.openai,
         kind: ProviderKind.anthropicCompatible,

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 export '../models/agent_state.dart' show AgentStatus, QueuedMessage;
@@ -1287,7 +1286,7 @@ class ChatProvider extends ChangeNotifier {
     if (currentSession == null) await createSession();
     final currentState = _getState(currentSession?.id);
     debugPrint(
-      '[COMPARE] sendCompare entered. models=$models, text="${text.substring(0, math.min(20, text.length))}"',
+      '[COMPARE] sendCompare entered. models=$models, textLength=${text.length}',
     );
     debugPrint(
       '[COMPARE] Guards: currentSending=${currentState?.isSending ?? false}, _isComparing=$_isComparing, session=${currentSession != null}',

@@ -24,8 +24,7 @@ class ProviderTransformOptions {
   bool get isOpenAI => apiFormat.toLowerCase() == 'openai';
   bool get isRecovery => mode == ProviderTransformMode.recovery;
   bool get supportsImages => capabilities.supportsImages;
-  bool get supportsReasoningContent =>
-      capabilities.supportsReasoningContent;
+  bool get supportsReasoningContent => capabilities.supportsReasoningContent;
   bool get supportsTools => capabilities.supportsTools;
   bool get supportsPromptCache => capabilities.supportsPromptCache;
 }
@@ -72,6 +71,7 @@ class ProviderMessageTransform {
     final warnings = <String>[];
     final toolIdMap = <String, String>{};
     final assignedToolIds = <String>{};
+    final toolNameById = <String, String>{};
     final sensitiveStats = SensitiveDataStatsBuilder();
     var droppedBlockCount = 0;
     final transformed = <Map<String, dynamic>>[];
@@ -83,6 +83,7 @@ class ProviderMessageTransform {
         warnings,
         toolIdMap,
         assignedToolIds,
+        toolNameById,
         sensitiveStats,
       );
       if (clean == null) {
@@ -147,17 +148,34 @@ class ProviderMessageTransform {
     List<String> warnings,
     Map<String, String> toolIdMap,
     Set<String> assignedToolIds,
+    Map<String, String> toolNameById,
     SensitiveDataStatsBuilder sensitiveStats,
   ) {
     final role = msg['role'];
     final toolCalls = msg['tool_calls'];
     final clean = <String, dynamic>{};
-    if (role is String) clean['role'] = role;
+    if (role is String) {
+      clean['role'] = !options.supportsTools && role == 'tool' ? 'user' : role;
+    }
 
     final content = msg['content'];
     if (content is String) {
-      if (content.isEmpty && toolCalls is! List) return null;
-      clean['content'] = _sanitizeText(content, sensitiveStats);
+      if (content.isEmpty && toolCalls is! List && role != 'tool') return null;
+      if (!options.supportsTools && role == 'tool') {
+        final rawId = msg['tool_call_id']?.toString();
+        final scrubbedId = rawId == null || rawId.isEmpty
+            ? null
+            : _scrubToolId(rawId, toolIdMap, assignedToolIds);
+        clean['content'] = _toolResultTranscriptText(
+          id: scrubbedId,
+          name: scrubbedId == null ? null : toolNameById[scrubbedId],
+          rawForLlm: content,
+          isError: msg['is_error'] == true,
+          sensitiveStats: sensitiveStats,
+        );
+      } else {
+        clean['content'] = _sanitizeText(content, sensitiveStats);
+      }
     } else if (content is List) {
       final blocks = <Map<String, dynamic>>[];
       for (final item in content) {
@@ -167,6 +185,7 @@ class ProviderMessageTransform {
           warnings,
           toolIdMap,
           assignedToolIds,
+          toolNameById,
           sensitiveStats,
         );
         if (block == null) continue;
@@ -178,6 +197,33 @@ class ProviderMessageTransform {
       return null;
     }
 
+    if (!options.supportsTools && toolCalls is List) {
+      final callBlocks = toolCalls
+          .map((toolCall) => _openAIToolCallTranscriptBlock(
+                toolCall,
+                toolIdMap,
+                assignedToolIds,
+                toolNameById,
+                sensitiveStats,
+              ))
+          .whereType<Map<String, dynamic>>()
+          .toList();
+      if (callBlocks.isNotEmpty) {
+        final currentContent = clean['content'];
+        if (currentContent is String) {
+          clean['content'] = [
+            if (currentContent.isNotEmpty)
+              {'type': 'text', 'text': currentContent},
+            ...callBlocks,
+          ];
+        } else if (currentContent is List) {
+          currentContent.addAll(callBlocks);
+        } else {
+          clean['content'] = callBlocks;
+        }
+      }
+    }
+
     final shouldKeepReasoning = !options.isRecovery &&
         options.supportsReasoningContent &&
         role == 'assistant';
@@ -186,7 +232,7 @@ class ProviderMessageTransform {
       clean['reasoning_content'] = _sanitizeText(reasoning, sensitiveStats);
     }
 
-    if (toolCalls is List && !options.isRecovery) {
+    if (options.supportsTools && toolCalls is List && !options.isRecovery) {
       final calls = toolCalls
           .map((toolCall) => _normalizeOpenAIToolCallWithScrub(
                 toolCall,
@@ -200,7 +246,7 @@ class ProviderMessageTransform {
     }
 
     final toolCallId = msg['tool_call_id'];
-    if (role == 'tool' && toolCallId != null) {
+    if (options.supportsTools && role == 'tool' && toolCallId != null) {
       clean['tool_call_id'] = _scrubToolId(
         toolCallId.toString(),
         toolIdMap,
@@ -217,6 +263,7 @@ class ProviderMessageTransform {
     List<String> warnings,
     Map<String, String> toolIdMap,
     Set<String> assignedToolIds,
+    Map<String, String> toolNameById,
     SensitiveDataStatsBuilder sensitiveStats,
   ) {
     if (value is! Map) return null;
@@ -265,10 +312,21 @@ class ProviderMessageTransform {
         warnings.add('dropped tool_use with missing id or name');
         return null;
       }
+      final scrubbedId = _scrubToolId(id, toolIdMap, assignedToolIds);
+      if (!options.supportsTools) {
+        final sanitizedName = _sanitizeText(name, sensitiveStats);
+        toolNameById[scrubbedId] = sanitizedName;
+        return _toolUseTranscriptBlock(
+          id: scrubbedId,
+          name: sanitizedName,
+          input: block['input'] ?? {},
+          sensitiveStats: sensitiveStats,
+        );
+      }
       return {
         ...block,
         'type': 'tool_use',
-        'id': _scrubToolId(id, toolIdMap, assignedToolIds),
+        'id': scrubbedId,
         'name': name,
         'input': _sanitizeObject(
           removeUnsafeMetadata(block['input'] ?? {}),
@@ -283,9 +341,19 @@ class ProviderMessageTransform {
         warnings.add('dropped tool_result with missing tool_use_id');
         return null;
       }
+      final scrubbedId = _scrubToolId(id, toolIdMap, assignedToolIds);
+      if (!options.supportsTools) {
+        return _toolResultTranscriptBlock(
+          id: scrubbedId,
+          name: _toolResultName(block, toolNameById[scrubbedId]),
+          rawForLlm: _toolResultForLlmPreview(block),
+          isError: block['is_error'] == true,
+          sensitiveStats: sensitiveStats,
+        );
+      }
       return {
         'type': 'tool_result',
-        'tool_use_id': _scrubToolId(id, toolIdMap, assignedToolIds),
+        'tool_use_id': scrubbedId,
         'content': _sanitizeText(
           _stringContent(
             block['for_llm'] ?? block['content'] ?? block['output'],
@@ -297,6 +365,134 @@ class ProviderMessageTransform {
     }
 
     return null;
+  }
+
+  Map<String, dynamic>? _openAIToolCallTranscriptBlock(
+    Object? toolCall,
+    Map<String, String> toolIdMap,
+    Set<String> assignedToolIds,
+    Map<String, String> toolNameById,
+    SensitiveDataStatsBuilder sensitiveStats,
+  ) {
+    if (toolCall is! Map) return null;
+    final function = toolCall['function'];
+    if (function is! Map) return null;
+    final rawId = toolCall['id']?.toString();
+    final rawName = function['name']?.toString();
+    if (rawId == null || rawId.isEmpty || rawName == null || rawName.isEmpty) {
+      return null;
+    }
+    final id = _scrubToolId(rawId, toolIdMap, assignedToolIds);
+    final name = _sanitizeText(rawName, sensitiveStats);
+    toolNameById[id] = name;
+    return _toolUseTranscriptBlock(
+      id: id,
+      name: name,
+      input: _openAIToolCallArguments(function['arguments']),
+      sensitiveStats: sensitiveStats,
+    );
+  }
+
+  Object? _openAIToolCallArguments(Object? rawArguments) {
+    if (rawArguments is Map) return rawArguments;
+    if (rawArguments is String && rawArguments.isNotEmpty) {
+      try {
+        return jsonDecode(rawArguments);
+      } catch (_) {
+        return rawArguments;
+      }
+    }
+    return {};
+  }
+
+  Map<String, dynamic> _toolUseTranscriptBlock({
+    required String id,
+    required String name,
+    required Object? input,
+    required SensitiveDataStatsBuilder sensitiveStats,
+  }) {
+    final sanitizedInput = _sanitizeObject(
+      removeUnsafeMetadata(input ?? {}),
+      sensitiveStats,
+    );
+    final inputPreview = _sanitizeText(
+      _truncatePreview(_stringContent(sanitizedInput)),
+      sensitiveStats,
+    );
+    return {
+      'type': 'text',
+      'text': [
+        '[Tool call]',
+        'id: $id',
+        'name: $name',
+        'status: requested',
+        'input: $inputPreview',
+      ].join('\n'),
+    };
+  }
+
+  Map<String, dynamic> _toolResultTranscriptBlock({
+    required String id,
+    required String? name,
+    required Object? rawForLlm,
+    required bool isError,
+    required SensitiveDataStatsBuilder sensitiveStats,
+  }) {
+    final safeName = name == null || name.isEmpty
+        ? null
+        : _sanitizeText(name, sensitiveStats);
+    return {
+      'type': 'text',
+      'text': _toolResultTranscriptText(
+        id: id,
+        name: safeName,
+        rawForLlm: rawForLlm,
+        isError: isError,
+        sensitiveStats: sensitiveStats,
+      ),
+    };
+  }
+
+  String _toolResultTranscriptText({
+    required String? id,
+    required String? name,
+    required Object? rawForLlm,
+    required bool isError,
+    required SensitiveDataStatsBuilder sensitiveStats,
+  }) {
+    final previewSource = rawForLlm == null ? '' : _stringContent(rawForLlm);
+    final preview = previewSource.isEmpty
+        ? '[no ForLLM preview available]'
+        : _sanitizeText(_truncatePreview(previewSource), sensitiveStats);
+    return [
+      '[Tool result]',
+      'id: ${id?.isNotEmpty == true ? id! : 'unknown'}',
+      if (name != null && name.isNotEmpty) 'name: $name',
+      'status: ${isError ? 'error' : 'success'}',
+      'for_llm: $preview',
+    ].join('\n');
+  }
+
+  Object? _toolResultForLlmPreview(Map<String, dynamic> block) {
+    if (block.containsKey('for_llm')) return block['for_llm'];
+    if (block.containsKey('content')) return block['content'];
+    if (block.containsKey('summary')) return block['summary'];
+    return null;
+  }
+
+  String? _toolResultName(Map<String, dynamic> block, String? pairedName) {
+    if (pairedName != null && pairedName.isNotEmpty) return pairedName;
+    final metadata = block['metadata'];
+    if (metadata is Map && metadata['toolName'] != null) {
+      return metadata['toolName'].toString();
+    }
+    final name = block['name'];
+    return name?.toString();
+  }
+
+  String _truncatePreview(String text, {int maxChars = 1200}) {
+    if (text.length <= maxChars) return text;
+    return '${text.substring(0, maxChars)}...';
   }
 
   List<Map<String, dynamic>> _convertMessageToAnthropic(

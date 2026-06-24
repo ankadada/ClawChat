@@ -507,7 +507,17 @@ class ContextManager {
     required bool hadToolCalls,
   }) {
     final pendingCalibration = _pendingTokenCalibration.remove(assemblyId);
-    if (pendingCalibration == null || hadToolCalls) return null;
+    if (pendingCalibration == null) return null;
+    if (hadToolCalls) {
+      _recordTokenCalibrationEvent(
+        pendingCalibration.sessionId,
+        TokenCalibrationRecordResult.skipped(
+          sample: pendingCalibration.toSample(usage),
+          reason: 'tool_call_turn',
+        ),
+      );
+      return null;
+    }
     final sample = pendingCalibration.toSample(usage);
     final calibrationResult = _tokenCalibration.recordSample(sample);
     _recordTokenCalibrationEvent(

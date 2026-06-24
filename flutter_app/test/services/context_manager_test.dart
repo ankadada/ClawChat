@@ -377,6 +377,32 @@ void main() {
         isNull,
       );
     });
+
+    test('records skipped calibration event for tool-call turns', () async {
+      final events = RuntimeDebugEventService();
+      final manager = await createManager(events: events);
+      final result = await manager.assembleForSend(
+        sendRequest(messages: _calibrationHistory()),
+      );
+
+      expect(
+        manager.recordCompletion(
+          assemblyId: result.assemblyId,
+          usage: const LlmUsage(inputTokens: 22000, outputTokens: 50),
+          hadToolCalls: true,
+        ),
+        isNull,
+      );
+
+      final calibrationEvent = events
+          .recent(sessionId: 'session')
+          .where((event) => event.type == 'token.calibration.skipped')
+          .single;
+      expect(calibrationEvent.data['reason'], 'tool_call_turn');
+      expect(calibrationEvent.data['actualInputTokens'], 22000);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(TokenCalibrationService.storageKey), isNull);
+    });
   });
 
   group('ContextManager assembleForCompare', () {

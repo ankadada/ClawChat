@@ -32,7 +32,8 @@ void main() {
     expect(profile.capabilities.maxContextTokens, 200000);
   });
 
-  test('OpenAI native reasoning family uses completion tokens without '
+  test(
+      'OpenAI native reasoning family uses completion tokens without '
       'temperature or request-side reasoning_content', () {
     final profile = registry.resolve(
       apiFormat: ApiFormat.openai,
@@ -50,7 +51,8 @@ void main() {
         StreamingUsageMode.openAIStreamOptions);
   });
 
-  test('DeepSeek and bare R1 support request-side reasoning_content and '
+  test(
+      'DeepSeek and bare R1 support request-side reasoning_content and '
       'disable images', () {
     final deepSeek = registry.resolve(
       apiFormat: ApiFormat.openai,
@@ -69,6 +71,82 @@ void main() {
       expect(profile.capabilities.tokenLimitParameter,
           TokenLimitParameter.maxCompletionTokens);
     }
+  });
+
+  test('reasoning_content runtime overrides are scoped by endpoint and model',
+      () {
+    const firstBaseUrl = 'https://proxy.example.com/v1';
+    const secondBaseUrl = 'https://other.example.com/v1';
+
+    expect(
+      registry
+          .resolve(
+            apiFormat: ApiFormat.openai,
+            baseUrl: firstBaseUrl,
+            model: 'gpt-test',
+          )
+          .capabilities
+          .supportsReasoningContent,
+      isFalse,
+    );
+
+    registry.markRequiresReasoningContent(
+      apiFormat: ApiFormat.openai,
+      baseUrl: firstBaseUrl,
+      modelId: 'gpt-test',
+    );
+
+    expect(
+      registry
+          .resolve(
+            apiFormat: ApiFormat.openai,
+            baseUrl: firstBaseUrl,
+            model: 'gpt-test',
+          )
+          .capabilities
+          .supportsReasoningContent,
+      isTrue,
+    );
+    expect(
+      registry
+          .resolve(
+            apiFormat: ApiFormat.openai,
+            baseUrl: firstBaseUrl,
+            model: 'other-model',
+          )
+          .capabilities
+          .supportsReasoningContent,
+      isFalse,
+    );
+    expect(
+      registry
+          .resolve(
+            apiFormat: ApiFormat.openai,
+            baseUrl: secondBaseUrl,
+            model: 'gpt-test',
+          )
+          .capabilities
+          .supportsReasoningContent,
+      isFalse,
+    );
+
+    registry.markDisablesReasoningContent(
+      apiFormat: ApiFormat.openai,
+      baseUrl: firstBaseUrl,
+      modelId: 'gpt-test',
+    );
+
+    expect(
+      registry
+          .resolve(
+            apiFormat: ApiFormat.openai,
+            baseUrl: firstBaseUrl,
+            model: 'gpt-test',
+          )
+          .capabilities
+          .supportsReasoningContent,
+      isFalse,
+    );
   });
 
   test('coder and codex model families disable images', () {

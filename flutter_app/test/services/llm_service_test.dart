@@ -164,6 +164,180 @@ void main() {
     });
   });
 
+  group('LlmService OpenAI reasoning_content 400 fallback', () {
+    const reasoningMessages = [
+      {
+        'role': 'assistant',
+        'content': 'answer',
+        'reasoning_content': 'internal reasoning',
+      },
+    ];
+
+    test('non-stream unsupported reasoning_content retries stripped', () async {
+      final bodies = await captureOpenAiChatBodiesForReasoning400(
+        model: 'deepseek-reasoner',
+        firstErrorBody: jsonEncode({
+          'error': {
+            'message': 'unrecognized extra field: reasoning_content',
+          },
+        }),
+        messages: reasoningMessages,
+      );
+
+      expect(bodies, hasLength(2));
+      expect(bodyContainsReasoningContent(bodies.first), isTrue);
+      expect(bodyContainsReasoningContent(bodies.last), isFalse);
+    });
+
+    test(
+        'non-stream unsupported reasoning_content does not enable stripped model',
+        () async {
+      final bodies = await captureOpenAiChatBodiesForReasoning400(
+        model: 'gpt-test',
+        firstErrorBody: jsonEncode({
+          'error': {
+            'message': 'unknown field: reasoning_content',
+          },
+        }),
+        messages: reasoningMessages,
+        expectSuccess: false,
+      );
+
+      expect(bodies, hasLength(1));
+      expect(bodyContainsReasoningContent(bodies.single), isFalse);
+    });
+
+    test('non-stream missing required reasoning_content enables fallback',
+        () async {
+      final bodies = await captureOpenAiChatBodiesForReasoning400(
+        model: 'gpt-test',
+        firstErrorBody: jsonEncode({
+          'error': {
+            'message': 'Missing required field: reasoning_content',
+          },
+        }),
+        messages: reasoningMessages,
+      );
+
+      expect(bodies, hasLength(2));
+      expect(bodyContainsReasoningContent(bodies.first), isFalse);
+      expect(bodyContainsReasoningContent(bodies.last), isTrue);
+    });
+
+    test('stream unsupported reasoning_content retries stripped', () async {
+      final bodies = <Map<String, dynamic>>[];
+      final events = await collectOpenAiStreamEventsWithHandler(
+        (request) async {
+          if (bodies.length == 1) {
+            request.response.statusCode = 400;
+            request.response.headers.contentType = ContentType.json;
+            request.response.write(jsonEncode({
+              'error': {
+                'message': 'reasoning_content is not permitted',
+              },
+            }));
+            await request.response.close();
+            return;
+          }
+
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {'content': 'ok'},
+                'finish_reason': null,
+              }
+            ],
+          }));
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {},
+                'finish_reason': 'stop',
+              }
+            ],
+          }, delimiter: false));
+          await request.response.close();
+        },
+        model: 'deepseek-reasoner',
+        messages: reasoningMessages,
+        onRequestBody: bodies.add,
+      );
+
+      expect(events.whereType<StreamError>(), isEmpty);
+      expect(bodies, hasLength(2));
+      expect(bodyContainsReasoningContent(bodies.first), isTrue);
+      expect(bodyContainsReasoningContent(bodies.last), isFalse);
+    });
+
+    test('stream unsupported reasoning_content does not enable stripped model',
+        () async {
+      final bodies = <Map<String, dynamic>>[];
+      final events = await collectOpenAiStreamEventsWithHandler(
+        (request) async {
+          request.response.statusCode = 400;
+          request.response.headers.contentType = ContentType.json;
+          request.response.write(jsonEncode({
+            'error': {
+              'message': 'reasoning_content is unsupported',
+            },
+          }));
+          await request.response.close();
+        },
+        messages: reasoningMessages,
+        onRequestBody: bodies.add,
+      );
+
+      expect(events.whereType<StreamError>(), hasLength(1));
+      expect(bodies, hasLength(1));
+      expect(bodyContainsReasoningContent(bodies.single), isFalse);
+    });
+
+    test('stream missing required reasoning_content enables fallback',
+        () async {
+      final bodies = <Map<String, dynamic>>[];
+      final events = await collectOpenAiStreamEventsWithHandler(
+        (request) async {
+          if (bodies.length == 1) {
+            request.response.statusCode = 400;
+            request.response.headers.contentType = ContentType.json;
+            request.response.write(jsonEncode({
+              'error': {
+                'message': 'reasoning_content is required',
+              },
+            }));
+            await request.response.close();
+            return;
+          }
+
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {'content': 'ok'},
+                'finish_reason': null,
+              }
+            ],
+          }));
+          request.response.write(sseData({
+            'choices': [
+              {
+                'delta': {},
+                'finish_reason': 'stop',
+              }
+            ],
+          }, delimiter: false));
+          await request.response.close();
+        },
+        messages: reasoningMessages,
+        onRequestBody: bodies.add,
+      );
+
+      expect(events.whereType<StreamError>(), isEmpty);
+      expect(bodies, hasLength(2));
+      expect(bodyContainsReasoningContent(bodies.first), isFalse);
+      expect(bodyContainsReasoningContent(bodies.last), isTrue);
+    });
+  });
+
   group('LlmService Anthropic invalid encrypted content handling', () {
     test('throws EncryptedContentError for invalid_encrypted_content 400',
         () async {
@@ -405,6 +579,96 @@ void main() {
       );
 
       expect(captured.body, isNot(contains('tools')));
+    });
+
+    test('downgrades historical tool payloads when tools are unsupported',
+        () async {
+      const toolDefinitions = [
+        ToolDefinition(
+          name: 'echo',
+          description: 'Echo text',
+          inputSchema: {
+            'type': 'object',
+            'properties': {
+              'text': {'type': 'string'},
+            },
+          },
+        ),
+      ];
+      const messages = [
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'call:1',
+              'name': 'bash',
+              'input': {'command': 'pwd'},
+            },
+          ],
+        },
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'call:1',
+              'for_llm': 'compact safe result',
+              'output': 'FULL OUTPUT THAT MUST NOT LEAK',
+            },
+          ],
+        },
+        {
+          'role': 'assistant',
+          'content': '',
+          'tool_calls': [
+            {
+              'id': 'call:2',
+              'type': 'function',
+              'function': {
+                'name': 'web_fetch',
+                'arguments': '{"url":"https://example.test"}',
+              },
+            },
+          ],
+        },
+        {
+          'role': 'tool',
+          'tool_call_id': 'call:2',
+          'content': 'fetch complete',
+        },
+      ];
+
+      final openai = await captureOpenAiRequest(
+        model: 'gpt-test',
+        messages: messages,
+        tools: toolDefinitions,
+        capabilityRegistry: const _NoToolsCapabilityRegistry(),
+      );
+      final anthropic = await captureAnthropicRequest(
+        model: 'claude-sonnet-4-20250514',
+        messages: messages,
+        tools: toolDefinitions,
+        capabilityRegistry: const _NoToolsCapabilityRegistry(),
+      );
+
+      expect(openai.body, isNot(contains('tools')));
+      expect(anthropic.body, isNot(contains('tools')));
+      expectNoProviderToolSyntax(openai.body);
+      expectNoProviderToolSyntax(anthropic.body);
+      expect(openai.body.toString(), contains('[Tool call]'));
+      expect(anthropic.body.toString(), contains('[Tool call]'));
+      expect(openai.body.toString(), contains('for_llm: compact safe result'));
+      expect(
+          anthropic.body.toString(), contains('for_llm: compact safe result'));
+      expect(
+        openai.body.toString(),
+        isNot(contains('FULL OUTPUT THAT MUST NOT LEAK')),
+      );
+      expect(
+        anthropic.body.toString(),
+        isNot(contains('FULL OUTPUT THAT MUST NOT LEAK')),
+      );
     });
 
     test('redacts secrets from system prompts in request bodies', () async {
@@ -1395,6 +1659,60 @@ Future<String> openAiChatError(int statusCode, String responseBody) async {
   fail('Expected chat request to fail');
 }
 
+bool bodyContainsReasoningContent(Map<String, dynamic> body) {
+  return jsonEncode(body).contains('reasoning_content');
+}
+
+Future<List<Map<String, dynamic>>> captureOpenAiChatBodiesForReasoning400({
+  required String model,
+  required String firstErrorBody,
+  required List<Map<String, dynamic>> messages,
+  bool expectSuccess = true,
+}) async {
+  final bodies = <Map<String, dynamic>>[];
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    final body = jsonDecode(await utf8.decoder.bind(request).join())
+        as Map<String, dynamic>;
+    bodies.add(body);
+
+    if (bodies.length == 1) {
+      request.response.statusCode = 400;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(firstErrorBody);
+    } else {
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode({
+        'choices': [
+          {
+            'message': {'content': 'ok'},
+            'finish_reason': 'stop',
+          }
+        ],
+      }));
+    }
+    await request.response.close();
+  });
+
+  final service = LlmService(LlmConfig.openai(
+    apiKey: 'sk-test',
+    model: model,
+    baseUrl: 'http://127.0.0.1:${server.port}',
+  ));
+  try {
+    await service.chat(system: '', messages: messages, tools: const []);
+    if (!expectSuccess) fail('Expected chat request to fail');
+    return bodies;
+  } catch (_) {
+    if (expectSuccess) rethrow;
+    return bodies;
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
+}
+
 Future<int> requestCountWhenFirstStatusIs(int statusCode) async {
   var count = 0;
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -1584,7 +1902,9 @@ Future<CapturedLlmRequest> captureAnthropicRequest({
   required String model,
   String system = '',
   List<Map<String, dynamic>> messages = const [],
+  List<ToolDefinition> tools = const [],
   String Function(int port)? baseUrlForPort,
+  CapabilityRegistry capabilityRegistry = CapabilityRegistry.instance,
 }) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   final capturedRequest = Completer<CapturedLlmRequest>();
@@ -1607,14 +1927,16 @@ Future<CapturedLlmRequest> captureAnthropicRequest({
     await request.response.close();
   });
 
-  final service = LlmService(LlmConfig.anthropic(
-    apiKey: 'sk-test',
-    model: model,
-    baseUrl:
-        baseUrlForPort?.call(server.port) ?? 'http://127.0.0.1:${server.port}',
-  ));
+  final service = LlmService(
+      LlmConfig.anthropic(
+        apiKey: 'sk-test',
+        model: model,
+        baseUrl: baseUrlForPort?.call(server.port) ??
+            'http://127.0.0.1:${server.port}',
+      ),
+      capabilityRegistry: capabilityRegistry);
   try {
-    await service.chat(system: system, messages: messages, tools: const []);
+    await service.chat(system: system, messages: messages, tools: tools);
     return await capturedRequest.future;
   } finally {
     service.dispose();
@@ -1746,22 +2068,40 @@ class _NoToolsCapabilityRegistry extends CapabilityRegistry {
     required String baseUrl,
     required String model,
   }) {
+    final resolved = CapabilityRegistry.instance.resolve(
+      apiFormat: apiFormat,
+      baseUrl: baseUrl,
+      model: model,
+    );
     return ResolvedModelProfile(
-      modelId: CapabilityRegistry.modelIdFromDisplay(model),
-      providerKey: '${apiFormat.name}|127.0.0.1',
-      provider: const ProviderCapabilities(
-        apiFormat: ApiFormat.openai,
-        kind: ProviderKind.genericOpenAICompatible,
-        systemPromptMode: SystemPromptMode.systemMessage,
-        defaultTokenLimitParameter: TokenLimitParameter.maxTokens,
-        streamingUsageMode: StreamingUsageMode.openAIStreamOptions,
-      ),
-      capabilities: const ModelCapabilities(
+      modelId: resolved.modelId,
+      providerKey: resolved.providerKey,
+      provider: resolved.provider,
+      capabilities: resolved.capabilities.copyWith(
         supportsTools: false,
-        supportsStreamingUsage: true,
-        streamingUsageMode: StreamingUsageMode.openAIStreamOptions,
       ),
     );
+  }
+}
+
+void expectNoProviderToolSyntax(Object? value) {
+  if (value is Map) {
+    for (final entry in value.entries) {
+      expect(entry.key, isNot('tool_calls'));
+      expect(entry.key, isNot('tool_call_id'));
+      if (entry.key == 'role') {
+        expect(entry.value, isNot('tool'));
+      }
+      if (entry.key == 'type') {
+        expect(entry.value, isNot('tool_use'));
+        expect(entry.value, isNot('tool_result'));
+      }
+      expectNoProviderToolSyntax(entry.value);
+    }
+  } else if (value is Iterable) {
+    for (final item in value) {
+      expectNoProviderToolSyntax(item);
+    }
   }
 }
 
@@ -1826,6 +2166,10 @@ Future<List<StreamEvent>> collectOpenAiStreamEvents(
 
 Future<List<StreamEvent>> collectOpenAiStreamEventsWithHandler(
   Future<void> Function(HttpRequest request) handleRequest, {
+  String model = 'gpt-test',
+  List<Map<String, dynamic>> messages = const [
+    {'role': 'user', 'content': 'hi'},
+  ],
   void Function(Map<String, dynamic> body)? onRequestBody,
 }) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -1842,15 +2186,13 @@ Future<List<StreamEvent>> collectOpenAiStreamEventsWithHandler(
 
   final service = LlmService(LlmConfig.openai(
     apiKey: 'sk-test',
-    model: 'gpt-test',
+    model: model,
     baseUrl: 'http://127.0.0.1:${server.port}',
   ));
   try {
     return await service.chatStream(
       system: '',
-      messages: const [
-        {'role': 'user', 'content': 'hi'},
-      ],
+      messages: messages,
       tools: const [],
     ).toList();
   } finally {
