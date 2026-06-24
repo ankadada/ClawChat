@@ -10,11 +10,9 @@ import '../models/chat_models.dart';
 import '../models/model_capabilities.dart';
 import '../models/provider_profile.dart';
 import '../services/agent_service.dart';
-import '../services/chat_context_utils.dart';
+import '../services/context_manager.dart';
 import '../services/context_summary_service.dart';
-import '../services/llm_content_sanitizer.dart';
 import '../services/llm_service.dart';
-import '../services/model_capability_registry.dart';
 import '../services/native_bridge.dart';
 import '../services/provider_message_transform.dart';
 import '../services/runtime_debug_events.dart';
@@ -22,7 +20,6 @@ import '../services/session_storage.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
 import '../services/tool_call_expansion_state.dart';
-import '../services/token_calibration_service.dart';
 import '../services/preferences_service.dart';
 import '../services/skill_service.dart';
 import '../services/memory_service.dart';
@@ -33,73 +30,6 @@ typedef LlmServiceFactory = LlmService Function(
   bool Function()? isInBackground,
 });
 
-typedef ContextSummaryServiceFactory = ContextSummaryService Function();
-
-typedef ProviderTransformPreflight = ProviderTransformResult Function(
-  List<Map<String, dynamic>> messages,
-  ProviderTransformOptions options,
-);
-
-class _PendingTokenCalibration {
-  final String key;
-  final int estimatedInputTokens;
-  final int rawEstimatedInputTokens;
-  final int estimatedImageTokens;
-  final int rawEstimatedImageTokens;
-  final int estimatedToolTokens;
-  final int rawEstimatedToolTokens;
-  final int largestBlockTokens;
-  final int rawLargestBlockTokens;
-  final String? skipReasonOverride;
-
-  const _PendingTokenCalibration({
-    required this.key,
-    required this.estimatedInputTokens,
-    required this.rawEstimatedInputTokens,
-    required this.estimatedImageTokens,
-    required this.rawEstimatedImageTokens,
-    required this.estimatedToolTokens,
-    required this.rawEstimatedToolTokens,
-    required this.largestBlockTokens,
-    required this.rawLargestBlockTokens,
-    this.skipReasonOverride,
-  });
-
-  TokenCalibrationSample toSample(LlmUsage? usage) {
-    return TokenCalibrationSample(
-      key: key,
-      estimatedInputTokens: estimatedInputTokens,
-      rawEstimatedInputTokens: rawEstimatedInputTokens,
-      actualInputTokens: usage?.inputTokens,
-      estimatedImageTokens: estimatedImageTokens,
-      rawEstimatedImageTokens: rawEstimatedImageTokens,
-      estimatedToolTokens: estimatedToolTokens,
-      rawEstimatedToolTokens: rawEstimatedToolTokens,
-      largestBlockTokens: largestBlockTokens,
-      rawLargestBlockTokens: rawLargestBlockTokens,
-      cacheReadTokens: usage?.cacheReadInputTokens,
-      cacheCreationTokens: usage?.cacheCreationInputTokens,
-      skipReasonOverride: skipReasonOverride,
-    );
-  }
-}
-
-class _SummaryContextResult {
-  final String systemPrompt;
-  final List<Map<String, dynamic>> messages;
-  final bool summaryGenerated;
-  final bool summaryFailed;
-  final int coveredMessageCount;
-
-  const _SummaryContextResult({
-    required this.systemPrompt,
-    required this.messages,
-    this.summaryGenerated = false,
-    this.summaryFailed = false,
-    this.coveredMessageCount = 0,
-  });
-}
-
 class ChatProvider extends ChangeNotifier {
   static const int maxQueuedMessages = 3;
 
@@ -108,8 +38,7 @@ class ChatProvider extends ChangeNotifier {
 
   final SessionStorage _storage;
   final LlmServiceFactory _llmServiceFactory;
-  final ContextSummaryServiceFactory _contextSummaryServiceFactory;
-  final ProviderTransformPreflight _providerTransformPreflight;
+  late final ContextManager _contextManager;
   final RuntimeDebugEventService runtimeDebugEvents;
   late final ToolRegistry _tools;
   final _uuid = const Uuid();
@@ -168,8 +97,6 @@ class ChatProvider extends ChangeNotifier {
   Completer<bool>? _approvalCompleter;
   Timer? _approvalTimeout;
   bool _appInBackground = false;
-  final TokenCalibrationService _tokenCalibration = TokenCalibrationService();
-  final Map<String, _PendingTokenCalibration> _pendingTokenCalibration = {};
 
   static const _backgroundApprovalTimeout = Duration(seconds: 15);
   static const _agentServiceThinkingText = 'AI 正在思考...';
@@ -459,11 +386,14 @@ class ChatProvider extends ChangeNotifier {
     ToolRegistry? toolRegistry,
   })  : _storage = storage ?? SessionStorage(),
         _llmServiceFactory = llmServiceFactory ?? LlmService.new,
-        _contextSummaryServiceFactory =
-            contextSummaryServiceFactory ?? ContextSummaryService.new,
-        _providerTransformPreflight = providerTransformPreflight ??
-            const ProviderMessageTransform().transformCanonical,
         runtimeDebugEvents = runtimeDebugEvents ?? RuntimeDebugEventService() {
+    _contextManager = ContextManager(
+      contextSummaryServiceFactory:
+          contextSummaryServiceFactory ?? ContextSummaryService.new,
+      providerTransformPreflight: providerTransformPreflight ??
+          const ProviderMessageTransform().transformCanonical,
+      runtimeDebugEvents: this.runtimeDebugEvents,
+    );
     NativeBridge.setAgentStopRequestedHandler(
       ({String? sessionId}) => cancelAgent(sessionId: sessionId),
     );
@@ -491,7 +421,7 @@ class ChatProvider extends ChangeNotifier {
   Future<void> _init() async {
     try {
       await _prefs.init();
-      await _tokenCalibration.init();
+      await _contextManager.init();
       _prefsInitialized = true;
       await _storage.init();
       sessions = await _storage.getSessionsSummary();
@@ -514,7 +444,7 @@ class ChatProvider extends ChangeNotifier {
   Future<void> _ensurePrefs() async {
     if (!_prefsInitialized) {
       await _prefs.init();
-      await _tokenCalibration.init();
+      await _contextManager.init();
       _prefsInitialized = true;
     }
   }
@@ -909,82 +839,32 @@ class ChatProvider extends ChangeNotifier {
         llmConfig,
         capabilities: capabilities,
       );
-      final estimator = _tokenEstimatorFor(llmConfig);
-      final tokenBudget = _resolveContextTokenBudget(
-        llmConfig: llmConfig,
-        capabilities: capabilities,
-        systemPrompt: fullPrompt,
-        estimator: estimator,
-        toolDefinitions: toolDefinitions,
-      );
-      final summaryResult = await _prepareSummaryContext(
-        session: activeSession,
-        fullApiMessages: fullApiMessages,
-        llmConfig: llmConfig,
-        systemPrompt: fullPrompt,
-        tokenBudget: tokenBudget,
-        estimator: estimator,
-        state: state,
-        capabilities: capabilities,
-      );
-      if (summaryResult.summaryGenerated) {
-        _appendContextSummaryCompactedNotice(
-          activeSession,
-          summaryResult.coveredMessageCount,
-        );
-        await _storage.saveSession(activeSession);
-        _syncCurrentSessionReference(activeSession);
-        notifyListeners();
-      } else if (summaryResult.summaryFailed) {
-        _appendContextSummaryFailedNotice(activeSession);
-        await _storage.saveSession(activeSession);
-        _syncCurrentSessionReference(activeSession);
-        notifyListeners();
-      }
-      final promptWithSummary = summaryResult.systemPrompt;
-      final finalTokenBudget = _resolveContextTokenBudget(
-        llmConfig: llmConfig,
-        capabilities: capabilities,
-        systemPrompt: promptWithSummary,
-        estimator: estimator,
-        toolDefinitions: toolDefinitions,
-      );
-      final compressedMessages = _compressOldToolResults(
-        summaryResult.messages,
-        estimator: estimator,
-        sessionId: activeSession.id,
-      );
-      final truncation = _truncateToFit(
-        compressedMessages,
-        maxTokens: finalTokenBudget,
-        estimator: estimator,
-        preserveLastMessages: 2,
-      );
-      final apiMessages = truncation.messages;
-      if (truncation.wasTruncated) {
-        _recordTruncationEvent(activeSession.id, truncation);
-        _appendContextCompactionNotice(
-          activeSession,
-          truncation.droppedMessageCount,
-          truncation.droppedBlockCount,
-          truncation.estimatedTokens,
-        );
-        await _storage.saveSession(activeSession);
-        _syncCurrentSessionReference(activeSession);
-        notifyListeners();
-      }
-      _recordProviderTransformWarningsBestEffort(
-        sessionId: activeSession.id,
-        messages: apiMessages,
-        options: ProviderTransformOptions(
-          apiFormat:
-              llmConfig.format == ApiFormat.anthropic ? 'anthropic' : 'openai',
-          modelId: LlmService.modelIdFromDisplay(llmConfig.model),
-          baseUrl: Uri.tryParse(llmConfig.baseUrl),
+      final assembly = await _contextManager.assembleForSend(
+        ContextSendRequest(
+          sessionId: activeSession.id,
+          fullApiMessages: fullApiMessages,
+          existingSummary: activeSession.contextSummary,
+          llmConfig: llmConfig,
+          systemPrompt: fullPrompt,
           capabilities: capabilities,
+          toolDefinitions: toolDefinitions,
+          contextTokenBudget: _prefs.contextTokenBudget,
+          autoCompact: _prefs.autoCompact,
+          activeProfileId: _prefs.activeProfileId,
+          onSummaryGenerationStarted: () {
+            state.status = AgentStatus.thinking;
+            notifyListeners();
+            unawaited(_startAgentServiceForState(
+              state,
+              AppStrings.contextSummaryGenerating,
+            ));
+          },
         ),
       );
-      final initialApiMsgCount = apiMessages.length;
+      await _applyContextSessionPatch(activeSession, assembly.patch);
+      final promptWithSummary = assembly.systemPrompt;
+      final apiMessages = assembly.messages;
+      final initialApiMsgCount = assembly.initialApiMsgCount;
       state.initialApiMsgCount = initialApiMsgCount;
       state.partialAgentResponseSaved = false;
       state.agent = _createAgentService(
@@ -992,22 +872,16 @@ class ChatProvider extends ChangeNotifier {
         systemPrompt: promptWithSummary,
         state: state,
       );
-      _pendingTokenCalibration[state.sessionId] = _buildPendingTokenCalibration(
-        llmConfig: llmConfig,
-        estimator: estimator,
-        messages: apiMessages,
-        systemPrompt: promptWithSummary,
-        toolDefinitions: toolDefinitions,
-      );
       try {
         var runResult = await _runAgentForState(
           state,
           activeSession,
           apiMessages,
+          assemblyId: assembly.assemblyId,
         );
         if (runResult is EncryptedContentError) {
           final originalError = runResult;
-          _pendingTokenCalibration.remove(state.sessionId);
+          _contextManager.discardCompletion(assembly.assemblyId);
           _recordRuntimeEvent(
             activeSession.id,
             'chat.recovery.invalid_encrypted_content',
@@ -1017,34 +891,19 @@ class ChatProvider extends ChangeNotifier {
               'stage': 'initial_error',
             },
           );
-          final recoveryTransformResult =
-              const ProviderMessageTransform().transformCanonical(
-            apiMessages,
-            ProviderTransformOptions(
-              apiFormat: llmConfig.format == ApiFormat.anthropic
-                  ? 'anthropic'
-                  : 'openai',
-              modelId: LlmService.modelIdFromDisplay(llmConfig.model),
-              baseUrl: Uri.tryParse(llmConfig.baseUrl),
-              mode: ProviderTransformMode.recovery,
-              capabilities: capabilities.copyWith(
-                supportsImages: true,
-                supportsReasoningContent: false,
-              ),
+          final recoveryAssembly = await _contextManager.assembleForRecovery(
+            ContextRecoveryRequest(
+              sessionId: activeSession.id,
+              messages: apiMessages,
+              llmConfig: llmConfig,
+              systemPrompt: promptWithSummary,
+              finalTokenBudget: assembly.finalTokenBudget,
+              estimator: assembly.estimator,
+              capabilities: capabilities,
+              autoCompact: _prefs.autoCompact,
             ),
           );
-          _recordProviderTransformWarning(
-            activeSession.id,
-            recoveryTransformResult,
-          );
-          final recoveryTransform = recoveryTransformResult.messages;
-          final recoveryTruncation = _truncateToFit(
-            recoveryTransform,
-            maxTokens: finalTokenBudget,
-            estimator: estimator,
-            preserveLastMessages: 2,
-          );
-          final recoveryMessages = recoveryTruncation.messages;
+          final recoveryMessages = recoveryAssembly.messages;
           final emptyRecoveryError = _encryptedRecoveryEmptyError(
             originalError,
             recoveryMessages,
@@ -1082,6 +941,7 @@ class ChatProvider extends ChangeNotifier {
               state,
               activeSession,
               recoveryMessages,
+              assemblyId: recoveryAssembly.assemblyId,
             );
             if (runResult != null || state.status == AgentStatus.error) {
               final recoveryError = runResult is EncryptedContentError
@@ -1127,7 +987,7 @@ class ChatProvider extends ChangeNotifier {
         state.errorMessage = '$e';
         notifyListeners();
       } finally {
-        _pendingTokenCalibration.remove(state.sessionId);
+        _contextManager.discardCompletion(assembly.assemblyId);
         state.agentSubscription = null;
         state.agentCompleter = null;
         state.partialAgentResponseSaved = false;
@@ -1489,8 +1349,6 @@ class ChatProvider extends ChangeNotifier {
           _prefs.systemPrompt ??
           AppConstants.defaultSystemPrompt;
       final fullPrompt = basePrompt + skillIndex + memoryPrompt;
-      const compareEstimator = TokenEstimator();
-      const compareToolDefinitions = <Map<String, dynamic>>[];
       final compareBudgetConfig = LlmConfig(
         format: format,
         apiKey: apiKey,
@@ -1500,61 +1358,25 @@ class ChatProvider extends ChangeNotifier {
         thinkingBudget: _prefs.thinkingBudget,
         temperature: _prefs.temperature,
       );
-      final compareCapabilities = _capabilitiesForCompareModels(
-        format: format,
-        baseUrl: baseUrl,
-        models: compareModels,
-      );
-      final baseCompareMessages = [
-        ...session.toApiMessages(),
-        {'role': 'user', 'content': comparePrompt},
-      ];
-      final baseCompareBudget = _resolveContextTokenBudget(
-        llmConfig: compareBudgetConfig,
-        capabilities: compareCapabilities,
-        systemPrompt: fullPrompt,
-        estimator: compareEstimator,
-        toolDefinitions: compareToolDefinitions,
-      );
-      final comparePlan = ChatContextUtils.planCompaction(
-        baseCompareMessages,
-        maxTokens: baseCompareBudget,
-        estimator: compareEstimator,
-      );
-      final compareSummary = _summaryForCompare(
-        session.contextSummary,
-        baseCompareMessages,
-        comparePlan,
-      );
-      final compareSystemPrompt =
-          _systemPromptWithSummary(fullPrompt, compareSummary);
-      final comparePayloadMessages = compareSummary == null
-          ? baseCompareMessages
-          : baseCompareMessages.sublist(compareSummary.coveredMessageCount);
       // Don't persist the user message to session.messages in compare mode.
       // Compare is a one-shot inspection — results live in compareResults only.
       // If we persisted, the next real sendMessage would break role alternation
       // (two consecutive user messages without an assistant reply between them).
-      final compressedCompareMessages = _compressOldToolResults(
-        comparePayloadMessages,
-        estimator: compareEstimator,
-        sessionId: session.id,
-      );
-      final compareTruncation = _truncateToFit(
-        compressedCompareMessages,
-        maxTokens: _resolveContextTokenBudget(
+      final assembly = await _contextManager.assembleForCompare(
+        ContextCompareRequest(
+          sessionId: session.id,
+          sessionApiMessages: session.toApiMessages(),
+          comparePrompt: comparePrompt,
+          existingSummary: session.contextSummary,
           llmConfig: compareBudgetConfig,
-          capabilities: compareCapabilities,
-          systemPrompt: compareSystemPrompt,
-          estimator: compareEstimator,
-          toolDefinitions: compareToolDefinitions,
+          systemPrompt: fullPrompt,
+          compareModels: compareModels,
+          contextTokenBudget: _prefs.contextTokenBudget,
+          autoCompact: _prefs.autoCompact,
         ),
-        estimator: compareEstimator,
       );
-      if (compareTruncation.wasTruncated) {
-        _recordTruncationEvent(session.id, compareTruncation);
-      }
-      final compareMessages = compareTruncation.messages;
+      final compareSystemPrompt = assembly.systemPrompt;
+      final compareMessages = assembly.messages;
       notifyListeners();
 
       debugPrint(
@@ -1672,107 +1494,6 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
-  ContextTruncationResult _truncateToFit(
-    List<Map<String, dynamic>> messages, {
-    required int maxTokens,
-    required TokenEstimator estimator,
-    int preserveLastMessages = 2,
-  }) {
-    return ChatContextUtils.truncateToFit(
-      messages,
-      maxTokens: maxTokens,
-      estimator: estimator,
-      autoCompact: _prefs.autoCompact,
-      preserveLastMessages: preserveLastMessages,
-    );
-  }
-
-  List<Map<String, dynamic>> _compressOldToolResults(
-    List<Map<String, dynamic>> messages, {
-    required TokenEstimator estimator,
-    required String sessionId,
-  }) {
-    if (!_prefs.autoCompact) return messages;
-    final compressed = ChatContextUtils.compressOldToolResults(
-      messages,
-      estimator: estimator,
-    );
-    final compressedCount = _countCompressedToolResults(messages, compressed);
-    if (compressedCount > 0) {
-      _recordRuntimeEvent(
-        sessionId,
-        'tool_result.compressed',
-        {
-          'compressedCount': compressedCount,
-          'protectedTurnCount': 2,
-          'thresholdTokens': 500,
-        },
-      );
-    }
-    return compressed;
-  }
-
-  int _resolveContextTokenBudget({
-    required LlmConfig llmConfig,
-    required ModelCapabilities capabilities,
-    required String systemPrompt,
-    required TokenEstimator estimator,
-    required List<Map<String, dynamic>> toolDefinitions,
-  }) {
-    final effectiveContextTokenBudget = _effectiveContextTokenBudget(
-      capabilities,
-    );
-    final systemTokens = estimator.estimateText(systemPrompt);
-    final toolDefinitionTokens =
-        estimator.estimateToolDefinitions(toolDefinitions);
-    final configuredOutputReserve = llmConfig.maxTokens +
-        (llmConfig.thinkingBudget > 0 ? llmConfig.thinkingBudget : 0);
-    final maxOutputReserve = (effectiveContextTokenBudget * 0.5).floor();
-    final outputReserve = math.min(configuredOutputReserve, maxOutputReserve);
-    const safetyMargin = 1024;
-    final budget = effectiveContextTokenBudget -
-        systemTokens -
-        toolDefinitionTokens -
-        outputReserve -
-        safetyMargin;
-    if (budget <= 0) {
-      debugPrint(
-        'Context token budget exhausted: context=$effectiveContextTokenBudget, '
-        'system=$systemTokens, tools=$toolDefinitionTokens, '
-        'outputReserve=$outputReserve, '
-        'safetyMargin=$safetyMargin.',
-      );
-      return 0;
-    }
-    return budget;
-  }
-
-  int _effectiveContextTokenBudget(ModelCapabilities capabilities) {
-    final maxContextTokens = capabilities.maxContextTokens;
-    if (maxContextTokens == null) return _prefs.contextTokenBudget;
-    return math.min(_prefs.contextTokenBudget, maxContextTokens);
-  }
-
-  ModelCapabilities _capabilitiesForCompareModels({
-    required ApiFormat format,
-    required String baseUrl,
-    required List<String> models,
-  }) {
-    if (models.isEmpty) return const ModelCapabilities();
-    final resolved = models
-        .map((model) => CapabilityRegistry.instance
-            .resolve(apiFormat: format, baseUrl: baseUrl, model: model)
-            .capabilities)
-        .toList();
-    final knownWindows = resolved
-        .map((capabilities) => capabilities.maxContextTokens)
-        .whereType<int>()
-        .toList();
-    if (knownWindows.isEmpty) return resolved.first;
-    knownWindows.sort();
-    return resolved.first.copyWith(maxContextTokens: knownWindows.first);
-  }
-
   AgentService _createAgentService({
     required LlmService llm,
     required String systemPrompt,
@@ -1795,289 +1516,6 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
-  Future<_SummaryContextResult> _prepareSummaryContext({
-    required ChatSession session,
-    required List<Map<String, dynamic>> fullApiMessages,
-    required LlmConfig llmConfig,
-    required String systemPrompt,
-    required int tokenBudget,
-    required TokenEstimator estimator,
-    required AgentState state,
-    required ModelCapabilities capabilities,
-  }) async {
-    if (!_prefs.autoCompact ||
-        fullApiMessages.isEmpty ||
-        estimator.estimateMessages(fullApiMessages) <= tokenBudget) {
-      return _SummaryContextResult(
-        systemPrompt: systemPrompt,
-        messages: fullApiMessages,
-      );
-    }
-
-    final plan = ChatContextUtils.planCompaction(
-      fullApiMessages,
-      maxTokens: tokenBudget,
-      estimator: estimator,
-    );
-    if (!plan.needsSummary || plan.headForSummary.isEmpty) {
-      return _SummaryContextResult(
-        systemPrompt: systemPrompt,
-        messages: fullApiMessages,
-      );
-    }
-
-    var summary = _validatedSummaryForPrefix(
-      session.contextSummary,
-      fullApiMessages,
-    );
-    var generated = false;
-    var failed = false;
-    if (!_canReuseSummary(summary, plan, fullApiMessages)) {
-      if (session.contextSummary != null && summary == null) {
-        _recordSummaryStaleEvent(
-          session.id,
-          session.contextSummary!,
-        );
-      }
-      state.status = AgentStatus.thinking;
-      notifyListeners();
-      unawaited(_startAgentServiceForState(
-        state,
-        AppStrings.contextSummaryGenerating,
-      ));
-      final request = ContextSummaryRequest(
-        messages: _messagesForSummaryGeneration(
-          fullApiMessages,
-          plan,
-          summary,
-        ),
-        existingSummary: summary,
-        llmConfig: llmConfig,
-        summaryBudget: plan.summaryBudget,
-        coveredDigest: plan.headDigest,
-        coveredMessageCount: plan.headForSummary.length,
-        sourceEstimatedTokens: plan.headEstimatedTokens,
-        estimator: estimator,
-        maxInputTokens: (_effectiveContextTokenBudget(capabilities) * 0.8)
-            .floor(),
-      );
-      final service = _contextSummaryServiceFactory();
-      try {
-        summary = await service.generateSummary(request);
-        generated = true;
-        _recordRuntimeEvent(
-          session.id,
-          'context.summary.generated',
-          {
-            'coveredMessageCount': summary.coveredMessageCount,
-            'sourceEstimatedTokens': summary.sourceEstimatedTokens,
-            'summaryEstimatedTokens': summary.summaryEstimatedTokens,
-            'reused': false,
-          },
-        );
-      } catch (e) {
-        debugPrint('Context summary generation failed: $e');
-        failed = true;
-        _recordRuntimeEvent(
-          session.id,
-          'context.summary.failed',
-          {
-            'stage': 'llm',
-            'errorType': e.runtimeType.toString(),
-          },
-        );
-        try {
-          summary = service.extractiveFallback(request);
-        } catch (fallbackError) {
-          debugPrint(
-              'Context summary extractive fallback failed: $fallbackError');
-          _recordRuntimeEvent(
-            session.id,
-            'context.summary.failed',
-            {
-              'stage': 'extractive',
-              'errorType': fallbackError.runtimeType.toString(),
-            },
-          );
-          return _SummaryContextResult(
-            systemPrompt: systemPrompt,
-            messages: fullApiMessages,
-            summaryFailed: true,
-          );
-        }
-      }
-      session.contextSummary = summary;
-    } else if (summary != null) {
-      _recordRuntimeEvent(
-        session.id,
-        'context.summary.reused',
-        {
-          'coveredMessageCount': summary.coveredMessageCount,
-          'summaryEstimatedTokens': summary.summaryEstimatedTokens,
-        },
-      );
-    }
-
-    final promptWithSummary = _systemPromptWithSummary(systemPrompt, summary);
-    final summaryTokens = estimator.estimateText(promptWithSummary) -
-        estimator.estimateText(systemPrompt);
-    final finalTailBudget = math.max(0, tokenBudget - summaryTokens);
-    final tailTruncation = _truncateToFit(
-      plan.recentTail,
-      maxTokens: finalTailBudget,
-      estimator: estimator,
-      preserveLastMessages: 2,
-    );
-    return _SummaryContextResult(
-      systemPrompt: promptWithSummary,
-      messages: tailTruncation.messages,
-      summaryGenerated: generated,
-      summaryFailed: failed,
-      coveredMessageCount: summary?.coveredMessageCount ?? 0,
-    );
-  }
-
-  bool _canReuseSummary(
-    ContextSummary? summary,
-    ContextCompactionPlan plan,
-    List<Map<String, dynamic>> fullMessages,
-  ) {
-    final currentSummary = _validatedSummaryForPrefix(summary, fullMessages);
-    return currentSummary != null &&
-        currentSummary.coveredDigest == plan.headDigest &&
-        currentSummary.coveredMessageCount == plan.headForSummary.length;
-  }
-
-  ContextSummary? _summaryForCompare(
-    ContextSummary? summary,
-    List<Map<String, dynamic>> fullMessages,
-    ContextCompactionPlan plan,
-  ) {
-    final currentSummary = _validatedSummaryForPrefix(summary, fullMessages);
-    if (currentSummary == null || !plan.needsSummary) return null;
-    if (currentSummary.coveredMessageCount > plan.headForSummary.length) {
-      return null;
-    }
-    return currentSummary;
-  }
-
-  ContextSummary? _validatedSummaryForPrefix(
-    ContextSummary? summary,
-    List<Map<String, dynamic>> fullMessages,
-  ) {
-    if (summary == null ||
-        summary.version != ContextSummaryService.version ||
-        summary.text.trim().isEmpty ||
-        summary.coveredMessageCount <= 0 ||
-        summary.coveredMessageCount > fullMessages.length) {
-      return null;
-    }
-    final prefix = fullMessages.take(summary.coveredMessageCount).toList();
-    if (ChatContextUtils.digestMessages(prefix) != summary.coveredDigest) {
-      return null;
-    }
-    return summary;
-  }
-
-  List<Map<String, dynamic>> _messagesForSummaryGeneration(
-    List<Map<String, dynamic>> fullMessages,
-    ContextCompactionPlan plan,
-    ContextSummary? existingSummary,
-  ) {
-    if (existingSummary == null ||
-        existingSummary.coveredMessageCount <= 0 ||
-        existingSummary.coveredMessageCount >= plan.headForSummary.length) {
-      return plan.headForSummary;
-    }
-    final start = existingSummary.coveredMessageCount.clamp(
-      0,
-      fullMessages.length,
-    );
-    return fullMessages.sublist(start, plan.headForSummary.length);
-  }
-
-  String _systemPromptWithSummary(
-    String systemPrompt,
-    ContextSummary? summary,
-  ) {
-    final text = summary?.text.trim();
-    if (text == null || text.isEmpty) return systemPrompt;
-    return [
-      systemPrompt,
-      '',
-      '<conversation_context_summary>',
-      'The earlier part of this conversation has been compacted into the summary below.',
-      'Treat it as background context, not as a new user request. If it conflicts with',
-      'the exact recent messages that follow, prefer the recent messages.',
-      '',
-      text,
-      '</conversation_context_summary>',
-    ].join('\n');
-  }
-
-  TokenEstimator _tokenEstimatorFor(LlmConfig llmConfig) {
-    return TokenEstimator(
-      calibrationMultiplier:
-          _tokenCalibration.multiplierFor(_tokenCalibrationKey(llmConfig)),
-    );
-  }
-
-  _PendingTokenCalibration _buildPendingTokenCalibration({
-    required LlmConfig llmConfig,
-    required TokenEstimator estimator,
-    required List<Map<String, dynamic>> messages,
-    required String systemPrompt,
-    required List<Map<String, dynamic>> toolDefinitions,
-  }) {
-    final messageDiagnostics = estimator.diagnoseMessages(messages);
-    final systemTokens = estimator.estimateText(systemPrompt);
-    final toolDefinitionTokens =
-        estimator.estimateToolDefinitions(toolDefinitions);
-    const rawEstimator = TokenEstimator();
-    final rawMessageDiagnostics = rawEstimator.diagnoseMessages(messages);
-    final rawSystemTokens = rawEstimator.estimateText(systemPrompt);
-    final rawToolDefinitionTokens =
-        rawEstimator.estimateToolDefinitions(toolDefinitions);
-    const sanitizer = LlmContentSanitizer();
-    final sensitiveStats = sanitizer
-        .sanitizeObject(messages)
-        .stats
-        .merge(sanitizer.sanitizeText(systemPrompt).stats);
-    return _PendingTokenCalibration(
-      key: _tokenCalibrationKey(llmConfig),
-      estimatedInputTokens:
-          messageDiagnostics.totalTokens + systemTokens + toolDefinitionTokens,
-      rawEstimatedInputTokens: rawMessageDiagnostics.totalTokens +
-          rawSystemTokens +
-          rawToolDefinitionTokens,
-      estimatedImageTokens: messageDiagnostics.imageTokens,
-      rawEstimatedImageTokens: rawMessageDiagnostics.imageTokens,
-      estimatedToolTokens: messageDiagnostics.toolTokens + toolDefinitionTokens,
-      rawEstimatedToolTokens:
-          rawMessageDiagnostics.toolTokens + rawToolDefinitionTokens,
-      largestBlockTokens: messageDiagnostics.largestBlockTokens,
-      rawLargestBlockTokens: rawMessageDiagnostics.largestBlockTokens,
-      skipReasonOverride:
-          sensitiveStats.hasRedactions ? 'sensitive_data_redacted' : null,
-    );
-  }
-
-  String _tokenCalibrationKey(LlmConfig llmConfig) {
-    final format = llmConfig.format.name;
-    final host = _normalizedBaseUrlHost(llmConfig.baseUrl);
-    final profileId = _prefs.activeProfileId;
-    final modelId = LlmService.modelIdFromDisplay(llmConfig.model);
-    return '$format|$host|$profileId|$modelId';
-  }
-
-  String _normalizedBaseUrlHost(String baseUrl) {
-    final trimmed = baseUrl.trim().replaceFirst(RegExp(r'/+$'), '');
-    final uri = Uri.tryParse(trimmed);
-    final host = uri?.host;
-    if (host != null && host.isNotEmpty) return host.toLowerCase();
-    return trimmed.toLowerCase();
-  }
-
   void _recordRuntimeEvent(
     String sessionId,
     String type,
@@ -2094,162 +1532,17 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
-  void _recordTruncationEvent(
-    String sessionId,
-    ContextTruncationResult result,
-  ) {
-    _recordRuntimeEvent(
-      sessionId,
-      'context.truncated',
-      {
-        'droppedMessageCount': result.droppedMessageCount,
-        'droppedBlockCount': result.droppedBlockCount,
-        'estimatedTokens': result.estimatedTokens,
-        'maxTokens': result.maxTokens,
-        'overBudgetAfterTruncation': result.overBudgetAfterTruncation,
-      },
-    );
-  }
-
   @visibleForTesting
   void recordProviderTransformWarningsBestEffortForTesting({
     required String sessionId,
     required List<Map<String, dynamic>> messages,
     required ProviderTransformOptions options,
   }) {
-    _recordProviderTransformWarningsBestEffort(
+    _contextManager.recordProviderTransformWarningsBestEffortForTesting(
       sessionId: sessionId,
       messages: messages,
       options: options,
     );
-  }
-
-  void _recordProviderTransformWarningsBestEffort({
-    required String sessionId,
-    required List<Map<String, dynamic>> messages,
-    required ProviderTransformOptions options,
-  }) {
-    try {
-      _recordProviderTransformWarning(
-        sessionId,
-        _providerTransformPreflight(messages, options),
-      );
-    } catch (e) {
-      debugPrint('Provider transform debug preflight failed: $e');
-    }
-  }
-
-  void _recordProviderTransformWarning(
-    String sessionId,
-    ProviderTransformResult result,
-  ) {
-    if (result.sensitiveDataStats.hasRedactions) {
-      _recordRuntimeEvent(
-        sessionId,
-        'llm.sensitive_data_redacted',
-        {
-          'stage': 'provider_payload',
-          'totalCount': result.sensitiveDataStats.totalCount,
-          'countByType': result.sensitiveDataStats.toJson(),
-        },
-      );
-    }
-    if (result.warnings.isEmpty) return;
-    _recordRuntimeEvent(
-      sessionId,
-      'provider.transform.warning',
-      {
-        'warningCount': result.warnings.length,
-        'firstWarning': result.warnings.first,
-        'droppedBlockCount': result.droppedBlockCount,
-      },
-    );
-  }
-
-  void _recordTokenCalibrationEvent(
-    String sessionId,
-    TokenCalibrationRecordResult result,
-  ) {
-    if (result.updated) {
-      _recordRuntimeEvent(
-        sessionId,
-        'token.calibration.updated',
-        {
-          'keyHash': _shortHash(result.key),
-          'oldMultiplier': result.oldMultiplier,
-          'ratio': result.ratio,
-          'newMultiplier': result.newMultiplier,
-        },
-      );
-      return;
-    }
-    _recordRuntimeEvent(
-      sessionId,
-      'token.calibration.skipped',
-      {
-        'reason': result.skipReason,
-        'estimatedInputTokens': result.estimatedInputTokens,
-        'actualInputTokens': result.actualInputTokens,
-      },
-    );
-  }
-
-  void _recordSummaryStaleEvent(
-    String sessionId,
-    ContextSummary summary,
-  ) {
-    final reason = summary.version != ContextSummaryService.version
-        ? 'version_mismatch'
-        : 'digest_mismatch';
-    _recordRuntimeEvent(
-      sessionId,
-      'context.summary.stale',
-      {
-        'reason': reason,
-        'coveredMessageCount': summary.coveredMessageCount,
-        'summaryEstimatedTokens': summary.summaryEstimatedTokens,
-      },
-    );
-  }
-
-  int _countCompressedToolResults(
-    List<Map<String, dynamic>> before,
-    List<Map<String, dynamic>> after,
-  ) {
-    final length = math.min(before.length, after.length);
-    var count = 0;
-    for (var i = 0; i < length; i++) {
-      final beforeContent = before[i]['content'];
-      final afterContent = after[i]['content'];
-      if (beforeContent is! List || afterContent is! List) continue;
-      final blockLength = math.min(beforeContent.length, afterContent.length);
-      for (var j = 0; j < blockLength; j++) {
-        final beforeBlock = beforeContent[j];
-        final afterBlock = afterContent[j];
-        if (beforeBlock is! Map || afterBlock is! Map) continue;
-        if (beforeBlock['type'] != 'tool_result' ||
-            afterBlock['type'] != 'tool_result') {
-          continue;
-        }
-        final beforeOutput = beforeBlock['content'] ?? beforeBlock['output'];
-        final afterOutput = afterBlock['content'] ?? afterBlock['output'];
-        if (beforeOutput != afterOutput &&
-            afterOutput is String &&
-            afterOutput.contains('Tool result truncated')) {
-          count++;
-        }
-      }
-    }
-    return count;
-  }
-
-  String _shortHash(String value) {
-    var hash = 0x811c9dc5;
-    for (final codeUnit in value.codeUnits) {
-      hash ^= codeUnit;
-      hash = (hash * 0x01000193) & 0xffffffff;
-    }
-    return hash.toRadixString(16).padLeft(8, '0');
   }
 
   List<Map<String, dynamic>> _toolDefinitionsForBudget(
@@ -2267,8 +1560,9 @@ class ChatProvider extends ChangeNotifier {
   Future<Object?> _runAgentForState(
     AgentState state,
     ChatSession activeSession,
-    List<Map<String, dynamic>> apiMessages,
-  ) async {
+    List<Map<String, dynamic>> apiMessages, {
+    required String assemblyId,
+  }) async {
     final completer = Completer<void>();
     state.agentCompleter = completer;
     state.agentCompletionFinalizing = false;
@@ -2369,16 +1663,11 @@ class ChatProvider extends ChangeNotifier {
                 break;
               }
             }
-            final pendingCalibration =
-                _pendingTokenCalibration.remove(state.sessionId);
-            if (pendingCalibration != null && !hadToolCalls) {
-              final sample = pendingCalibration.toSample(usage);
-              final calibrationResult = _tokenCalibration.recordSample(sample);
-              _recordTokenCalibrationEvent(
-                state.sessionId,
-                calibrationResult,
-              );
-            }
+            _contextManager.recordCompletion(
+              assemblyId: assemblyId,
+              usage: usage,
+              hadToolCalls: hadToolCalls,
+            );
             _syncCurrentSessionReference(activeSession);
             _storage.saveSession(activeSession).then((_) {
               if (!_disposed) notifyListeners();
@@ -2442,6 +1731,37 @@ class ChatProvider extends ChangeNotifier {
       state.agentSubscription = null;
     }
     return errorCause;
+  }
+
+  Future<void> _applyContextSessionPatch(
+    ChatSession session,
+    ContextSessionPatch patch,
+  ) async {
+    if (patch.isEmpty) return;
+    if (patch.hasSummaryUpdate) {
+      session.contextSummary = patch.nextSummary;
+    }
+    for (final notice in patch.notices) {
+      switch (notice.type) {
+        case ContextNoticeType.summaryCompacted:
+          _appendContextSummaryCompactedNotice(
+            session,
+            notice.coveredMessageCount,
+          );
+        case ContextNoticeType.summaryFailed:
+          _appendContextSummaryFailedNotice(session);
+        case ContextNoticeType.truncated:
+          _appendContextCompactionNotice(
+            session,
+            notice.droppedMessageCount,
+            notice.droppedBlockCount,
+            notice.estimatedTokens,
+          );
+      }
+    }
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+    notifyListeners();
   }
 
   void _appendContextCompactionNotice(
