@@ -76,6 +76,9 @@ class ToolRegistry {
     return _tools.values.map((t) => t.toDefinition()).toList();
   }
 
+  Map<String, dynamic>? inputSchemaFor(String name) =>
+      _tools[name]?.inputSchema;
+
   Future<String> executeTool(String name, Map<String, dynamic> input) async {
     final payload = await executeToolResult(name, input);
     return payload.forUser;

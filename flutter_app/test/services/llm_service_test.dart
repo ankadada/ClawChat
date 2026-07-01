@@ -2067,11 +2067,13 @@ class _NoToolsCapabilityRegistry extends CapabilityRegistry {
     required ApiFormat apiFormat,
     required String baseUrl,
     required String model,
+    CapabilityOverride? override,
   }) {
     final resolved = CapabilityRegistry.instance.resolve(
       apiFormat: apiFormat,
       baseUrl: baseUrl,
       model: model,
+      override: override,
     );
     return ResolvedModelProfile(
       modelId: resolved.modelId,

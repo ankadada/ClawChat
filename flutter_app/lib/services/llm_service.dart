@@ -33,6 +33,7 @@ class LlmConfig {
   final int maxTokens;
   final int thinkingBudget; // 0 = disabled
   final double? temperature;
+  final CapabilityOverride? capabilityOverride;
 
   const LlmConfig({
     required this.format,
@@ -42,6 +43,7 @@ class LlmConfig {
     this.maxTokens = 8192,
     this.thinkingBudget = 0,
     this.temperature,
+    this.capabilityOverride,
   });
 
   @override
@@ -54,11 +56,20 @@ class LlmConfig {
           baseUrl == other.baseUrl &&
           maxTokens == other.maxTokens &&
           thinkingBudget == other.thinkingBudget &&
-          temperature == other.temperature;
+          temperature == other.temperature &&
+          capabilityOverride == other.capabilityOverride;
 
   @override
   int get hashCode => Object.hash(
-      format, apiKey, model, baseUrl, maxTokens, thinkingBudget, temperature);
+        format,
+        apiKey,
+        model,
+        baseUrl,
+        maxTokens,
+        thinkingBudget,
+        temperature,
+        capabilityOverride,
+      );
 
   factory LlmConfig.anthropic({
     required String apiKey,
@@ -66,6 +77,7 @@ class LlmConfig {
     String baseUrl = 'https://api.anthropic.com',
     int maxTokens = 8192,
     int thinkingBudget = 0,
+    CapabilityOverride? capabilityOverride,
   }) {
     return LlmConfig(
       format: ApiFormat.anthropic,
@@ -74,6 +86,7 @@ class LlmConfig {
       baseUrl: baseUrl,
       maxTokens: maxTokens,
       thinkingBudget: thinkingBudget,
+      capabilityOverride: capabilityOverride,
     );
   }
 
@@ -83,6 +96,7 @@ class LlmConfig {
     String baseUrl = 'https://api.openai.com',
     int maxTokens = 8192,
     int thinkingBudget = 0,
+    CapabilityOverride? capabilityOverride,
   }) {
     return LlmConfig(
       format: ApiFormat.openai,
@@ -91,6 +105,7 @@ class LlmConfig {
       baseUrl: baseUrl,
       maxTokens: maxTokens,
       thinkingBudget: thinkingBudget,
+      capabilityOverride: capabilityOverride,
     );
   }
 }
@@ -197,6 +212,7 @@ class ContentBlock {
   final String? toolUseId;
   final String? toolName;
   final Map<String, dynamic>? toolInput;
+  final String? rawToolInputJson;
 
   const ContentBlock({
     required this.type,
@@ -205,6 +221,7 @@ class ContentBlock {
     this.toolUseId,
     this.toolName,
     this.toolInput,
+    this.rawToolInputJson,
   });
 
   Map<String, dynamic> toJson() {
@@ -485,6 +502,7 @@ class LlmService {
         apiFormat: config.format,
         baseUrl: config.baseUrl,
         model: config.model,
+        override: config.capabilityOverride,
       );
 
   bool get supportsImagesForTransform =>
@@ -856,11 +874,14 @@ class LlmService {
           // Malformed tool input JSON - proceed with empty input
         }
         if (!shouldSuppressToolBlock) {
+          final rawToolInputJson = currentToolInput.toString();
           collectedBlocks.add(ContentBlock(
             type: 'tool_use',
             toolUseId: currentToolId,
             toolName: currentToolName,
             toolInput: input,
+            rawToolInputJson:
+                rawToolInputJson.isEmpty ? null : rawToolInputJson,
           ));
           completedToolBlocks++;
         }
@@ -1453,6 +1474,7 @@ class LlmService {
         toolUseId: tc['id'],
         toolName: tc['name'],
         toolInput: args,
+        rawToolInputJson: tc['arguments']!.isEmpty ? null : tc['arguments']!,
       ));
     }
 
@@ -1661,6 +1683,7 @@ class LlmService {
           toolUseId: tc['id'] as String,
           toolName: func['name'] as String,
           toolInput: args,
+          rawToolInputJson: func['arguments'] as String?,
         ));
       }
     }

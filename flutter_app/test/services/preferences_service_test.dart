@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:clawchat/constants.dart';
+import 'package:clawchat/models/model_capabilities.dart';
 import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:flutter/services.dart';
@@ -292,6 +293,40 @@ void main() {
     expect(updated.model, isEmpty);
     expect(service.model, isNull);
     expect(service.activeProfile.effectiveModel, AppConstants.defaultModel);
+  });
+
+  test('provider profiles preserve capability overrides in storage', () async {
+    final profile = ProviderProfile.defaults(name: 'Override').copyWith(
+      id: 'override',
+      apiFormat: ProviderProfile.openaiFormat,
+      model: 'codex/gpt-5.5',
+      capabilityOverride: const CapabilityOverride(
+        supportsImages: true,
+        supportsTools: false,
+        supportsReasoningContent: true,
+        maxContextTokens: 123456,
+      ),
+    );
+    secureStorage['provider_profiles'] = jsonEncode([profile.toJson()]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'override',
+    });
+
+    final service = PreferencesService();
+    await service.init();
+
+    expect(service.activeProfile.model, 'codex/gpt-5.5');
+    expect(
+        service.activeProfile.capabilityOverride, profile.capabilityOverride);
+
+    await service.setProfiles(service.profiles);
+    final stored = jsonDecode(secureStorage['provider_profiles']!) as List;
+    final storedProfile = ProviderProfile.fromJson(
+      Map<String, dynamic>.from(stored.single as Map),
+    );
+
+    expect(storedProfile.model, 'codex/gpt-5.5');
+    expect(storedProfile.capabilityOverride, profile.capabilityOverride);
   });
 
   test('setProfiles propagates write failures and reverts in-memory state',

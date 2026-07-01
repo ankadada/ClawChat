@@ -62,7 +62,8 @@ void main() {
       'value': 'ghp_secret_token_value',
     });
 
-    expect(result, '已设置环境变量 GITHUB_TOKEN');
+    expect(result, contains('已设置环境变量 GITHUB_TOKEN'));
+    expect(result, contains('值已隐藏'));
     expect(result, isNot(contains('ghp_secret_token_value')));
     expect(prefs.envVars['GITHUB_TOKEN'], 'ghp_secret_token_value');
   });

@@ -104,6 +104,6 @@ class EnvVarTool extends Tool {
 
     updated[name] = value;
     _prefs.envVars = updated;
-    return AppStrings.envVarSet(name);
+    return '${AppStrings.envVarSet(name)}（值已隐藏，不会回显）';
   }
 }

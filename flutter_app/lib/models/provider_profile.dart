@@ -1,6 +1,7 @@
 import 'package:uuid/uuid.dart';
 
 import '../constants.dart';
+import 'model_capabilities.dart';
 
 class ProviderProfile {
   static const anthropicFormat = 'anthropic';
@@ -15,6 +16,7 @@ class ProviderProfile {
   int maxTokens;
   int thinkingBudget;
   double temperature;
+  CapabilityOverride? capabilityOverride;
 
   ProviderProfile({
     String? id,
@@ -26,6 +28,7 @@ class ProviderProfile {
     required this.maxTokens,
     required this.thinkingBudget,
     required this.temperature,
+    this.capabilityOverride,
   }) : id = id ?? const Uuid().v4();
 
   factory ProviderProfile.defaults({String name = '默认配置'}) {
@@ -56,6 +59,8 @@ class ProviderProfile {
     int? maxTokens,
     int? thinkingBudget,
     double? temperature,
+    CapabilityOverride? capabilityOverride,
+    bool clearCapabilityOverride = false,
   }) {
     return ProviderProfile(
       id: id ?? this.id,
@@ -67,6 +72,9 @@ class ProviderProfile {
       maxTokens: maxTokens ?? this.maxTokens,
       thinkingBudget: thinkingBudget ?? this.thinkingBudget,
       temperature: temperature ?? this.temperature,
+      capabilityOverride: clearCapabilityOverride
+          ? null
+          : (capabilityOverride ?? this.capabilityOverride),
     );
   }
 
@@ -80,6 +88,8 @@ class ProviderProfile {
         'maxTokens': maxTokens,
         'thinkingBudget': thinkingBudget,
         'temperature': temperature,
+        if (capabilityOverride != null && !capabilityOverride!.isEmpty)
+          'capabilityOverride': capabilityOverride!.toJson(),
       };
 
   factory ProviderProfile.fromJson(Map<String, dynamic> json) {
@@ -102,6 +112,7 @@ class ProviderProfile {
         json['temperature'],
         fallback: AppConstants.defaultTemperature,
       ),
+      capabilityOverride: _capabilityOverride(json['capabilityOverride']),
     );
   }
 
@@ -125,5 +136,13 @@ class ProviderProfile {
     if (value is double) return value;
     if (value is num) return value.toDouble();
     return double.tryParse(value?.toString() ?? '') ?? fallback;
+  }
+
+  static CapabilityOverride? _capabilityOverride(Object? value) {
+    if (value is! Map) return null;
+    final override = CapabilityOverride.fromJson(
+      Map<String, dynamic>.from(value),
+    );
+    return override.isEmpty ? null : override;
   }
 }

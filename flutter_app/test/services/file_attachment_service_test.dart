@@ -14,7 +14,8 @@ void main() {
   late Directory tempDir;
 
   setUp(() async {
-    tempDir = await Directory.systemTemp.createTemp('clawchat_attachment_test_');
+    tempDir =
+        await Directory.systemTemp.createTemp('clawchat_attachment_test_');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
       switch (call.method) {
@@ -44,6 +45,18 @@ void main() {
   Future<File> writeStringFile(String name, String content) async {
     final file = File('${tempDir.path}/$name');
     await file.writeAsString(content);
+    return file;
+  }
+
+  Future<File> writeSparseFile(String name, int size) async {
+    final file = File('${tempDir.path}/$name');
+    final raf = await file.open(mode: FileMode.write);
+    try {
+      await raf.setPosition(size - 1);
+      await raf.writeByte(0);
+    } finally {
+      await raf.close();
+    }
     return file;
   }
 
@@ -85,11 +98,23 @@ void main() {
     });
 
     test('oversized image throws', () async {
-      final file = await writeFile('large.png', List<int>.filled(4 * 1024 * 1024, 1));
+      final file =
+          await writeFile('large.png', List<int>.filled(4 * 1024 * 1024, 1));
 
       expect(
         FileAttachmentService.prepareForMessage(
           platformFile(file, 'large.png'),
+        ),
+        throwsException,
+      );
+    });
+
+    test('oversized binary import throws before workspace write', () async {
+      final file = await writeSparseFile('large.bin', 51 * 1024 * 1024);
+
+      expect(
+        FileAttachmentService.prepareForMessage(
+          platformFile(file, 'large.bin'),
         ),
         throwsException,
       );
@@ -114,7 +139,8 @@ void main() {
       );
 
       expect(prepared.content, isA<TextContent>());
-      expect(prepared.inputText, contains('/root/workspace/uploads/archive.bin'));
+      expect(
+          prepared.inputText, contains('/root/workspace/uploads/archive.bin'));
       expect(prepared.includeAsContentBlock, isFalse);
     });
   });

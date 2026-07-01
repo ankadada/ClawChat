@@ -5,6 +5,7 @@ import 'package:uuid/uuid.dart';
 import '../models/chat_models.dart';
 import '../services/agent_service.dart';
 import '../services/llm_service.dart';
+import '../services/stream_flush_scheduler.dart';
 
 enum AgentStatus { idle, thinking, streaming, tooling, error }
 
@@ -33,7 +34,8 @@ class AgentState {
   StringBuffer streamBuffer = StringBuffer();
   StreamSubscription<AgentEvent>? agentSubscription;
   Completer<void>? agentCompleter;
-  Timer? streamThrottle;
+  final StreamFlushScheduler streamFlushScheduler = StreamFlushScheduler();
+  Timer? messageQueueDrainTimer;
   LlmService? cachedLlm;
   LlmConfig? cachedLlmConfig;
   bool agentServiceActive = false;
@@ -51,7 +53,8 @@ class AgentState {
   AgentState(this.sessionId);
 
   void dispose() {
-    streamThrottle?.cancel();
+    streamFlushScheduler.cancel();
+    messageQueueDrainTimer?.cancel();
     agentSubscription?.cancel();
     if (agentCompleter != null && !agentCompleter!.isCompleted) {
       agentCompleter!.complete();

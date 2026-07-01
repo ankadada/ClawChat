@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 
 import '../models/chat_models.dart';
+import 'attachment_budget.dart';
 import 'native_bridge.dart';
 
 class PreparedAttachment {
@@ -21,19 +22,56 @@ class PreparedAttachment {
 /// Service for picking files from device storage and importing them
 /// into the proot workspace for use by the AI agent.
 class FileAttachmentService {
-  static const int _maxInlineImageBase64Bytes = 5 * 1024 * 1024;
-  static const int _maxInlineTextBytes = 100 * 1024;
+  static const _attachmentBudget = AttachmentBudget();
 
   static const Set<String> _imageExtensions = {
-    'jpg', 'jpeg', 'png', 'gif', 'webp',
+    'jpg',
+    'jpeg',
+    'png',
+    'gif',
+    'webp',
   };
 
   static const Set<String> _textExtensions = {
-    'txt', 'md', 'json', 'yaml', 'yml', 'xml', 'csv',
-    'py', 'js', 'jsx', 'ts', 'tsx', 'dart', 'sh', 'bash',
-    'html', 'css', 'scss', 'toml', 'cfg', 'ini', 'log', 'sql',
-    'go', 'rs', 'rb', 'php', 'java', 'kt', 'kts', 'swift',
-    'c', 'cc', 'cpp', 'h', 'hpp', 'gradle', 'properties', 'env',
+    'txt',
+    'md',
+    'json',
+    'yaml',
+    'yml',
+    'xml',
+    'csv',
+    'py',
+    'js',
+    'jsx',
+    'ts',
+    'tsx',
+    'dart',
+    'sh',
+    'bash',
+    'html',
+    'css',
+    'scss',
+    'toml',
+    'cfg',
+    'ini',
+    'log',
+    'sql',
+    'go',
+    'rs',
+    'rb',
+    'php',
+    'java',
+    'kt',
+    'kts',
+    'swift',
+    'c',
+    'cc',
+    'cpp',
+    'h',
+    'hpp',
+    'gradle',
+    'properties',
+    'env',
   };
 
   /// Pick files from device storage.
@@ -66,18 +104,22 @@ class FileAttachmentService {
   static Future<PreparedAttachment> prepareForMessage(PlatformFile file) async {
     final sourcePath = file.path;
     if (sourcePath == null) {
-      throw Exception('File path is null - file may not have been saved to disk');
+      throw Exception(
+          'File path is null - file may not have been saved to disk');
     }
 
     final safeName = sanitizeFileName(file.name);
     final extension = _extensionFor(safeName);
 
     if (_imageExtensions.contains(extension)) {
-      final bytes = await File(sourcePath).readAsBytes();
+      final sourceFile = File(sourcePath);
+      final byteLength = await sourceFile.length();
+      _attachmentBudget.checkInlineImageBytes(
+        byteLength,
+        fileName: safeName,
+      );
+      final bytes = await sourceFile.readAsBytes();
       final base64Content = base64Encode(bytes);
-      if (base64Content.length > _maxInlineImageBase64Bytes) {
-        throw Exception('Image is too large to inline after base64 encoding (5 MB limit)');
-      }
       return PreparedAttachment(
         content: ImageContent(
           data: base64Content,
@@ -90,10 +132,13 @@ class FileAttachmentService {
     }
 
     if (_textExtensions.contains(extension)) {
-      final bytes = await File(sourcePath).readAsBytes();
-      if (bytes.length > _maxInlineTextBytes) {
-        throw Exception('Text file is too large to inline (100 KB limit)');
-      }
+      final sourceFile = File(sourcePath);
+      final byteLength = await sourceFile.length();
+      _attachmentBudget.checkInlineTextBytes(
+        byteLength,
+        fileName: safeName,
+      );
+      final bytes = await sourceFile.readAsBytes();
       final text = utf8.decode(bytes, allowMalformed: true);
       final fence = text.contains('```') ? '````' : '```';
       return PreparedAttachment(
@@ -119,22 +164,29 @@ class FileAttachmentService {
   static Future<String> importToWorkspace(PlatformFile file) async {
     final sourcePath = file.path;
     if (sourcePath == null) {
-      throw Exception('File path is null - file may not have been saved to disk');
+      throw Exception(
+          'File path is null - file may not have been saved to disk');
     }
 
     final safeName = sanitizeFileName(file.name);
     final extension = _extensionFor(safeName);
+    final sourceFile = File(sourcePath);
+    final byteLength = await sourceFile.length();
+    _attachmentBudget.checkWorkspaceImportBytes(
+      byteLength,
+      fileName: safeName,
+    );
 
     const destDir = 'root/workspace/uploads';
     final destPath = '$destDir/$safeName';
 
     if (_textExtensions.contains(extension)) {
       // Text file: read as string and write directly via rootfs
-      final content = await File(sourcePath).readAsString();
+      final content = await sourceFile.readAsString();
       await NativeBridge.writeRootfsFile(destPath, content);
     } else {
       // Binary file: base64 encode, write to temp file, decode inside proot
-      final bytes = await File(sourcePath).readAsBytes();
+      final bytes = await sourceFile.readAsBytes();
       final base64Content = base64Encode(bytes);
       await NativeBridge.writeRootfsFile('$destDir/.tmp_b64', base64Content);
       await NativeBridge.runInProot(

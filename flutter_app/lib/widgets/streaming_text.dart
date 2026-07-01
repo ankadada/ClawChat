@@ -17,6 +17,23 @@ class StreamingText extends StatefulWidget {
 
   @override
   State<StreamingText> createState() => _StreamingTextState();
+
+  @visibleForTesting
+  static int get cacheEntryCountForTesting =>
+      _MarkdownSpanCache.instance.entryCount;
+
+  @visibleForTesting
+  static int get cacheCharacterCountForTesting =>
+      _MarkdownSpanCache.instance.characterCount;
+
+  @visibleForTesting
+  static int get cacheMaxCharactersForTesting =>
+      _MarkdownSpanCache.maxCharacters;
+
+  @visibleForTesting
+  static void clearCacheForTesting() {
+    _MarkdownSpanCache.instance.clear();
+  }
 }
 
 class _StreamingTextState extends State<StreamingText>
@@ -73,7 +90,8 @@ class _StreamingTextState extends State<StreamingText>
         final maxInlineWidth = constraints.hasBoundedWidth
             ? constraints.maxWidth
             : MediaQuery.sizeOf(context).width * 0.78;
-        final spans = _getOrParseSpans(widget.text, context, theme, maxInlineWidth);
+        final spans =
+            _getOrParseSpans(widget.text, context, theme, maxInlineWidth);
 
         return SelectableText.rich(
           TextSpan(children: spans),
@@ -115,6 +133,21 @@ class _StreamingTextState extends State<StreamingText>
       return result;
     }
 
+    if (!widget.isStreaming) {
+      final sharedSpans = _MarkdownSpanCache.instance.get(
+        text: parseText,
+        maxInlineWidth: maxInlineWidth,
+        theme: theme,
+      );
+      if (sharedSpans != null) {
+        _disposeRecognizers();
+        _cachedSpans = sharedSpans;
+        _cachedText = parseText;
+        _cachedMaxWidth = maxInlineWidth;
+        return List<InlineSpan>.from(sharedSpans);
+      }
+    }
+
     final isNewAppend = !_tableRegex.hasMatch(parseText) &&
         !parseText.contains('```') &&
         _cachedText != null &&
@@ -124,7 +157,8 @@ class _StreamingTextState extends State<StreamingText>
 
     if (isNewAppend && _cachedSpans != null) {
       final newSpans = List<InlineSpan>.from(_cachedSpans!);
-      _appendParsedSpans(parseText, context, theme, newSpans, _lastParseEnd, maxInlineWidth);
+      _appendParsedSpans(
+          parseText, context, theme, newSpans, _lastParseEnd, maxInlineWidth);
       _cachedSpans = newSpans;
       _cachedText = parseText;
       _cachedMaxWidth = maxInlineWidth;
@@ -143,6 +177,14 @@ class _StreamingTextState extends State<StreamingText>
     _cachedSpans = spans;
     _cachedText = parseText;
     _cachedMaxWidth = maxInlineWidth;
+    if (!widget.isStreaming && _recognizers.isEmpty) {
+      _MarkdownSpanCache.instance.put(
+        text: parseText,
+        maxInlineWidth: maxInlineWidth,
+        theme: theme,
+        spans: spans,
+      );
+    }
     final result = List<InlineSpan>.from(spans);
     if (trailing.isNotEmpty) {
       result.add(TextSpan(text: trailing));
@@ -349,9 +391,9 @@ class _StreamingTextState extends State<StreamingText>
                       ? theme.textTheme.titleSmall
                       : theme.textTheme.bodyLarge)
               ?.copyWith(
-                fontWeight: FontWeight.w700,
-                color: theme.colorScheme.onSurface,
-              );
+            fontWeight: FontWeight.w700,
+            color: theme.colorScheme.onSurface,
+          );
           spans.add(TextSpan(
             text: '${info.match.group(2)}\n',
             style: headingStyle,
@@ -548,5 +590,127 @@ class _ParsedMarkdownTable {
     required this.headers,
     required this.rows,
     required this.alignments,
+  });
+}
+
+class _MarkdownSpanCache {
+  static final instance = _MarkdownSpanCache();
+  static const int maxEntries = 160;
+  static const int maxCharacters = 220000;
+
+  final _entries = <_MarkdownSpanCacheKey, _MarkdownSpanCacheEntry>{};
+  int _characterCount = 0;
+
+  int get entryCount => _entries.length;
+  int get characterCount => _characterCount;
+
+  List<InlineSpan>? get({
+    required String text,
+    required double maxInlineWidth,
+    required ThemeData theme,
+  }) {
+    final key = _MarkdownSpanCacheKey.from(
+      text: text,
+      maxInlineWidth: maxInlineWidth,
+      theme: theme,
+    );
+    final entry = _entries.remove(key);
+    if (entry == null) return null;
+    _entries[key] = entry;
+    return List<InlineSpan>.from(entry.spans);
+  }
+
+  void put({
+    required String text,
+    required double maxInlineWidth,
+    required ThemeData theme,
+    required List<InlineSpan> spans,
+  }) {
+    if (text.isEmpty || text.length > maxCharacters ~/ 3) return;
+    final key = _MarkdownSpanCacheKey.from(
+      text: text,
+      maxInlineWidth: maxInlineWidth,
+      theme: theme,
+    );
+    final previous = _entries.remove(key);
+    if (previous != null) {
+      _characterCount -= previous.characterCount;
+    }
+    _entries[key] = _MarkdownSpanCacheEntry(
+      spans: List<InlineSpan>.from(spans),
+      characterCount: text.length,
+    );
+    _characterCount += text.length;
+    _evictToBudget();
+  }
+
+  void _evictToBudget() {
+    while (_entries.length > maxEntries || _characterCount > maxCharacters) {
+      final oldestKey = _entries.keys.first;
+      final oldest = _entries.remove(oldestKey);
+      if (oldest == null) break;
+      _characterCount -= oldest.characterCount;
+    }
+  }
+
+  void clear() {
+    _entries.clear();
+    _characterCount = 0;
+  }
+}
+
+class _MarkdownSpanCacheKey {
+  final String text;
+  final int width;
+  final int colorHash;
+  final Brightness brightness;
+
+  const _MarkdownSpanCacheKey({
+    required this.text,
+    required this.width,
+    required this.colorHash,
+    required this.brightness,
+  });
+
+  factory _MarkdownSpanCacheKey.from({
+    required String text,
+    required double maxInlineWidth,
+    required ThemeData theme,
+  }) {
+    final colors = theme.colorScheme;
+    return _MarkdownSpanCacheKey(
+      text: text,
+      width: maxInlineWidth.round(),
+      colorHash: Object.hash(
+        colors.primary,
+        colors.onSurface,
+        colors.onSurfaceVariant,
+        colors.surfaceContainerHighest,
+        colors.outline,
+      ),
+      brightness: theme.brightness,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) {
+    return other is _MarkdownSpanCacheKey &&
+        text == other.text &&
+        width == other.width &&
+        colorHash == other.colorHash &&
+        brightness == other.brightness;
+  }
+
+  @override
+  int get hashCode => Object.hash(text, width, colorHash, brightness);
+}
+
+class _MarkdownSpanCacheEntry {
+  final List<InlineSpan> spans;
+  final int characterCount;
+
+  const _MarkdownSpanCacheEntry({
+    required this.spans,
+    required this.characterCount,
   });
 }

@@ -18,6 +18,7 @@ import '../services/preferences_service.dart';
 import '../services/file_attachment_service.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
+import '../services/chat_render_window.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/voice_input_state.dart';
 import '../widgets/streaming_text.dart';
@@ -52,6 +53,9 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
+  static const int _initialRenderMessageWindow = 180;
+  static const int _loadOlderMessageIncrement = 120;
+
   final _inputController = TextEditingController();
   final _scrollController = ScrollController();
   final _focusNode = FocusNode();
@@ -74,9 +78,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _agentJustCompleted = false;
   bool _isCompensatingScroll = false;
   bool _scrollCompensationScheduled = false;
+  bool _loadOlderScrollCompensationScheduled = false;
   double? _lastMaxScrollExtent;
   String? _trackedAgentSessionId;
   bool _trackedAgentWasActive = false;
+  ChatRenderWindowState _renderWindowState =
+      ChatRenderWindowState.initial(_initialRenderMessageWindow);
+  String? _renderWindowSessionId;
 
   bool get _isListening => _voiceInput.isListening;
   bool get _isWhisperRecording => _voiceInput.isWhisperRecording;
@@ -700,6 +708,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
   }
 
+  void _scheduleLoadOlderScrollCompensation({
+    required double previousMaxScrollExtent,
+    required double previousOffset,
+  }) {
+    if (_loadOlderScrollCompensationScheduled) return;
+    _loadOlderScrollCompensationScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadOlderScrollCompensationScheduled = false;
+      if (!mounted || !_scrollController.hasClients) return;
+      final position = _scrollController.position;
+      final target = compensatedScrollOffsetAfterPrepend(
+        previousMaxScrollExtent: previousMaxScrollExtent,
+        previousOffset: previousOffset,
+        currentMinScrollExtent: position.minScrollExtent,
+        currentMaxScrollExtent: position.maxScrollExtent,
+      );
+      if (target == null) return;
+      _isCompensatingScroll = true;
+      _scrollController.jumpTo(target);
+      _isCompensatingScroll = false;
+      _lastMaxScrollExtent = position.maxScrollExtent;
+      _updateScrollState();
+    });
+  }
+
   void _compensateScrollExtentChange() {
     if (!mounted || !_scrollController.hasClients || _isCompensatingScroll) {
       return;
@@ -757,9 +790,44 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _agentJustCompleted = false;
     _isCompensatingScroll = false;
     _scrollCompensationScheduled = false;
+    _loadOlderScrollCompensationScheduled = false;
     _lastMaxScrollExtent = null;
     _trackedAgentSessionId = null;
     _trackedAgentWasActive = false;
+    _renderWindowState = _renderWindowState.reset(_initialRenderMessageWindow);
+    _renderWindowSessionId = null;
+  }
+
+  void _showMoreHistory(int totalMessageCount) {
+    final previousMaxScrollExtent = _scrollController.hasClients
+        ? _scrollController.position.maxScrollExtent
+        : 0.0;
+    final previousOffset =
+        _scrollController.hasClients ? _scrollController.offset : 0.0;
+    setState(() {
+      _renderWindowState = _renderWindowState.loadOlder(
+        totalCount: totalMessageCount,
+        increment: _loadOlderMessageIncrement,
+      );
+    });
+    if (_scrollController.hasClients) {
+      _scheduleLoadOlderScrollCompensation(
+        previousMaxScrollExtent: previousMaxScrollExtent,
+        previousOffset: previousOffset,
+      );
+    }
+  }
+
+  _MessageWindow _messageWindowFor(List<ChatMessage> messages) {
+    final window = _renderWindowState.windowFor(messages.length);
+    return _MessageWindow(
+      messages: messages.sublist(
+        window.startIndex,
+        window.endIndexExclusive,
+      ),
+      startIndex: window.startIndex,
+      hiddenBeforeCount: window.hiddenBeforeCount,
+    );
   }
 
   void _scrollToBottom() {
@@ -913,6 +981,40 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       body: Column(
         children: [
           const AgentStatusBar(),
+          Consumer<ChatProvider>(
+            builder: (_, provider, __) {
+              if (!provider.safeMode) return const SizedBox.shrink();
+              return Material(
+                color: theme.colorScheme.errorContainer,
+                child: SafeArea(
+                  bottom: false,
+                  child: ListTile(
+                    leading: Icon(
+                      Icons.health_and_safety_outlined,
+                      color: theme.colorScheme.onErrorContainer,
+                    ),
+                    title: Text(
+                      '安全模式已启用',
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        color: theme.colorScheme.onErrorContainer,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    subtitle: Text(
+                      '已跳过自动恢复会话，避免重复打开异常长会话。',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onErrorContainer,
+                      ),
+                    ),
+                    trailing: TextButton(
+                      onPressed: provider.exitSafeMode,
+                      child: const Text('退出'),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -963,15 +1065,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       _syncDraftForSession();
                     }
                     _primeMessageAnimations(currentId, messages);
+                    if (currentId != _renderWindowSessionId) {
+                      _renderWindowSessionId = currentId;
+                      _renderWindowState =
+                          _renderWindowState.reset(_initialRenderMessageWindow);
+                    }
 
                     if (messages.isEmpty && !hasStreaming && !showTyping) {
                       return _buildEmptyState(
                           theme, data.modelLabel, maxContentWidth);
                     }
 
-                    final itemCount = messages.length +
-                        (hasStreaming ? 1 : 0) +
-                        (showTyping ? 1 : 0);
+                    final window = _messageWindowFor(messages);
+                    final visibleMessages = window.messages;
+                    final hasLoadOlder = window.hiddenBeforeCount > 0;
+                    final virtualMessageStart = hasLoadOlder ? 1 : 0;
+                    final extraItemCount =
+                        (hasStreaming ? 1 : 0) + (showTyping ? 1 : 0);
+                    final itemCount = visibleMessages.length +
+                        virtualMessageStart +
+                        extraItemCount;
+                    final streamingOrTypingIndex =
+                        virtualMessageStart + visibleMessages.length;
                     if (_userHasScrolledUp && hasStreaming) {
                       _scheduleScrollExtentCompensation();
                     }
@@ -980,14 +1095,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         NotificationListener<ScrollNotification>(
                           onNotification: _handleScrollNotification,
                           child: ListView.builder(
+                            key: const ValueKey('chat-message-list'),
                             controller: _scrollController,
                             reverse: true,
                             padding: const EdgeInsets.symmetric(
                                 horizontal: 16, vertical: 12),
                             itemCount: itemCount,
                             itemBuilder: (context, index) {
-                              final reversedIndex = itemCount - 1 - index;
-                              if (reversedIndex == messages.length &&
+                              final virtualIndex = itemCount - 1 - index;
+                              if (virtualIndex == streamingOrTypingIndex &&
                                   hasStreaming) {
                                 return Consumer<ChatProvider>(
                                   builder: (_, provider, __) {
@@ -1004,7 +1120,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   },
                                 );
                               }
-                              if (reversedIndex == messages.length &&
+                              if (virtualIndex == streamingOrTypingIndex &&
                                   showTyping) {
                                 return RepaintBoundary(
                                   child: _buildTypingIndicatorBubble(
@@ -1016,13 +1132,27 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   ),
                                 );
                               }
-                              final message = messages[reversedIndex];
-                              final previousRole = reversedIndex > 0
-                                  ? messages[reversedIndex - 1].role
+                              if (hasLoadOlder && virtualIndex == 0) {
+                                return _buildLoadOlderMessagesAffordance(
+                                  theme,
+                                  hiddenCount: window.hiddenBeforeCount,
+                                  totalMessageCount: messages.length,
+                                );
+                              }
+                              final visibleIndex =
+                                  virtualIndex - virtualMessageStart;
+                              final message = visibleMessages[visibleIndex];
+                              final originalIndex =
+                                  originalMessageIndexForVisibleIndex(
+                                windowStartIndex: window.startIndex,
+                                visibleIndex: visibleIndex,
+                              );
+                              final previousRole = visibleIndex > 0
+                                  ? visibleMessages[visibleIndex - 1].role
                                   : null;
                               final nextRole =
-                                  reversedIndex < messages.length - 1
-                                      ? messages[reversedIndex + 1].role
+                                  visibleIndex < visibleMessages.length - 1
+                                      ? visibleMessages[visibleIndex + 1].role
                                       : null;
                               final animationId = _messageAnimationId(message);
                               final animate =
@@ -1033,7 +1163,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                 child: RepaintBoundary(
                                   child: _buildMessageBubble(
                                     message,
-                                    reversedIndex,
+                                    originalIndex,
                                     theme,
                                     maxContentWidth,
                                     messages: messages,
@@ -1343,6 +1473,55 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLoadOlderMessagesAffordance(
+    ThemeData theme, {
+    required int hiddenCount,
+    required int totalMessageCount,
+  }) {
+    final loadCount = math.min(hiddenCount, _loadOlderMessageIncrement);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Center(
+        child: Material(
+          color: theme.colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(AppRadii.xl),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(AppRadii.xl),
+            onTap: () => _showMoreHistory(totalMessageCount),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.keyboard_arrow_up,
+                    size: 18,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    AppStrings.loadOlderMessages(loadCount),
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    AppStrings.hiddenOlderMessages(hiddenCount),
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant.withAlpha(155),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -3268,6 +3447,18 @@ class _PendingAttachmentPreview {
     required this.inputText,
     required this.insertedText,
     required this.includeAsContentBlock,
+  });
+}
+
+class _MessageWindow {
+  final List<ChatMessage> messages;
+  final int startIndex;
+  final int hiddenBeforeCount;
+
+  const _MessageWindow({
+    required this.messages,
+    required this.startIndex,
+    required this.hiddenBeforeCount,
   });
 }
 

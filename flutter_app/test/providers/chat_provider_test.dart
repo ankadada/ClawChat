@@ -8,10 +8,12 @@ import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
 import 'package:clawchat/services/context_summary_service.dart';
+import 'package:clawchat/services/startup_restore_guard.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/provider_message_transform.dart';
 import 'package:clawchat/services/runtime_debug_events.dart';
+import 'package:clawchat/services/session_storage.dart';
 import 'package:clawchat/services/token_calibration_service.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:clawchat/services/tools/tool_registry.dart';
@@ -177,6 +179,148 @@ void main() {
       expect(message.alternatives, ['v1']);
 
       await Future<void>.delayed(const Duration(milliseconds: 20));
+    });
+  });
+
+  group('safe mode and diagnostics', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('safe mode skips selecting existing sessions until cleared', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'safe_mode_session',
+        title: 'bad long session',
+        messages: [ChatMessage.user('large prompt')],
+      );
+      await storage.saveSession(session);
+      final guard = StartupRestoreGuard();
+      await guard.recordStartupFailure();
+      await guard.recordStartupFailure();
+
+      final provider =
+          ChatProvider(storage: storage, startupRestoreGuard: guard);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(provider.safeMode, isTrue);
+      expect(provider.sessions.map((s) => s.id), contains('safe_mode_session'));
+
+      await provider.selectSession('safe_mode_session');
+      expect(provider.currentSession, isNull);
+      expect(provider.errorMessage, contains('安全模式'));
+
+      await provider.exitSafeMode();
+      await provider.selectSession('safe_mode_session');
+      expect(provider.currentSession?.id, 'safe_mode_session');
+    });
+
+    test('init failure safe-opens when restore guard prefs are unavailable',
+        () async {
+      final guard = StartupRestoreGuard(
+        prefsFactory: () async => throw StateError('prefs unavailable'),
+      );
+
+      final firstProvider = ChatProvider(
+        storage: _ThrowingInitSessionStorage(),
+        startupRestoreGuard: guard,
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        firstProvider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(firstProvider.safeMode, isFalse);
+      expect(firstProvider.startupFailureCount, 1);
+      expect(firstProvider.sessions, isEmpty);
+      expect(firstProvider.currentSession, isNull);
+      expect(firstProvider.errorMessage, isNotNull);
+
+      final secondProvider = ChatProvider(
+        storage: _ThrowingInitSessionStorage(),
+        startupRestoreGuard: guard,
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        secondProvider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(secondProvider.safeMode, isTrue);
+      expect(secondProvider.startupFailureCount, 2);
+      expect(secondProvider.sessions, isEmpty);
+      expect(secondProvider.currentSession, isNull);
+      expect(secondProvider.errorMessage, isNotNull);
+    });
+
+    test('diagnostics report excludes raw prompt, base64, and secrets',
+        () async {
+      final events = RuntimeDebugEventService();
+      events.record(RuntimeDebugEvent(
+        type: 'provider.debug',
+        sessionId: 's1',
+        data: {
+          'prompt': 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456',
+          'imageData': 'data:image/png;base64,${'a' * 200}',
+          'api_key': 'sk-secretsecretsecret',
+        },
+      ));
+      final provider = ChatProvider(runtimeDebugEvents: events);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final report = await provider.buildDiagnosticsReport();
+
+      expect(report, contains('ClawChat diagnostics'));
+      expect(report, isNot(contains('sk-secretsecretsecret')));
+      expect(report, isNot(contains('abcdefghijklmnopqrstuvwxyz')));
+      expect(report, isNot(contains('data:image/png;base64')));
+      expect(report, isNot(contains('aaaaaaaaaaaaaaaaaaaa')));
+    });
+
+    test('sendMessage rejects oversized image attachment before persistence',
+        () async {
+      var requestCount = 0;
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+
+      await provider.sendMessage('', attachments: [
+        ImageContent(data: 'a' * (4 * 1024 * 1024 + 4), mediaType: 'image/png'),
+      ]);
+
+      expect(requestCount, 0);
+      expect(provider.errorMessage, contains('图片数据过大'));
+      expect(session.messages, isEmpty);
     });
   });
 
@@ -2212,6 +2356,74 @@ void main() {
       expect(prefs.getString(TokenCalibrationService.storageKey), isNull);
     });
 
+    test('tool-call preflight repairs malformed args with sanitized event',
+        () async {
+      var requestCount = 0;
+      final events = RuntimeDebugEventService();
+      final tools = ToolRegistry()..register(_EchoTool(), risk: ToolRisk.safe);
+      final provider = ChatProvider(
+        runtimeDebugEvents: events,
+        toolRegistry: tools,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) => _summaryForRequest(request),
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'call_1',
+                      toolName: 'echo',
+                      toolInput: {},
+                      rawToolInputJson: '{"text":"hi"',
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'ok')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      await provider.sendMessage('use repaired tool');
+
+      expect(provider.errorMessage, isNull);
+      expect(requestCount, 2);
+      final toolResult = provider.currentSession!.messages
+          .expand((message) => message.toolResults)
+          .single;
+      expect(toolResult.output, contains('hi'));
+
+      final event = events
+          .recent(sessionId: session.id)
+          .where((event) => event.type == 'tool.preflight.repaired')
+          .single;
+      expect(event.data['repairCount'], 1);
+      expect(event.data['repairTypes'], {'json_closure': 1});
+      expect(event.data.containsKey('toolName'), isFalse);
+      expect(event.data.toString(), isNot(contains('hi')));
+      expect(event.data.toString(), isNot(contains('text')));
+    });
+
     test('tool calls persist ForUser while next LLM request receives ForLLM',
         () async {
       final observedMessages = <List<Map<String, dynamic>>>[];
@@ -2797,6 +3009,13 @@ class _ScriptedLlmService extends LlmService {
       if (text.isNotEmpty) yield TextDelta(text);
     }
     yield event;
+  }
+}
+
+class _ThrowingInitSessionStorage extends SessionStorage {
+  @override
+  Future<void> init() async {
+    throw StateError('session storage unavailable');
   }
 }
 

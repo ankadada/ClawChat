@@ -9,13 +9,16 @@ import '../models/chat_models.dart';
 import '../models/model_capabilities.dart';
 import '../models/provider_profile.dart';
 import '../services/agent_service.dart';
+import '../services/attachment_budget.dart';
 import '../services/context_manager.dart';
 import '../services/context_summary_service.dart';
+import '../services/diagnostics_export_service.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/provider_message_transform.dart';
 import '../services/runtime_debug_events.dart';
 import '../services/session_storage.dart';
+import '../services/startup_restore_guard.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
 import '../services/tool_call_expansion_state.dart';
@@ -39,6 +42,9 @@ class ChatProvider extends ChangeNotifier {
   final LlmServiceFactory _llmServiceFactory;
   late final ContextManager _contextManager;
   final RuntimeDebugEventService runtimeDebugEvents;
+  final StartupRestoreGuard _startupRestoreGuard;
+  final DiagnosticsExportService _diagnosticsExportService;
+  final AttachmentBudget _attachmentBudget;
   late final ToolRegistry _tools;
   final _uuid = const Uuid();
 
@@ -85,6 +91,12 @@ class ChatProvider extends ChangeNotifier {
   List<SkillInfo> _skills = [];
 
   bool _disposed = false;
+  bool _safeMode = false;
+  bool _startupRestoreGuardReady = false;
+  String? _pendingStartupSessionId;
+  int _startupFailureCount = 0;
+  bool get safeMode => _safeMode;
+  int get startupFailureCount => _startupFailureCount;
 
   int _messageVersion = 0;
   int get messageVersion => _messageVersion;
@@ -368,6 +380,43 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
+  void _flushStreamingState(AgentState state, {bool notify = true}) {
+    state.streamingText = state.streamBuffer.toString();
+    if (notify && !_disposed) notifyListeners();
+  }
+
+  void _cancelStreamingFlush(AgentState state) {
+    state.streamFlushScheduler.cancel();
+  }
+
+  void _flushStreamingNow(AgentState state, {bool notify = true}) {
+    state.streamFlushScheduler.flushNow(() {
+      _flushStreamingState(state, notify: notify);
+    });
+  }
+
+  void _clearStreamingState(AgentState state, {bool notify = false}) {
+    _cancelStreamingFlush(state);
+    state.streamingText = '';
+    state.streamBuffer = StringBuffer();
+    if (notify && !_disposed) notifyListeners();
+  }
+
+  void _appendStreamingDelta(AgentState state, String text) {
+    state.status = AgentStatus.streaming;
+    state.streamBuffer.write(text);
+    state.streamFlushScheduler.schedule(
+      delta: text,
+      flush: () {
+        _flushStreamingState(state);
+        unawaited(_startAgentServiceForState(
+          state,
+          _agentServiceStreamingText,
+        ));
+      },
+    );
+  }
+
   void saveDraft(String sessionId, String text) {
     if (text.isEmpty) {
       _drafts.remove(sessionId);
@@ -382,10 +431,17 @@ class ChatProvider extends ChangeNotifier {
     ContextSummaryServiceFactory? contextSummaryServiceFactory,
     ProviderTransformPreflight? providerTransformPreflight,
     RuntimeDebugEventService? runtimeDebugEvents,
+    StartupRestoreGuard? startupRestoreGuard,
+    DiagnosticsExportService? diagnosticsExportService,
+    AttachmentBudget? attachmentBudget,
     ToolRegistry? toolRegistry,
   })  : _storage = storage ?? SessionStorage(),
         _llmServiceFactory = llmServiceFactory ?? LlmService.new,
-        runtimeDebugEvents = runtimeDebugEvents ?? RuntimeDebugEventService() {
+        runtimeDebugEvents = runtimeDebugEvents ?? RuntimeDebugEventService(),
+        _startupRestoreGuard = startupRestoreGuard ?? StartupRestoreGuard(),
+        _diagnosticsExportService =
+            diagnosticsExportService ?? const DiagnosticsExportService(),
+        _attachmentBudget = attachmentBudget ?? const AttachmentBudget() {
     _contextManager = ContextManager(
       contextSummaryServiceFactory:
           contextSummaryServiceFactory ?? ContextSummaryService.new,
@@ -397,7 +453,13 @@ class ChatProvider extends ChangeNotifier {
       ({String? sessionId}) => cancelAgent(sessionId: sessionId),
     );
     NativeBridge.setNavigateToSessionHandler((sessionId) {
-      unawaited(selectSession(sessionId));
+      if (!_startupRestoreGuardReady) {
+        _pendingStartupSessionId = sessionId;
+        return;
+      }
+      if (!_safeMode) {
+        unawaited(selectSession(sessionId));
+      }
     });
     _tools = toolRegistry ?? ToolRegistry.withDefaults(prefs: _prefs);
     _init();
@@ -423,14 +485,35 @@ class ChatProvider extends ChangeNotifier {
       await _contextManager.init();
       _prefsInitialized = true;
       await _storage.init();
+      final guardState = await _startupRestoreGuard.state();
+      _safeMode = guardState.safeMode;
+      _startupFailureCount = guardState.failureCount;
       sessions = await _storage.getSessionsSummary();
+      _startupRestoreGuardReady = true;
       notifyListeners();
       await loadSkills();
       MemoryService.getMemories();
+      await _startupRestoreGuard.recordStartupSuccess();
+      if (!_safeMode) {
+        _startupFailureCount = 0;
+        final pendingSessionId = _pendingStartupSessionId;
+        _pendingStartupSessionId = null;
+        if (pendingSessionId != null && pendingSessionId.isNotEmpty) {
+          unawaited(selectSession(pendingSessionId));
+        }
+      } else {
+        _pendingStartupSessionId = null;
+      }
     } catch (e) {
       debugPrint('ChatProvider init failed: $e');
+      final guardState = await _recordStartupFailureBestEffort();
+      _safeMode = guardState.safeMode;
+      _startupFailureCount = guardState.failureCount;
+      _startupRestoreGuardReady = true;
+      _pendingStartupSessionId = null;
       // Initialize with empty state rather than silently failing
       sessions = [];
+      _fallbackErrorMessage = '启动恢复失败，已进入安全打开模式';
       notifyListeners();
     }
   }
@@ -466,11 +549,84 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> selectSession(String id) async {
+    if (_safeMode) {
+      _fallbackErrorMessage = '安全模式已启用，已跳过自动恢复。请手动退出安全模式后再打开会话。';
+      notifyListeners();
+      return;
+    }
     if (currentSession?.id != id) {
       _clearSessionScopedState();
     }
-    currentSession = await _storage.getSession(id);
+    try {
+      currentSession = await _storage.getSession(id);
+      await _startupRestoreGuard.recordStartupSuccess();
+      notifyListeners();
+    } catch (e) {
+      final guardState = await _recordStartupFailureBestEffort();
+      _safeMode = guardState.safeMode;
+      _startupFailureCount = guardState.failureCount;
+      currentSession = null;
+      _clearSessionScopedState();
+      _fallbackErrorMessage = '会话恢复失败，已进入安全打开状态: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<StartupRestoreGuardState> _recordStartupFailureBestEffort() async {
+    try {
+      return await _startupRestoreGuard.recordStartupFailure();
+    } catch (guardError) {
+      debugPrint('Startup restore guard failure recording failed: $guardError');
+      return const StartupRestoreGuardState(
+        failureCount: StartupRestoreGuard.failureThreshold,
+        safeMode: true,
+      );
+    }
+  }
+
+  Future<void> exitSafeMode() async {
+    await _startupRestoreGuard.clear();
+    _safeMode = false;
+    _startupFailureCount = 0;
+    _fallbackErrorMessage = null;
     notifyListeners();
+  }
+
+  Future<String> buildDiagnosticsReport() async {
+    await _ensurePrefs();
+    ResolvedModelProfile? resolvedProfile;
+    try {
+      final session = currentSession ??
+          ChatSession(
+            id: 'diagnostics',
+            modelOverride: _prefs.model,
+            baseUrlOverride: _prefs.baseUrl,
+            apiFormatOverride: _prefs.apiFormat,
+          );
+      final llmConfig = _buildLlmConfig(_prefs, session);
+      final llm = _llmServiceFactory(
+        llmConfig,
+        isInBackground: () => _appInBackground,
+      );
+      try {
+        resolvedProfile = llm.resolvedModelProfile;
+      } finally {
+        llm.dispose();
+      }
+    } catch (_) {
+      resolvedProfile = null;
+    }
+
+    return _diagnosticsExportService.buildReport(DiagnosticsExportSummary(
+      activeProfileId: _prefs.activeProfileId,
+      activeProfile: _prefs.activeProfile,
+      resolvedModelProfile: resolvedProfile,
+      currentSessionId: currentSession?.id,
+      lastError: errorMessage,
+      safeMode: _safeMode,
+      startupFailureCount: _startupFailureCount,
+      events: runtimeDebugEvents.recent(limit: 120),
+    ));
   }
 
   Future<void> deleteSession(String id) async {
@@ -733,6 +889,20 @@ class ChatProvider extends ChangeNotifier {
     AgentState? activeState;
     try {
       await _ensurePrefs();
+      try {
+        _attachmentBudget.checkMessageAttachments(attachments);
+      } on AttachmentBudgetException catch (e) {
+        final message = e.message;
+        final targetState = _getState(targetSessionId ?? currentSession?.id);
+        if (targetState != null) {
+          targetState.status = AgentStatus.error;
+          targetState.errorMessage = message;
+        } else {
+          _fallbackErrorMessage = message;
+        }
+        notifyListeners();
+        return;
+      }
 
       ChatSession? session;
       if (targetSessionId != null) {
@@ -1011,6 +1181,8 @@ class ChatProvider extends ChangeNotifier {
     if (state == null || !state.isSending) return;
 
     state.wasCancelled = true;
+    state.messageQueueDrainTimer?.cancel();
+    state.messageQueueDrainTimer = null;
     state.agent?.cancel();
     unawaited(_stopAgentServiceForState(state));
     if (identical(_pendingApprovalState, state)) {
@@ -1018,17 +1190,15 @@ class ChatProvider extends ChangeNotifier {
     }
     state.agentSubscription?.cancel();
     state.agentSubscription = null;
-    state.streamThrottle?.cancel();
-    state.streamThrottle = null;
     if (savePartial) {
+      _flushStreamingNow(state, notify: false);
       _savePartialAgentResponse(state);
     }
-    state.streamBuffer = StringBuffer();
+    _clearStreamingState(state);
     if (state.agentCompleter != null && !state.agentCompleter!.isCompleted) {
       state.agentCompleter!.complete();
     }
     state.status = AgentStatus.idle;
-    state.streamingText = '';
     notifyListeners();
   }
 
@@ -1060,7 +1230,9 @@ class ChatProvider extends ChangeNotifier {
     }
     final next = state.messageQueue.first;
     notifyListeners();
-    Future.delayed(const Duration(seconds: 1), () {
+    state.messageQueueDrainTimer?.cancel();
+    state.messageQueueDrainTimer = Timer(const Duration(seconds: 1), () {
+      state.messageQueueDrainTimer = null;
       if (!_disposed && !state.wasCancelled) {
         final activeCount = _activeAgentStates.length;
         if (activeCount >= maxConcurrentAgents) {
@@ -1089,6 +1261,10 @@ class ChatProvider extends ChangeNotifier {
     final state = _getState(currentSession?.id);
     if (state == null) return;
     state.messageQueue.removeWhere((m) => m.id == id);
+    if (state.messageQueue.isEmpty) {
+      state.messageQueueDrainTimer?.cancel();
+      state.messageQueueDrainTimer = null;
+    }
     _cleanupIdleState(state.sessionId);
     notifyListeners();
   }
@@ -1097,6 +1273,8 @@ class ChatProvider extends ChangeNotifier {
     final state = _getState(currentSession?.id);
     if (state == null) return;
     state.messageQueue.clear();
+    state.messageQueueDrainTimer?.cancel();
+    state.messageQueueDrainTimer = null;
     state.wasCancelled = false;
     _cleanupIdleState(state.sessionId);
     notifyListeners();
@@ -1107,6 +1285,8 @@ class ChatProvider extends ChangeNotifier {
     if (id == null) return;
     final state = _getState(id);
     if (state == null || state.isSending || state.messageQueue.isEmpty) return;
+    state.messageQueueDrainTimer?.cancel();
+    state.messageQueueDrainTimer = null;
     state.wasCancelled = false;
     final next = state.messageQueue.removeAt(0);
     notifyListeners();
@@ -1477,6 +1657,7 @@ class ChatProvider extends ChangeNotifier {
         session.apiFormatOverride ?? prefs.apiFormat ?? 'anthropic';
     final format =
         formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
+    final activeProfile = prefs.activeProfile;
 
     return LlmConfig(
       format: format,
@@ -1490,6 +1671,9 @@ class ChatProvider extends ChangeNotifier {
       maxTokens: prefs.maxTokens ?? AppConstants.defaultMaxTokens,
       thinkingBudget: prefs.thinkingBudget,
       temperature: prefs.temperature,
+      capabilityOverride: session.modelOverride == null
+          ? activeProfile.capabilityOverride
+          : null,
     );
   }
 
@@ -1512,6 +1696,8 @@ class ChatProvider extends ChangeNotifier {
       privacyMode: _prefs.privacyMode,
       supportsTools: llm.resolvedModelProfile.capabilities.supportsTools,
       envVars: _prefs.envVars,
+      runtimeDebugEvents: runtimeDebugEvents,
+      sessionId: state.sessionId,
     );
   }
 
@@ -1579,7 +1765,7 @@ class ChatProvider extends ChangeNotifier {
         switch (event) {
           case AgentThinking():
             state.status = AgentStatus.thinking;
-            state.streamBuffer = StringBuffer();
+            _clearStreamingState(state);
             notifyListeners();
             unawaited(_startAgentServiceForState(
               state,
@@ -1587,20 +1773,10 @@ class ChatProvider extends ChangeNotifier {
             ));
 
           case AgentTextDelta(:final text):
-            state.status = AgentStatus.streaming;
-            state.streamBuffer.write(text);
-            state.streamThrottle ??=
-                Timer(const Duration(milliseconds: 50), () {
-              state.streamingText = state.streamBuffer.toString();
-              state.streamThrottle = null;
-              notifyListeners();
-              unawaited(_startAgentServiceForState(
-                state,
-                _agentServiceStreamingText,
-              ));
-            });
+            _appendStreamingDelta(state, text);
 
           case AgentToolStart(:final toolName):
+            _flushStreamingNow(state);
             state.status = AgentStatus.tooling;
             notifyListeners();
             unawaited(_startAgentServiceForState(
@@ -1617,10 +1793,7 @@ class ChatProvider extends ChangeNotifier {
             notifyListeners();
 
           case AgentIterationDone(:final messages):
-            state.streamThrottle?.cancel();
-            state.streamThrottle = null;
-            state.streamingText = '';
-            state.streamBuffer = StringBuffer();
+            _clearStreamingState(state);
             _appendNewAgentMessages(
               state,
               activeSession,
@@ -1641,12 +1814,8 @@ class ChatProvider extends ChangeNotifier {
               :final usage,
               :final hadToolCalls,
             ):
-            state.streamThrottle?.cancel();
-            state.streamThrottle = null;
-            state.streamingText = state.streamBuffer.toString();
-            state.streamBuffer = StringBuffer();
+            _flushStreamingNow(state, notify: false);
             state.status = AgentStatus.idle;
-            state.streamingText = '';
             _appendNewAgentMessages(
               state,
               activeSession,
@@ -1672,12 +1841,11 @@ class ChatProvider extends ChangeNotifier {
               if (!_disposed) notifyListeners();
             });
             state.agentCompletionFinalizing = true;
+            _clearStreamingState(state);
             unawaited(_finishAgentComplete(state, finalText, completer));
 
           case AgentError(:final message, :final cause):
-            state.streamThrottle?.cancel();
-            state.streamThrottle = null;
-            state.streamBuffer = StringBuffer();
+            _clearStreamingState(state);
             errorCause = cause;
             if (cause is EncryptedContentError) {
               state.status = AgentStatus.thinking;
@@ -1696,8 +1864,7 @@ class ChatProvider extends ChangeNotifier {
       onError: (Object e) {
         if (!isCurrentRun()) return;
         errorCause = e;
-        state.streamThrottle?.cancel();
-        state.streamThrottle = null;
+        _clearStreamingState(state);
         if (e is EncryptedContentError) {
           state.status = AgentStatus.thinking;
           state.errorMessage = null;

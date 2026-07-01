@@ -165,6 +165,44 @@ void main() {
     expect(codex.capabilities.supportsImages, isFalse);
   });
 
+  test('custom model ids remain distinct from similarly named base models', () {
+    final codex = registry.resolve(
+      apiFormat: ApiFormat.openai,
+      baseUrl: 'https://example.com/v1',
+      model: 'codex/gpt-5.5',
+    );
+    final openAI = registry.resolve(
+      apiFormat: ApiFormat.openai,
+      baseUrl: 'https://example.com/v1',
+      model: 'gpt-5.5',
+    );
+
+    expect(codex.modelId, 'codex/gpt-5.5');
+    expect(openAI.modelId, 'gpt-5.5');
+    expect(codex.capabilities.supportsImages, isFalse);
+    expect(openAI.capabilities.supportsImages, isTrue);
+  });
+
+  test('capability override applies after model defaults', () {
+    final profile = registry.resolve(
+      apiFormat: ApiFormat.openai,
+      baseUrl: 'https://example.com/v1',
+      model: 'codex/gpt-5.5',
+      override: const CapabilityOverride(
+        supportsImages: true,
+        supportsTools: false,
+        supportsReasoningContent: true,
+        maxContextTokens: 123456,
+      ),
+    );
+
+    expect(profile.override?.supportsImages, isTrue);
+    expect(profile.capabilities.supportsImages, isTrue);
+    expect(profile.capabilities.supportsTools, isFalse);
+    expect(profile.capabilities.supportsReasoningContent, isTrue);
+    expect(profile.capabilities.maxContextTokens, 123456);
+  });
+
   test('OpenRouter Groq and LiteLLM preserve max_completion_tokens default',
       () {
     final openRouter = registry.resolve(

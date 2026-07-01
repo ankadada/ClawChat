@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 import '../app.dart' show AppRadii;
 import '../constants.dart';
 import '../l10n/app_strings.dart';
+import '../services/capability_summary.dart';
 import '../models/provider_profile.dart';
 import '../providers/chat_provider.dart';
 import '../services/llm_service.dart';
@@ -97,6 +98,15 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
       if (profile.id == id) return profile;
     }
     return null;
+  }
+
+  ProviderProfile _draftProfileForSummary() {
+    final profile = _editingProfile ?? ProviderProfile.defaults();
+    return profile.copyWith(
+      apiFormat: _apiFormat,
+      baseUrl: _baseUrlController.text.trim(),
+      model: _modelController.text.trim(),
+    );
   }
 
   ProviderProfile _profileById(String id) {
@@ -424,9 +434,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     final isActive = profile.id == _activeProfileId;
     final isEditing = profile.id == _editingProfileId;
     final needsApiKey = profile.apiKey.trim().isEmpty;
-    final formatLabel = profile.apiFormat == ProviderProfile.openaiFormat
-        ? AppStrings.openaiCompatible
-        : 'Anthropic';
+    final capabilitySummary = CapabilitySummary.resolve(profile);
 
     return Dismissible(
       key: ValueKey(profile.id),
@@ -505,8 +513,8 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
             ),
             subtitle: Text(
               needsApiKey
-                  ? '$formatLabel · ${profile.effectiveModel}\n${AppStrings.apiKeyRequiredToUse}'
-                  : '$formatLabel · ${profile.effectiveModel}',
+                  ? '${capabilitySummary.detailLabel}\n${AppStrings.apiKeyRequiredToUse}'
+                  : capabilitySummary.detailLabel,
               maxLines: needsApiKey ? 2 : 1,
               overflow: TextOverflow.ellipsis,
             ),
@@ -590,7 +598,10 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         child: TextField(
           controller: _baseUrlController,
-          onChanged: (_) => _scheduleSave(),
+          onChanged: (_) {
+            setState(() {});
+            _scheduleSave();
+          },
           decoration: InputDecoration(
             labelText: AppStrings.baseUrlOptional,
             hintText: _apiFormat == ProviderProfile.anthropicFormat
@@ -640,14 +651,19 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
                             if (v == '__manual__') {
                               setState(() => _manualModelInput = true);
                             } else if (v != null) {
-                              _modelController.text = v;
+                              setState(() {
+                                _modelController.text = v;
+                              });
                               _scheduleSave();
                             }
                           },
                         )
                       : TextField(
                           controller: _modelController,
-                          onChanged: (_) => _scheduleSave(),
+                          onChanged: (_) {
+                            setState(() {});
+                            _scheduleSave();
+                          },
                           decoration: const InputDecoration(
                             labelText: AppStrings.model,
                             hintText: AppConstants.defaultModel,
@@ -663,7 +679,54 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
           ],
         ),
       ),
+      _capabilitySummaryPanel(
+          theme,
+          CapabilitySummary.resolve(
+            _draftProfileForSummary(),
+          )),
     ]);
+  }
+
+  Widget _capabilitySummaryPanel(ThemeData theme, CapabilitySummary summary) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surface,
+          borderRadius: BorderRadius.circular(AppRadii.s),
+          border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                summary.detailLabel,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: summary.chips
+                    .map((label) => Chip(
+                          label: Text(label),
+                          visualDensity: VisualDensity.compact,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                        ))
+                    .toList(),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Widget _advancedSettings(ThemeData theme) {

@@ -822,6 +822,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       trailing: const Icon(Icons.chevron_right),
                       onTap: _importConfig,
                     ),
+                    ListTile(
+                      title: const Text('导出诊断信息'),
+                      subtitle: const Text('仅包含脱敏事件、版本和能力摘要'),
+                      leading: const Icon(Icons.bug_report_outlined),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: _exportDiagnostics,
+                    ),
                     _settingsDivider(theme),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -1235,6 +1242,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
           SnackBar(content: Text('${AppStrings.importFailed}: $e')),
         );
       }
+    }
+  }
+
+  Future<void> _exportDiagnostics() async {
+    try {
+      final report =
+          await context.read<ChatProvider>().buildDiagnosticsReport();
+      try {
+        await NativeBridge.shareText(
+          text: report,
+          subject: 'ClawChat diagnostics',
+        );
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text(AppStrings.shareSheetOpened)),
+        );
+      } catch (e) {
+        await Clipboard.setData(ClipboardData(text: report));
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${AppStrings.shareFailed}: $e')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('导出诊断信息失败: $e')),
+      );
     }
   }
 

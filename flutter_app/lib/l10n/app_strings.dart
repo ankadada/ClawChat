@@ -84,6 +84,8 @@ class AppStrings {
   static const contextSummaryFailed = '上下文摘要生成失败，已使用截断上下文继续';
   static const encryptedContentRecoveryNotice = '检测到缓存上下文失效，已自动恢复对话上下文';
   static const encryptedContentRecoveryFailed = '自动恢复上下文失败，请重新发送消息';
+  static String loadOlderMessages(int count) => '加载更早 $count 条消息';
+  static String hiddenOlderMessages(int count) => '还有 $count 条更早消息';
   static const inputHint = '输入消息...';
   static const toolApprovalTitle = '工具执行确认';
   static const toolApprovalArguments = '参数';

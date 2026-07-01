@@ -20,6 +20,7 @@ class CapabilityRegistry {
     required ApiFormat apiFormat,
     required String baseUrl,
     required String model,
+    CapabilityOverride? override,
   }) {
     final modelId = modelIdFromDisplay(model);
     final provider = _providerCapabilities(apiFormat, baseUrl);
@@ -54,12 +55,16 @@ class CapabilityRegistry {
         supportsStreamingUsage: false,
       );
     }
+    if (override != null && !override.isEmpty) {
+      capabilities = override.applyTo(capabilities);
+    }
 
     return ResolvedModelProfile(
       modelId: modelId,
       providerKey: providerKey,
       provider: provider,
       capabilities: capabilities,
+      override: override,
     );
   }
 

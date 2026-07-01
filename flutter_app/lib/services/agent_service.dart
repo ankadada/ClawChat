@@ -3,6 +3,8 @@ import '../models/chat_models.dart';
 import 'llm_content_sanitizer.dart';
 import 'llm_service.dart';
 import 'privacy_filter.dart';
+import 'runtime_debug_events.dart';
+import 'tools/tool_argument_preflight.dart';
 import 'tools/tool_policy.dart';
 import 'tools/tool_registry.dart';
 
@@ -65,6 +67,9 @@ class AgentService {
   final bool privacyMode;
   final bool supportsTools;
   final Map<String, String> envVars;
+  final RuntimeDebugEventService? runtimeDebugEvents;
+  final String? sessionId;
+  final ToolArgumentPreflight _toolArgumentPreflight;
   bool _cancelled = false;
   List<Map<String, dynamic>> _lastMessages = [];
 
@@ -78,10 +83,15 @@ class AgentService {
     this.privacyMode = true,
     this.supportsTools = true,
     this.envVars = const {},
+    this.runtimeDebugEvents,
+    this.sessionId,
+    ToolArgumentPreflight? toolArgumentPreflight,
   })  : _llm = llm,
         _tools = tools,
         _systemPrompt = systemPrompt,
-        _toolPolicy = toolPolicy ?? const ToolPolicy();
+        _toolPolicy = toolPolicy ?? const ToolPolicy(),
+        _toolArgumentPreflight =
+            toolArgumentPreflight ?? const ToolArgumentPreflight();
 
   void cancel() => _cancelled = true;
   bool get isCancelled => _cancelled;
@@ -178,11 +188,17 @@ class AgentService {
       if (toolBlocks.isNotEmpty) hadToolCalls = true;
       final toolResults = <Map<String, dynamic>>[];
 
+      final toolInputs = <ContentBlock, Map<String, dynamic>>{};
       for (final block in toolBlocks) {
         final toolUseId = block.toolUseId;
         final toolName = block.toolName;
         if (toolUseId == null || toolName == null) continue;
-        yield AgentToolStart(toolUseId, toolName, block.toolInput ?? {});
+        final toolInput = _preflightToolInput(
+          toolName,
+          block.rawToolInputJson ?? block.toolInput ?? {},
+        );
+        toolInputs[block] = toolInput;
+        yield AgentToolStart(toolUseId, toolName, toolInput);
       }
 
       if (parallelTools && toolBlocks.length > 1) {
@@ -191,7 +207,7 @@ class AgentService {
           final toolUseId = block.toolUseId;
           final toolName = block.toolName;
           if (toolUseId == null || toolName == null) return null;
-          final toolInput = block.toolInput ?? {};
+          final toolInput = toolInputs[block] ?? block.toolInput ?? {};
           return _executeToolWithPolicy(toolUseId, toolName, toolInput);
         }).toList();
         final results = await Future.wait(futures);
@@ -206,7 +222,7 @@ class AgentService {
           final toolUseId = block.toolUseId;
           final toolName = block.toolName;
           if (toolUseId == null || toolName == null) continue;
-          final toolInput = block.toolInput ?? {};
+          final toolInput = toolInputs[block] ?? block.toolInput ?? {};
 
           final result =
               await _executeToolWithPolicy(toolUseId, toolName, toolInput);
@@ -324,6 +340,42 @@ class AgentService {
         ),
         true,
       );
+    }
+  }
+
+  Map<String, dynamic> _preflightToolInput(
+    String toolName,
+    Object? rawToolInput,
+  ) {
+    final schema = _tools.inputSchemaFor(toolName);
+    if (schema == null) {
+      return rawToolInput is Map
+          ? Map<String, dynamic>.from(rawToolInput)
+          : const {};
+    }
+    final result = _toolArgumentPreflight.repair(rawToolInput, schema);
+    if (result.repaired) {
+      _recordRuntimeEvent('tool.preflight.repaired', {
+        'repairCount': result.repairCounts.values
+            .fold<int>(0, (sum, count) => sum + count),
+        'repairTypes': result.repairCounts,
+      });
+    }
+    return result.arguments;
+  }
+
+  void _recordRuntimeEvent(String type, Map<String, Object?> data) {
+    final service = runtimeDebugEvents;
+    final id = sessionId;
+    if (service == null || id == null) return;
+    try {
+      service.record(RuntimeDebugEvent(
+        type: type,
+        sessionId: id,
+        data: data,
+      ));
+    } catch (_) {
+      // Debug events must never affect tool execution.
     }
   }
 }

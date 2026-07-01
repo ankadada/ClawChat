@@ -127,11 +127,91 @@ class ResolvedModelProfile {
   final String providerKey;
   final ProviderCapabilities provider;
   final ModelCapabilities capabilities;
+  final CapabilityOverride? override;
 
   const ResolvedModelProfile({
     required this.modelId,
     required this.providerKey,
     required this.provider,
     required this.capabilities,
+    this.override,
   });
+}
+
+class CapabilityOverride {
+  final bool? supportsImages;
+  final bool? supportsTools;
+  final bool? supportsReasoningContent;
+  final int? maxContextTokens;
+
+  const CapabilityOverride({
+    this.supportsImages,
+    this.supportsTools,
+    this.supportsReasoningContent,
+    this.maxContextTokens,
+  });
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CapabilityOverride &&
+          supportsImages == other.supportsImages &&
+          supportsTools == other.supportsTools &&
+          supportsReasoningContent == other.supportsReasoningContent &&
+          maxContextTokens == other.maxContextTokens;
+
+  @override
+  int get hashCode => Object.hash(
+        supportsImages,
+        supportsTools,
+        supportsReasoningContent,
+        maxContextTokens,
+      );
+
+  bool get isEmpty =>
+      supportsImages == null &&
+      supportsTools == null &&
+      supportsReasoningContent == null &&
+      maxContextTokens == null;
+
+  ModelCapabilities applyTo(ModelCapabilities capabilities) {
+    return capabilities.copyWith(
+      supportsImages: supportsImages,
+      supportsTools: supportsTools,
+      supportsReasoningContent: supportsReasoningContent,
+      maxContextTokens: maxContextTokens,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        if (supportsImages != null) 'supportsImages': supportsImages,
+        if (supportsTools != null) 'supportsTools': supportsTools,
+        if (supportsReasoningContent != null)
+          'supportsReasoningContent': supportsReasoningContent,
+        if (maxContextTokens != null) 'maxContextTokens': maxContextTokens,
+      };
+
+  factory CapabilityOverride.fromJson(Map<String, dynamic> json) {
+    return CapabilityOverride(
+      supportsImages: json['supportsImages'] is bool
+          ? json['supportsImages'] as bool
+          : null,
+      supportsTools:
+          json['supportsTools'] is bool ? json['supportsTools'] as bool : null,
+      supportsReasoningContent: json['supportsReasoningContent'] is bool
+          ? json['supportsReasoningContent'] as bool
+          : null,
+      maxContextTokens: _positiveIntOrNull(json['maxContextTokens']),
+    );
+  }
+
+  static int? _positiveIntOrNull(Object? value) {
+    final parsed = value is int
+        ? value
+        : value is num
+            ? value.round()
+            : int.tryParse(value?.toString() ?? '');
+    if (parsed == null || parsed <= 0) return null;
+    return parsed;
+  }
 }

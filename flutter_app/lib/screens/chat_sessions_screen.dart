@@ -178,9 +178,13 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
             : _searchResults.map((result) => result.summary).toList();
         if (_selectedFolder != null) {
           if (_selectedFolder == '__none__') {
-            filteredSessions = filteredSessions.where((s) => s.folder == null || s.folder!.isEmpty).toList();
+            filteredSessions = filteredSessions
+                .where((s) => s.folder == null || s.folder!.isEmpty)
+                .toList();
           } else {
-            filteredSessions = filteredSessions.where((s) => s.folder == _selectedFolder).toList();
+            filteredSessions = filteredSessions
+                .where((s) => s.folder == _selectedFolder)
+                .toList();
           }
         }
 
@@ -212,8 +216,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                 onChanged: _setSearchQuery,
               ),
             ),
-            if (_searching)
-              const LinearProgressIndicator(minHeight: 2),
+            if (_searching) const LinearProgressIndicator(minHeight: 2),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
               child: Row(
@@ -258,28 +261,31 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                           color: _selectedFolder == null
                               ? theme.colorScheme.onPrimaryContainer
                               : null,
-                          fontWeight: _selectedFolder == null ? FontWeight.w700 : null,
+                          fontWeight:
+                              _selectedFolder == null ? FontWeight.w700 : null,
                         ),
-                        onSelected: (_) => setState(() => _selectedFolder = null),
+                        onSelected: (_) =>
+                            setState(() => _selectedFolder = null),
                       ),
                     ),
                     ...sortedFolders.map((f) => Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      child: FilterChip(
-                        label: Text(f),
-                        selected: _selectedFolder == f,
-                        showCheckmark: false,
-                        selectedColor: theme.colorScheme.primaryContainer,
-                        labelStyle: TextStyle(
-                          color: _selectedFolder == f
-                              ? theme.colorScheme.onPrimaryContainer
-                              : null,
-                          fontWeight: _selectedFolder == f ? FontWeight.w700 : null,
-                        ),
-                        onSelected: (_) => setState(() =>
-                          _selectedFolder = _selectedFolder == f ? null : f),
-                      ),
-                    )),
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          child: FilterChip(
+                            label: Text(f),
+                            selected: _selectedFolder == f,
+                            showCheckmark: false,
+                            selectedColor: theme.colorScheme.primaryContainer,
+                            labelStyle: TextStyle(
+                              color: _selectedFolder == f
+                                  ? theme.colorScheme.onPrimaryContainer
+                                  : null,
+                              fontWeight:
+                                  _selectedFolder == f ? FontWeight.w700 : null,
+                            ),
+                            onSelected: (_) => setState(() => _selectedFolder =
+                                _selectedFolder == f ? null : f),
+                          ),
+                        )),
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 4),
                       child: FilterChip(
@@ -291,10 +297,12 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                           color: _selectedFolder == '__none__'
                               ? theme.colorScheme.onPrimaryContainer
                               : null,
-                          fontWeight: _selectedFolder == '__none__' ? FontWeight.w700 : null,
+                          fontWeight: _selectedFolder == '__none__'
+                              ? FontWeight.w700
+                              : null,
                         ),
-                        onSelected: (_) => setState(() =>
-                          _selectedFolder = _selectedFolder == '__none__' ? null : '__none__'),
+                        onSelected: (_) => setState(() => _selectedFolder =
+                            _selectedFolder == '__none__' ? null : '__none__'),
                       ),
                     ),
                   ],
@@ -304,42 +312,42 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
               child: _searching && filteredSessions.isEmpty
                   ? const Center(child: CircularProgressIndicator())
                   : filteredSessions.isEmpty
-                  ? Center(
-                      child: Text(AppStrings.noChats,
-                          style: theme.textTheme.bodyLarge?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant)),
-                    )
-                  : CustomScrollView(
-                      slivers: [
-                        for (final group in dateGroups) ...[
-                          SliverPersistentHeader(
-                            pinned: true,
-                            delegate: _DateHeaderDelegate(
-                              label: group.label,
-                              theme: theme,
-                            ),
-                          ),
-                          SliverList(
-                            delegate: SliverChildBuilderDelegate(
-                              (context, index) {
-                                final session = group.sessions[index];
-                                final isSelected =
-                                    session.id == provider.currentSession?.id;
-                                return _buildSessionTile(
-                                  context,
-                                  theme,
-                                  provider,
-                                  session,
-                                  isSelected,
-                                  searchMatches[session.id],
-                                );
-                              },
-                              childCount: group.sessions.length,
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
+                      ? Center(
+                          child: Text(AppStrings.noChats,
+                              style: theme.textTheme.bodyLarge?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant)),
+                        )
+                      : CustomScrollView(
+                          slivers: [
+                            for (final group in dateGroups) ...[
+                              SliverPersistentHeader(
+                                pinned: true,
+                                delegate: _DateHeaderDelegate(
+                                  label: group.label,
+                                  theme: theme,
+                                ),
+                              ),
+                              SliverList(
+                                delegate: SliverChildBuilderDelegate(
+                                  (context, index) {
+                                    final session = group.sessions[index];
+                                    final isSelected = session.id ==
+                                        provider.currentSession?.id;
+                                    return _buildSessionTile(
+                                      context,
+                                      theme,
+                                      provider,
+                                      session,
+                                      isSelected,
+                                      searchMatches[session.id],
+                                    );
+                                  },
+                                  childCount: group.sessions.length,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
             ),
           ],
         );
@@ -550,6 +558,18 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           ),
           selected: isSelected,
           onTap: () {
+            if (provider.safeMode) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: const Text('安全模式已启用，先退出安全模式再打开会话。'),
+                  action: SnackBarAction(
+                    label: '退出',
+                    onPressed: provider.exitSafeMode,
+                  ),
+                ),
+              );
+              return;
+            }
             provider.selectSession(session.id);
             if (!widget.embedded) {
               Navigator.of(context).pop();
@@ -614,7 +634,8 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     };
   }
 
-  void _showSessionOptions(BuildContext context, SessionSummary session, ChatProvider provider) {
+  void _showSessionOptions(
+      BuildContext context, SessionSummary session, ChatProvider provider) {
     showModalBottomSheet(
       context: context,
       builder: (ctx) => SafeArea(
@@ -689,7 +710,8 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     await provider.deleteSession(session.id);
   }
 
-  Future<void> _showMoveToFolderDialog(BuildContext context, SessionSummary session, ChatProvider provider) async {
+  Future<void> _showMoveToFolderDialog(BuildContext context,
+      SessionSummary session, ChatProvider provider) async {
     // Collect existing folders
     final folders = <String>{};
     for (final s in provider.sessions) {
@@ -712,11 +734,11 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
               onTap: () => Navigator.pop(ctx, '__remove__'),
             ),
             ...sortedFolders.map((f) => ListTile(
-              leading: const Icon(Icons.folder),
-              title: Text(f),
-              selected: session.folder == f,
-              onTap: () => Navigator.pop(ctx, f),
-            )),
+                  leading: const Icon(Icons.folder),
+                  title: Text(f),
+                  selected: session.folder == f,
+                  onTap: () => Navigator.pop(ctx, f),
+                )),
             const Divider(),
             ListTile(
               leading: const Icon(Icons.create_new_folder),
@@ -774,7 +796,8 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     }
   }
 
-  Future<void> _renameSession(BuildContext context, SessionSummary session, ChatProvider provider) async {
+  Future<void> _renameSession(BuildContext context, SessionSummary session,
+      ChatProvider provider) async {
     final controller = TextEditingController(text: session.title);
     final result = await showDialog<String>(
       context: context,
@@ -786,8 +809,12 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           decoration: const InputDecoration(labelText: AppStrings.sessionTitle),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text(AppStrings.cancel)),
-          FilledButton(onPressed: () => Navigator.pop(ctx, controller.text.trim()), child: const Text(AppStrings.confirm)),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel)),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+              child: const Text(AppStrings.confirm)),
         ],
       ),
     );
@@ -806,9 +833,12 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
         title: const Text(AppStrings.clearAllSessions),
         content: const Text(AppStrings.clearAllConfirm),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text(AppStrings.cancel)),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text(AppStrings.cancel)),
           FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Theme.of(ctx).colorScheme.error),
+            style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(ctx).colorScheme.error),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text(AppStrings.delete),
           ),
@@ -888,7 +918,8 @@ class _DateHeaderDelegate extends SliverPersistentHeaderDelegate {
     return label != oldDelegate.label ||
         theme.brightness != oldDelegate.theme.brightness ||
         theme.colorScheme.primary != oldDelegate.theme.colorScheme.primary ||
-        theme.scaffoldBackgroundColor != oldDelegate.theme.scaffoldBackgroundColor;
+        theme.scaffoldBackgroundColor !=
+            oldDelegate.theme.scaffoldBackgroundColor;
   }
 }
 

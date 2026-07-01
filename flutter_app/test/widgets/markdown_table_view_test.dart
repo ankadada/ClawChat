@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  setUp(StreamingText.clearCacheForTesting);
+
   Future<void> pumpStreamingText(
     WidgetTester tester,
     String text, {
@@ -167,6 +169,35 @@ void main() {
       );
 
       expect(find.byType(MarkdownTableView), findsOneWidget);
+    });
+  });
+
+  group('StreamingText markdown cache budget', () {
+    testWidgets('evicts parsed spans by character budget', (tester) async {
+      final chunkSize = StreamingText.cacheMaxCharactersForTesting ~/ 4;
+
+      for (var i = 0; i < 8; i++) {
+        await pumpStreamingText(
+          tester,
+          '## Title $i\n\n${'body $i ' * (chunkSize ~/ 7)}',
+        );
+      }
+
+      expect(
+        StreamingText.cacheCharacterCountForTesting,
+        lessThanOrEqualTo(StreamingText.cacheMaxCharactersForTesting),
+      );
+      expect(StreamingText.cacheEntryCountForTesting, lessThan(8));
+    });
+
+    testWidgets('does not share link recognizers through the cache',
+        (tester) async {
+      await pumpStreamingText(
+        tester,
+        '[Open](https://example.test)',
+      );
+
+      expect(StreamingText.cacheEntryCountForTesting, 0);
     });
   });
 }
