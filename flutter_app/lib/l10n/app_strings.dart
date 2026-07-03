@@ -18,6 +18,7 @@ class AppStrings {
   static const copied = '已复制';
   static const share = '分享';
   static const shareFailed = '分享失败';
+  static const sharedContentReady = '分享内容已放入新对话，请确认后发送';
   static const forkConversation = '从这里分支';
   static const forkCreated = '已创建分支对话';
   static const forkFailed = '创建分支失败';
@@ -82,6 +83,20 @@ class AppStrings {
   static String contextSummaryCompactedNotice(int count) =>
       '对话上下文已压缩为摘要（覆盖 $count 条旧消息）';
   static const contextSummaryFailed = '上下文摘要生成失败，已使用截断上下文继续';
+  static const contextSummary = '上下文摘要';
+  static const contextSummaryNone = '当前对话还没有上下文摘要';
+  static const contextSummaryPreview = '摘要预览';
+  static const contextSummaryClear = '清除摘要';
+  static const contextSummaryClearConfirm = '清除当前摘要？历史消息不会被删除。';
+  static const contextSummaryManualCompactBefore = '压缩此处之前';
+  static const contextSummaryNoSession = '当前没有可处理的对话';
+  static const contextSummarySelectLaterMessage = '请选择更靠后的消息';
+  static const contextSummaryNoSafePrefix = '所选位置之前没有完整、安全的上下文边界';
+  static const contextSummaryBusy = '当前会话正在回复或整理上下文，请稍后再试';
+  static String contextSummaryRebuilt(int count) => '已重建上下文摘要（覆盖 $count 条消息）';
+  static String contextSummaryRebuildFailed(String error) => '重建摘要失败: $error';
+  static String contextSummaryCoverage(int count, int tokens) =>
+      '覆盖 $count 条 API 消息，来源约 $tokens tokens';
   static const encryptedContentRecoveryNotice = '检测到缓存上下文失效，已自动恢复对话上下文';
   static const encryptedContentRecoveryFailed = '自动恢复上下文失败，请重新发送消息';
   static String loadOlderMessages(int count) => '加载更早 $count 条消息';
@@ -178,6 +193,26 @@ class AppStrings {
   static String deleteActiveProfileConfirm(String name) =>
       '删除 "$name" 后将自动切换到其他配置。';
   static String providerProfileSaveFailed(String e) => '配置保存失败: $e';
+  static const modelFallback = '模型回退';
+  static const modelFallbackEnabled = '自动回退';
+  static const modelFallbackDisabled = '未启用回退目标';
+  static const modelFallbackSubtitle = '请求失败时按顺序尝试你配置的其他模型';
+  static const modelFallbackPrivacyNotice = '回退会把本次对话发送到所选配置的服务端点，请只选择你信任的配置。';
+  static const addFallbackTarget = '添加回退目标';
+  static const editFallbackTarget = '编辑回退目标';
+  static const fallbackTargetProfile = '目标配置';
+  static const fallbackModelOverride = '模型覆盖（可选）';
+  static const fallbackUsesTargetModel = '使用目标配置模型';
+  static const noFallbackProfilesAvailable = '请先创建第二个模型配置';
+  static const removeFallbackTarget = '移除回退目标';
+  static const moveFallbackTargetUp = '上移回退目标';
+  static const moveFallbackTargetDown = '下移回退目标';
+  static String modelFallbackUsedNotice({
+    required String primary,
+    required String fallback,
+    required String reason,
+  }) =>
+      '主模型 $primary 请求失败（$reason），已改用 $fallback。';
   static const advancedModelSettings = '高级模型设置';
   static const saveSettings = '保存设置';
   static const settingsSaved = '设置已保存';
@@ -358,6 +393,11 @@ class AppStrings {
   // ── Search ─────────────────────────────────────────────────────────
   static const searchConversations = '搜索标题或消息内容...';
   static const searching = '搜索中...';
+  static const searchCurrentConversation = '搜索当前对话';
+  static const searchMessagesHint = '输入关键词搜索本会话消息';
+  static const noSearchResults = '没有匹配消息';
+  static String searchResultCount(int count) => '$count 条匹配';
+  static String searchResultPosition(int index) => '第 ${index + 1} 条消息';
 
   // ── Attach ─────────────────────────────────────────────────────────
   static const attachFile = '添加附件';
@@ -366,6 +406,20 @@ class AppStrings {
   static const pickFile = '选择文件';
   static const attachFailed = '附件上传失败';
   static const removeAttachment = '移除附件';
+
+  // ── Usage ─────────────────────────────────────────────────────────
+  static const usageSummary = '用量统计';
+  static const sessionUsageSummary = '本会话用量';
+  static const globalUsageSummary = '全局用量统计';
+  static const usageSummarySubtitle = '基于已保存消息的 token 用量';
+  static const usageMessages = '有用量记录的消息';
+  static const usageInputTokens = '输入 tokens';
+  static const usageOutputTokens = '输出 tokens';
+  static const usageTotalTokens = '合计 tokens';
+  static const usageCacheTokens = '缓存 tokens';
+  static const usageUnavailable = '未保存';
+  static const usageCost = '费用';
+  static const usageCostUnavailable = '未配置价格，未计算';
 
   // ── Regenerate ─────────────────────────────────────────────────────
   static const regenerate = '重新生成';
@@ -414,7 +468,29 @@ class AppStrings {
 
   // ── Message edit ───────────────────────────────────────────────────
   static const editMessage = '编辑消息';
+  static const editAndResend = '编辑并重新发送';
+  static const editMessageHint = '修改消息内容...';
+  static const editMessageEmpty = '消息内容不能为空';
+  static const editMessageInvalid = '只能编辑带文本的用户消息';
+  static const editMessageBlockedActive = '当前会话正在回复或有排队消息，暂不能编辑重发';
+  static const editMessageMissingApiKey = '请先配置 API Key 再编辑重发';
+  static const editMessageBranchStarted = '已创建分支并重新发送';
+  static const editMessageBranchFailed = '编辑重发失败';
   static const deleteMessage = '删除消息';
+
+  // ── Prompt profiles ────────────────────────────────────────────────
+  static const promptProfiles = '提示词配置';
+  static const promptProfilesEmpty = '暂无提示词配置';
+  static const promptProfileName = '名称';
+  static const promptProfilePrompt = '系统提示词';
+  static const promptProfileAdd = '新增配置';
+  static const promptProfileEdit = '编辑配置';
+  static const promptProfileApplyGlobal = '设为全局提示词';
+  static const promptProfileApplySession = '应用到当前会话';
+  static const promptProfileAppliedGlobal = '已设为全局提示词';
+  static const promptProfileAppliedSession = '已应用到当前会话';
+  static const promptProfileDeleteConfirm = '删除这个提示词配置？';
+  static const promptProfileInvalid = '名称和系统提示词不能为空';
 
   // ── Session management ──────────────────────────────────────────
   static const renameSession = '重命名会话';
@@ -474,11 +550,44 @@ class AppStrings {
   static const conflictReplace = '覆盖（全部替换）';
   static const conflictSkip = '跳过已有';
   static const importConfigComplete = '配置导入完成';
-  static String configImportSummary(int profiles, int envVars, int skipped) =>
-      '导入了 $profiles 个配置文件，$envVars 个环境变量，跳过 $skipped 个已有配置。';
+  static String configImportSummary(
+    int profiles,
+    int envVars,
+    int skipped, {
+    int mcpServers = 0,
+    int mcpSkipped = 0,
+  }) =>
+      '导入了 $profiles 个配置文件，$envVars 个环境变量，$mcpServers 个 MCP 服务器，跳过 ${skipped + mcpSkipped} 个已有配置。';
   static const invalidConfigFile = '无效的配置文件格式';
   static const importConfigFailed = '导入配置失败';
   // importFailed is already defined in the Skills section above
+
+  // ── Tool safety ──────────────────────────────────────────────────
+  static const toolSafety = '工具安全';
+  static const toolAlwaysDeny = '始终拒绝工具';
+  static const toolAlwaysDenySubtitle = '被拒绝的工具不会进入确认弹窗，也不会执行';
+  static const bashDenyPatterns = 'Bash 命令拒绝规则';
+  static const bashDenyPatternsSubtitle = '命中规则的 bash 命令会在执行前被拦截';
+  static const addBashDenyPattern = '添加 Bash 拒绝规则';
+  static const bashDenyPatternHint = '输入正则或文本片段';
+  static const noBashDenyPatterns = '暂无 Bash 拒绝规则';
+
+  // ── MCP ──────────────────────────────────────────────────────────
+  static const mcpServers = 'MCP 服务器';
+  static const mcpServersSubtitle = '配置本地 stdio MCP 工具服务器，工具执行仍会经过审批';
+  static const mcpStdioUnsupportedAndroid =
+      '当前 Android 版本暂不启动 stdio MCP 服务器；配置会保留，但不会执行 npx/proot 服务器。';
+  static const noMcpServers = '暂无 MCP 服务器';
+  static const addMcpServer = '添加 MCP 服务器';
+  static const editMcpServer = '编辑 MCP 服务器';
+  static const mcpServerName = '显示名称';
+  static const mcpCommand = '命令';
+  static const mcpArgs = '参数（每行一个）';
+  static const mcpEnv = '环境变量（KEY=value，每行一个）';
+  static const mcpEnabled = '启用';
+  static const mcpInvalid = '名称和命令不能为空';
+  static const mcpEnvKeysHidden = '环境变量值已隐藏；保留占位符将继续使用原值';
+  static String deleteMcpServerConfirm(String name) => '删除 MCP 服务器 "$name"？';
 
   // ── Folder / grouping ─────────────────────────────────────────────
   static const allConversations = '全部对话';

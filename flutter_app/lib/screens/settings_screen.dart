@@ -8,13 +8,16 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../app.dart' show AppColors, AppRadii, fontScaleNotifier, themeNotifier;
 import '../constants.dart';
+import '../models/mcp_server_config.dart';
 import '../services/config_export_service.dart';
 import '../services/memory_service.dart';
+import '../services/mcp_service.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
 import '../services/session_storage.dart';
 import '../services/skill_service.dart';
 import '../services/tts_service.dart';
+import '../services/usage_summary_service.dart';
 import '../providers/chat_provider.dart';
 import 'model_api_settings_screen.dart';
 import 'setup_wizard_screen.dart';
@@ -28,6 +31,7 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  static const _mcpHiddenEnvValue = '<hidden>';
   static const _sectionAppearance = 'appearance';
   static const _sectionVoice = 'voice';
   static const _sectionAgentSkills = 'agent_skills';
@@ -54,6 +58,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _allowPhoneCall = false;
   bool _allowSms = false;
   String _toolApprovalPolicy = PreferencesService.defaultToolApprovalPolicy;
+  Set<String> _deniedToolNames = {};
+  List<String> _bashCommandDenyPatterns = [];
+  List<McpServerConfig> _mcpServers = [];
   List<String> _memories = [];
   bool _loadingMemories = false;
   final Set<String> _expandedSections = {
@@ -63,6 +70,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _sectionData,
     _sectionAbout,
   };
+  static const _toolSafetyToolNames = [
+    'bash',
+    'read_file',
+    'write_file',
+    'web_fetch',
+    'web_search',
+    'set_env_var',
+    'generate_image',
+    'phone_intent',
+  ];
 
   @override
   void initState() {
@@ -84,6 +101,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
       _toolApprovalPolicy = _prefs.toolApprovalPolicy;
+      _deniedToolNames = _prefs.deniedToolNames;
+      _bashCommandDenyPatterns = _prefs.bashCommandDenyPatterns;
+      _mcpServers = _prefs.mcpServers;
       _whisperModelController.text = _prefs.whisperModel ?? '';
       _ttsModelController.text = _prefs.ttsModel ?? '';
 
@@ -622,6 +642,160 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         ],
                       ),
                     ),
+                    _settingsDivider(theme),
+                    _subsectionHeader(theme, AppStrings.toolSafety),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: Text(
+                        AppStrings.toolAlwaysDenySubtitle,
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.hintColor),
+                      ),
+                    ),
+                    ..._toolSafetyToolNames.map(
+                      (toolName) => SwitchListTile(
+                        title: Text(toolName),
+                        value: _deniedToolNames.contains(toolName),
+                        onChanged: (value) {
+                          HapticFeedback.lightImpact();
+                          _setToolDenied(toolName, value);
+                        },
+                      ),
+                    ),
+                    _settingsDivider(theme),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        _subsectionHeader(theme, AppStrings.bashDenyPatterns),
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: IconButton(
+                            icon: const Icon(Icons.add),
+                            tooltip: AppStrings.addBashDenyPattern,
+                            onPressed: _addBashDenyPattern,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: Text(
+                        AppStrings.bashDenyPatternsSubtitle,
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.hintColor),
+                      ),
+                    ),
+                    if (_bashCommandDenyPatterns.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Text(
+                          AppStrings.noBashDenyPatterns,
+                          style: TextStyle(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      )
+                    else
+                      ..._bashCommandDenyPatterns
+                          .asMap()
+                          .entries
+                          .map((entry) => ListTile(
+                                title: Text(entry.value),
+                                trailing: IconButton(
+                                  icon: const Icon(Icons.delete_outline),
+                                  onPressed: () =>
+                                      _removeBashDenyPattern(entry.key),
+                                ),
+                              )),
+                    _settingsDivider(theme),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        _subsectionHeader(theme, AppStrings.mcpServers),
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: IconButton(
+                            icon: const Icon(Icons.add),
+                            tooltip: AppStrings.addMcpServer,
+                            onPressed: () => _editMcpServer(),
+                          ),
+                        ),
+                      ],
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: Text(
+                        AppStrings.mcpServersSubtitle,
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.hintColor),
+                      ),
+                    ),
+                    if (!McpPlatformSupport.isStdioSupported)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Text(
+                          AppStrings.mcpStdioUnsupportedAndroid,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.error,
+                          ),
+                        ),
+                      ),
+                    if (_mcpServers.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Text(
+                          AppStrings.noMcpServers,
+                          style: TextStyle(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      )
+                    else
+                      ..._mcpServers.map(
+                        (server) => ListTile(
+                          leading: const Icon(Icons.extension_outlined),
+                          title: Text(server.displayName),
+                          subtitle: Text(
+                            [
+                              server.command,
+                              if (server.args.isNotEmpty)
+                                '${server.args.length} args',
+                              if (server.env.isNotEmpty)
+                                '${server.env.length} env',
+                            ].join(' · '),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.edit_outlined),
+                                tooltip: AppStrings.editMcpServer,
+                                onPressed: () => _editMcpServer(server),
+                              ),
+                              Switch(
+                                value: server.enabled,
+                                onChanged: McpPlatformSupport.isStdioSupported
+                                    ? (value) async {
+                                        HapticFeedback.lightImpact();
+                                        await _saveMcpServer(
+                                          server.copyWith(enabled: value),
+                                        );
+                                      }
+                                    : null,
+                              ),
+                            ],
+                          ),
+                          onTap: () => _editMcpServer(server),
+                          shape: Border(
+                            bottom: BorderSide(
+                              color: theme.dividerColor.withAlpha(60),
+                            ),
+                          ),
+                        ),
+                      ),
+                    _settingsDivider(theme),
                     SwitchListTile(
                       title: const Text(AppStrings.notifyOnComplete),
                       subtitle: const Text(AppStrings.notifyOnCompleteSubtitle),
@@ -748,6 +922,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   collapsedBadges: [
                     _countBadge(
                         theme, '${AppStrings.skills} ${_skills.length}'),
+                    _countBadge(
+                      theme,
+                      '${AppStrings.mcpServers} ${_mcpServers.length}',
+                    ),
                   ],
                 ),
                 _settingsGroup(
@@ -828,6 +1006,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       leading: const Icon(Icons.bug_report_outlined),
                       trailing: const Icon(Icons.chevron_right),
                       onTap: _exportDiagnostics,
+                    ),
+                    ListTile(
+                      title: const Text(AppStrings.globalUsageSummary),
+                      subtitle: const Text(AppStrings.usageSummarySubtitle),
+                      leading: const Icon(Icons.query_stats),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: _showGlobalUsageSummary,
                     ),
                     _settingsDivider(theme),
                     Row(
@@ -987,6 +1172,263 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
     _prefs.envVars = _envVars;
     _showEnvVarAgentRunningNotice();
+  }
+
+  Future<void> _editMcpServer([McpServerConfig? server]) async {
+    final nameController =
+        TextEditingController(text: server?.displayName ?? '');
+    final commandController =
+        TextEditingController(text: server?.command ?? '');
+    final argsController = TextEditingController(
+      text: server?.args.join('\n') ?? '',
+    );
+    final envController = TextEditingController(
+      text: server?.env.entries
+              .map((entry) => '${entry.key}=$_mcpHiddenEnvValue')
+              .join('\n') ??
+          '',
+    );
+    var enabled = server?.enabled ?? true;
+
+    final result = await showDialog<McpServerConfig>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: Text(
+            server == null ? AppStrings.addMcpServer : AppStrings.editMcpServer,
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text(AppStrings.mcpEnabled),
+                    value: enabled,
+                    onChanged: (value) => setDialogState(() {
+                      enabled = value;
+                    }),
+                  ),
+                  TextField(
+                    controller: nameController,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.mcpServerName,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: commandController,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.mcpCommand,
+                      hintText: 'npx',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: argsController,
+                    minLines: 2,
+                    maxLines: 4,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.mcpArgs,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: envController,
+                    minLines: 2,
+                    maxLines: 4,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.mcpEnv,
+                    ),
+                  ),
+                  if (server?.env.isNotEmpty == true) ...[
+                    const SizedBox(height: 8),
+                    const Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(AppStrings.mcpEnvKeysHidden),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            if (server != null)
+              TextButton(
+                onPressed: () async {
+                  final confirmed = await _confirmDelete(
+                    AppStrings.delete,
+                    AppStrings.deleteMcpServerConfirm(server.displayName),
+                  );
+                  if (!confirmed || !ctx.mounted) return;
+                  Navigator.pop(ctx);
+                  await _deleteMcpServer(server.id);
+                },
+                child: const Text(AppStrings.delete),
+              ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel),
+            ),
+            FilledButton(
+              onPressed: () {
+                final name = nameController.text.trim();
+                final command = commandController.text.trim();
+                if (name.isEmpty || command.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text(AppStrings.mcpInvalid)),
+                  );
+                  return;
+                }
+                Navigator.pop(
+                  ctx,
+                  McpServerConfig(
+                    id: server?.id ?? '',
+                    displayName: name,
+                    enabled: enabled,
+                    command: command,
+                    args: _parseMcpArgs(argsController.text),
+                    env: _parseMcpEnv(
+                      envController.text,
+                      existing: server?.env,
+                    ),
+                  ),
+                );
+              },
+              child: const Text(AppStrings.save),
+            ),
+          ],
+        ),
+      ),
+    ).whenComplete(() {
+      nameController.dispose();
+      commandController.dispose();
+      argsController.dispose();
+      envController.dispose();
+    });
+    if (result == null || !mounted) return;
+    await _saveMcpServer(result);
+  }
+
+  Future<void> _saveMcpServer(McpServerConfig server) async {
+    final saved = await _prefs.saveMcpServer(
+      id: server.id.isEmpty ? null : server.id,
+      displayName: server.displayName,
+      enabled: server.enabled,
+      command: server.command,
+      args: server.args,
+      env: server.env,
+    );
+    if (!mounted) return;
+    setState(() {
+      final index = _mcpServers.indexWhere((item) => item.id == saved.id);
+      final next = List<McpServerConfig>.from(_mcpServers);
+      if (index >= 0) {
+        next[index] = saved;
+      } else {
+        next.add(saved);
+      }
+      _mcpServers = next;
+    });
+  }
+
+  Future<void> _deleteMcpServer(String id) async {
+    await _prefs.deleteMcpServer(id);
+    if (!mounted) return;
+    setState(() {
+      _mcpServers = _mcpServers.where((server) => server.id != id).toList();
+    });
+  }
+
+  List<String> _parseMcpArgs(String text) {
+    return text
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  Map<String, String> _parseMcpEnv(
+    String text, {
+    Map<String, String>? existing,
+  }) {
+    final env = <String, String>{};
+    for (final line in text.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.isEmpty || !trimmed.contains('=')) continue;
+      final index = trimmed.indexOf('=');
+      final key = trimmed.substring(0, index).trim();
+      final value = trimmed.substring(index + 1);
+      if (key.isEmpty) continue;
+      if (value == _mcpHiddenEnvValue && existing?.containsKey(key) == true) {
+        env[key] = existing![key]!;
+      } else {
+        env[key] = value;
+      }
+    }
+    return env;
+  }
+
+  void _setToolDenied(String toolName, bool denied) {
+    setState(() {
+      if (denied) {
+        _deniedToolNames.add(toolName);
+      } else {
+        _deniedToolNames.remove(toolName);
+      }
+    });
+    _prefs.deniedToolNames = _deniedToolNames;
+  }
+
+  Future<void> _addBashDenyPattern() async {
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.addBashDenyPattern),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: AppStrings.bashDenyPatternHint,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text(AppStrings.confirm),
+          ),
+        ],
+      ),
+    ).whenComplete(controller.dispose);
+    if (result == null || result.isEmpty || !mounted) return;
+    setState(() {
+      _bashCommandDenyPatterns = [..._bashCommandDenyPatterns, result];
+    });
+    _prefs.bashCommandDenyPatterns = _bashCommandDenyPatterns;
+  }
+
+  Future<void> _removeBashDenyPattern(int index) async {
+    if (index < 0 || index >= _bashCommandDenyPatterns.length) return;
+    final confirmed = await _confirmDelete(
+      AppStrings.delete,
+      AppStrings.bashDenyPatterns,
+    );
+    if (!confirmed || !mounted) return;
+    setState(() {
+      _bashCommandDenyPatterns = [
+        for (var i = 0; i < _bashCommandDenyPatterns.length; i++)
+          if (i != index) _bashCommandDenyPatterns[i],
+      ];
+    });
+    _prefs.bashCommandDenyPatterns = _bashCommandDenyPatterns;
   }
 
   void _showEnvVarAgentRunningNotice() {
@@ -1273,6 +1715,113 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _showGlobalUsageSummary() async {
+    try {
+      final storage = SessionStorage();
+      await storage.init();
+      final aggregate = await storage.getUsageSummaryAggregate();
+      if (!mounted) return;
+      await _showUsageSummaryDialog(
+        title: AppStrings.globalUsageSummary,
+        subtitle: '${aggregate.sessionCount} 个会话',
+        summary: aggregate.summary,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('读取用量统计失败: $e')),
+      );
+    }
+  }
+
+  Future<void> _showUsageSummaryDialog({
+    required String title,
+    required String subtitle,
+    required UsageSummary summary,
+  }) {
+    return showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              subtitle,
+              style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                  ),
+            ),
+            const SizedBox(height: 12),
+            _usageRow(ctx, AppStrings.usageMessages,
+                '${summary.messagesWithUsage}/${summary.messageCount}'),
+            _usageRow(ctx, AppStrings.usageInputTokens,
+                _formatTokenCount(summary.inputTokens)),
+            _usageRow(ctx, AppStrings.usageOutputTokens,
+                _formatTokenCount(summary.outputTokens)),
+            _usageRow(ctx, AppStrings.usageTotalTokens,
+                _formatTokenCount(summary.totalTokens)),
+            _usageRow(
+              ctx,
+              AppStrings.usageCacheTokens,
+              summary.hasCacheUsage
+                  ? [
+                      if (summary.cacheReadInputTokens != null)
+                        'read ${_formatTokenCount(summary.cacheReadInputTokens!)}',
+                      if (summary.cacheCreationInputTokens != null)
+                        'create ${_formatTokenCount(summary.cacheCreationInputTokens!)}',
+                    ].join(' · ')
+                  : AppStrings.usageUnavailable,
+            ),
+            _usageRow(
+              ctx,
+              AppStrings.usageCost,
+              AppStrings.usageCostUnavailable,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.close),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _usageRow(BuildContext context, String label, String value) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          Text(
+            value,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatTokenCount(int value) {
+    if (value >= 1000000) return '${(value / 1000000).toStringAsFixed(2)}M';
+    if (value >= 1000) return '${(value / 1000).toStringAsFixed(1)}K';
+    return value.toString();
+  }
+
   Future<void> _exportConfig() async {
     try {
       final options = await _showExportConfigDialog();
@@ -1452,6 +2001,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             importResult.profilesImported,
             importResult.envVarsImported,
             importResult.profilesSkipped,
+            mcpServers: importResult.mcpServersImported,
+            mcpSkipped: importResult.mcpServersSkipped,
           )),
           actions: [
             FilledButton(
@@ -1521,6 +2072,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   AppStrings.envVars,
                   preview.envVarCount >= 0
                       ? '${preview.envVarCount}'
+                      : AppStrings.encryptedPreviewHidden,
+                ),
+                _previewLine(
+                  AppStrings.mcpServers,
+                  preview.mcpServerCount >= 0
+                      ? '${preview.mcpServerCount}'
                       : AppStrings.encryptedPreviewHidden,
                 ),
                 _previewLine(

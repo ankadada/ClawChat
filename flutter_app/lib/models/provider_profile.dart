@@ -3,6 +3,59 @@ import 'package:uuid/uuid.dart';
 import '../constants.dart';
 import 'model_capabilities.dart';
 
+class ModelFallbackTarget {
+  final String targetProfileId;
+  final String modelOverride;
+  final bool enabled;
+
+  const ModelFallbackTarget({
+    required this.targetProfileId,
+    this.modelOverride = '',
+    this.enabled = true,
+  });
+
+  String get effectiveModelOverride => modelOverride.trim();
+
+  bool get hasModelOverride => effectiveModelOverride.isNotEmpty;
+
+  String effectiveModelFor(ProviderProfile targetProfile) {
+    return hasModelOverride
+        ? effectiveModelOverride
+        : targetProfile.effectiveModel;
+  }
+
+  ModelFallbackTarget copyWith({
+    String? targetProfileId,
+    String? modelOverride,
+    bool? enabled,
+  }) {
+    return ModelFallbackTarget(
+      targetProfileId: targetProfileId ?? this.targetProfileId,
+      modelOverride: modelOverride ?? this.modelOverride,
+      enabled: enabled ?? this.enabled,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'targetProfileId': targetProfileId,
+        'modelOverride': modelOverride,
+        'enabled': enabled,
+      };
+
+  factory ModelFallbackTarget.fromJson(Map<String, dynamic> json) {
+    final targetProfileId = json['targetProfileId']?.toString().trim();
+    if (targetProfileId == null || targetProfileId.isEmpty) {
+      throw const FormatException('Invalid fallback target profile id');
+    }
+    final enabled = json['enabled'];
+    return ModelFallbackTarget(
+      targetProfileId: targetProfileId,
+      modelOverride: json['modelOverride']?.toString().trim() ?? '',
+      enabled: enabled is bool ? enabled : true,
+    );
+  }
+}
+
 class ProviderProfile {
   static const anthropicFormat = 'anthropic';
   static const openaiFormat = 'openai';
@@ -17,6 +70,7 @@ class ProviderProfile {
   int thinkingBudget;
   double temperature;
   CapabilityOverride? capabilityOverride;
+  final List<ModelFallbackTarget> fallbackTargets;
 
   ProviderProfile({
     String? id,
@@ -29,6 +83,7 @@ class ProviderProfile {
     required this.thinkingBudget,
     required this.temperature,
     this.capabilityOverride,
+    this.fallbackTargets = const [],
   }) : id = id ?? const Uuid().v4();
 
   factory ProviderProfile.defaults({String name = '默认配置'}) {
@@ -49,6 +104,9 @@ class ProviderProfile {
   String get effectiveModel =>
       model.trim().isEmpty ? AppConstants.defaultModel : model.trim();
 
+  bool get hasEnabledFallbackTargets =>
+      fallbackTargets.any((target) => target.enabled);
+
   ProviderProfile copyWith({
     String? id,
     String? name,
@@ -60,6 +118,7 @@ class ProviderProfile {
     int? thinkingBudget,
     double? temperature,
     CapabilityOverride? capabilityOverride,
+    List<ModelFallbackTarget>? fallbackTargets,
     bool clearCapabilityOverride = false,
   }) {
     return ProviderProfile(
@@ -75,6 +134,7 @@ class ProviderProfile {
       capabilityOverride: clearCapabilityOverride
           ? null
           : (capabilityOverride ?? this.capabilityOverride),
+      fallbackTargets: fallbackTargets ?? this.fallbackTargets,
     );
   }
 
@@ -90,6 +150,9 @@ class ProviderProfile {
         'temperature': temperature,
         if (capabilityOverride != null && !capabilityOverride!.isEmpty)
           'capabilityOverride': capabilityOverride!.toJson(),
+        if (fallbackTargets.isNotEmpty)
+          'fallbackTargets':
+              fallbackTargets.map((target) => target.toJson()).toList(),
       };
 
   factory ProviderProfile.fromJson(Map<String, dynamic> json) {
@@ -113,6 +176,7 @@ class ProviderProfile {
         fallback: AppConstants.defaultTemperature,
       ),
       capabilityOverride: _capabilityOverride(json['capabilityOverride']),
+      fallbackTargets: _fallbackTargets(json['fallbackTargets']),
     );
   }
 
@@ -144,5 +208,22 @@ class ProviderProfile {
       Map<String, dynamic>.from(value),
     );
     return override.isEmpty ? null : override;
+  }
+
+  static List<ModelFallbackTarget> _fallbackTargets(Object? value) {
+    if (value == null) return const [];
+    if (value is! List) {
+      throw const FormatException('Invalid fallback targets');
+    }
+    final targets = <ModelFallbackTarget>[];
+    for (final item in value) {
+      if (item is! Map) {
+        throw const FormatException('Invalid fallback target');
+      }
+      targets.add(
+        ModelFallbackTarget.fromJson(Map<String, dynamic>.from(item)),
+      );
+    }
+    return targets;
   }
 }

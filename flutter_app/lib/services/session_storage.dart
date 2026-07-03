@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../l10n/app_strings.dart';
 import '../models/chat_models.dart';
+import 'usage_summary_service.dart';
 
 class SessionSummary {
   final String id;
@@ -80,7 +81,10 @@ class SessionStorage {
 
     final sessionsPath = await _canonicalSessionsDirPath();
     final file = File('$sessionsPath${Platform.pathSeparator}$id.json');
-    final targetParentPath = await file.parent.resolveSymbolicLinks();
+    if (!await file.parent.exists()) {
+      await file.parent.create(recursive: true);
+    }
+    final targetParentPath = await _canonicalPath(file.parent);
     if (targetParentPath != sessionsPath) return null;
 
     final targetPath = file.absolute.path;
@@ -90,10 +94,17 @@ class SessionStorage {
   }
 
   Future<String> _canonicalSessionsDirPath() async {
+    if (!await _sessionsDir!.exists()) {
+      await _sessionsDir!.create(recursive: true);
+    }
+    return _canonicalPath(_sessionsDir!);
+  }
+
+  Future<String> _canonicalPath(FileSystemEntity entity) async {
     try {
-      return await _sessionsDir!.resolveSymbolicLinks();
+      return await entity.resolveSymbolicLinks();
     } catch (_) {
-      return _sessionsDir!.absolute.path;
+      return entity.absolute.path;
     }
   }
 
@@ -145,15 +156,30 @@ class SessionStorage {
     final sessions = <ChatSession>[];
     await for (final entity in _sessionsDir!.list()) {
       if (entity is! File || !entity.path.endsWith('.json')) continue;
-      try {
-        final content = await entity.readAsString();
-        sessions.add(ChatSession.fromJson(jsonDecode(content)));
-      } catch (_) {
-        // Skip corrupted session files
-      }
+      final id = _idFromSessionFile(entity);
+      if (id == null) continue;
+      final session = await getSession(id);
+      if (session != null) sessions.add(session);
     }
     sessions.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     return sessions;
+  }
+
+  Future<UsageSummaryAggregate> getUsageSummaryAggregate() async {
+    await init();
+    final payloads = <String>[];
+    await for (final entity in _sessionsDir!.list()) {
+      if (entity is! File || !entity.path.endsWith('.json')) continue;
+      final id = _idFromSessionFile(entity);
+      if (id == null) continue;
+      try {
+        payloads.add(await entity.readAsString());
+      } catch (_) {
+        // Skip unreadable session files; parsing happens in the worker isolate.
+      }
+    }
+    final result = await compute(_usageSummaryAggregateFromPayloads, payloads);
+    return UsageSummaryAggregate.fromJson(Map<String, dynamic>.from(result));
   }
 
   Future<List<SessionSummary>> getSessionsSummary() async {
@@ -161,20 +187,17 @@ class SessionStorage {
     final summaries = <SessionSummary>[];
     await for (final entity in _sessionsDir!.list()) {
       if (entity is! File || !entity.path.endsWith('.json')) continue;
-      try {
-        final content = await entity.readAsString();
-        final map = jsonDecode(content) as Map<String, dynamic>;
-        final session = ChatSession.fromJson(map);
-        summaries.add(SessionSummary(
-          id: session.id,
-          title: session.title,
-          createdAt: session.createdAt,
-          updatedAt: session.updatedAt,
-          folder: session.folder,
-        ));
-      } catch (_) {
-        // Skip corrupted session files
-      }
+      final id = _idFromSessionFile(entity);
+      if (id == null) continue;
+      final session = await getSession(id);
+      if (session == null) continue;
+      summaries.add(SessionSummary(
+        id: session.id,
+        title: session.title,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        folder: session.folder,
+      ));
     }
     summaries.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     return summaries;
@@ -188,10 +211,15 @@ class SessionStorage {
     final payloads = <Map<String, String>>[];
     await for (final entity in _sessionsDir!.list()) {
       if (entity is! File || !entity.path.endsWith('.json')) continue;
-      try {
-        payloads.add({'json': await entity.readAsString()});
-      } catch (_) {
-        // Skip unreadable session files
+      final id = _idFromSessionFile(entity);
+      if (id == null) continue;
+      final primaryRaw = await _readRawIfExists(entity);
+      final backupRaw = await _readRawIfExists(_backupFileFor(entity));
+      if (primaryRaw != null || backupRaw != null) {
+        payloads.add({
+          'json': primaryRaw ?? '',
+          if (backupRaw != null) 'backupJson': backupRaw,
+        });
       }
     }
 
@@ -202,43 +230,39 @@ class SessionStorage {
     return rawResults.map(SessionSearchResult.fromJson).toList();
   }
 
-  Future<ChatSession?> getSession(String id) async {
-    await init();
-    final file = await _sessionFile(id);
-    if (file == null) return null;
-    if (!await file.exists()) return null;
+  Future<String?> _readRawIfExists(File file) async {
     try {
-      final content = await file.readAsString();
-      return ChatSession.fromJson(jsonDecode(content));
+      if (!await file.exists()) return null;
+      return await file.readAsString();
     } catch (_) {
-      // Corrupted session file — treat as missing
       return null;
     }
   }
 
-  Future<SessionPreview?> getSessionPreview(String id) async {
+  Future<ChatSession?> getSession(String id) async {
     await init();
     final file = await _sessionFile(id);
     if (file == null) return null;
-    if (!await file.exists()) return null;
-    try {
-      final content = await file.readAsString();
-      final map = jsonDecode(content) as Map<String, dynamic>;
-      final messages = map['messages'];
-      String? preview;
-      if (messages is List) {
-        for (final message in messages.reversed) {
-          preview = _previewTextFromMessage(message);
-          if (preview != null) break;
-        }
+    return _readSessionWithBackupRecovery(file);
+  }
+
+  Future<SessionPreview?> getSessionPreview(String id) async {
+    await init();
+    final session = await getSession(id);
+    if (session == null) return null;
+    final map = session.toJson();
+    final messages = map['messages'];
+    String? preview;
+    if (messages is List) {
+      for (final message in messages.reversed) {
+        preview = _previewTextFromMessage(message);
+        if (preview != null) break;
       }
-      return SessionPreview(
-        preview: preview,
-        modelOverride: map['modelOverride'] as String?,
-      );
-    } catch (_) {
-      return null;
     }
+    return SessionPreview(
+      preview: preview,
+      modelOverride: map['modelOverride'] as String?,
+    );
   }
 
   String? _previewTextFromMessage(Object? rawMessage) {
@@ -276,6 +300,68 @@ class SessionStorage {
     return trimmed.isEmpty ? null : trimmed;
   }
 
+  String? _idFromSessionFile(File file) {
+    final filename = file.uri.pathSegments.last;
+    if (!filename.endsWith('.json')) return null;
+    final id = filename.substring(0, filename.length - 5);
+    return _validSessionIdPattern.hasMatch(id) ? id : null;
+  }
+
+  File _backupFileFor(File file) => File('${file.path}.bak');
+
+  Future<ChatSession?> _tryReadSession(File file) async {
+    try {
+      final content = await file.readAsString();
+      return ChatSession.fromJson(jsonDecode(content) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<ChatSession?> _readSessionWithBackupRecovery(File file) async {
+    if (await file.exists()) {
+      final session = await _tryReadSession(file);
+      if (session != null) return session;
+
+      final backup = _backupFileFor(file);
+      final backupSession =
+          await backup.exists() ? await _tryReadSession(backup) : null;
+      await _quarantineCorruptedFile(file);
+      if (backupSession != null) {
+        try {
+          await backup.copy(file.path);
+        } catch (_) {
+          // Keep returning the backup even if restoring the primary fails.
+        }
+        return backupSession;
+      }
+      return null;
+    }
+
+    final backup = _backupFileFor(file);
+    if (!await backup.exists()) return null;
+    final backupSession = await _tryReadSession(backup);
+    if (backupSession == null) return null;
+    try {
+      await backup.copy(file.path);
+    } catch (_) {
+      // Keep returning the backup even if restoring the primary fails.
+    }
+    return backupSession;
+  }
+
+  Future<void> _quarantineCorruptedFile(File file) async {
+    if (!await file.exists()) return;
+    final quarantine = File(
+      '${file.path}.corrupt-${DateTime.now().microsecondsSinceEpoch}',
+    );
+    try {
+      await file.rename(quarantine.path);
+    } catch (_) {
+      // If quarantine fails, leave the corrupted file in place for inspection.
+    }
+  }
+
   Future<void> saveSession(ChatSession session) async {
     await init();
     session.updatedAt = DateTime.now();
@@ -283,7 +369,41 @@ class SessionStorage {
     if (file == null) {
       throw Exception('Invalid session id');
     }
-    await file.writeAsString(jsonEncode(session.toJson()));
+    final payload = jsonEncode(session.toJson());
+    final temp = File(
+      '${file.path}.tmp-${DateTime.now().microsecondsSinceEpoch}',
+    );
+    IOSink? sink;
+    try {
+      sink = temp.openWrite();
+      sink.write(payload);
+      await sink.flush();
+      await sink.close();
+      sink = null;
+
+      if (await file.exists()) {
+        final previous = await _tryReadSession(file);
+        if (previous != null) {
+          await file.copy(_backupFileFor(file).path);
+        }
+      }
+      await temp.rename(file.path);
+    } finally {
+      if (sink != null) {
+        try {
+          await sink.close();
+        } catch (_) {
+          // Ignore cleanup failures from a failed write.
+        }
+      }
+      if (await temp.exists()) {
+        try {
+          await temp.delete();
+        } catch (_) {
+          // Ignore temp cleanup failures.
+        }
+      }
+    }
   }
 
   Future<void> deleteSession(String id) async {
@@ -291,9 +411,12 @@ class SessionStorage {
     final file = await _sessionFile(id);
     if (file == null) return;
     if (await file.exists()) await file.delete();
+    final backup = _backupFileFor(file);
+    if (await backup.exists()) await backup.delete();
   }
 
-  Future<ChatSession?> forkSession(String sessionId, int upToMessageIndex) async {
+  Future<ChatSession?> forkSession(
+      String sessionId, int upToMessageIndex) async {
     final source = await getSession(sessionId);
     if (source == null ||
         upToMessageIndex < 0 ||
@@ -307,6 +430,35 @@ class SessionStorage {
         .map(_deepCopyMessage)
         .toList();
     if (copiedMessages.isEmpty) return null;
+
+    final fork = ChatSession(
+      id: const Uuid().v4(),
+      title: AppStrings.forkedFromTitle(source.title),
+      messages: copiedMessages,
+      modelOverride: source.modelOverride,
+      baseUrlOverride: source.baseUrlOverride,
+      apiFormatOverride: source.apiFormatOverride,
+      systemPrompt: source.systemPrompt,
+      folder: source.folder,
+    );
+    await saveSession(fork);
+    return fork;
+  }
+
+  Future<ChatSession?> forkSessionBeforeMessage(
+      String sessionId, int messageIndex) async {
+    final source = await getSession(sessionId);
+    if (source == null ||
+        messageIndex < 0 ||
+        messageIndex >= source.messages.length) {
+      return null;
+    }
+
+    final copiedMessages = source.messages
+        .take(messageIndex)
+        .where((message) => !message.isSystemNotice)
+        .map(_deepCopyMessage)
+        .toList();
 
     final fork = ChatSession(
       id: const Uuid().v4(),
@@ -341,11 +493,23 @@ class SessionStorage {
         .map((j) => ChatSession.fromJson(j as Map<String, dynamic>))
         .toList();
     int count = 0;
+    final usedIds = (await getSessionIds()).toSet();
     for (final session in sessions) {
-      if (!_validSessionIdPattern.hasMatch(session.id)) continue;
-      final file = await _sessionFile(session.id);
+      var sessionToSave = session;
+      if (usedIds.contains(sessionToSave.id)) {
+        sessionToSave = sessionToSave.copyWith(
+          id: const Uuid().v4(),
+          title: '${sessionToSave.title} (imported copy)',
+        );
+      }
+      while (usedIds.contains(sessionToSave.id)) {
+        sessionToSave = sessionToSave.copyWith(id: const Uuid().v4());
+      }
+      if (!_validSessionIdPattern.hasMatch(sessionToSave.id)) continue;
+      final file = await _sessionFile(sessionToSave.id);
       if (file == null) continue;
-      await saveSession(session);
+      await saveSession(sessionToSave);
+      usedIds.add(sessionToSave.id);
       count++;
     }
     return count;
@@ -358,6 +522,26 @@ ChatMessage _deepCopyMessage(ChatMessage message) {
   );
 }
 
+Map<String, dynamic> _usageSummaryAggregateFromPayloads(List<String> payloads) {
+  const service = UsageSummaryService();
+  final summaries = <UsageSummary>[];
+  var sessionCount = 0;
+  for (final payload in payloads) {
+    try {
+      final session =
+          ChatSession.fromJson(jsonDecode(payload) as Map<String, dynamic>);
+      sessionCount++;
+      summaries.add(service.forSession(session));
+    } catch (_) {
+      // Skip corrupted session files
+    }
+  }
+  return UsageSummaryAggregate(
+    sessionCount: sessionCount,
+    summary: service.combine(summaries),
+  ).toJson();
+}
+
 List<Map<String, dynamic>> _searchSessionPayloads(Map<String, dynamic> args) {
   final query = args['query'] as String;
   final payloads = (args['payloads'] as List)
@@ -367,9 +551,8 @@ List<Map<String, dynamic>> _searchSessionPayloads(Map<String, dynamic> args) {
 
   for (final payload in payloads) {
     try {
-      final session = ChatSession.fromJson(
-        jsonDecode(payload['json']!) as Map<String, dynamic>,
-      );
+      final session = _decodeSearchSessionPayload(payload);
+      if (session == null) continue;
       final titleMatch = session.title.toLowerCase().contains(query);
       String? matchPreview;
 
@@ -406,6 +589,19 @@ List<Map<String, dynamic>> _searchSessionPayloads(Map<String, dynamic> args) {
     return bUpdated.compareTo(aUpdated);
   });
   return results;
+}
+
+ChatSession? _decodeSearchSessionPayload(Map<String, String> payload) {
+  ChatSession? decode(String? raw) {
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      return ChatSession.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  return decode(payload['json']) ?? decode(payload['backupJson']);
 }
 
 String _searchSnippet(String text, String query) {

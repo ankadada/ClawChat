@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:io' as io;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import '../constants.dart';
+import 'shared_content.dart';
 
 // Private aliases to keep dart:io usage contained
 typedef _File = io.File;
@@ -12,9 +14,52 @@ class NativeBridge {
   static const _channel = MethodChannel(AppConstants.channelName);
   static const _agentCallbackChannel =
       MethodChannel('${AppConstants.channelName}/agent_callbacks');
+  static const _shareCallbackChannel =
+      MethodChannel('${AppConstants.channelName}/share_callbacks');
   static void Function({String? sessionId})? _agentStopRequestedHandler;
   static void Function(String sessionId)? _navigateToSessionHandler;
+  static Future<void> Function(SharedContent content)? _shareIntentHandler;
   static bool _agentCallbackInitialized = false;
+  static bool _nativeCallbackInitialized = false;
+
+  static void setShareIntentHandler(
+    Future<void> Function(SharedContent content)? handler,
+  ) {
+    _shareIntentHandler = handler;
+    if (handler == null) return;
+    _ensureNativeCallbackHandler();
+    consumePendingShareIntent().then((content) {
+      if (content != null && content.hasPayload) {
+        _shareIntentHandler?.call(content);
+      }
+    }).catchError((_) => null);
+  }
+
+  static void _ensureNativeCallbackHandler() {
+    if (_nativeCallbackInitialized) return;
+    _nativeCallbackInitialized = true;
+    _shareCallbackChannel.setMethodCallHandler((call) async {
+      if (call.method == 'onShareIntent') {
+        final args = call.arguments;
+        final content = SharedContent.fromNative(args is Map ? args : null);
+        if (!content.hasPayload) return false;
+        final handler = _shareIntentHandler;
+        if (handler == null) return false;
+        await handler(content);
+        return true;
+      }
+      return null;
+    });
+  }
+
+  @visibleForTesting
+  static void resetShareIntentHandlerForTesting() {
+    _shareIntentHandler = null;
+    if (_nativeCallbackInitialized) {
+      _shareCallbackChannel.setMethodCallHandler(null);
+      _nativeCallbackInitialized = false;
+    }
+  }
 
   static void setAgentStopRequestedHandler(
     void Function({String? sessionId})? handler,
@@ -79,13 +124,23 @@ class NativeBridge {
     return _channel.invokeMethod<String>('consumePendingNavigateToSession');
   }
 
+  static Future<SharedContent?> consumePendingShareIntent() async {
+    final result = await _channel.invokeMethod<dynamic>(
+      'consumePendingShareIntent',
+    );
+    if (result is! Map) return null;
+    final content = SharedContent.fromNative(result);
+    return content.hasPayload ? content : null;
+  }
+
   static Future<Map<String, dynamic>> getBootstrapStatus() async {
     final result = await _channel.invokeMethod<Map>('getBootstrapStatus');
     return Map<String, dynamic>.from(result!);
   }
 
   static Future<bool> extractRootfs(String tarPath) async {
-    return (await _channel.invokeMethod<bool>('extractRootfs', {'tarPath': tarPath}))!;
+    return (await _channel
+        .invokeMethod<bool>('extractRootfs', {'tarPath': tarPath}))!;
   }
 
   static Future<String> runInProot(
@@ -201,8 +256,10 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('startSetupService'))!;
   }
 
-  static Future<bool> updateSetupNotification(String text, {int progress = -1}) async {
-    return (await _channel.invokeMethod<bool>('updateSetupNotification', {'text': text, 'progress': progress}))!;
+  static Future<bool> updateSetupNotification(String text,
+      {int progress = -1}) async {
+    return (await _channel.invokeMethod<bool>(
+        'updateSetupNotification', {'text': text, 'progress': progress}))!;
   }
 
   static Future<bool> showToolAutoApprovedNotification(String toolName) async {
@@ -246,14 +303,18 @@ class NativeBridge {
   }
 
   static Future<String?> readRootfsFile(String path) async {
-    return await _channel.invokeMethod<String?>('readRootfsFile', {'path': path});
+    return await _channel
+        .invokeMethod<String?>('readRootfsFile', {'path': path});
   }
 
   static Future<bool> writeRootfsFile(String path, String content) async {
-    return (await _channel.invokeMethod<bool>('writeRootfsFile', {'path': path, 'content': content}))!;
+    return (await _channel.invokeMethod<bool>(
+        'writeRootfsFile', {'path': path, 'content': content}))!;
   }
 
-  static Future<Map<String, dynamic>> phoneIntent(String action, Map<String, dynamic> params, {bool allowed = false}) async {
+  static Future<Map<String, dynamic>> phoneIntent(
+      String action, Map<String, dynamic> params,
+      {bool allowed = false}) async {
     final result = await _channel.invokeMethod<Map>('phoneIntent', {
       'action': action,
       'params': params,
@@ -312,16 +373,33 @@ class NativeBridge {
   /// [sourcePath] is the absolute path on the host filesystem (e.g. from file_picker cache).
   /// [destFilename] is the desired filename inside /root/workspace/uploads/.
   /// Returns the destination path inside proot.
-  static Future<String> importFileToWorkspace(String sourcePath, String destFilename) async {
+  static Future<String> importFileToWorkspace(
+      String sourcePath, String destFilename) async {
     final safeName = destFilename.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
     const destDir = 'root/workspace/uploads';
     final destPath = '$destDir/$safeName';
 
     final extension = safeName.split('.').last.toLowerCase();
     const textExtensions = {
-      'txt', 'md', 'json', 'yaml', 'yml', 'xml', 'csv',
-      'py', 'js', 'ts', 'dart', 'sh', 'html', 'css',
-      'toml', 'cfg', 'ini', 'log', 'sql',
+      'txt',
+      'md',
+      'json',
+      'yaml',
+      'yml',
+      'xml',
+      'csv',
+      'py',
+      'js',
+      'ts',
+      'dart',
+      'sh',
+      'html',
+      'css',
+      'toml',
+      'cfg',
+      'ini',
+      'log',
+      'sql',
     };
 
     if (textExtensions.contains(extension)) {

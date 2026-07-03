@@ -217,6 +217,22 @@ class ContextRecoveryRequest {
   });
 }
 
+class ContextManualSummaryRequest {
+  final String sessionId;
+  final List<Map<String, dynamic>> apiPrefixMessages;
+  final LlmConfig llmConfig;
+  final int contextTokenBudget;
+  final TokenEstimator estimator;
+
+  const ContextManualSummaryRequest({
+    required this.sessionId,
+    required this.apiPrefixMessages,
+    required this.llmConfig,
+    required this.contextTokenBudget,
+    this.estimator = const TokenEstimator(),
+  });
+}
+
 class ContextManager {
   final ContextSummaryServiceFactory _contextSummaryServiceFactory;
   final ProviderTransformPreflight _providerTransformPreflight;
@@ -499,6 +515,72 @@ class ContextManager {
       estimator: request.estimator,
       truncation: recoveryTruncation,
     );
+  }
+
+  Future<ContextSummary> buildManualSummary(
+    ContextManualSummaryRequest request,
+  ) async {
+    final messages = request.apiPrefixMessages;
+    if (messages.isEmpty) {
+      throw ArgumentError.value(
+        messages.length,
+        'apiPrefixMessages',
+        'Manual summary requires at least one API message.',
+      );
+    }
+    final sourceEstimatedTokens = request.estimator.estimateMessages(messages);
+    final summaryBudget = math.max(
+      512,
+      math.min(
+        2048,
+        math.max(768, (sourceEstimatedTokens * 0.25).round()),
+      ),
+    );
+    final summaryRequest = ContextSummaryRequest(
+      messages: messages,
+      llmConfig: request.llmConfig,
+      summaryBudget: summaryBudget,
+      coveredDigest: ChatContextUtils.digestMessages(messages),
+      coveredMessageCount: messages.length,
+      sourceEstimatedTokens: sourceEstimatedTokens,
+      estimator: request.estimator,
+      maxInputTokens: (request.contextTokenBudget * 0.8).floor(),
+    );
+    final service = _contextSummaryServiceFactory();
+    try {
+      final summary = await service.generateSummary(summaryRequest);
+      _recordRuntimeEvent(
+        request.sessionId,
+        'context.summary.manual.generated',
+        {
+          'coveredMessageCount': summary.coveredMessageCount,
+          'sourceEstimatedTokens': summary.sourceEstimatedTokens,
+          'summaryEstimatedTokens': summary.summaryEstimatedTokens,
+        },
+      );
+      return summary;
+    } catch (e) {
+      _recordRuntimeEvent(
+        request.sessionId,
+        'context.summary.manual.failed',
+        {
+          'stage': 'llm',
+          'errorType': e.runtimeType.toString(),
+        },
+      );
+      final summary = service.extractiveFallback(summaryRequest);
+      _recordRuntimeEvent(
+        request.sessionId,
+        'context.summary.manual.generated',
+        {
+          'coveredMessageCount': summary.coveredMessageCount,
+          'sourceEstimatedTokens': summary.sourceEstimatedTokens,
+          'summaryEstimatedTokens': summary.summaryEstimatedTokens,
+          'fallback': true,
+        },
+      );
+      return summary;
+    }
   }
 
   TokenCalibrationRecordResult? recordCompletion({

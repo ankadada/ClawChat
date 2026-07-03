@@ -137,6 +137,113 @@ void main() {
     );
   });
 
+  test('persists and imports tool safety settings', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+
+    service.deniedToolNames = {' bash ', 'read_file', ''};
+    service.bashCommandDenyPatterns = [' rm\\s+-rf ', ' secret-project ', ''];
+
+    expect(service.deniedToolNames, {'bash', 'read_file'});
+    expect(service.bashCommandDenyPatterns, [
+      r'rm\s+-rf',
+      'secret-project',
+    ]);
+
+    final exported = service.exportAllSettings();
+    expect(exported['deniedToolNames'], ['bash', 'read_file']);
+    expect(exported['bashCommandDenyPatterns'], [
+      r'rm\s+-rf',
+      'secret-project',
+    ]);
+
+    PreferencesService.resetForTesting();
+    final secondService = PreferencesService();
+    await secondService.init();
+    expect(secondService.deniedToolNames, {'bash', 'read_file'});
+    expect(secondService.bashCommandDenyPatterns, [
+      r'rm\s+-rf',
+      'secret-project',
+    ]);
+
+    secondService.importAllSettings({
+      'deniedToolNames': ['write_file', ' bash ', ''],
+      'bashCommandDenyPatterns': ['curl .*token', ''],
+    });
+    expect(secondService.deniedToolNames, {'bash', 'write_file'});
+    expect(secondService.bashCommandDenyPatterns, ['curl .*token']);
+  });
+
+  test('stores MCP server configs in secure storage', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+
+    final server = await service.saveMcpServer(
+      displayName: 'Local Files',
+      enabled: true,
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-filesystem'],
+      env: {'MCP_TOKEN': 'token-placeholder-value', 'bad-name': 'ignored'},
+    );
+
+    expect(service.mcpServers, hasLength(1));
+    expect(service.mcpServers.single.id, server.id);
+    expect(service.mcpServers.single.env, {
+      'MCP_TOKEN': 'token-placeholder-value',
+    });
+
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('mcp_servers'), isNull);
+    expect(secureStorage['mcp_servers'], contains('token-placeholder-value'));
+
+    PreferencesService.resetForTesting();
+    final secondService = PreferencesService();
+    await secondService.init();
+    expect(secondService.mcpServers.single.displayName, 'Local Files');
+    expect(secondService.mcpServers.single.command, 'npx');
+    expect(secondService.mcpServers.single.env['MCP_TOKEN'],
+        'token-placeholder-value');
+  });
+
+  test('saves updates and deletes prompt profiles', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+
+    final created = await service.savePromptProfile(
+      name: 'Coder',
+      systemPrompt: 'You are a precise coding assistant.',
+    );
+
+    expect(service.promptProfiles, hasLength(1));
+    expect(service.promptProfiles.single.id, created.id);
+    expect(service.promptProfiles.single.name, 'Coder');
+    expect(
+      service.promptProfiles.single.systemPrompt,
+      'You are a precise coding assistant.',
+    );
+
+    final updated = await service.savePromptProfile(
+      id: created.id,
+      name: 'Reviewer',
+      systemPrompt: 'Review code for regressions.',
+    );
+
+    expect(updated.id, created.id);
+    expect(service.promptProfiles, hasLength(1));
+    expect(service.promptProfiles.single.name, 'Reviewer');
+    expect(service.promptProfiles.single.systemPrompt,
+        'Review code for regressions.');
+
+    await service.deletePromptProfile(created.id);
+    expect(service.promptProfiles, isEmpty);
+  });
+
   test('foldable view preferences default and clamp persisted values',
       () async {
     SharedPreferences.setMockInitialValues({});
@@ -327,6 +434,119 @@ void main() {
 
     expect(storedProfile.model, 'codex/gpt-5.5');
     expect(storedProfile.capabilityOverride, profile.capabilityOverride);
+  });
+
+  test('provider profile fallback targets round trip JSON and copyWith',
+      () async {
+    final profile = ProviderProfile.defaults(name: 'Primary').copyWith(
+      id: 'primary',
+      fallbackTargets: const [
+        ModelFallbackTarget(
+          targetProfileId: 'backup',
+          modelOverride: 'backup-model',
+          enabled: false,
+        ),
+      ],
+    );
+
+    final copied = profile.copyWith(name: 'Renamed');
+    final decoded = ProviderProfile.fromJson(profile.toJson());
+    final legacy = ProviderProfile.fromJson({
+      'id': 'legacy',
+      'name': 'Legacy',
+      'apiFormat': ProviderProfile.anthropicFormat,
+      'apiKey': '',
+      'baseUrl': '',
+      'model': AppConstants.defaultModel,
+      'maxTokens': AppConstants.defaultMaxTokens,
+      'thinkingBudget': 0,
+      'temperature': AppConstants.defaultTemperature,
+    });
+
+    expect(copied.fallbackTargets.single.targetProfileId, 'backup');
+    expect(decoded.fallbackTargets, hasLength(1));
+    expect(decoded.fallbackTargets.single.modelOverride, 'backup-model');
+    expect(decoded.fallbackTargets.single.enabled, isFalse);
+    expect(legacy.fallbackTargets, isEmpty);
+    expect(
+      () => ProviderProfile.fromJson({
+        ...profile.toJson(),
+        'fallbackTargets': [
+          {'modelOverride': 'missing target id'},
+        ],
+      }),
+      throwsFormatException,
+    );
+  });
+
+  test('provider profiles preserve fallback targets in secure storage',
+      () async {
+    final primary = ProviderProfile.defaults(name: 'Primary').copyWith(
+      id: 'primary',
+      apiKey: 'primary-key',
+      model: 'primary-model',
+      fallbackTargets: const [
+        ModelFallbackTarget(
+          targetProfileId: 'backup',
+          modelOverride: 'backup-model',
+        ),
+      ],
+    );
+    final backup = ProviderProfile.defaults(name: 'Backup').copyWith(
+      id: 'backup',
+      apiFormat: ProviderProfile.openaiFormat,
+      apiKey: 'backup-key',
+      model: 'backup-default-model',
+    );
+    secureStorage['provider_profiles'] = jsonEncode([
+      primary.toJson(),
+      backup.toJson(),
+    ]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'primary',
+    });
+
+    final service = PreferencesService();
+    await service.init();
+
+    expect(service.activeProfile.fallbackTargets, hasLength(1));
+    expect(
+        service.activeProfile.fallbackTargets.single.targetProfileId, 'backup');
+    expect(
+        service.activeProfile.fallbackTargets.single.effectiveModelFor(backup),
+        'backup-model');
+
+    await service.setProfiles(service.profiles);
+    final stored = jsonDecode(secureStorage['provider_profiles']!) as List;
+    final storedPrimary = ProviderProfile.fromJson(
+      Map<String, dynamic>.from(stored.first as Map),
+    );
+    expect(storedPrimary.fallbackTargets.single.targetProfileId, 'backup');
+    expect(storedPrimary.fallbackTargets.single.modelOverride, 'backup-model');
+  });
+
+  test('setProfiles removes fallback targets that cannot be used', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+    final primary = ProviderProfile.defaults(name: 'Primary').copyWith(
+      id: 'primary',
+      fallbackTargets: const [
+        ModelFallbackTarget(targetProfileId: 'primary'),
+        ModelFallbackTarget(targetProfileId: 'missing'),
+        ModelFallbackTarget(targetProfileId: 'backup'),
+      ],
+    );
+    final backup = ProviderProfile.defaults(name: 'Backup').copyWith(
+      id: 'backup',
+    );
+
+    await service.setProfiles([primary, backup]);
+
+    final sanitized = service.profiles.firstWhere((p) => p.id == 'primary');
+    expect(sanitized.fallbackTargets, hasLength(1));
+    expect(sanitized.fallbackTargets.single.targetProfileId, 'backup');
   });
 
   test('setProfiles propagates write failures and reverts in-memory state',

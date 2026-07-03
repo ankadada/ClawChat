@@ -304,6 +304,7 @@ class LlmService {
   final http.Client _client;
   final bool Function()? _isInBackground;
   final CapabilityRegistry _capabilityRegistry;
+  bool _disposed = false;
 
   static const _allowedApiHosts = {
     'api.anthropic.com',
@@ -496,7 +497,11 @@ class LlmService {
 
   /// Closes the underlying HTTP client. Must be called when the service
   /// is no longer needed to avoid connection pool leaks.
-  void dispose() => _client.close();
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _client.close();
+  }
 
   ResolvedModelProfile get resolvedModelProfile => _capabilityRegistry.resolve(
         apiFormat: config.format,

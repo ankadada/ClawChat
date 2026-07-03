@@ -160,7 +160,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           );
         }
 
-        // Collect unique folders
+        // Collect folders already used by sessions.
         final folders = <String>{};
         for (final s in sessions) {
           if (s.folder != null && s.folder!.isNotEmpty) {
@@ -712,7 +712,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
 
   Future<void> _showMoveToFolderDialog(BuildContext context,
       SessionSummary session, ChatProvider provider) async {
-    // Collect existing folders
+    // Collect folders already used by sessions.
     final folders = <String>{};
     for (final s in provider.sessions) {
       if (s.folder != null && s.folder!.isNotEmpty) {

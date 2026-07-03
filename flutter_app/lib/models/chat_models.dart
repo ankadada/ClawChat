@@ -184,6 +184,9 @@ class ChatMessage {
   final DateTime timestamp;
   int? inputTokens;
   int? outputTokens;
+  int? cacheReadInputTokens;
+  int? cacheCreationInputTokens;
+  bool inputTokensIncludeCache;
   final List<String>? alternatives; // previous generation texts
   int activeAlternative; // -1 = current content, 0+ = index into alternatives
   final bool isSystemNotice;
@@ -194,6 +197,9 @@ class ChatMessage {
     DateTime? timestamp,
     this.inputTokens,
     this.outputTokens,
+    this.cacheReadInputTokens,
+    this.cacheCreationInputTokens,
+    this.inputTokensIncludeCache = false,
     this.alternatives,
     this.activeAlternative = -1,
     this.isSystemNotice = false,
@@ -222,6 +228,9 @@ class ChatMessage {
       activeAlternative: -1,
       inputTokens: inputTokens,
       outputTokens: outputTokens,
+      cacheReadInputTokens: cacheReadInputTokens,
+      cacheCreationInputTokens: cacheCreationInputTokens,
+      inputTokensIncludeCache: inputTokensIncludeCache,
     );
   }
 
@@ -339,6 +348,11 @@ class ChatMessage {
         'content': content.map((c) => c.toJson()).toList(),
         if (inputTokens != null) 'inputTokens': inputTokens,
         if (outputTokens != null) 'outputTokens': outputTokens,
+        if (cacheReadInputTokens != null)
+          'cacheReadInputTokens': cacheReadInputTokens,
+        if (cacheCreationInputTokens != null)
+          'cacheCreationInputTokens': cacheCreationInputTokens,
+        if (inputTokensIncludeCache) 'inputTokensIncludeCache': true,
         if (alternatives != null && alternatives!.isNotEmpty)
           'alternatives': alternatives,
         if (activeAlternative != -1) 'activeAlternative': activeAlternative,
@@ -391,6 +405,10 @@ class ChatMessage {
           DateTime.now(),
       inputTokens: json['inputTokens'] as int?,
       outputTokens: json['outputTokens'] as int?,
+      cacheReadInputTokens: json['cacheReadInputTokens'] as int?,
+      cacheCreationInputTokens: json['cacheCreationInputTokens'] as int?,
+      inputTokensIncludeCache:
+          json['inputTokensIncludeCache'] as bool? ?? false,
       alternatives: altsList?.map((e) => e as String).toList(),
       activeAlternative: json['activeAlternative'] as int? ?? -1,
       isSystemNotice: json['isSystemNotice'] as bool? ?? false,

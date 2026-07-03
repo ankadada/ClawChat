@@ -93,13 +93,13 @@ class AgentService {
         _toolArgumentPreflight =
             toolArgumentPreflight ?? const ToolArgumentPreflight();
 
-  void cancel() => _cancelled = true;
+  void cancel() {
+    _cancelled = true;
+    _llm.dispose();
+  }
+
   bool get isCancelled => _cancelled;
   List<Map<String, dynamic>> get messages => _lastMessages;
-
-  // NOTE: cancel() sets a flag that is checked between iterations and tool calls,
-  // but it cannot interrupt an in-flight HTTP request to the LLM API.
-  // The current request will complete before the cancellation takes effect.
 
   /// Runs the agentic tool-use loop, streaming [AgentEvent]s as it progresses.
   ///
@@ -312,6 +312,27 @@ class AgentService {
       arguments: Map<String, dynamic>.from(toolInput),
       risk: _tools.riskFor(toolName),
     );
+    final denyDecision = _toolPolicy.denyFor(request);
+    if (denyDecision != null) {
+      _recordRuntimeEvent('tool.execution.denied', {
+        'ruleType': denyDecision.ruleType,
+        'ruleId': denyDecision.ruleId,
+      });
+      return _ToolResult(
+        toolUseId,
+        ToolResultPayload(
+          forUser: denyDecision.message,
+          forLlm: denyDecision.message,
+          summary: denyDecision.message,
+          metadata: {
+            'status': 'error',
+            'denyRuleType': denyDecision.ruleType,
+            'denyRuleId': denyDecision.ruleId,
+          },
+        ),
+        true,
+      );
+    }
     final approved = await _toolPolicy.approve(request);
     if (!approved) {
       return _ToolResult(

@@ -104,6 +104,23 @@ void main() {
       expect(appendedWindow.visibleCount, 300);
       expect(appendedWindow.hiddenBeforeCount, 201);
     });
+
+    test('ensureIncludes expands only enough to include an older target', () {
+      final state = ChatRenderWindowState.initial(initialWindow);
+
+      final unchanged = state.ensureIncludes(
+        totalCount: 500,
+        messageIndex: 400,
+      );
+      final expanded = state.ensureIncludes(
+        totalCount: 500,
+        messageIndex: 120,
+      );
+
+      expect(unchanged.visibleLimit, 180);
+      expect(expanded.visibleLimit, 380);
+      expect(expanded.windowFor(500).startIndex, 120);
+    });
   });
 
   group('ChatScreen render window helpers', () {
@@ -153,6 +170,39 @@ void main() {
           currentMaxScrollExtent: 1000,
         ),
         isNull,
+      );
+    });
+
+    test('estimates reverse-list offset for message jumps', () {
+      const window = ChatRenderWindow(
+        startIndex: 100,
+        endIndexExclusive: 200,
+        hiddenBeforeCount: 100,
+      );
+
+      expect(
+        estimatedReversedListOffsetForMessageIndex(
+          window: window,
+          messageIndex: 199,
+          maxScrollExtent: 990,
+        ),
+        0,
+      );
+      expect(
+        estimatedReversedListOffsetForMessageIndex(
+          window: window,
+          messageIndex: 100,
+          maxScrollExtent: 990,
+        ),
+        990,
+      );
+      expect(
+        estimatedReversedListOffsetForMessageIndex(
+          window: window,
+          messageIndex: 150,
+          maxScrollExtent: 990,
+        ),
+        490,
       );
     });
   });

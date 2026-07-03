@@ -3,10 +3,74 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import '../constants.dart';
+import '../models/mcp_server_config.dart';
 import '../models/provider_profile.dart';
 
 enum ConflictResolution { merge, replace, skip }
+
+class PromptProfile {
+  final String id;
+  final String name;
+  final String systemPrompt;
+  final DateTime createdAt;
+  final DateTime updatedAt;
+
+  const PromptProfile({
+    required this.id,
+    required this.name,
+    required this.systemPrompt,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  PromptProfile copyWith({
+    String? id,
+    String? name,
+    String? systemPrompt,
+    DateTime? createdAt,
+    DateTime? updatedAt,
+  }) {
+    return PromptProfile(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      systemPrompt: systemPrompt ?? this.systemPrompt,
+      createdAt: createdAt ?? this.createdAt,
+      updatedAt: updatedAt ?? this.updatedAt,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'systemPrompt': systemPrompt,
+        'createdAt': createdAt.toIso8601String(),
+        'updatedAt': updatedAt.toIso8601String(),
+      };
+
+  factory PromptProfile.fromJson(Map<String, dynamic> json) {
+    final now = DateTime.now();
+    final id = json['id']?.toString().trim();
+    final name = json['name']?.toString().trim();
+    final systemPrompt = json['systemPrompt']?.toString();
+    if (id == null ||
+        id.isEmpty ||
+        name == null ||
+        name.isEmpty ||
+        systemPrompt == null ||
+        systemPrompt.trim().isEmpty) {
+      throw const FormatException('Invalid prompt profile');
+    }
+    return PromptProfile(
+      id: id,
+      name: name,
+      systemPrompt: systemPrompt,
+      createdAt: DateTime.tryParse(json['createdAt']?.toString() ?? '') ?? now,
+      updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? '') ?? now,
+    );
+  }
+}
 
 class PreferencesService {
   static const _keyApiKey = 'api_key';
@@ -30,12 +94,16 @@ class PreferencesService {
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
   static const _keyToolApprovalPolicy = 'tool_approval_policy';
+  static const _keyDeniedToolNames = 'denied_tool_names';
+  static const _keyBashCommandDenyPatterns = 'bash_command_deny_patterns';
   static const _keyDualPaneSidebarWidth = 'dual_pane_sidebar_width';
   static const _keyTerminalFontSize = 'terminal_font_size';
   static const _keyWhisperModel = 'whisper_model';
   static const _keyTtsModel = 'tts_model';
   static const _keyProviderProfiles = 'provider_profiles';
   static const _keyActiveProfileId = 'active_provider_profile_id';
+  static const _keyPromptProfiles = 'prompt_profiles';
+  static const _keyMcpServers = 'mcp_servers';
 
   static const toolApprovalAlways = 'always';
   static const toolApprovalSessionFirst = 'session_first';
@@ -55,6 +123,7 @@ class PreferencesService {
   static PreferencesService? _instance;
   Map<String, String> _cachedEnvVars = {};
   List<ProviderProfile> _cachedProfiles = [];
+  List<McpServerConfig> _cachedMcpServers = [];
   String? _cachedActiveProfileId;
 
   late SharedPreferences _prefs;
@@ -79,6 +148,7 @@ class PreferencesService {
     await _loadProviderProfiles();
     _cachedEnvVars =
         _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
+    await _loadMcpServers();
     _initialized = true;
   }
 
@@ -154,6 +224,7 @@ class PreferencesService {
     }
 
     await _ensureAtLeastOneProfile();
+    await _sanitizeCachedProviderFallbacks();
   }
 
   Future<void> _migrateLegacyProviderProfile() async {
@@ -224,6 +295,15 @@ class PreferencesService {
     await _ensureValidActiveProfile();
   }
 
+  Future<void> _sanitizeCachedProviderFallbacks() async {
+    final before = jsonEncode(_cachedProfiles.map((p) => p.toJson()).toList());
+    _cachedProfiles = _sanitizeProviderFallbacks(_cachedProfiles);
+    final after = jsonEncode(_cachedProfiles.map((p) => p.toJson()).toList());
+    if (before != after) {
+      await _persistProfiles();
+    }
+  }
+
   int _activeProfileIndex() {
     if (_cachedProfiles.isEmpty) return -1;
     final index =
@@ -248,6 +328,7 @@ class PreferencesService {
       throw StateError('PreferencesService has no provider profiles');
     }
     _cachedProfiles[index] = profile;
+    _cachedProfiles = _sanitizeProviderFallbacks(_cachedProfiles);
     _persistProfilesAfterSyncMutation(
       previousProfiles,
       previousActiveProfileId,
@@ -285,6 +366,34 @@ class PreferencesService {
     return profiles.map((p) => p.copyWith()).toList();
   }
 
+  List<ProviderProfile> _sanitizeProviderFallbacks(
+    List<ProviderProfile> profiles,
+  ) {
+    if (profiles.isEmpty) return [ProviderProfile.defaults()];
+    final copied = profiles.map((p) => p.copyWith()).toList();
+    final ids = copied.map((profile) => profile.id).toSet();
+    return copied.map((profile) {
+      final seen = <String>{};
+      final targets = <ModelFallbackTarget>[];
+      for (final target in profile.fallbackTargets) {
+        final targetId = target.targetProfileId.trim();
+        if (targetId.isEmpty ||
+            targetId == profile.id ||
+            !ids.contains(targetId)) {
+          continue;
+        }
+        final modelOverride = target.modelOverride.trim();
+        final key = '$targetId\n$modelOverride';
+        if (!seen.add(key)) continue;
+        targets.add(target.copyWith(
+          targetProfileId: targetId,
+          modelOverride: modelOverride,
+        ));
+      }
+      return profile.copyWith(fallbackTargets: targets);
+    }).toList(growable: false);
+  }
+
   List<ProviderProfile> get profiles {
     return _cachedProfiles.map((p) => p.copyWith()).toList();
   }
@@ -299,9 +408,7 @@ class PreferencesService {
     final previousProfiles = _copyProfiles(_cachedProfiles);
     final previousActiveProfileId = _cachedActiveProfileId;
 
-    _cachedProfiles = value.isEmpty
-        ? [ProviderProfile.defaults()]
-        : value.map((p) => p.copyWith()).toList();
+    _cachedProfiles = _sanitizeProviderFallbacks(value);
     if (!_cachedProfiles.any((p) => p.id == _cachedActiveProfileId)) {
       _cachedActiveProfileId = _cachedProfiles.first.id;
     }
@@ -368,6 +475,7 @@ class PreferencesService {
       throw StateError('PreferencesService has no provider profiles');
     }
     _cachedProfiles[index] = profile.copyWith(id: _cachedProfiles[index].id);
+    _cachedProfiles = _sanitizeProviderFallbacks(_cachedProfiles);
 
     try {
       await _persistProfiles();
@@ -419,6 +527,265 @@ class PreferencesService {
   set systemPrompt(String? v) => v != null
       ? _prefs.setString(_keySystemPrompt, v)
       : _prefs.remove(_keySystemPrompt);
+
+  List<PromptProfile> get promptProfiles {
+    final raw = _prefs.getString(_keyPromptProfiles);
+    if (raw == null || raw.isEmpty) return const [];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const [];
+      final profiles = decoded
+          .whereType<Map>()
+          .map((item) => PromptProfile.fromJson(
+                Map<String, dynamic>.from(item),
+              ))
+          .toList();
+      profiles.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      return profiles;
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<PromptProfile> savePromptProfile({
+    String? id,
+    required String name,
+    required String systemPrompt,
+  }) async {
+    final trimmedName = name.trim();
+    final trimmedPrompt = systemPrompt.trim();
+    if (trimmedName.isEmpty) {
+      throw ArgumentError.value(name, 'name', 'Prompt profile name is empty');
+    }
+    if (trimmedPrompt.isEmpty) {
+      throw ArgumentError.value(
+        systemPrompt,
+        'systemPrompt',
+        'Prompt profile prompt is empty',
+      );
+    }
+
+    final existing = promptProfiles;
+    final now = DateTime.now();
+    final existingIndex =
+        id == null ? -1 : existing.indexWhere((profile) => profile.id == id);
+    final profile = existingIndex >= 0
+        ? existing[existingIndex].copyWith(
+            name: trimmedName,
+            systemPrompt: trimmedPrompt,
+            updatedAt: now,
+          )
+        : PromptProfile(
+            id: id?.trim().isNotEmpty == true ? id!.trim() : const Uuid().v4(),
+            name: trimmedName,
+            systemPrompt: trimmedPrompt,
+            createdAt: now,
+            updatedAt: now,
+          );
+    final next = List<PromptProfile>.from(existing);
+    if (existingIndex >= 0) {
+      next[existingIndex] = profile;
+    } else {
+      next.insert(0, profile);
+    }
+    await _savePromptProfiles(next);
+    return profile;
+  }
+
+  Future<void> deletePromptProfile(String id) async {
+    final next = promptProfiles.where((profile) => profile.id != id).toList();
+    await _savePromptProfiles(next);
+  }
+
+  Future<({int imported, int skipped})> importPromptProfiles(
+    List<PromptProfile> importedProfiles,
+    ConflictResolution resolution,
+  ) async {
+    final existing = promptProfiles;
+    final existingIds = existing.map((profile) => profile.id).toSet();
+    final seenImportedIds = <String>{};
+    var imported = 0;
+    var skipped = 0;
+
+    switch (resolution) {
+      case ConflictResolution.replace:
+        final next = <PromptProfile>[];
+        for (final profile in importedProfiles) {
+          if (!seenImportedIds.add(profile.id)) {
+            skipped++;
+            continue;
+          }
+          next.add(profile);
+          imported++;
+        }
+        await _savePromptProfiles(next);
+      case ConflictResolution.merge:
+      case ConflictResolution.skip:
+        final merged = List<PromptProfile>.from(existing);
+        for (final profile in importedProfiles) {
+          if (!seenImportedIds.add(profile.id) ||
+              existingIds.contains(profile.id)) {
+            skipped++;
+            continue;
+          }
+          merged.add(profile);
+          imported++;
+        }
+        await _savePromptProfiles(merged);
+    }
+
+    return (imported: imported, skipped: skipped);
+  }
+
+  Future<void> _savePromptProfiles(List<PromptProfile> profiles) {
+    return _prefs.setString(
+      _keyPromptProfiles,
+      jsonEncode(profiles.map((profile) => profile.toJson()).toList()),
+    );
+  }
+
+  List<McpServerConfig> get mcpServers => List.unmodifiable(_cachedMcpServers);
+
+  Future<McpServerConfig> saveMcpServer({
+    String? id,
+    required String displayName,
+    required bool enabled,
+    required String command,
+    List<String> args = const [],
+    Map<String, String> env = const {},
+  }) async {
+    final trimmedName = displayName.trim();
+    final trimmedCommand = command.trim();
+    if (trimmedName.isEmpty) {
+      throw ArgumentError.value(
+        displayName,
+        'displayName',
+        'MCP server name is empty',
+      );
+    }
+    if (trimmedCommand.isEmpty) {
+      throw ArgumentError.value(
+        command,
+        'command',
+        'MCP server command is empty',
+      );
+    }
+
+    final existing = mcpServers;
+    final nextId =
+        id?.trim().isNotEmpty == true ? id!.trim() : const Uuid().v4();
+    final index = existing.indexWhere((server) => server.id == nextId);
+    final config = McpServerConfig(
+      id: nextId,
+      displayName: trimmedName,
+      enabled: enabled,
+      command: trimmedCommand,
+      args: args
+          .map((arg) => arg.trim())
+          .where((arg) => arg.isNotEmpty)
+          .toList(growable: false),
+      env: _normalizeMcpEnv(env),
+    );
+    final next = List<McpServerConfig>.from(existing);
+    if (index >= 0) {
+      next[index] = config;
+    } else {
+      next.add(config);
+    }
+    await setMcpServers(next);
+    return config;
+  }
+
+  Future<void> deleteMcpServer(String id) async {
+    await setMcpServers(
+      _cachedMcpServers.where((server) => server.id != id).toList(),
+    );
+  }
+
+  Future<void> setMcpServers(List<McpServerConfig> servers) async {
+    _cachedMcpServers = List.unmodifiable(servers);
+    await _persistMcpServers();
+  }
+
+  Future<({int imported, int skipped})> importMcpServers(
+    List<McpServerConfig> importedServers,
+    ConflictResolution resolution,
+  ) async {
+    final existing = mcpServers;
+    final existingIds = existing.map((server) => server.id).toSet();
+    final seenImportedIds = <String>{};
+    var imported = 0;
+    var skipped = 0;
+
+    switch (resolution) {
+      case ConflictResolution.replace:
+        final next = <McpServerConfig>[];
+        for (final server in importedServers) {
+          if (!seenImportedIds.add(server.id)) {
+            skipped++;
+            continue;
+          }
+          next.add(server);
+          imported++;
+        }
+        await setMcpServers(next);
+      case ConflictResolution.merge:
+      case ConflictResolution.skip:
+        final merged = List<McpServerConfig>.from(existing);
+        for (final server in importedServers) {
+          if (!seenImportedIds.add(server.id) ||
+              existingIds.contains(server.id)) {
+            skipped++;
+            continue;
+          }
+          merged.add(server);
+          imported++;
+        }
+        await setMcpServers(merged);
+    }
+    return (imported: imported, skipped: skipped);
+  }
+
+  Future<void> _loadMcpServers() async {
+    final raw = await _secureStorage.read(key: _keyMcpServers);
+    if (raw == null || raw.isEmpty) {
+      _cachedMcpServers = [];
+      return;
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) {
+        _cachedMcpServers = [];
+        return;
+      }
+      _cachedMcpServers = decoded
+          .whereType<Map>()
+          .map((item) => McpServerConfig.fromJson(
+                Map<String, dynamic>.from(item),
+              ))
+          .toList(growable: false);
+    } catch (_) {
+      debugPrint('Failed to read MCP server configs');
+      _cachedMcpServers = [];
+    }
+  }
+
+  Future<void> _persistMcpServers() async {
+    if (_cachedMcpServers.isEmpty) {
+      await _secureStorage.delete(key: _keyMcpServers);
+      return;
+    }
+    await _secureStorage.write(
+      key: _keyMcpServers,
+      value: jsonEncode(
+        _cachedMcpServers.map((server) => server.toJson()).toList(),
+      ),
+    );
+  }
+
+  Map<String, String> _normalizeMcpEnv(Map<String, String> env) {
+    return McpServerConfig.normalizeEnv(env);
+  }
 
   int get thinkingBudget => _activeProfile.thinkingBudget;
   set thinkingBudget(int v) => _replaceActiveProfile(
@@ -558,6 +925,43 @@ class PreferencesService {
     _prefs.setString(_keyToolApprovalPolicy, normalizeToolApprovalPolicy(v));
   }
 
+  Set<String> get deniedToolNames {
+    final values = _prefs.getStringList(_keyDeniedToolNames) ?? const [];
+    return values
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty)
+        .toSet();
+  }
+
+  set deniedToolNames(Set<String> values) {
+    final normalized = values
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty)
+        .toSet()
+        .toList()
+      ..sort();
+    _prefs.setStringList(_keyDeniedToolNames, normalized);
+  }
+
+  List<String> get bashCommandDenyPatterns {
+    final values =
+        _prefs.getStringList(_keyBashCommandDenyPatterns) ?? const [];
+    return values
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  set bashCommandDenyPatterns(List<String> values) {
+    _prefs.setStringList(
+      _keyBashCommandDenyPatterns,
+      values
+          .map((value) => value.trim())
+          .where((value) => value.isNotEmpty)
+          .toList(growable: false),
+    );
+  }
+
   static String normalizeToolApprovalPolicy(String? value) {
     return switch (value) {
       toolApprovalAlways => toolApprovalAlways,
@@ -633,6 +1037,8 @@ class PreferencesService {
       'privacyMode': privacyMode,
       'allowPhoneCall': allowPhoneCall,
       'allowSms': allowSms,
+      'deniedToolNames': deniedToolNames.toList()..sort(),
+      'bashCommandDenyPatterns': bashCommandDenyPatterns,
       'whisperModel': _prefs.getString(_keyWhisperModel),
       'ttsModel': _prefs.getString(_keyTtsModel),
       'temperature': temperature,
@@ -694,6 +1100,15 @@ class PreferencesService {
     if (settings['allowSms'] is bool) {
       allowSms = settings['allowSms'] as bool;
     }
+    final importedDeniedToolNames = _stringList(settings['deniedToolNames']);
+    if (importedDeniedToolNames != null) {
+      deniedToolNames = importedDeniedToolNames.toSet();
+    }
+    final importedBashDenyPatterns =
+        _stringList(settings['bashCommandDenyPatterns']);
+    if (importedBashDenyPatterns != null) {
+      bashCommandDenyPatterns = importedBashDenyPatterns;
+    }
     if (settings.containsKey('whisperModel')) {
       final value = settings['whisperModel'];
       if (value is String) {
@@ -725,13 +1140,24 @@ class PreferencesService {
 
     switch (resolution) {
       case ConflictResolution.replace:
-        await setProfiles(importedProfiles);
-        imported = importedProfiles.length;
+        final seenIds = <String>{};
+        final next = <ProviderProfile>[];
+        for (final profile in importedProfiles) {
+          if (!seenIds.add(profile.id)) {
+            skipped++;
+            continue;
+          }
+          next.add(profile);
+          imported++;
+        }
+        await setProfiles(next);
       case ConflictResolution.merge:
       case ConflictResolution.skip:
         final merged = List<ProviderProfile>.from(existing);
+        final seenImportedIds = <String>{};
         for (final profile in importedProfiles) {
-          if (existingIds.contains(profile.id)) {
+          if (!seenImportedIds.add(profile.id) ||
+              existingIds.contains(profile.id)) {
             skipped++;
           } else {
             merged.add(profile);
@@ -756,5 +1182,13 @@ class PreferencesService {
         : double.tryParse(value?.toString() ?? '');
     if (parsed == null || !parsed.isFinite) return null;
     return parsed;
+  }
+
+  List<String>? _stringList(Object? value) {
+    if (value is! List) return null;
+    return value
+        .map((item) => item?.toString().trim() ?? '')
+        .where((item) => item.isNotEmpty)
+        .toList(growable: false);
   }
 }

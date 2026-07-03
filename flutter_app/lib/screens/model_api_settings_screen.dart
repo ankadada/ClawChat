@@ -319,6 +319,211 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     }
   }
 
+  Future<void> _addFallbackTarget() async {
+    final profile = _editingProfile;
+    if (profile == null) return;
+    final candidates = _profiles.where((p) => p.id != profile.id).toList();
+    if (candidates.isEmpty) {
+      _showModelFetchNotice(AppStrings.noFallbackProfilesAvailable);
+      return;
+    }
+    final target = await _showFallbackTargetDialog(candidates: candidates);
+    if (target == null) return;
+    _replaceEditingFallbackTargets([
+      ...profile.fallbackTargets,
+      target,
+    ]);
+  }
+
+  Future<void> _editFallbackTarget(int index) async {
+    final profile = _editingProfile;
+    if (profile == null ||
+        index < 0 ||
+        index >= profile.fallbackTargets.length) {
+      return;
+    }
+    final candidates = _profiles.where((p) => p.id != profile.id).toList();
+    if (candidates.isEmpty) {
+      _showModelFetchNotice(AppStrings.noFallbackProfilesAvailable);
+      return;
+    }
+    final target = await _showFallbackTargetDialog(
+      candidates: candidates,
+      initial: profile.fallbackTargets[index],
+    );
+    if (target == null) return;
+    final next = [...profile.fallbackTargets];
+    next[index] = target;
+    _replaceEditingFallbackTargets(next);
+  }
+
+  Future<ModelFallbackTarget?> _showFallbackTargetDialog({
+    required List<ProviderProfile> candidates,
+    ModelFallbackTarget? initial,
+  }) async {
+    var selectedProfileId = candidates.any(
+      (profile) => profile.id == initial?.targetProfileId,
+    )
+        ? initial!.targetProfileId
+        : candidates.first.id;
+    final modelController = TextEditingController(
+      text: initial?.modelOverride.trim() ?? '',
+    );
+    final enabled = initial?.enabled ?? true;
+    try {
+      return await showDialog<ModelFallbackTarget>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(
+            initial == null
+                ? AppStrings.addFallbackTarget
+                : AppStrings.editFallbackTarget,
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              DropdownButtonFormField<String>(
+                value: selectedProfileId,
+                decoration: const InputDecoration(
+                  labelText: AppStrings.fallbackTargetProfile,
+                ),
+                items: [
+                  for (final profile in candidates)
+                    DropdownMenuItem(
+                      value: profile.id,
+                      child: Text(
+                        profile.displayName,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
+                onChanged: (value) {
+                  if (value != null) selectedProfileId = value;
+                },
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: modelController,
+                decoration: const InputDecoration(
+                  labelText: AppStrings.fallbackModelOverride,
+                  helperText: AppStrings.fallbackUsesTargetModel,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(
+                ctx,
+                ModelFallbackTarget(
+                  targetProfileId: selectedProfileId,
+                  modelOverride: modelController.text.trim(),
+                  enabled: enabled,
+                ),
+              ),
+              child: const Text(AppStrings.save),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      modelController.dispose();
+    }
+  }
+
+  void _replaceEditingFallbackTargets(List<ModelFallbackTarget> targets) {
+    final editingId = _editingProfileId;
+    final index = _profiles.indexWhere((profile) => profile.id == editingId);
+    if (index < 0) return;
+    setState(() {
+      _profiles[index] = _profiles[index].copyWith(
+        fallbackTargets: _sanitizeFallbackTargetsForProfile(
+          _profiles[index],
+          targets,
+        ),
+      );
+    });
+    _scheduleSave();
+  }
+
+  List<ModelFallbackTarget> _sanitizeFallbackTargetsForProfile(
+    ProviderProfile profile,
+    List<ModelFallbackTarget> targets,
+  ) {
+    final ids = _profiles.map((p) => p.id).toSet();
+    final seen = <String>{};
+    final sanitized = <ModelFallbackTarget>[];
+    for (final target in targets) {
+      final targetId = target.targetProfileId.trim();
+      if (targetId.isEmpty ||
+          targetId == profile.id ||
+          !ids.contains(targetId)) {
+        continue;
+      }
+      final modelOverride = target.modelOverride.trim();
+      final key = '$targetId\n$modelOverride';
+      if (!seen.add(key)) continue;
+      sanitized.add(target.copyWith(
+        targetProfileId: targetId,
+        modelOverride: modelOverride,
+      ));
+    }
+    return sanitized;
+  }
+
+  void _toggleAllFallbackTargets(bool enabled) {
+    final profile = _editingProfile;
+    if (profile == null || profile.fallbackTargets.isEmpty) return;
+    _replaceEditingFallbackTargets(
+      profile.fallbackTargets
+          .map((target) => target.copyWith(enabled: enabled))
+          .toList(),
+    );
+  }
+
+  void _toggleFallbackTarget(int index, bool enabled) {
+    final profile = _editingProfile;
+    if (profile == null ||
+        index < 0 ||
+        index >= profile.fallbackTargets.length) {
+      return;
+    }
+    final next = [...profile.fallbackTargets];
+    next[index] = next[index].copyWith(enabled: enabled);
+    _replaceEditingFallbackTargets(next);
+  }
+
+  void _moveFallbackTarget(int index, int delta) {
+    final profile = _editingProfile;
+    if (profile == null) return;
+    final targetIndex = index + delta;
+    if (index < 0 ||
+        index >= profile.fallbackTargets.length ||
+        targetIndex < 0 ||
+        targetIndex >= profile.fallbackTargets.length) {
+      return;
+    }
+    final next = [...profile.fallbackTargets];
+    final item = next.removeAt(index);
+    next.insert(targetIndex, item);
+    _replaceEditingFallbackTargets(next);
+  }
+
+  void _removeFallbackTarget(int index) {
+    final profile = _editingProfile;
+    if (profile == null ||
+        index < 0 ||
+        index >= profile.fallbackTargets.length) {
+      return;
+    }
+    final next = [...profile.fallbackTargets]..removeAt(index);
+    _replaceEditingFallbackTargets(next);
+  }
+
   Future<void> _fetchModels() async {
     final apiKey = _apiKeyController.text.trim();
     if (apiKey.isEmpty) {
@@ -687,6 +892,154 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     ]);
   }
 
+  Widget _fallbackSettings(ThemeData theme) {
+    final profile = _editingProfile;
+    if (profile == null) return const SizedBox.shrink();
+
+    final targets = profile.fallbackTargets;
+    final hasEnabledTargets = targets.any((target) => target.enabled);
+    return _settingsGroup(theme, [
+      _groupHeader(
+        theme,
+        AppStrings.modelFallback,
+        trailing: TextButton.icon(
+          onPressed: () => unawaited(_addFallbackTarget()),
+          icon: const Icon(Icons.add),
+          label: const Text(AppStrings.addFallbackTarget),
+        ),
+      ),
+      SwitchListTile(
+        title: const Text(AppStrings.modelFallbackEnabled),
+        subtitle: Text(targets.isEmpty
+            ? AppStrings.modelFallbackDisabled
+            : AppStrings.modelFallbackSubtitle),
+        value: targets.isNotEmpty && hasEnabledTargets,
+        onChanged: targets.isEmpty ? null : _toggleAllFallbackTargets,
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        child: Text(
+          AppStrings.modelFallbackPrivacyNotice,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ),
+      if (targets.isEmpty)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+          child: Text(
+            AppStrings.modelFallbackDisabled,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        )
+      else
+        for (var i = 0; i < targets.length; i++)
+          _fallbackTargetTile(theme, targets[i], i, targets.length),
+    ]);
+  }
+
+  Widget _fallbackTargetTile(
+    ThemeData theme,
+    ModelFallbackTarget target,
+    int index,
+    int count,
+  ) {
+    ProviderProfile? targetProfile;
+    for (final profile in _profiles) {
+      if (profile.id == target.targetProfileId) {
+        targetProfile = profile;
+        break;
+      }
+    }
+    if (targetProfile == null) return const SizedBox.shrink();
+    final model = target.effectiveModelFor(targetProfile);
+    final summary = CapabilitySummary.resolve(
+      targetProfile.copyWith(model: model),
+    );
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surface,
+          borderRadius: BorderRadius.circular(AppRadii.s),
+          border: Border.all(color: theme.colorScheme.outline.withAlpha(40)),
+        ),
+        child: ListTile(
+          leading: CircleAvatar(
+            backgroundColor: target.enabled
+                ? theme.colorScheme.primary.withAlpha(20)
+                : theme.colorScheme.surfaceContainerHighest,
+            foregroundColor: target.enabled
+                ? theme.colorScheme.primary
+                : theme.colorScheme.onSurfaceVariant,
+            child: Text('${index + 1}'),
+          ),
+          title: Text(
+            targetProfile.displayName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontWeight: FontWeight.w700),
+          ),
+          subtitle: Text(
+            '$model\n${summary.detailLabel}',
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+          isThreeLine: true,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Switch(
+                value: target.enabled,
+                onChanged: (value) => _toggleFallbackTarget(index, value),
+              ),
+              PopupMenuButton<String>(
+                tooltip: AppStrings.editFallbackTarget,
+                onSelected: (value) {
+                  switch (value) {
+                    case 'edit':
+                      unawaited(_editFallbackTarget(index));
+                    case 'up':
+                      _moveFallbackTarget(index, -1);
+                    case 'down':
+                      _moveFallbackTarget(index, 1);
+                    case 'remove':
+                      _removeFallbackTarget(index);
+                  }
+                },
+                itemBuilder: (context) => [
+                  const PopupMenuItem(
+                    value: 'edit',
+                    child: Text(AppStrings.editFallbackTarget),
+                  ),
+                  PopupMenuItem(
+                    value: 'up',
+                    enabled: index > 0,
+                    child: const Text(AppStrings.moveFallbackTargetUp),
+                  ),
+                  PopupMenuItem(
+                    value: 'down',
+                    enabled: index < count - 1,
+                    child: const Text(AppStrings.moveFallbackTargetDown),
+                  ),
+                  const PopupMenuItem(
+                    value: 'remove',
+                    child: Text(AppStrings.removeFallbackTarget),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          onTap: () => unawaited(_editFallbackTarget(index)),
+        ),
+      ),
+    );
+  }
+
   Widget _capabilitySummaryPanel(ThemeData theme, CapabilitySummary summary) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
@@ -869,6 +1222,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
               children: [
                 _profileList(theme),
                 _profileForm(theme),
+                _fallbackSettings(theme),
                 _advancedSettings(theme),
               ],
             ),

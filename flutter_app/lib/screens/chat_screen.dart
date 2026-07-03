@@ -15,11 +15,14 @@ import '../models/chat_models.dart';
 import '../models/provider_profile.dart';
 import '../providers/chat_provider.dart';
 import '../services/preferences_service.dart';
+import '../services/current_session_search.dart';
 import '../services/file_attachment_service.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/chat_render_window.dart';
+import '../services/shared_content.dart';
 import '../services/tools/tool_policy.dart';
+import '../services/usage_summary_service.dart';
 import '../services/voice_input_state.dart';
 import '../widgets/streaming_text.dart';
 import '../widgets/tool_call_card.dart';
@@ -57,12 +60,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   static const int _loadOlderMessageIncrement = 120;
 
   final _inputController = TextEditingController();
+  final _sessionSearchController = TextEditingController();
   final _scrollController = ScrollController();
   final _focusNode = FocusNode();
   final stt.SpeechToText _speech = stt.SpeechToText();
   final TtsService _tts = TtsService();
   final WhisperService _whisper = WhisperService();
   final VoiceInputStateMachine _voiceInput = VoiceInputStateMachine();
+  final SharedContentPreparer _sharedContentPreparer =
+      const SharedContentPreparer();
+  final UsageSummaryService _usageSummaryService = const UsageSummaryService();
   bool _showScrollToBottom = false;
   bool _approvalDialogOpen = false;
   bool _appInBackground = false;
@@ -85,6 +92,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   ChatRenderWindowState _renderWindowState =
       ChatRenderWindowState.initial(_initialRenderMessageWindow);
   String? _renderWindowSessionId;
+  int? _highlightedSearchMessageIndex;
+  final Map<int, GlobalKey> _messageKeys = {};
 
   bool get _isListening => _voiceInput.isListening;
   bool get _isWhisperRecording => _voiceInput.isWhisperRecording;
@@ -95,6 +104,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _scrollController.addListener(_handleScroll);
     _tts.addListener(_onTtsStateChanged);
+    NativeBridge.setShareIntentHandler(_handleSharedContent);
     _initSpeech();
   }
 
@@ -105,6 +115,79 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   String _briefError(Object error) {
     final text = error.toString().replaceFirst('Exception: ', '');
     return text.length > 160 ? '${text.substring(0, 160)}...' : text;
+  }
+
+  Future<void> _showContextSummaryDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => Consumer<ChatProvider>(
+        builder: (_, provider, __) {
+          final summary = provider.currentContextSummary;
+          return AlertDialog(
+            title: const Text(AppStrings.contextSummary),
+            content: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: summary == null
+                  ? const Text(AppStrings.contextSummaryNone)
+                  : SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            AppStrings.contextSummaryCoverage(
+                              summary.coveredMessageCount,
+                              summary.sourceEstimatedTokens,
+                            ),
+                            style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                                  color: Theme.of(ctx)
+                                      .colorScheme
+                                      .onSurfaceVariant,
+                                ),
+                          ),
+                          const SizedBox(height: 12),
+                          SelectableText(summary.text),
+                        ],
+                      ),
+                    ),
+            ),
+            actions: [
+              if (summary != null)
+                TextButton(
+                  onPressed: () async {
+                    final confirmed = await showDialog<bool>(
+                      context: ctx,
+                      builder: (confirmCtx) => AlertDialog(
+                        title: const Text(AppStrings.contextSummaryClear),
+                        content: const Text(
+                          AppStrings.contextSummaryClearConfirm,
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(confirmCtx, false),
+                            child: const Text(AppStrings.cancel),
+                          ),
+                          FilledButton(
+                            onPressed: () => Navigator.pop(confirmCtx, true),
+                            child: const Text(AppStrings.confirm),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirmed != true) return;
+                    await provider.clearCurrentContextSummary();
+                  },
+                  child: const Text(AppStrings.contextSummaryClear),
+                ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text(AppStrings.close),
+              ),
+            ],
+          );
+        },
+      ),
+    );
   }
 
   void _scheduleToolApprovalDialog(ToolApprovalRequest? request) {
@@ -343,11 +426,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _tts.removeListener(_onTtsStateChanged);
+    NativeBridge.setShareIntentHandler(null);
     unawaited(NativeBridge.cancelSpeechRecognition());
     unawaited(_whisper.cancelRecording());
     _speech.cancel();
     _scrollController.removeListener(_handleScroll);
     _inputController.dispose();
+    _sessionSearchController.dispose();
     _scrollController.dispose();
     _focusNode.dispose();
     super.dispose();
@@ -649,6 +734,76 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     provider.sendMessage(text, attachments: attachments);
   }
 
+  Future<void> _handleSharedContent(SharedContent content) async {
+    if (!mounted || !content.hasPayload) return;
+    final prepared = await _sharedContentPreparer.prepare(content);
+    if (!mounted) return;
+
+    final plan = SharedContentImportPlan.fromPrepared(prepared);
+    if (!plan.createDraft) {
+      if (plan.showFeedback) {
+        _showShareImportSnack(prepared.warnings, contentReady: false);
+      }
+      return;
+    }
+
+    final provider = context.read<ChatProvider>();
+    final session = await provider.createSession();
+    if (!mounted) return;
+
+    setState(() {
+      _lastSessionId = session.id;
+      _pendingAttachments.clear();
+      _pendingAttachmentPreviews.clear();
+      _inputController.text = prepared.draftText;
+      _inputController.selection = TextSelection.collapsed(
+        offset: _inputController.text.length,
+      );
+    });
+
+    final previews = <_PendingAttachmentPreview>[];
+    final contentBlocks = <MessageContent>[];
+    for (final attachment in prepared.attachments) {
+      final insertedText = _appendAttachmentText(attachment.inputText);
+      if (attachment.includeAsContentBlock) {
+        contentBlocks.add(attachment.content);
+      }
+      previews.add(_PendingAttachmentPreview(
+        content: attachment.content,
+        inputText: attachment.inputText,
+        insertedText: insertedText,
+        includeAsContentBlock: attachment.includeAsContentBlock,
+      ));
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _pendingAttachments.addAll(contentBlocks);
+      _pendingAttachmentPreviews.addAll(previews);
+    });
+    provider.saveDraft(session.id, _inputController.text);
+    _focusNode.requestFocus();
+    if (plan.showFeedback) _showShareImportSnack(prepared.warnings);
+  }
+
+  void _showShareImportSnack(
+    List<String> warnings, {
+    bool contentReady = true,
+  }) {
+    if (!mounted) return;
+    final warningText = warnings.take(2).join('；');
+    final message = contentReady
+        ? warnings.isEmpty
+            ? AppStrings.sharedContentReady
+            : '${AppStrings.sharedContentReady}；$warningText'
+        : warningText.isEmpty
+            ? AppStrings.shareFailed
+            : warningText;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
   void _handleScroll() {
     if (!_scrollController.hasClients || _isCompensatingScroll) return;
     _updateScrollState();
@@ -794,6 +949,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _lastMaxScrollExtent = null;
     _trackedAgentSessionId = null;
     _trackedAgentWasActive = false;
+    _highlightedSearchMessageIndex = null;
+    _messageKeys.clear();
     _renderWindowState = _renderWindowState.reset(_initialRenderMessageWindow);
     _renderWindowSessionId = null;
   }
@@ -816,6 +973,282 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         previousOffset: previousOffset,
       );
     }
+  }
+
+  Future<void> _showSessionUsageDialog() async {
+    final provider = context.read<ChatProvider>();
+    final session = provider.currentSession;
+    final summary = _usageSummaryService.forSession(session);
+    await _showUsageSummaryDialog(
+      title: AppStrings.sessionUsageSummary,
+      subtitle: session?.title ?? AppStrings.appName,
+      summary: summary,
+    );
+  }
+
+  Future<void> _showUsageSummaryDialog({
+    required String title,
+    required String subtitle,
+    required UsageSummary summary,
+  }) {
+    return showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              subtitle,
+              style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                  ),
+            ),
+            const SizedBox(height: 12),
+            _usageRow(ctx, AppStrings.usageMessages,
+                '${summary.messagesWithUsage}/${summary.messageCount}'),
+            _usageRow(ctx, AppStrings.usageInputTokens,
+                _formatTokenCount(summary.inputTokens)),
+            _usageRow(ctx, AppStrings.usageOutputTokens,
+                _formatTokenCount(summary.outputTokens)),
+            _usageRow(ctx, AppStrings.usageTotalTokens,
+                _formatTokenCount(summary.totalTokens)),
+            _usageRow(
+              ctx,
+              AppStrings.usageCacheTokens,
+              summary.hasCacheUsage
+                  ? [
+                      if (summary.cacheReadInputTokens != null)
+                        'read ${_formatTokenCount(summary.cacheReadInputTokens!)}',
+                      if (summary.cacheCreationInputTokens != null)
+                        'create ${_formatTokenCount(summary.cacheCreationInputTokens!)}',
+                    ].join(' · ')
+                  : AppStrings.usageUnavailable,
+            ),
+            _usageRow(
+              ctx,
+              AppStrings.usageCost,
+              AppStrings.usageCostUnavailable,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.close),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _usageRow(BuildContext context, String label, String value) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          Text(
+            value,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatTokenCount(int value) {
+    if (value >= 1000000) return '${(value / 1000000).toStringAsFixed(2)}M';
+    if (value >= 1000) return '${(value / 1000).toStringAsFixed(1)}K';
+    return value.toString();
+  }
+
+  Future<void> _showCurrentSessionSearch() async {
+    final provider = context.read<ChatProvider>();
+    final messages = provider.currentSession?.messages ?? const <ChatMessage>[];
+    const search = CurrentSessionSearch();
+    var results = search.search(messages, _sessionSearchController.text);
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        final theme = Theme.of(sheetContext);
+        final maxHeight = MediaQuery.sizeOf(sheetContext).height * 0.72;
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            void updateQuery(String value) {
+              setSheetState(() {
+                results = search.search(messages, value);
+              });
+            }
+
+            return SafeArea(
+              child: SizedBox(
+                height: math.min(560.0, maxHeight),
+                child: Padding(
+                  padding: EdgeInsets.only(
+                    left: 16,
+                    right: 16,
+                    bottom: 16 + MediaQuery.viewInsetsOf(context).bottom,
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        AppStrings.searchCurrentConversation,
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _sessionSearchController,
+                        autofocus: true,
+                        textInputAction: TextInputAction.search,
+                        decoration: InputDecoration(
+                          hintText: AppStrings.searchMessagesHint,
+                          prefixIcon: const Icon(Icons.search),
+                          suffixIcon: _sessionSearchController.text.isEmpty
+                              ? null
+                              : IconButton(
+                                  icon: const Icon(Icons.close),
+                                  onPressed: () {
+                                    _sessionSearchController.clear();
+                                    updateQuery('');
+                                  },
+                                ),
+                          border: const OutlineInputBorder(),
+                        ),
+                        onChanged: updateQuery,
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        _sessionSearchController.text.trim().isEmpty
+                            ? AppStrings.searchMessagesHint
+                            : results.isEmpty
+                                ? AppStrings.noSearchResults
+                                : AppStrings.searchResultCount(results.length),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Expanded(
+                        child: results.isEmpty
+                            ? const Center(
+                                child: Text(AppStrings.noSearchResults),
+                              )
+                            : ListView.separated(
+                                itemCount: results.length,
+                                separatorBuilder: (_, __) =>
+                                    const Divider(height: 1),
+                                itemBuilder: (context, index) {
+                                  final result = results[index];
+                                  return ListTile(
+                                    dense: true,
+                                    leading: CircleAvatar(
+                                      radius: 14,
+                                      child: Text('${index + 1}'),
+                                    ),
+                                    title: Text(
+                                      AppStrings.searchResultPosition(
+                                        result.messageIndex,
+                                      ),
+                                    ),
+                                    subtitle: Text(
+                                      result.preview,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    onTap: () {
+                                      Navigator.pop(sheetContext);
+                                      _jumpToMessageIndex(
+                                        result.messageIndex,
+                                        messages.length,
+                                      );
+                                    },
+                                  );
+                                },
+                              ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _jumpToMessageIndex(int messageIndex, int totalMessageCount) {
+    if (totalMessageCount <= 0) return;
+    final safeIndex = messageIndex.clamp(0, totalMessageCount - 1).toInt();
+    setState(() {
+      _highlightedSearchMessageIndex = safeIndex;
+      _renderWindowState = _renderWindowState.ensureIncludes(
+        totalCount: totalMessageCount,
+        messageIndex: safeIndex,
+      );
+    });
+    _scheduleScrollToMessageIndex(safeIndex, totalMessageCount);
+  }
+
+  void _scheduleScrollToMessageIndex(int messageIndex, int totalMessageCount) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final contextForKey = _messageKeys[messageIndex]?.currentContext;
+      if (contextForKey != null) {
+        Scrollable.ensureVisible(
+          contextForKey,
+          duration: const Duration(milliseconds: 260),
+          curve: Curves.easeOutCubic,
+          alignment: 0.18,
+        );
+        _updateScrollState();
+        return;
+      }
+
+      final position = _scrollController.position;
+      final window = _renderWindowState.windowFor(totalMessageCount);
+      final target = estimatedReversedListOffsetForMessageIndex(
+        window: window,
+        messageIndex: messageIndex,
+        maxScrollExtent: position.maxScrollExtent,
+      );
+      _isCompensatingScroll = true;
+      _scrollController.jumpTo(
+        target.clamp(position.minScrollExtent, position.maxScrollExtent),
+      );
+      _isCompensatingScroll = false;
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final contextForKey = _messageKeys[messageIndex]?.currentContext;
+        if (contextForKey == null) return;
+        Scrollable.ensureVisible(
+          contextForKey,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          alignment: 0.18,
+        );
+        _updateScrollState();
+      });
+    });
   }
 
   _MessageWindow _messageWindowFor(List<ChatMessage> messages) {
@@ -885,6 +1318,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.search),
+            tooltip: AppStrings.searchCurrentConversation,
+            onPressed: _showCurrentSessionSearch,
+          ),
+          IconButton(
             icon: const Icon(Icons.add),
             tooltip: AppStrings.newChat,
             onPressed: () => context.read<ChatProvider>().createSession(),
@@ -899,12 +1337,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   _showSystemPromptDialog();
                 case 'session_system_prompt':
                   _showSessionSystemPromptDialog();
+                case 'prompt_profiles':
+                  _showPromptProfilesDialog();
                 case 'switch_model':
                   _showSwitchModelDialog();
                 case 'regenerate':
                   context.read<ChatProvider>().regenerateLastResponse();
                 case 'compare':
                   _showCompareDialog();
+                case 'context_summary':
+                  _showContextSummaryDialog();
+                case 'usage':
+                  _showSessionUsageDialog();
                 case 'terminal':
                   Navigator.of(context).push(CupertinoPageRoute(
                       builder: (_) => const TerminalScreen()));
@@ -932,6 +1376,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       dense: true,
                     )),
                 const PopupMenuItem(
+                    value: 'context_summary',
+                    child: ListTile(
+                      leading: Icon(Icons.summarize_outlined),
+                      title: Text(AppStrings.contextSummary),
+                      dense: true,
+                    )),
+                if (provider.currentSession != null)
+                  const PopupMenuItem(
+                      value: 'usage',
+                      child: ListTile(
+                        leading: Icon(Icons.query_stats),
+                        title: Text(AppStrings.usageSummary),
+                        dense: true,
+                      )),
+                const PopupMenuItem(
                     value: 'switch_model',
                     child: ListTile(
                       leading: Icon(Icons.swap_horiz),
@@ -957,6 +1416,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     child: ListTile(
                       leading: Icon(Icons.tune),
                       title: Text(AppStrings.systemPromptTitle),
+                      dense: true,
+                    )),
+                const PopupMenuItem(
+                    value: 'prompt_profiles',
+                    child: ListTile(
+                      leading: Icon(Icons.badge_outlined),
+                      title: Text(AppStrings.promptProfiles),
                       dense: true,
                     )),
                 const PopupMenuItem(
@@ -1078,6 +1544,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
                     final window = _messageWindowFor(messages);
                     final visibleMessages = window.messages;
+                    _retainMessageKeysForWindow(
+                      window.startIndex,
+                      window.startIndex + visibleMessages.length,
+                    );
                     final hasLoadOlder = window.hiddenBeforeCount > 0;
                     final virtualMessageStart = hasLoadOlder ? 1 : 0;
                     final extraItemCount =
@@ -1160,15 +1630,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               return _AnimatedMessageEntry(
                                 key: ValueKey(animationId),
                                 animate: animate,
-                                child: RepaintBoundary(
-                                  child: _buildMessageBubble(
-                                    message,
-                                    originalIndex,
-                                    theme,
-                                    maxContentWidth,
-                                    messages: messages,
-                                    previousRole: previousRole,
-                                    nextRole: nextRole,
+                                child: KeyedSubtree(
+                                  key: _keyForMessageIndex(originalIndex),
+                                  child: RepaintBoundary(
+                                    child: _buildMessageBubble(
+                                      message,
+                                      originalIndex,
+                                      theme,
+                                      maxContentWidth,
+                                      messages: messages,
+                                      previousRole: previousRole,
+                                      nextRole: nextRole,
+                                      highlighted: originalIndex ==
+                                          _highlightedSearchMessageIndex,
+                                    ),
                                   ),
                                 ),
                               );
@@ -1225,6 +1700,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   String _messageAnimationId(ChatMessage message) {
     return '${message.timestamp.microsecondsSinceEpoch}-${message.role}-${message.content.length}';
+  }
+
+  GlobalKey _keyForMessageIndex(int messageIndex) {
+    return _messageKeys.putIfAbsent(
+      messageIndex,
+      () => GlobalObjectKey('chat-message-$messageIndex'),
+    );
+  }
+
+  void _retainMessageKeysForWindow(int startIndex, int endIndexExclusive) {
+    _messageKeys.removeWhere(
+      (index, _) => index < startIndex || index >= endIndexExclusive,
+    );
   }
 
   Widget _buildScrollToBottomButton(ThemeData theme) {
@@ -1398,6 +1886,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     required List<ChatMessage> messages,
     String? previousRole,
     String? nextRole,
+    bool highlighted = false,
   }) {
     if (message.isSystemNotice) {
       return _buildSystemNotice(message, theme);
@@ -1410,7 +1899,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ? <MessageContent>[TextContent(message.textContent)]
         : message.content;
 
-    return Padding(
+    final bubble = Padding(
       padding: EdgeInsets.only(
         top: _halfMessageGap(previousRole, message.role),
         bottom: _halfMessageGap(nextRole, message.role),
@@ -1447,6 +1936,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           if (!isUser) _buildAssistantFooter(message, messageId, theme),
         ],
       ),
+    );
+
+    if (!highlighted) return bubble;
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.secondaryContainer.withAlpha(85),
+        borderRadius: BorderRadius.circular(AppRadii.l),
+        border: Border.all(
+          color: theme.colorScheme.secondary.withAlpha(120),
+        ),
+      ),
+      child: bubble,
     );
   }
 
@@ -1692,6 +2197,108 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _compactBeforeMessage(int? messageIndex) async {
+    if (messageIndex == null) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final provider = context.read<ChatProvider>();
+    if (!provider.canRebuildCurrentContextSummary) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text(AppStrings.contextSummaryBusy),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+    messenger.showSnackBar(
+      const SnackBar(content: Text(AppStrings.contextSummaryGenerating)),
+    );
+    final result = await provider.rebuildContextSummaryBeforeMessage(
+      messageIndex,
+    );
+    if (!mounted) return;
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(result.message),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  bool _canEditMessage(ChatMessage? message) {
+    return message != null &&
+        message.role == 'user' &&
+        message.textContent.trim().isNotEmpty &&
+        message.toolResults.isEmpty;
+  }
+
+  Future<void> _showEditMessageDialog(
+    ChatMessage? message,
+    int? messageIndex,
+  ) async {
+    if (!_canEditMessage(message) || messageIndex == null) return;
+    final provider = context.read<ChatProvider>();
+    final controller = TextEditingController(text: message!.textContent);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.editMessage),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: TextField(
+            controller: controller,
+            autofocus: true,
+            minLines: 4,
+            maxLines: 10,
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              hintText: AppStrings.editMessageHint,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text(AppStrings.editAndResend),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (!mounted || result == null) return;
+
+    final status = await provider.editUserMessageAndResend(
+      messageIndex,
+      result,
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(_editMessageStatusText(status)),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  String _editMessageStatusText(EditUserMessageBranchStatus status) {
+    return switch (status) {
+      EditUserMessageBranchStatus.started =>
+        AppStrings.editMessageBranchStarted,
+      EditUserMessageBranchStatus.empty => AppStrings.editMessageEmpty,
+      EditUserMessageBranchStatus.invalidMessage =>
+        AppStrings.editMessageInvalid,
+      EditUserMessageBranchStatus.busy => AppStrings.editMessageBlockedActive,
+      EditUserMessageBranchStatus.missingApiKey =>
+        AppStrings.editMessageMissingApiKey,
+      EditUserMessageBranchStatus.failed => AppStrings.editMessageBranchFailed,
+    };
+  }
+
   void _showMessageActions({
     required String text,
     required ChatMessage? message,
@@ -1700,6 +2307,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final actionText = text.isNotEmpty
         ? text
         : _messageToMarkdown(message, fallbackText: text);
+    final compactEnabled =
+        context.read<ChatProvider>().canRebuildCurrentContextSummary;
     HapticFeedback.lightImpact();
     showModalBottomSheet(
       context: context,
@@ -1707,6 +2316,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (_canEditMessage(message))
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text(AppStrings.editMessage),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  await _showEditMessageDialog(message, messageIndex);
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.copy),
               title: const Text(AppStrings.copyText),
@@ -1761,6 +2379,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 await _forkFromMessage(messageIndex);
               },
             ),
+            if (messageIndex != null && messageIndex > 0)
+              ListTile(
+                leading: const Icon(Icons.summarize_outlined),
+                title: const Text(AppStrings.contextSummaryManualCompactBefore),
+                subtitle: compactEnabled
+                    ? null
+                    : const Text(AppStrings.contextSummaryBusy),
+                enabled: compactEnabled,
+                onTap: compactEnabled
+                    ? () async {
+                        Navigator.pop(ctx);
+                        await _compactBeforeMessage(messageIndex);
+                      }
+                    : null,
+              ),
             ListTile(
               leading: const Icon(Icons.format_quote),
               title: const Text(AppStrings.quoteReply),
@@ -2182,6 +2815,266 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (result != null) {
       provider.updateSessionSystemPrompt(result.isEmpty ? null : result);
     }
+  }
+
+  Future<void> _showPromptProfilesDialog() async {
+    final provider = context.read<ChatProvider>();
+    final messenger = ScaffoldMessenger.of(context);
+    final prefs = PreferencesService();
+    await prefs.init();
+    if (!mounted) return;
+
+    var profiles = prefs.promptProfiles;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) {
+          void reload() {
+            setDialogState(() {
+              profiles = prefs.promptProfiles;
+            });
+          }
+
+          return AlertDialog(
+            title: const Text(AppStrings.promptProfiles),
+            content: SizedBox(
+              width: double.maxFinite,
+              height: 420,
+              child: profiles.isEmpty
+                  ? const Center(child: Text(AppStrings.promptProfilesEmpty))
+                  : ListView.separated(
+                      itemCount: profiles.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (_, index) {
+                        final profile = profiles[index];
+                        final hasSession = provider.currentSession != null;
+                        return ListTile(
+                          title: Text(profile.name),
+                          subtitle: Text(
+                            _promptProfilePreview(profile.systemPrompt),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: PopupMenuButton<String>(
+                            onSelected: (value) async {
+                              switch (value) {
+                                case 'apply_global':
+                                  prefs.systemPrompt = profile.systemPrompt;
+                                  if (!dialogContext.mounted) return;
+                                  Navigator.pop(dialogContext);
+                                  messenger.showSnackBar(
+                                    const SnackBar(
+                                      content: Text(
+                                        AppStrings.promptProfileAppliedGlobal,
+                                      ),
+                                    ),
+                                  );
+                                  return;
+                                case 'apply_session':
+                                  if (provider.currentSession == null) return;
+                                  await provider.updateSessionSystemPrompt(
+                                    profile.systemPrompt,
+                                  );
+                                  if (!dialogContext.mounted) return;
+                                  Navigator.pop(dialogContext);
+                                  messenger.showSnackBar(
+                                    const SnackBar(
+                                      content: Text(
+                                        AppStrings.promptProfileAppliedSession,
+                                      ),
+                                    ),
+                                  );
+                                  return;
+                                case 'edit':
+                                  final saved =
+                                      await _showPromptProfileEditorDialog(
+                                    profile: profile,
+                                  );
+                                  if (!dialogContext.mounted) return;
+                                  if (saved) reload();
+                                  return;
+                                case 'delete':
+                                  final confirmed =
+                                      await _confirmDeletePromptProfile();
+                                  if (!dialogContext.mounted) return;
+                                  if (confirmed) {
+                                    await prefs.deletePromptProfile(profile.id);
+                                    if (!dialogContext.mounted) return;
+                                    reload();
+                                  }
+                                  return;
+                              }
+                            },
+                            itemBuilder: (_) => [
+                              const PopupMenuItem(
+                                value: 'apply_global',
+                                child: ListTile(
+                                  leading: Icon(Icons.public),
+                                  title: Text(
+                                    AppStrings.promptProfileApplyGlobal,
+                                  ),
+                                  dense: true,
+                                ),
+                              ),
+                              PopupMenuItem(
+                                value: 'apply_session',
+                                enabled: hasSession,
+                                child: const ListTile(
+                                  leading: Icon(Icons.chat_bubble_outline),
+                                  title: Text(
+                                    AppStrings.promptProfileApplySession,
+                                  ),
+                                  dense: true,
+                                ),
+                              ),
+                              const PopupMenuItem(
+                                value: 'edit',
+                                child: ListTile(
+                                  leading: Icon(Icons.edit_outlined),
+                                  title: Text(AppStrings.promptProfileEdit),
+                                  dense: true,
+                                ),
+                              ),
+                              const PopupMenuItem(
+                                value: 'delete',
+                                child: ListTile(
+                                  leading: Icon(Icons.delete_outline),
+                                  title: Text(AppStrings.delete),
+                                  dense: true,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text(AppStrings.close),
+              ),
+              FilledButton.icon(
+                icon: const Icon(Icons.add),
+                label: const Text(AppStrings.promptProfileAdd),
+                onPressed: () async {
+                  final saved = await _showPromptProfileEditorDialog();
+                  if (!dialogContext.mounted) return;
+                  if (saved) reload();
+                },
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<bool> _showPromptProfileEditorDialog({
+    PromptProfile? profile,
+  }) async {
+    final prefs = PreferencesService();
+    await prefs.init();
+    if (!mounted) return false;
+
+    final nameController = TextEditingController(text: profile?.name ?? '');
+    final promptController =
+        TextEditingController(text: profile?.systemPrompt ?? '');
+    final result = await showDialog<({String name, String prompt})>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(
+          profile == null
+              ? AppStrings.promptProfileAdd
+              : AppStrings.promptProfileEdit,
+        ),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 360,
+          child: Column(
+            children: [
+              TextField(
+                controller: nameController,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: AppStrings.promptProfileName,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: TextField(
+                  controller: promptController,
+                  maxLines: null,
+                  expands: true,
+                  textAlignVertical: TextAlignVertical.top,
+                  decoration: const InputDecoration(
+                    labelText: AppStrings.promptProfilePrompt,
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, (
+              name: nameController.text,
+              prompt: promptController.text,
+            )),
+            child: const Text(AppStrings.save),
+          ),
+        ],
+      ),
+    );
+    nameController.dispose();
+    promptController.dispose();
+    if (result == null) return false;
+
+    try {
+      await prefs.savePromptProfile(
+        id: profile?.id,
+        name: result.name,
+        systemPrompt: result.prompt,
+      );
+      return true;
+    } on ArgumentError {
+      if (!mounted) return false;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.promptProfileInvalid)),
+      );
+      return false;
+    }
+  }
+
+  Future<bool> _confirmDeletePromptProfile() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.delete),
+        content: const Text(AppStrings.promptProfileDeleteConfirm),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(AppStrings.delete),
+          ),
+        ],
+      ),
+    );
+    return confirmed ?? false;
+  }
+
+  String _promptProfilePreview(String prompt) {
+    return prompt.trim().replaceAll(RegExp(r'\s+'), ' ');
   }
 
   Future<void> _showSwitchModelDialog() async {
@@ -2925,12 +3818,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             FilledButton(
               onPressed: selectedModels.length >= 2
                   ? () {
-                      debugPrint(
-                        '[COMPARE] Button pressed. selectedModels=$selectedModels, count=${selectedModels.length}',
-                      );
-                      debugPrint(
-                        '[COMPARE] textLength=${textController.text.length}',
-                      );
                       final selectedModelList = selectedModels.toList();
                       final selectedModelCount = selectedModelList.length;
                       final text = textController.text.trim();

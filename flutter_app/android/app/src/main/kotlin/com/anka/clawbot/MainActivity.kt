@@ -12,6 +12,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.BatteryManager
 import android.os.PowerManager
+import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -39,6 +40,8 @@ class MainActivity : FlutterActivity() {
     private var mediaRecorder: MediaRecorder? = null
     private var recordingPath: String? = null
     private var pendingNavigateToSessionId: String? = null
+    private var pendingShareIntent: Map<String, Any?>? = null
+    private var shareCallbackChannel: MethodChannel? = null
     private var mediaPlayer: MediaPlayer? = null
 
     private fun safeRunOnUiThread(action: () -> Unit) {
@@ -67,7 +70,13 @@ class MainActivity : FlutterActivity() {
             }.start()
         }
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+        val mainChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        shareCallbackChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            SHARE_CALLBACK_CHANNEL
+        )
+
+        mainChannel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "getProotPath" -> result.success(processManager.getProotPath())
                 "getArch" -> result.success(ArchUtils.getArch())
@@ -578,10 +587,10 @@ class MainActivity : FlutterActivity() {
                                 setDataSource(path)
                                 setOnCompletionListener {
                                     safeRunOnUiThread {
-                                        flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
-                                            MethodChannel(messenger, CHANNEL)
-                                                .invokeMethod("onAudioComplete", null)
-                                        }
+                                        MethodChannel(
+                                            flutterEngine.dartExecutor.binaryMessenger,
+                                            CHANNEL
+                                        ).invokeMethod("onAudioComplete", null)
                                     }
                                     release()
                                     mediaPlayer = null
@@ -589,10 +598,10 @@ class MainActivity : FlutterActivity() {
                                 setOnErrorListener { _, what, extra ->
                                     Log.e("ClawChat", "MediaPlayer error: what=$what extra=$extra")
                                     safeRunOnUiThread {
-                                        flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
-                                            MethodChannel(messenger, CHANNEL)
-                                                .invokeMethod("onAudioComplete", null)
-                                        }
+                                        MethodChannel(
+                                            flutterEngine.dartExecutor.binaryMessenger,
+                                            CHANNEL
+                                        ).invokeMethod("onAudioComplete", null)
                                     }
                                     release()
                                     mediaPlayer = null
@@ -632,6 +641,10 @@ class MainActivity : FlutterActivity() {
                     result.success(pendingNavigateToSessionId)
                     pendingNavigateToSessionId = null
                 }
+                "consumePendingShareIntent" -> {
+                    result.success(pendingShareIntent)
+                    pendingShareIntent = null
+                }
                 else -> result.notImplemented()
             }
         }
@@ -643,12 +656,216 @@ class MainActivity : FlutterActivity() {
         createAgentCompleteNotificationChannel()
         requestNotificationPermission()
         handleNavigateToSession(intent)
+        handleShareIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleNavigateToSession(intent)
+        handleShareIntent(intent)
+    }
+
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent == null || intent.getBooleanExtra(SHARE_CONSUMED_EXTRA, false)) return
+        val action = intent.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+
+        val shareIntent = Intent(intent)
+        intent.putExtra(SHARE_CONSUMED_EXTRA, true)
+        Thread {
+            cleanupOldSharedIntentCache()
+            val payload = try {
+                parseShareIntent(shareIntent)
+            } catch (_: Exception) {
+                mapOf(
+                    "text" to "",
+                    "subject" to null,
+                    "images" to emptyList<Map<String, Any?>>(),
+                    "errors" to listOf("Unable to import shared content")
+                )
+            }
+            safeRunOnUiThread {
+                deliverSharePayload(payload)
+            }
+        }.start()
+    }
+
+    private fun deliverSharePayload(payload: Map<String, Any?>) {
+        val hasText = (payload["text"] as? String)?.isNotBlank() == true
+        val hasImages = (payload["images"] as? List<*>)?.isNotEmpty() == true
+        val hasErrors = (payload["errors"] as? List<*>)?.isNotEmpty() == true
+        if (!hasText && !hasImages && !hasErrors) return
+
+        pendingShareIntent = payload
+        shareCallbackChannel?.invokeMethod(
+            "onShareIntent",
+            payload,
+            object : MethodChannel.Result {
+                override fun success(result: Any?) {
+                    if (result == true) pendingShareIntent = null
+                }
+
+                override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) {
+                }
+
+                override fun notImplemented() {
+                }
+            }
+        )
+    }
+
+    private fun parseShareIntent(intent: Intent): Map<String, Any?> {
+        val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        val subject = intent.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()?.trim()
+        val images = mutableListOf<Map<String, Any?>>()
+        val errors = mutableListOf<String>()
+        val seenUris = mutableSetOf<String>()
+        var imageCandidates = 0
+        var skippedImageCount = 0
+
+        for (uri in sharedStreamUris(intent)) {
+            if (!seenUris.add(uri.toString())) continue
+            val mimeType = contentResolver.getType(uri) ?: intent.type.orEmpty()
+            if (!mimeType.startsWith("image/")) {
+                errors.add("Unsupported shared file type: ${mimeType.ifBlank { "unknown" }}")
+                continue
+            }
+            if (imageCandidates >= MAX_SHARED_IMAGES) {
+                skippedImageCount += 1
+                continue
+            }
+            val imageIndex = imageCandidates
+            imageCandidates += 1
+            try {
+                images.add(copySharedImageToCache(uri, imageIndex, mimeType))
+            } catch (e: Exception) {
+                errors.add(e.message ?: "Unable to import shared image")
+            }
+        }
+        if (skippedImageCount > 0) {
+            errors.add(
+                "Shared image limit is $MAX_SHARED_IMAGES; skipped $skippedImageCount extra image(s)"
+            )
+        }
+
+        return mapOf(
+            "text" to text,
+            "subject" to subject,
+            "images" to images,
+            "errors" to errors
+        )
+    }
+
+    @Suppress("DEPRECATION")
+    private fun sharedStreamUris(intent: Intent): List<Uri> {
+        val uris = mutableListOf<Uri>()
+        val single = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+        if (single != null) uris.add(single)
+        val multiple = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+        if (multiple != null) uris.addAll(multiple)
+        val clipData = intent.clipData
+        if (clipData != null) {
+            for (i in 0 until clipData.itemCount) {
+                clipData.getItemAt(i).uri?.let { uris.add(it) }
+            }
+        }
+        return uris
+    }
+
+    private fun copySharedImageToCache(
+        uri: Uri,
+        index: Int,
+        mimeType: String
+    ): Map<String, Any?> {
+        val declaredSize = queryOpenableLong(uri, OpenableColumns.SIZE)
+        if (declaredSize != null && declaredSize > MAX_SHARED_IMAGE_BYTES) {
+            throw IllegalArgumentException(
+                "Shared image is too large (${declaredSize} bytes)"
+            )
+        }
+
+        val displayName = queryOpenableString(uri, OpenableColumns.DISPLAY_NAME)
+            ?: "shared-image-$index${extensionForMime(mimeType)}"
+        val safeName = sanitizeSharedFileName(displayName)
+        val dir = File(cacheDir, SHARED_INTENT_CACHE_DIR).apply { mkdirs() }
+        val dest = File(dir, "${System.currentTimeMillis()}-$index-$safeName")
+        var total = 0L
+
+        val input = contentResolver.openInputStream(uri)
+            ?: throw IllegalArgumentException("Unable to open shared image")
+        input.use { source ->
+            dest.outputStream().use { target ->
+                val buffer = ByteArray(16 * 1024)
+                while (true) {
+                    val read = source.read(buffer)
+                    if (read < 0) break
+                    total += read.toLong()
+                    if (total > MAX_SHARED_IMAGE_BYTES) {
+                        target.close()
+                        dest.delete()
+                        throw IllegalArgumentException("Shared image is too large")
+                    }
+                    target.write(buffer, 0, read)
+                }
+            }
+        }
+
+        return mapOf(
+            "path" to dest.absolutePath,
+            "name" to safeName,
+            "size" to total,
+            "mimeType" to mimeType
+        )
+    }
+
+    private fun queryOpenableString(uri: Uri, column: String): String? {
+        return try {
+            contentResolver.query(uri, arrayOf(column), null, null, null)?.use { cursor ->
+                val index = cursor.getColumnIndex(column)
+                if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
+            }
+        } catch (_: Exception) { null }
+    }
+
+    private fun queryOpenableLong(uri: Uri, column: String): Long? {
+        return try {
+            contentResolver.query(uri, arrayOf(column), null, null, null)?.use { cursor ->
+                val index = cursor.getColumnIndex(column)
+                if (index < 0 || !cursor.moveToFirst()) return@use null
+                if (cursor.isNull(index)) null else cursor.getLong(index)
+            }
+        } catch (_: Exception) { null }
+    }
+
+    private fun sanitizeSharedFileName(name: String): String {
+        val sanitized = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .trim('_', '.', '-')
+        return sanitized.ifBlank { "shared-image" }
+    }
+
+    private fun extensionForMime(mimeType: String): String {
+        return when (mimeType.lowercase()) {
+            "image/jpeg", "image/jpg" -> ".jpg"
+            "image/gif" -> ".gif"
+            "image/webp" -> ".webp"
+            else -> ".png"
+        }
+    }
+
+    private fun cleanupOldSharedIntentCache() {
+        val cutoff = System.currentTimeMillis() - SHARED_INTENT_CACHE_TTL_MS
+        val dir = File(cacheDir, SHARED_INTENT_CACHE_DIR)
+        if (!dir.exists()) return
+        try {
+            dir.listFiles()?.forEach { file ->
+                val modified = file.lastModified()
+                if (file.isFile && modified > 0 && modified < cutoff) {
+                    file.delete()
+                }
+            }
+        } catch (_: Exception) {
+        }
     }
 
     private fun handleNavigateToSession(intent: Intent?) {
@@ -843,6 +1060,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         const val CHANNEL_ID = "clawchat_main"
         const val AGENT_CALLBACK_CHANNEL = "com.anka.clawbot/native/agent_callbacks"
+        const val SHARE_CALLBACK_CHANNEL = "com.anka.clawbot/native/share_callbacks"
         const val AGENT_COMPLETE_CHANNEL_ID = "clawchat_agent_complete_v2"
         const val NOTIFICATION_PERMISSION_REQUEST = 1001
         const val STORAGE_PERMISSION_REQUEST = 1003
@@ -850,5 +1068,10 @@ class MainActivity : FlutterActivity() {
         const val SPEECH_REQUEST = 1005
         const val TOOL_AUTO_APPROVED_NOTIFICATION_ID = 2001
         const val AGENT_COMPLETE_NOTIFICATION_ID = 2002
+        const val SHARE_CONSUMED_EXTRA = "com.anka.clawbot.SHARE_CONSUMED"
+        const val MAX_SHARED_IMAGE_BYTES = 3L * 1024L * 1024L
+        const val MAX_SHARED_IMAGES = 9
+        const val SHARED_INTENT_CACHE_DIR = "shared_intents"
+        const val SHARED_INTENT_CACHE_TTL_MS = 7L * 24L * 60L * 60L * 1000L
     }
 }

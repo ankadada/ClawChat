@@ -5,7 +5,8 @@ void main() {
   group('ToolPolicy approval flow', () {
     test('safe tools pass without approval callback', () async {
       final policy = ToolPolicy(
-        onApprovalRequired: (_) => fail('safe tool should not request approval'),
+        onApprovalRequired: (_) =>
+            fail('safe tool should not request approval'),
       );
 
       final approved = await policy.approve(const ToolApprovalRequest(
@@ -70,6 +71,75 @@ void main() {
       expect(await policy.approve(request), isTrue);
       expect(await policy.approve(request), isTrue);
       expect(callbackCount, 1);
+    });
+
+    test('denied tools bypass approval callback', () async {
+      var callbackCount = 0;
+      final policy = ToolPolicy(
+        deniedToolNames: const {'bash'},
+        onApprovalRequired: (_) {
+          callbackCount++;
+          return true;
+        },
+      );
+
+      const request = ToolApprovalRequest(
+        toolName: 'bash',
+        arguments: {'command': 'pwd'},
+        risk: ToolRisk.dangerous,
+      );
+
+      final deny = policy.denyFor(request);
+      expect(deny?.ruleType, 'tool');
+      expect(deny?.ruleId, 'tool:bash');
+      expect(await policy.approve(request), isFalse);
+      expect(callbackCount, 0);
+    });
+
+    test('bash deny patterns match before approval', () async {
+      var callbackCount = 0;
+      final policy = ToolPolicy(
+        bashCommandDenyPatterns: const [r'rm\s+-rf'],
+        onApprovalRequired: (_) {
+          callbackCount++;
+          return true;
+        },
+      );
+
+      const request = ToolApprovalRequest(
+        toolName: 'bash',
+        arguments: {'command': 'rm -rf /tmp/example'},
+        risk: ToolRisk.dangerous,
+      );
+
+      final deny = policy.denyFor(request);
+      expect(deny?.ruleType, 'bash_pattern');
+      expect(deny?.ruleId, 'bash_pattern_1');
+      expect(await policy.approve(request), isFalse);
+      expect(callbackCount, 0);
+    });
+
+    test('bash deny patterns also apply to MCP command arguments', () async {
+      var callbackCount = 0;
+      final policy = ToolPolicy(
+        bashCommandDenyPatterns: const [r'rm\s+-rf'],
+        onApprovalRequired: (_) {
+          callbackCount++;
+          return true;
+        },
+      );
+
+      const request = ToolApprovalRequest(
+        toolName: 'mcp_12345678_shell_abcd1234',
+        arguments: {'command': 'rm -rf /tmp/example'},
+        risk: ToolRisk.moderate,
+      );
+
+      final deny = policy.denyFor(request);
+      expect(deny?.ruleType, 'bash_pattern');
+      expect(deny?.ruleId, 'bash_pattern_1');
+      expect(await policy.approve(request), isFalse);
+      expect(callbackCount, 0);
     });
   });
 }

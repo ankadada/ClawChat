@@ -1,6 +1,7 @@
 import '../../services/llm_service.dart';
 import '../../models/chat_models.dart';
 import '../llm_content_sanitizer.dart';
+import '../mcp_service.dart';
 import '../preferences_service.dart';
 import 'bash_tool.dart';
 import 'env_var_tool.dart';
@@ -39,11 +40,15 @@ abstract class Tool {
 class ToolRegistry {
   final Map<String, Tool> _tools = {};
   final Map<String, ToolRisk> _risks = {};
+  final Set<String> _mcpToolNames = {};
+  final McpService? _mcpService;
 
-  ToolRegistry();
+  ToolRegistry({McpService? mcpService}) : _mcpService = mcpService;
 
   factory ToolRegistry.withDefaults({PreferencesService? prefs}) {
-    final registry = ToolRegistry();
+    final registry = ToolRegistry(
+      mcpService: prefs == null ? null : McpService(prefs: prefs),
+    );
     registry.register(BashTool(), risk: ToolRisk.dangerous);
     registry.register(ReadFileTool(), risk: ToolRisk.moderate);
     registry.register(WriteFileTool(), risk: ToolRisk.dangerous);
@@ -74,6 +79,25 @@ class ToolRegistry {
 
   List<ToolDefinition> getToolDefinitions() {
     return _tools.values.map((t) => t.toDefinition()).toList();
+  }
+
+  Future<void> refreshMcpTools() async {
+    final service = _mcpService;
+    if (service == null) return;
+    for (final name in _mcpToolNames) {
+      unregister(name);
+    }
+    _mcpToolNames.clear();
+
+    final tools = await service.loadTools();
+    for (final tool in tools) {
+      register(tool, risk: ToolRisk.moderate);
+      _mcpToolNames.add(tool.name);
+    }
+  }
+
+  Future<void> dispose() async {
+    await _mcpService?.dispose();
   }
 
   Map<String, dynamic>? inputSchemaFor(String name) =>

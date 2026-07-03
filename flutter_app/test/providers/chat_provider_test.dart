@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,6 +8,7 @@ import 'package:clawchat/models/model_capabilities.dart' as caps;
 import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
+import 'package:clawchat/services/config_export_service.dart';
 import 'package:clawchat/services/context_summary_service.dart';
 import 'package:clawchat/services/startup_restore_guard.dart';
 import 'package:clawchat/services/llm_service.dart';
@@ -34,6 +36,19 @@ List<Map<String, dynamic>> truncateToFit(List<Map<String, dynamic>> messages) {
     maxTokens: _maxContextTokens,
     estimator: const TokenEstimator(),
   ).messages;
+}
+
+Future<void> _waitUntil(
+  bool Function() condition, {
+  Duration timeout = const Duration(seconds: 2),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (!condition()) {
+    if (DateTime.now().isAfter(deadline)) {
+      throw TimeoutException('condition was not met');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
 }
 
 void main() {
@@ -128,6 +143,45 @@ void main() {
     });
   }
 
+  void configureModelFallbackProfiles({
+    List<ProviderProfile>? fallbackProfiles,
+    List<ModelFallbackTarget>? targets,
+    int primaryThinkingBudget = 0,
+    int contextTokenBudget = 65536,
+  }) {
+    final configuredTargets = targets ??
+        const [
+          ModelFallbackTarget(targetProfileId: 'fallback'),
+        ];
+    final primary = ProviderProfile.defaults().copyWith(
+      id: 'primary',
+      name: 'Primary',
+      apiKey: 'sk-test-primary',
+      apiFormat: ProviderProfile.anthropicFormat,
+      baseUrl: 'http://primary.test',
+      model: 'claude-primary-200k',
+      thinkingBudget: primaryThinkingBudget,
+      fallbackTargets: configuredTargets,
+    );
+    final fallback = ProviderProfile.defaults().copyWith(
+      id: 'fallback',
+      name: 'Fallback',
+      apiKey: 'sk-test-fallback',
+      apiFormat: ProviderProfile.anthropicFormat,
+      baseUrl: 'http://fallback.test',
+      model: 'claude-fallback-200k',
+      thinkingBudget: primaryThinkingBudget,
+    );
+    secureStorage['provider_profiles'] = jsonEncode([
+      primary.toJson(),
+      ...(fallbackProfiles ?? [fallback]).map((profile) => profile.toJson()),
+    ]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'primary',
+      'context_token_budget': contextTokenBudget,
+    });
+  }
+
   group('alternative navigation', () {
     setUp(() async {
       await installPlatformMocks();
@@ -179,6 +233,390 @@ void main() {
       expect(message.alternatives, ['v1']);
 
       await Future<void>.delayed(const Duration(milliseconds: 20));
+    });
+  });
+
+  group('session metadata', () {
+    setUp(() async {
+      await installPlatformMocks();
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('renameSession preserves folder in session summary', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(storage: storage);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      await provider.moveToFolder(session.id, 'Work');
+      await provider.renameSession(session.id, 'Renamed');
+
+      expect(provider.sessions.single.title, 'Renamed');
+      expect(provider.sessions.single.folder, 'Work');
+    });
+  });
+
+  group('tool approval hardening', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('background current session denies dangerous tool approval', () async {
+      var requestCount = 0;
+      final tools = ToolRegistry()
+        ..register(_EchoTool(), risk: ToolRisk.dangerous);
+      final provider = ChatProvider(
+        toolRegistry: tools,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'call_1',
+                      toolName: 'echo',
+                      toolInput: {'text': 'secret-free'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      provider.setAppInBackground(true);
+      await provider.sendMessage('use tool');
+
+      expect(requestCount, 2);
+      final toolResult =
+          provider.currentSession!.messages.expand((m) => m.toolResults).single;
+      expect(toolResult.output, contains('denied'));
+      expect(toolResult.output, isNot(contains('secret-free')));
+    });
+
+    test('non-current session denies dangerous tool approval', () async {
+      var requestCount = 0;
+      final storage = SessionStorage();
+      await storage.init();
+      final tools = ToolRegistry()
+        ..register(_EchoTool(), risk: ToolRisk.dangerous);
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: tools,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'call_1',
+                      toolName: 'echo',
+                      toolInput: {'text': 'non-current'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final target = await provider.createSession();
+      await provider.createSession();
+      await provider.sendMessage('use tool', targetSessionId: target.id);
+
+      expect(requestCount, 2);
+      ChatSession? storedTarget;
+      // Non-current session persistence is saved from the agent event stream
+      // without blocking UI updates.
+      for (var i = 0; i < 50; i++) {
+        storedTarget = await storage.getSession(target.id);
+        if (storedTarget!.messages.expand((m) => m.toolResults).isNotEmpty) {
+          break;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      final toolResult =
+          storedTarget!.messages.expand((m) => m.toolResults).single;
+      expect(toolResult.output, contains('denied'));
+      expect(toolResult.output, isNot(contains('non-current')));
+    });
+
+    test('foreground current session keeps explicit approval path', () async {
+      var requestCount = 0;
+      final tools = ToolRegistry()
+        ..register(_EchoTool(), risk: ToolRisk.dangerous);
+      final provider = ChatProvider(
+        toolRegistry: tools,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'call_1',
+                      toolName: 'echo',
+                      toolInput: {'text': 'approved'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      final sendFuture = provider.sendMessage('use tool');
+      await _waitUntil(() => provider.pendingApproval != null);
+      provider.resolveToolApproval(true);
+      await sendFuture;
+
+      expect(requestCount, 2);
+      final toolResult =
+          provider.currentSession!.messages.expand((m) => m.toolResults).single;
+      expect(toolResult.output, 'approved');
+    });
+  });
+
+  group('agent cancellation', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('cancelAgent disposes active LLM request client', () async {
+      final streamStarted = Completer<void>();
+      final releaseStream = Completer<void>();
+      final llmDisposed = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: streamStarted,
+          release: releaseStream,
+          disposed: llmDisposed,
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseStream.isCompleted) releaseStream.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final sendFuture = provider.sendMessage('slow prompt');
+      await streamStarted.future;
+
+      provider.cancelAgent(sessionId: session.id);
+
+      await llmDisposed.future.timeout(const Duration(seconds: 1));
+      expect(provider.isSessionSending(session.id), isFalse);
+      await sendFuture;
+    });
+  });
+
+  group('message edit branching', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('branches before edited user message and reruns from edited text',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      List<Map<String, dynamic>>? capturedMessages;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            capturedMessages = messages;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'edited answer')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final originalId = session.id;
+      session.contextSummary = ContextSummary(
+        version: ContextSummaryService.version,
+        text: 'old summary',
+        coveredMessageCount: 3,
+        coveredDigest: 'digest',
+        sourceEstimatedTokens: 12,
+        summaryEstimatedTokens: 2,
+        createdAt: DateTime.utc(2026),
+        updatedAt: DateTime.utc(2026),
+        model: 'claude',
+        apiFormat: 'anthropic',
+      );
+      session.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.user('setup'),
+          ChatMessage(
+            role: 'assistant',
+            content: [
+              ToolUseContent(
+                id: 'tool_1',
+                name: 'echo',
+                input: const {'text': 'setup'},
+              ),
+            ],
+          ),
+          ChatMessage.toolResults([
+            {
+              'tool_use_id': 'tool_1',
+              'content': 'tool result',
+            },
+          ]),
+          ChatMessage.user('revise me'),
+          ChatMessage.assistant([
+            {'type': 'text', 'text': 'obsolete answer'},
+          ]),
+        ]);
+      await storage.saveSession(session);
+
+      final status = await provider.editUserMessageAndResend(
+        3,
+        ' edited prompt ',
+      );
+
+      expect(status, EditUserMessageBranchStatus.started);
+      final branch = provider.currentSession!;
+      expect(branch.id, isNot(originalId));
+      expect(branch.contextSummary, isNull);
+      expect(branch.messages, hasLength(5));
+      expect(branch.messages[0].textContent, 'setup');
+      expect(branch.messages[1].toolUses.single.id, 'tool_1');
+      expect(branch.messages[2].toolResults.single.toolUseId, 'tool_1');
+      expect(branch.messages[3].textContent, 'edited prompt');
+      expect(branch.messages[4].textContent, 'edited answer');
+
+      final original = await storage.getSession(originalId);
+      expect(original!.messages[3].textContent, 'revise me');
+      expect(original.messages[4].textContent, 'obsolete answer');
+      expect(original.contextSummary, isNotNull);
+
+      final payload = jsonEncode(capturedMessages);
+      expect(payload, contains('edited prompt'));
+      expect(payload, isNot(contains('obsolete answer')));
+    });
+
+    test('rejects empty edited text without creating a branch', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      session.messages
+        ..clear()
+        ..add(ChatMessage.user('keep me'));
+      await storage.saveSession(session);
+
+      final status = await provider.editUserMessageAndResend(0, '   ');
+
+      expect(status, EditUserMessageBranchStatus.empty);
+      expect(provider.currentSession!.id, session.id);
+      expect((await storage.getSessionsSummary()), hasLength(1));
     });
   });
 
@@ -321,6 +759,735 @@ void main() {
       expect(requestCount, 0);
       expect(provider.errorMessage, contains('图片数据过大'));
       expect(session.messages, isEmpty);
+    });
+  });
+
+  group('model fallback runtime', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureModelFallbackProfiles();
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('retryable primary network failure uses configured fallback once',
+        () async {
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            if (config.model == 'claude-primary-200k') {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception(
+                  'OpenAI API error (503): temporarily unavailable',
+                ),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'fallback ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('hello');
+
+      expect(provider.errorMessage, isNull);
+      expect(attemptedModels, ['claude-primary-200k', 'claude-fallback-200k']);
+      final messages = provider.currentSession!.messages;
+      expect(messages.where((message) => message.role == 'user'), hasLength(1));
+      expect(
+        messages.where((message) => message.role == 'assistant'),
+        hasLength(1),
+      );
+      expect(
+        messages.any((message) =>
+            message.isSystemNotice &&
+            message.textContent.contains('已改用') &&
+            message.textContent.contains('claude-fallback-200k')),
+        isTrue,
+      );
+      expect(messages.toString(), isNot(contains('temporarily unavailable')));
+      expect(
+        provider.runtimeDebugEvents
+            .recent()
+            .where((event) => event.type == 'model.fallback.success'),
+        hasLength(1),
+      );
+    });
+
+    test('rolls back primary context patch before fallback success', () async {
+      configureModelFallbackProfiles(contextTokenBudget: 4096);
+      final summaryModels = <String>[];
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryModels.add(request.llmConfig.model);
+            return _summaryForRequestWithModel(request);
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            if (config.model == 'claude-primary-200k') {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'fallback ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      session.messages.addAll(_longContextMessages());
+
+      await provider.sendMessage('final question');
+
+      expect(provider.errorMessage, isNull);
+      expect(attemptedModels, ['claude-primary-200k', 'claude-fallback-200k']);
+      expect(summaryModels, ['claude-primary-200k', 'claude-fallback-200k']);
+      expect(provider.currentContextSummary?.model, 'claude-fallback-200k');
+      final contextNoticeCount = provider.currentSession!.messages
+          .where((message) =>
+              message.isSystemNotice && message.textContent.contains('已压缩为摘要'))
+          .length;
+      expect(contextNoticeCount, 1);
+    });
+
+    test('stream failure rolls back primary patch and blocks fallback',
+        () async {
+      configureModelFallbackProfiles(contextTokenBudget: 4096);
+      final summaryModels = <String>[];
+      final attemptedModels = <String>[];
+      var fallbackCreated = false;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryModels.add(request.llmConfig.model);
+            return _summaryForRequestWithModel(request);
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) {
+          if (config.model == 'claude-fallback-200k') {
+            fallbackCreated = true;
+          }
+          return _ScriptedLlmService(
+            config,
+            onMessages: (_) => StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'unused')],
+            )),
+            onMessageEvents: (_) {
+              attemptedModels.add(config.model);
+              if (config.model == 'claude-primary-200k') {
+                return [
+                  TextDelta('partial streamed text'),
+                  StreamError(
+                    'OpenAI API error (503): temporarily unavailable',
+                    cause: Exception('OpenAI API error (503)'),
+                  ),
+                ];
+              }
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'end_turn',
+                  content: [ContentBlock(type: 'text', text: 'fallback')],
+                )),
+              ];
+            },
+          );
+        },
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      session.messages.addAll(_longContextMessages());
+      final assistantCountBefore = session.messages
+          .where((message) => message.role == 'assistant')
+          .length;
+
+      await provider.sendMessage('final question');
+
+      expect(provider.errorMessage, isNotNull);
+      expect(attemptedModels, ['claude-primary-200k']);
+      expect(summaryModels, ['claude-primary-200k']);
+      expect(fallbackCreated, isFalse);
+      expect(provider.currentContextSummary, isNull);
+      expect(
+        provider.currentSession!.messages.where((message) =>
+            message.isSystemNotice && message.textContent.contains('已压缩为摘要')),
+        isEmpty,
+      );
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant'),
+        hasLength(assistantCountBefore),
+      );
+      expect(
+        provider.currentSession!.messages
+            .map((message) => message.textContent)
+            .join('\n'),
+        isNot(contains('partial streamed text')),
+      );
+      expect(
+        provider.runtimeDebugEvents.recent().any((event) =>
+            event.type == 'model.fallback.skipped' &&
+            event.data['reason'] == 'unsafe_after_partial_run'),
+        isTrue,
+      );
+    });
+
+    test('cancel before persisted messages rolls back primary patch', () async {
+      configureModelFallbackProfiles(contextTokenBudget: 4096);
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final summaryModels = <String>[];
+      var fallbackCreated = false;
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryModels.add(request.llmConfig.model);
+            return _summaryForRequestWithModel(request);
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) {
+          if (config.model == 'claude-fallback-200k') {
+            fallbackCreated = true;
+            return _ScriptedLlmService(
+              config,
+              onMessages: (_) => StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'fallback')],
+              )),
+            );
+          }
+          return _BlockingLlmService(
+            config,
+            started: started,
+            release: release,
+          );
+        },
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      session.messages.addAll(_longContextMessages());
+      final assistantCountBefore = session.messages
+          .where((message) => message.role == 'assistant')
+          .length;
+
+      final sendFuture = provider.sendMessage('final question');
+      await started.future.timeout(const Duration(seconds: 2));
+      expect(provider.currentContextSummary?.model, 'claude-primary-200k');
+
+      provider.cancelAgent();
+      await sendFuture.timeout(const Duration(seconds: 2));
+
+      expect(summaryModels, ['claude-primary-200k']);
+      expect(fallbackCreated, isFalse);
+      expect(provider.currentContextSummary, isNull);
+      expect(
+        provider.currentSession!.messages.where((message) =>
+            message.isSystemNotice && message.textContent.contains('已压缩为摘要')),
+        isEmpty,
+      );
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant'),
+        hasLength(assistantCountBefore),
+      );
+      expect(provider.isSessionSending(provider.currentSession!.id), isFalse);
+    });
+
+    test('successful primary keeps context patch', () async {
+      configureModelFallbackProfiles(contextTokenBudget: 4096);
+      final summaryModels = <String>[];
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            summaryModels.add(request.llmConfig.model);
+            return _summaryForRequestWithModel(request);
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'primary ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      session.messages.addAll(_longContextMessages());
+
+      await provider.sendMessage('final question');
+
+      expect(provider.errorMessage, isNull);
+      expect(attemptedModels, ['claude-primary-200k']);
+      expect(summaryModels, ['claude-primary-200k']);
+      expect(provider.currentContextSummary?.model, 'claude-primary-200k');
+      expect(
+        provider.currentSession!.messages.where((message) =>
+            message.isSystemNotice && message.textContent.contains('已压缩为摘要')),
+        hasLength(1),
+      );
+    });
+
+    test('fallback notices and events omit profile display names', () async {
+      const sensitiveDisplayName = 'Confidential Project Phoenix';
+      final fallback = ProviderProfile.defaults(
+        name: sensitiveDisplayName,
+      ).copyWith(
+        id: 'fallback',
+        apiKey: 'sk-test-fallback',
+        apiFormat: ProviderProfile.anthropicFormat,
+        baseUrl: 'http://fallback.test',
+        model: 'claude-fallback-200k',
+      );
+      configureModelFallbackProfiles(fallbackProfiles: [fallback]);
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            if (config.model == 'claude-primary-200k') {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'fallback ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('hello');
+
+      final messageText = provider.currentSession!.messages
+          .map((message) => message.textContent)
+          .join('\n');
+      final eventText = provider.runtimeDebugEvents
+          .recent()
+          .map((event) => '${event.type} ${event.data}')
+          .join('\n');
+      expect(messageText, contains('claude-fallback-200k'));
+      expect(eventText, contains('claude-fallback-200k'));
+      expect(messageText, isNot(contains(sensitiveDisplayName)));
+      expect(eventText, isNot(contains(sensitiveDisplayName)));
+    });
+
+    test('uses original profile snapshot when profiles change in flight',
+        () async {
+      final primaryStarted = Completer<void>();
+      final primaryRelease = Completer<void>();
+      final createdModels = <String>[];
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) {
+          createdModels.add(config.model);
+          if (config.model == 'claude-primary-200k') {
+            return _BlockingLlmService(
+              config,
+              started: primaryStarted,
+              release: primaryRelease,
+              completionEvent: StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              ),
+            );
+          }
+          return _ScriptedLlmService(
+            config,
+            onMessages: (_) {
+              attemptedModels.add(config.model);
+              return StreamDone(LlmResponse(
+                stopReason: 'end_turn',
+                content: [
+                  ContentBlock(type: 'text', text: 'used ${config.model}'),
+                ],
+              ));
+            },
+          );
+        },
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      final sendFuture = provider.sendMessage('hello');
+      await primaryStarted.future.timeout(const Duration(seconds: 2));
+
+      final profileB = ProviderProfile.defaults(name: 'Profile B').copyWith(
+        id: 'profile_b',
+        apiKey: 'sk-test-profile-b',
+        apiFormat: ProviderProfile.anthropicFormat,
+        baseUrl: 'http://profile-b.test',
+        model: 'claude-profile-b-200k',
+        fallbackTargets: const [
+          ModelFallbackTarget(targetProfileId: 'fallback_b'),
+        ],
+      );
+      final fallbackB = ProviderProfile.defaults(name: 'Fallback B').copyWith(
+        id: 'fallback_b',
+        apiKey: 'sk-test-fallback-b',
+        apiFormat: ProviderProfile.anthropicFormat,
+        baseUrl: 'http://fallback-b.test',
+        model: 'claude-fallback-b-200k',
+      );
+      await ConfigExportService.importConfig(
+        jsonEncode({
+          'version': 1,
+          'exportedAt': DateTime.utc(2026).toIso8601String(),
+          'settings': {},
+          'secrets': {
+            'encrypted': false,
+            'providerProfiles': [profileB.toJson(), fallbackB.toJson()],
+            'envVars': {},
+          },
+        }),
+        conflictResolution: ConflictResolution.replace,
+      );
+
+      primaryRelease.complete();
+      await sendFuture.timeout(const Duration(seconds: 2));
+
+      expect(provider.errorMessage, isNull);
+      expect(createdModels, contains('claude-primary-200k'));
+      expect(createdModels, contains('claude-fallback-200k'));
+      expect(createdModels, isNot(contains('claude-profile-b-200k')));
+      expect(createdModels, isNot(contains('claude-fallback-b-200k')));
+      expect(attemptedModels, ['claude-fallback-200k']);
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant')
+            .single
+            .textContent,
+        contains('claude-fallback-200k'),
+      );
+    });
+
+    test('auth failure does not fallback and displayed error is sanitized',
+        () async {
+      final attemptedModels = <String>[];
+      const secret = 'sk-proj-abcdefghijklmnopqrstuvwxyz123456';
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            return StreamError(
+              'OpenAI API error (401): api_key=$secret invalid',
+              cause: Exception(
+                'OpenAI API error (401): api_key=$secret invalid',
+              ),
+            );
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('hello');
+
+      expect(attemptedModels, ['claude-primary-200k']);
+      expect(provider.errorMessage, contains('[redacted: api_key]'));
+      expect(provider.errorMessage, isNot(contains(secret)));
+      expect(provider.currentSession!.messages, hasLength(1));
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.isSystemNotice),
+        isEmpty,
+      );
+    });
+
+    test('skips fallback candidates lacking tools vision or reasoning',
+        () async {
+      final fallbackProfiles = [
+        ProviderProfile.defaults().copyWith(
+          id: 'no_tools',
+          name: 'No Tools',
+          apiKey: 'sk-test-no-tools',
+          apiFormat: ProviderProfile.anthropicFormat,
+          baseUrl: 'http://no-tools.test',
+          model: 'claude-no-tools-200k',
+          thinkingBudget: 4096,
+          capabilityOverride:
+              const caps.CapabilityOverride(supportsTools: false),
+        ),
+        ProviderProfile.defaults().copyWith(
+          id: 'no_vision',
+          name: 'No Vision',
+          apiKey: 'sk-test-no-vision',
+          apiFormat: ProviderProfile.anthropicFormat,
+          baseUrl: 'http://no-vision.test',
+          model: 'claude-no-vision-200k',
+          thinkingBudget: 4096,
+          capabilityOverride:
+              const caps.CapabilityOverride(supportsImages: false),
+        ),
+        ProviderProfile.defaults().copyWith(
+          id: 'no_reasoning',
+          name: 'No Reasoning',
+          apiKey: 'sk-test-no-reasoning',
+          apiFormat: ProviderProfile.openaiFormat,
+          baseUrl: 'http://openai-compatible.test',
+          model: 'gpt-4o-200k',
+          thinkingBudget: 4096,
+        ),
+        ProviderProfile.defaults().copyWith(
+          id: 'good',
+          name: 'Good',
+          apiKey: 'sk-test-good',
+          apiFormat: ProviderProfile.anthropicFormat,
+          baseUrl: 'http://good.test',
+          model: 'claude-good-200k',
+          thinkingBudget: 4096,
+        ),
+      ];
+      configureModelFallbackProfiles(
+        primaryThinkingBudget: 4096,
+        fallbackProfiles: fallbackProfiles,
+        targets: const [
+          ModelFallbackTarget(targetProfileId: 'no_tools'),
+          ModelFallbackTarget(targetProfileId: 'no_vision'),
+          ModelFallbackTarget(targetProfileId: 'no_reasoning'),
+          ModelFallbackTarget(targetProfileId: 'good'),
+        ],
+      );
+      final attemptedModels = <String>[];
+      final createdModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) {
+          createdModels.add(config.model);
+          return _ScriptedLlmService(
+            config,
+            onMessages: (_) {
+              attemptedModels.add(config.model);
+              if (config.model == 'claude-primary-200k') {
+                return StreamError(
+                  'OpenAI API error (503): temporarily unavailable',
+                  cause: Exception('OpenAI API error (503)'),
+                );
+              }
+              return StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'good fallback')],
+              ));
+            },
+          );
+        },
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('describe image', attachments: [
+        ImageContent(data: 'abc123', mediaType: 'image/png'),
+      ]);
+
+      expect(provider.errorMessage, isNull);
+      expect(
+          createdModels,
+          containsAll([
+            'claude-no-tools-200k',
+            'claude-no-vision-200k',
+            'gpt-4o-200k',
+            'claude-good-200k',
+          ]));
+      expect(attemptedModels, ['claude-primary-200k', 'claude-good-200k']);
+      final skipReasons = provider.runtimeDebugEvents
+          .recent()
+          .where((event) => event.type == 'model.fallback.skipped')
+          .map((event) => event.data['reason'])
+          .toSet();
+      expect(skipReasons, contains('tools_not_supported'));
+      expect(skipReasons, contains('vision_not_supported'));
+      expect(skipReasons, contains('reasoning_not_supported'));
+    });
+
+    test('does not fallback after tool execution has started', () async {
+      var fallbackCreated = false;
+      var primaryCalls = 0;
+      final tools = ToolRegistry()..register(_EchoTool(), risk: ToolRisk.safe);
+      final provider = ChatProvider(
+        toolRegistry: tools,
+        llmServiceFactory: (config, {isInBackground}) {
+          if (config.model == 'claude-fallback-200k') {
+            fallbackCreated = true;
+          }
+          return _ScriptedLlmService(
+            config,
+            onMessages: (_) => StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'unused')],
+            )),
+            onMessageEvents: (_) {
+              if (config.model != 'claude-primary-200k') {
+                return [
+                  StreamDone(const LlmResponse(
+                    stopReason: 'end_turn',
+                    content: [ContentBlock(type: 'text', text: 'unused')],
+                  )),
+                ];
+              }
+              primaryCalls++;
+              if (primaryCalls == 1) {
+                return [
+                  StreamDone(const LlmResponse(
+                    stopReason: 'tool_use',
+                    content: [
+                      ContentBlock(
+                        type: 'tool_use',
+                        toolUseId: 'toolu_1',
+                        toolName: 'echo',
+                        toolInput: {'text': 'hello'},
+                      ),
+                    ],
+                  )),
+                ];
+              }
+              return [
+                StreamError(
+                  'OpenAI API error (503): temporarily unavailable',
+                  cause: Exception('OpenAI API error (503)'),
+                ),
+              ];
+            },
+          );
+        },
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('use echo');
+
+      expect(fallbackCreated, isFalse);
+      expect(provider.errorMessage, isNotNull);
+      expect(
+        provider.currentSession!.messages
+            .expand((message) => message.toolResults)
+            .map((result) => result.output),
+        contains('hello'),
+      );
+      expect(
+        provider.runtimeDebugEvents.recent().any((event) =>
+            event.type == 'model.fallback.skipped' &&
+            event.data['reason'] == 'unsafe_after_partial_run'),
+        isTrue,
+      );
+    });
+
+    test('disposes primary on fallback switch and fallback on cancel',
+        () async {
+      final primaryDisposed = Completer<void>();
+      final fallbackStarted = Completer<void>();
+      final fallbackRelease = Completer<void>();
+      final fallbackDisposed = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) {
+          if (config.model == 'claude-primary-200k') {
+            return _ScriptedLlmService(
+              config,
+              onMessages: (_) => StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              ),
+              onDispose: () {
+                if (!primaryDisposed.isCompleted) primaryDisposed.complete();
+              },
+            );
+          }
+          return _BlockingLlmService(
+            config,
+            started: fallbackStarted,
+            release: fallbackRelease,
+            disposed: fallbackDisposed,
+          );
+        },
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      final sendFuture = provider.sendMessage('hello');
+      await fallbackStarted.future.timeout(const Duration(seconds: 2));
+
+      provider.cancelAgent();
+      await primaryDisposed.future.timeout(const Duration(seconds: 2));
+      await fallbackDisposed.future.timeout(const Duration(seconds: 2));
+      await sendFuture.timeout(const Duration(seconds: 2));
+
+      expect(provider.agentStatus, AgentStatus.idle);
+      expect(provider.isSessionSending(provider.currentSession!.id), isFalse);
+      expect(provider.currentSession!.messages, hasLength(1));
     });
   });
 
@@ -544,6 +1711,222 @@ void main() {
 
     tearDown(() async {
       await clearPlatformMocks();
+    });
+
+    test('manual context summary uses safe API prefix and keeps history',
+        () async {
+      final observedRequests = <ContextSummaryRequest>[];
+      final storage = SessionStorage();
+      final provider = ChatProvider(
+        storage: storage,
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            observedRequests.add(request);
+            return _summaryForRequest(request);
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('first prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [
+            ToolUseContent(
+              id: 'call_1',
+              name: 'bash',
+              input: const {'command': 'echo ok'},
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(
+              toolUseId: 'call_1',
+              output: 'for-user-ok',
+              forLlm: 'for-llm-ok',
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('done')],
+        ),
+        ChatMessage.systemNotice('system notice hidden'),
+        ChatMessage.user('recent prompt'),
+      ]);
+      final originalMessageCount = session.messages.length;
+
+      final result = await provider.rebuildContextSummaryBeforeMessage(5);
+
+      expect(result.success, isTrue);
+      expect(result.requestedApiMessageCount, 4);
+      expect(result.coveredMessageCount, 4);
+      expect(observedRequests, hasLength(1));
+      expect(observedRequests.single.messages, hasLength(4));
+      final serialized = observedRequests.single.messages.toString();
+      expect(serialized, contains('first prompt'));
+      expect(serialized, contains('for-llm-ok'));
+      expect(serialized, isNot(contains('system notice hidden')));
+      expect(session.messages, hasLength(originalMessageCount));
+      expect(provider.currentContextSummary?.coveredMessageCount, 4);
+
+      final persisted = await storage.getSession(session.id);
+      expect(persisted, isNotNull);
+      expect(persisted!.messages, hasLength(originalMessageCount));
+      expect(persisted.contextSummary?.coveredMessageCount, 4);
+    });
+
+    test('manual context summary backs off incomplete tool boundaries',
+        () async {
+      final observedRequests = <ContextSummaryRequest>[];
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            observedRequests.add(request);
+            return _summaryForRequest(request);
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('safe prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [
+            ToolUseContent(
+              id: 'call_1',
+              name: 'bash',
+              input: const {'command': 'echo ok'},
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(
+              toolUseId: 'call_1',
+              output: 'ok',
+              forLlm: 'ok',
+            ),
+          ],
+        ),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('done')],
+        ),
+      ]);
+
+      final result = await provider.rebuildContextSummaryBeforeMessage(2);
+
+      expect(result.success, isTrue);
+      expect(result.requestedApiMessageCount, 2);
+      expect(result.coveredMessageCount, 1);
+      expect(observedRequests, hasLength(1));
+      expect(observedRequests.single.messages, hasLength(1));
+      expect(observedRequests.single.messages.single['role'], 'user');
+      expect(
+        observedRequests.single.messages.toString(),
+        isNot(contains('tool_use')),
+      );
+      expect(session.messages, hasLength(4));
+    });
+
+    test('manual context summary rejects while session is sending', () async {
+      final observedRequests = <ContextSummaryRequest>[];
+      final streamStarted = Completer<void>();
+      final releaseStream = Completer<void>();
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            observedRequests.add(request);
+            return _summaryForRequest(request);
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: streamStarted,
+          release: releaseStream,
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseStream.isCompleted) releaseStream.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.add(ChatMessage.user('old prompt'));
+
+      final sendFuture = provider.sendMessage('busy prompt');
+      await streamStarted.future;
+
+      final result = await provider.rebuildContextSummaryBeforeMessage(1);
+
+      expect(result.success, isFalse);
+      expect(observedRequests, isEmpty);
+      expect(provider.isSessionSending(session.id), isTrue);
+
+      releaseStream.complete();
+      await sendFuture;
+    });
+
+    test('manual context summary rejects duplicate rebuild taps', () async {
+      final observedRequests = <ContextSummaryRequest>[];
+      final summaryStarted = Completer<void>();
+      final releaseSummary = Completer<void>();
+      final provider = ChatProvider(
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) async {
+            observedRequests.add(request);
+            if (!summaryStarted.isCompleted) summaryStarted.complete();
+            await releaseSummary.future;
+            return _summaryForRequest(request);
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSummary.isCompleted) releaseSummary.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('first prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('first response')],
+        ),
+      ]);
+
+      final first = provider.rebuildContextSummaryBeforeMessage(2);
+      await summaryStarted.future;
+      expect(provider.isCurrentContextSummaryRebuilding, isTrue);
+      expect(provider.canRebuildCurrentContextSummary, isFalse);
+
+      final duplicate = await provider.rebuildContextSummaryBeforeMessage(2);
+
+      expect(duplicate.success, isFalse);
+      expect(observedRequests, hasLength(1));
+
+      releaseSummary.complete();
+      final completed = await first;
+      expect(completed.success, isTrue);
+      expect(provider.isCurrentContextSummaryRebuilding, isFalse);
+      expect(provider.canRebuildCurrentContextSummary, isTrue);
+      expect(session.messages, hasLength(2));
     });
 
     test('sendMessage uses token budget instead of raw character length',
@@ -2936,6 +4319,7 @@ class _ScriptedLlmService extends LlmService {
   final LlmResponse Function(List<Map<String, dynamic>> messages)? onChat;
   final void Function(List<ToolDefinition> tools)? onTools;
   final void Function(String system)? onStreamSystem;
+  final void Function()? onDispose;
   final caps.ResolvedModelProfile? resolvedProfile;
 
   _ScriptedLlmService(
@@ -2945,6 +4329,7 @@ class _ScriptedLlmService extends LlmService {
     this.onChat,
     this.onTools,
     this.onStreamSystem,
+    this.onDispose,
     this.resolvedProfile,
   });
 
@@ -3010,6 +4395,51 @@ class _ScriptedLlmService extends LlmService {
     }
     yield event;
   }
+
+  @override
+  void dispose() {
+    onDispose?.call();
+    super.dispose();
+  }
+}
+
+class _BlockingLlmService extends LlmService {
+  final Completer<void> started;
+  final Completer<void> release;
+  final Completer<void>? disposed;
+  final StreamEvent completionEvent;
+
+  _BlockingLlmService(
+    super.config, {
+    required this.started,
+    required this.release,
+    this.disposed,
+    StreamEvent? completionEvent,
+  }) : completionEvent = completionEvent ??
+            StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'done')],
+            ));
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    if (!started.isCompleted) started.complete();
+    await release.future;
+    yield completionEvent;
+  }
+
+  @override
+  void dispose() {
+    if (disposed != null && !disposed!.isCompleted) {
+      disposed!.complete();
+    }
+    if (!release.isCompleted) release.complete();
+    super.dispose();
+  }
 }
 
 class _ThrowingInitSessionStorage extends SessionStorage {
@@ -3020,7 +4450,8 @@ class _ThrowingInitSessionStorage extends SessionStorage {
 }
 
 class _ScriptedContextSummaryService extends ContextSummaryService {
-  final ContextSummary Function(ContextSummaryRequest request) onGenerate;
+  final FutureOr<ContextSummary> Function(ContextSummaryRequest request)
+      onGenerate;
   final ContextSummary Function(ContextSummaryRequest request)? onExtractive;
 
   _ScriptedContextSummaryService({
@@ -3032,7 +4463,7 @@ class _ScriptedContextSummaryService extends ContextSummaryService {
   Future<ContextSummary> generateSummary(
     ContextSummaryRequest request,
   ) async {
-    return onGenerate(request);
+    return await onGenerate(request);
   }
 
   @override
@@ -3056,6 +4487,32 @@ ContextSummary _summaryForRequest(ContextSummaryRequest request) {
     model: 'claude',
     apiFormat: 'anthropic',
   );
+}
+
+ContextSummary _summaryForRequestWithModel(ContextSummaryRequest request) {
+  return ContextSummary(
+    version: ContextSummaryService.version,
+    text: '## Goal\nTest summary for ${request.llmConfig.model}',
+    coveredMessageCount: request.coveredMessageCount,
+    coveredDigest: request.coveredDigest,
+    sourceEstimatedTokens: request.sourceEstimatedTokens,
+    summaryEstimatedTokens: 20,
+    createdAt: DateTime.utc(2026),
+    updatedAt: DateTime.utc(2026),
+    model: request.llmConfig.model,
+    apiFormat: request.llmConfig.format.name,
+  );
+}
+
+List<ChatMessage> _longContextMessages() {
+  return List.generate(8, (index) {
+    final text = 'history_$index ${'x' * 20000}';
+    if (index.isEven) return ChatMessage.user(text);
+    return ChatMessage(
+      role: 'assistant',
+      content: [TextContent(text)],
+    );
+  });
 }
 
 caps.ResolvedModelProfile _resolvedProfileWithCapabilities(

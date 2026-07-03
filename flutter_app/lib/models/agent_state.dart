@@ -49,6 +49,9 @@ class AgentState {
   bool wasCancelled = false;
   List<String>? pendingAlternatives;
   bool agentOverlayPermissionRequestStarted = false;
+  bool fallbackTextEmitted = false;
+  bool fallbackToolStarted = false;
+  bool fallbackMessagesPersisted = false;
 
   AgentState(this.sessionId);
 

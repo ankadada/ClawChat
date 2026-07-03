@@ -13,6 +13,7 @@ import '../services/attachment_budget.dart';
 import '../services/context_manager.dart';
 import '../services/context_summary_service.dart';
 import '../services/diagnostics_export_service.dart';
+import '../services/llm_content_sanitizer.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/provider_message_transform.dart';
@@ -31,6 +32,31 @@ typedef LlmServiceFactory = LlmService Function(
   LlmConfig config, {
   bool Function()? isInBackground,
 });
+
+enum EditUserMessageBranchStatus {
+  started,
+  empty,
+  invalidMessage,
+  busy,
+  missingApiKey,
+  failed,
+}
+
+class ManualContextSummaryResult {
+  final bool success;
+  final String message;
+  final ContextSummary? summary;
+  final int requestedApiMessageCount;
+  final int coveredMessageCount;
+
+  const ManualContextSummaryResult({
+    required this.success,
+    required this.message,
+    this.summary,
+    this.requestedApiMessageCount = 0,
+    this.coveredMessageCount = 0,
+  });
+}
 
 class ChatProvider extends ChangeNotifier {
   static const int maxQueuedMessages = 3;
@@ -102,14 +128,13 @@ class ChatProvider extends ChangeNotifier {
   int get messageVersion => _messageVersion;
   final Map<String, String> _drafts = {};
   final Map<String, AgentState> _agentStates = {};
+  final Set<String> _manualContextSummarySessions = {};
   String? _fallbackErrorMessage;
   ToolApprovalRequest? pendingApproval;
   AgentState? _pendingApprovalState;
   Completer<bool>? _approvalCompleter;
-  Timer? _approvalTimeout;
   bool _appInBackground = false;
 
-  static const _backgroundApprovalTimeout = Duration(seconds: 15);
   static const _agentServiceThinkingText = 'AI 正在思考...';
   static const _agentServiceToolingText = 'AI 正在执行命令...';
   static const _agentServiceStreamingText = 'AI 正在回复...';
@@ -130,6 +155,19 @@ class ChatProvider extends ChangeNotifier {
 
   String get streamingText =>
       _getState(currentSession?.id)?.streamingText ?? '';
+
+  ContextSummary? get currentContextSummary => currentSession?.contextSummary;
+
+  bool get isCurrentContextSummaryRebuilding {
+    final session = currentSession;
+    return session != null &&
+        _manualContextSummarySessions.contains(session.id);
+  }
+
+  bool get canRebuildCurrentContextSummary {
+    final session = currentSession;
+    return session != null && !_isManualContextSummaryBusy(session);
+  }
 
   String? get errorMessage =>
       _getState(currentSession?.id)?.errorMessage ?? _fallbackErrorMessage;
@@ -158,6 +196,15 @@ class ChatProvider extends ChangeNotifier {
       _agentStates[sessionId]?.isSending ?? false;
 
   String getDraft(String sessionId) => _drafts[sessionId] ?? '';
+
+  bool _isManualContextSummaryBusy(ChatSession session) {
+    if (_manualContextSummarySessions.contains(session.id)) return true;
+    final state = _getState(session.id);
+    if (state == null) return false;
+    return state.isSending ||
+        state.status == AgentStatus.streaming ||
+        state.messageQueue.isNotEmpty;
+  }
 
   void _syncCurrentSessionReference(ChatSession session) {
     if (currentSession?.id == session.id) {
@@ -471,6 +518,7 @@ class ChatProvider extends ChangeNotifier {
     NativeBridge.setAgentStopRequestedHandler(null);
     NativeBridge.setNavigateToSessionHandler(null);
     unawaited(_stopAgentService());
+    unawaited(_tools.dispose());
     _completePendingApproval(false);
     for (final state in _agentStates.values) {
       state.dispose();
@@ -482,6 +530,7 @@ class ChatProvider extends ChangeNotifier {
   Future<void> _init() async {
     try {
       await _prefs.init();
+      await _tools.refreshMcpTools();
       await _contextManager.init();
       _prefsInitialized = true;
       await _storage.init();
@@ -541,6 +590,7 @@ class ChatProvider extends ChangeNotifier {
           title: session.title,
           createdAt: session.createdAt,
           updatedAt: session.updatedAt,
+          folder: session.folder,
         ));
     currentSession = session;
     _clearSessionScopedState();
@@ -660,6 +710,7 @@ class ChatProvider extends ChangeNotifier {
         title: newTitle,
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
+        folder: session.folder,
       );
     }
     if (currentSession?.id == id) {
@@ -698,14 +749,14 @@ class ChatProvider extends ChangeNotifier {
     if (_disposed) return false;
 
     final policy = _prefs.toolApprovalPolicy;
+    final isCurrentSession = state.sessionId == currentSession?.id;
+    final userPresent = isCurrentSession && !_appInBackground;
+    if (!userPresent) return false;
+
     if (policy == PreferencesService.toolApprovalAuto) return true;
     if (policy == PreferencesService.toolApprovalSessionFirst &&
         state.sessionApprovedTools.contains(request.toolName)) {
       return true;
-    }
-    if (state.sessionId != currentSession?.id) {
-      await Future.delayed(_backgroundApprovalTimeout);
-      return !_disposed;
     }
 
     _completePendingApproval(false, notify: false);
@@ -713,9 +764,6 @@ class ChatProvider extends ChangeNotifier {
     _approvalCompleter = completer;
     _pendingApprovalState = state;
     pendingApproval = request;
-    if (_appInBackground) {
-      _startBackgroundApprovalTimeout(request);
-    }
     notifyListeners();
     final approved = await completer.future;
     if (approved &&
@@ -742,7 +790,6 @@ class ChatProvider extends ChangeNotifier {
     if (_appInBackground == inBackground) return;
     _appInBackground = inBackground;
     if (!_appInBackground) {
-      _cancelApprovalTimeout();
       unawaited(NativeBridge.setAgentOverlayVisible(false));
       _resumeActiveAgentStreamAfterForeground();
       if (pendingApproval != null && !_disposed) notifyListeners();
@@ -799,29 +846,7 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
-  void _startBackgroundApprovalTimeout(ToolApprovalRequest request) {
-    _approvalTimeout?.cancel();
-    _approvalTimeout = Timer(_backgroundApprovalTimeout, () {
-      if (_disposed || !identical(pendingApproval, request)) return;
-      _rememberToolApproval(_pendingApprovalState, request.toolName);
-      unawaited(
-        NativeBridge.showToolAutoApprovedNotification(request.toolName)
-            .catchError((Object e) {
-          debugPrint('Tool auto-approval notification failed: $e');
-          return false;
-        }),
-      );
-      _completePendingApproval(true);
-    });
-  }
-
-  void _cancelApprovalTimeout() {
-    _approvalTimeout?.cancel();
-    _approvalTimeout = null;
-  }
-
   void _completePendingApproval(bool approved, {bool notify = true}) {
-    _cancelApprovalTimeout();
     pendingApproval = null;
     _pendingApprovalState = null;
     final completer = _approvalCompleter;
@@ -833,9 +858,13 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> moveToFolder(String sessionId, String? folder) async {
+    final normalizedFolder = folder?.trim();
+    final nextFolder = normalizedFolder == null || normalizedFolder.isEmpty
+        ? null
+        : normalizedFolder;
     final session = await _storage.getSession(sessionId);
     if (session == null) return;
-    session.folder = folder;
+    session.folder = nextFolder;
     await _storage.saveSession(session);
     final idx = sessions.indexWhere((s) => s.id == sessionId);
     if (idx >= 0) {
@@ -844,11 +873,11 @@ class ChatProvider extends ChangeNotifier {
         title: session.title,
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
-        folder: folder,
+        folder: nextFolder,
       );
     }
     if (currentSession?.id == sessionId) {
-      currentSession!.folder = folder;
+      currentSession!.folder = nextFolder;
     }
     notifyListeners();
   }
@@ -873,6 +902,93 @@ class ChatProvider extends ChangeNotifier {
     return fork;
   }
 
+  Future<EditUserMessageBranchStatus> editUserMessageAndResend(
+    int messageIndex,
+    String editedText,
+  ) async {
+    final trimmedText = editedText.trim();
+    if (trimmedText.isEmpty) return EditUserMessageBranchStatus.empty;
+
+    final source = currentSession;
+    if (source == null ||
+        messageIndex < 0 ||
+        messageIndex >= source.messages.length) {
+      return EditUserMessageBranchStatus.invalidMessage;
+    }
+
+    final sourceState = _getState(source.id);
+    if ((sourceState?.isSending ?? false) ||
+        (sourceState?.messageQueue.isNotEmpty ?? false)) {
+      if (sourceState != null) {
+        sourceState.errorMessage = AppStrings.editMessageBlockedActive;
+      } else {
+        _fallbackErrorMessage = AppStrings.editMessageBlockedActive;
+      }
+      notifyListeners();
+      return EditUserMessageBranchStatus.busy;
+    }
+
+    final sourceMessage = source.messages[messageIndex];
+    if (!_isEditableUserMessage(sourceMessage)) {
+      return EditUserMessageBranchStatus.invalidMessage;
+    }
+
+    await _ensurePrefs();
+    final apiKey = _prefs.apiKey;
+    if (apiKey == null || apiKey.isEmpty) {
+      _fallbackErrorMessage = AppStrings.editMessageMissingApiKey;
+      notifyListeners();
+      return EditUserMessageBranchStatus.missingApiKey;
+    }
+
+    final activeCount = _activeAgentStates.length;
+    if (activeCount >= maxConcurrentAgents) {
+      _fallbackErrorMessage = AppStrings.maxConcurrentAgentsReached(
+        maxConcurrentAgents,
+      );
+      notifyListeners();
+      return EditUserMessageBranchStatus.busy;
+    }
+
+    final attachments = _editableAttachmentsFor(sourceMessage);
+    final branch = await _storage.forkSessionBeforeMessage(
+      source.id,
+      messageIndex,
+    );
+    if (branch == null) return EditUserMessageBranchStatus.failed;
+
+    sessions.insert(
+      0,
+      SessionSummary(
+        id: branch.id,
+        title: branch.title,
+        createdAt: branch.createdAt,
+        updatedAt: branch.updatedAt,
+        folder: branch.folder,
+      ),
+    );
+    currentSession = branch;
+    _clearSessionScopedState();
+    notifyListeners();
+
+    await sendMessage(trimmedText, attachments: attachments);
+    return EditUserMessageBranchStatus.started;
+  }
+
+  bool _isEditableUserMessage(ChatMessage message) {
+    return message.role == 'user' &&
+        message.textContent.trim().isNotEmpty &&
+        message.toolResults.isEmpty;
+  }
+
+  List<MessageContent> _editableAttachmentsFor(ChatMessage message) {
+    final copied = ChatMessage.fromJson(message.toJson());
+    return copied.content
+        .where((content) =>
+            content is! TextContent && content is! ToolResultContent)
+        .toList();
+  }
+
   Future<void> sendMessage(
     String text, {
     List<MessageContent> attachments = const [],
@@ -889,6 +1005,7 @@ class ChatProvider extends ChangeNotifier {
     AgentState? activeState;
     try {
       await _ensurePrefs();
+      final providerSnapshot = _captureProviderProfileSnapshot();
       try {
         _attachmentBudget.checkMessageAttachments(attachments);
       } on AttachmentBudgetException catch (e) {
@@ -925,8 +1042,8 @@ class ChatProvider extends ChangeNotifier {
         return;
       }
 
-      final apiKey = _prefs.apiKey;
-      if (apiKey == null || apiKey.isEmpty) {
+      final apiKey = providerSnapshot.activeProfile.apiKey.trim();
+      if (apiKey.isEmpty) {
         if (sessionState != null) {
           sessionState.errorMessage = AppStrings.apiKeyNotConfigured;
           sessionState.status = AgentStatus.error;
@@ -960,6 +1077,7 @@ class ChatProvider extends ChangeNotifier {
       activeState = state;
       state.pendingAlternatives = null;
       state.isSending = true;
+      state.wasCancelled = false;
       state.pendingAlternatives = pendingAlternativesForSend;
       activeSession.messages.add(ChatMessage.userContent([
         if (trimmedText.isNotEmpty) TextContent(trimmedText),
@@ -971,7 +1089,10 @@ class ChatProvider extends ChangeNotifier {
       _syncCurrentSessionReference(activeSession);
       notifyListeners();
 
-      final llmConfig = _buildLlmConfig(_prefs, activeSession);
+      final llmConfig = _buildLlmConfigFromSnapshot(
+        providerSnapshot,
+        activeSession,
+      );
       if (state.cachedLlm == null || state.cachedLlmConfig != llmConfig) {
         state.cachedLlm?.dispose();
         state.cachedLlm = _llmServiceFactory(
@@ -985,6 +1106,7 @@ class ChatProvider extends ChangeNotifier {
       // Refresh skills (and memory) to pick up any user toggle changes
       _skills = await SkillService.scanSkills();
       await MemoryService.getMemories();
+      await _tools.refreshMcpTools();
 
       final basePrompt = activeSession.systemPrompt ??
           _prefs.systemPrompt ??
@@ -1019,7 +1141,7 @@ class ChatProvider extends ChangeNotifier {
           toolDefinitions: toolDefinitions,
           contextTokenBudget: _prefs.contextTokenBudget,
           autoCompact: _prefs.autoCompact,
-          activeProfileId: _prefs.activeProfileId,
+          activeProfileId: providerSnapshot.activeProfileId,
           onSummaryGenerationStarted: () {
             state.status = AgentStatus.thinking;
             notifyListeners();
@@ -1030,6 +1152,19 @@ class ChatProvider extends ChangeNotifier {
           },
         ),
       );
+      final primaryPatchSnapshot =
+          _ContextSessionPatchSnapshot.capture(activeSession);
+      var primaryPatchRolledBack = false;
+      var preservingPrimaryPatchForRecovery = false;
+      Future<void> rollbackPrimaryPatchIfSafe() async {
+        if (primaryPatchRolledBack) return;
+        primaryPatchRolledBack = await _restoreContextSessionPatchSnapshot(
+          activeSession,
+          primaryPatchSnapshot,
+          assembly.patch,
+        );
+      }
+
       await _applyContextSessionPatch(activeSession, assembly.patch);
       final promptWithSummary = assembly.systemPrompt;
       final apiMessages = assembly.messages;
@@ -1049,6 +1184,7 @@ class ChatProvider extends ChangeNotifier {
           assemblyId: assembly.assemblyId,
         );
         if (runResult is EncryptedContentError) {
+          preservingPrimaryPatchForRecovery = true;
           final originalError = runResult;
           _contextManager.discardCompletion(assembly.assemblyId);
           _recordRuntimeEvent(
@@ -1150,10 +1286,31 @@ class ChatProvider extends ChangeNotifier {
               notifyListeners();
             }
           }
+        } else if (state.wasCancelled) {
+          if (!preservingPrimaryPatchForRecovery) {
+            await rollbackPrimaryPatchIfSafe();
+          }
+        } else if (runResult != null || state.status == AgentStatus.error) {
+          if (!preservingPrimaryPatchForRecovery) {
+            await rollbackPrimaryPatchIfSafe();
+          }
+          await _tryRunModelFallback(
+            state: state,
+            activeSession: activeSession,
+            primaryConfig: llmConfig,
+            primaryAssembly: assembly,
+            fullApiMessages: fullApiMessages,
+            fullPrompt: fullPrompt,
+            primaryCapabilities: capabilities,
+            primaryToolDefinitions: toolDefinitions,
+            primaryError: runResult ?? _AgentRuntimeError(state.errorMessage),
+            providerSnapshot: providerSnapshot,
+          );
         }
       } catch (e) {
+        await rollbackPrimaryPatchIfSafe();
         state.status = AgentStatus.error;
-        state.errorMessage = '$e';
+        state.errorMessage = _sanitizeProviderErrorMessage(e);
         notifyListeners();
       } finally {
         _contextManager.discardCompletion(assembly.assemblyId);
@@ -1184,6 +1341,9 @@ class ChatProvider extends ChangeNotifier {
     state.messageQueueDrainTimer?.cancel();
     state.messageQueueDrainTimer = null;
     state.agent?.cancel();
+    state.cachedLlm?.dispose();
+    state.cachedLlm = null;
+    state.cachedLlmConfig = null;
     unawaited(_stopAgentServiceForState(state));
     if (identical(_pendingApprovalState, state)) {
       _completePendingApproval(false);
@@ -1198,6 +1358,7 @@ class ChatProvider extends ChangeNotifier {
     if (state.agentCompleter != null && !state.agentCompleter!.isCompleted) {
       state.agentCompleter!.complete();
     }
+    state.isSending = false;
     state.status = AgentStatus.idle;
     notifyListeners();
   }
@@ -1427,6 +1588,9 @@ class ChatProvider extends ChangeNotifier {
       timestamp: msg.timestamp,
       inputTokens: msg.inputTokens,
       outputTokens: msg.outputTokens,
+      cacheReadInputTokens: msg.cacheReadInputTokens,
+      cacheCreationInputTokens: msg.cacheCreationInputTokens,
+      inputTokensIncludeCache: msg.inputTokensIncludeCache,
       alternatives: msg.alternatives,
       activeAlternative: activeAlternative,
       isSystemNotice: msg.isSystemNotice,
@@ -1465,12 +1629,6 @@ class ChatProvider extends ChangeNotifier {
   Future<void> sendCompare(String text, List<String> models) async {
     if (currentSession == null) await createSession();
     final currentState = _getState(currentSession?.id);
-    debugPrint(
-      '[COMPARE] sendCompare entered. models=$models, textLength=${text.length}',
-    );
-    debugPrint(
-      '[COMPARE] Guards: currentSending=${currentState?.isSending ?? false}, _isComparing=$_isComparing, session=${currentSession != null}',
-    );
     if ((currentState?.isSending ?? false) || _isComparing) {
       errorMessage =
           (currentState?.isSending ?? false) ? '当前会话正在发送中' : '正在对比中，请等待完成';
@@ -1479,9 +1637,6 @@ class ChatProvider extends ChangeNotifier {
     }
     final compareModels =
         models.where((model) => model.trim().isNotEmpty).toList();
-    debugPrint(
-      '[COMPARE] compareModels=$compareModels, count=${compareModels.length}',
-    );
     if (text.trim().isEmpty || compareModels.length < 2) {
       errorMessage = text.trim().isEmpty ? '请输入对比内容' : '请选择至少两个模型';
       notifyListeners();
@@ -1497,9 +1652,6 @@ class ChatProvider extends ChangeNotifier {
     try {
       await _ensurePrefs();
       final apiKey = _prefs.apiKey;
-      debugPrint(
-        '[COMPARE] apiKey present: ${apiKey != null && apiKey.isNotEmpty}',
-      );
       if (apiKey == null || apiKey.isEmpty) {
         errorMessage = AppStrings.apiKeyNotConfigured;
         compareResults!.add(CompareResult(
@@ -1558,13 +1710,9 @@ class ChatProvider extends ChangeNotifier {
       final compareMessages = assembly.messages;
       notifyListeners();
 
-      debugPrint(
-        '[COMPARE] Starting model loop for ${compareModels.length} models',
-      );
       for (final model in compareModels) {
         if (_disposed) break;
         try {
-          debugPrint('[COMPARE] Calling model: $model');
           final config = LlmConfig(
             format: format,
             apiKey: apiKey,
@@ -1593,7 +1741,6 @@ class ChatProvider extends ChangeNotifier {
               text: responseText,
               tokens: response.outputTokens,
             ));
-            debugPrint('[COMPARE] Model $model completed');
           } finally {
             llm.dispose();
           }
@@ -1652,29 +1799,704 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  LlmConfig _buildLlmConfig(PreferencesService prefs, ChatSession session) {
-    final formatStr =
-        session.apiFormatOverride ?? prefs.apiFormat ?? 'anthropic';
+  Future<void> clearCurrentContextSummary() async {
+    final session = currentSession;
+    if (session == null || session.contextSummary == null) return;
+    session.contextSummary = null;
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+    _recordRuntimeEvent(session.id, 'context.summary.manual.cleared', {
+      'messageCount': session.toApiMessages().length,
+    });
+    notifyListeners();
+  }
+
+  Future<ManualContextSummaryResult> rebuildContextSummaryBeforeMessage(
+    int messageIndex,
+  ) async {
+    final session = currentSession;
+    if (session == null) {
+      return const ManualContextSummaryResult(
+        success: false,
+        message: AppStrings.contextSummaryNoSession,
+      );
+    }
+    if (messageIndex <= 0 || messageIndex > session.messages.length) {
+      return const ManualContextSummaryResult(
+        success: false,
+        message: AppStrings.contextSummarySelectLaterMessage,
+      );
+    }
+    if (_isManualContextSummaryBusy(session)) {
+      return const ManualContextSummaryResult(
+        success: false,
+        message: AppStrings.contextSummaryBusy,
+      );
+    }
+    _manualContextSummarySessions.add(session.id);
+    notifyListeners();
+    var requestedApiMessageCount = 0;
+    var coveredMessageCount = 0;
+    try {
+      await _ensurePrefs();
+      if (_prefs.apiKey == null || _prefs.apiKey!.isEmpty) {
+        return const ManualContextSummaryResult(
+          success: false,
+          message: AppStrings.apiKeyNotConfigured,
+        );
+      }
+
+      final requestedPrefix = _apiPrefixBeforeMessage(session, messageIndex);
+      requestedApiMessageCount = requestedPrefix.length;
+      final safeCount = _safeManualSummaryPrefixCount(requestedPrefix);
+      if (safeCount <= 0) {
+        return ManualContextSummaryResult(
+          success: false,
+          message: AppStrings.contextSummaryNoSafePrefix,
+          requestedApiMessageCount: requestedApiMessageCount,
+        );
+      }
+      final safePrefix = requestedPrefix.take(safeCount).toList();
+      coveredMessageCount = safePrefix.length;
+      final summary = await _contextManager.buildManualSummary(
+        ContextManualSummaryRequest(
+          sessionId: session.id,
+          apiPrefixMessages: safePrefix,
+          llmConfig: _buildLlmConfig(_prefs, session),
+          contextTokenBudget: _prefs.contextTokenBudget,
+        ),
+      );
+      session.contextSummary = summary;
+      await _storage.saveSession(session);
+      _syncCurrentSessionReference(session);
+      notifyListeners();
+      return ManualContextSummaryResult(
+        success: true,
+        message: AppStrings.contextSummaryRebuilt(
+          summary.coveredMessageCount,
+        ),
+        summary: summary,
+        requestedApiMessageCount: requestedPrefix.length,
+        coveredMessageCount: summary.coveredMessageCount,
+      );
+    } catch (e) {
+      _recordRuntimeEvent(session.id, 'context.summary.manual.failed', {
+        'stage': 'provider',
+        'errorType': e.runtimeType.toString(),
+      });
+      return ManualContextSummaryResult(
+        success: false,
+        message: AppStrings.contextSummaryRebuildFailed(_briefError(e)),
+        requestedApiMessageCount: requestedApiMessageCount,
+        coveredMessageCount: coveredMessageCount,
+      );
+    } finally {
+      _manualContextSummarySessions.remove(session.id);
+      if (!_disposed) notifyListeners();
+    }
+  }
+
+  List<Map<String, dynamic>> _apiPrefixBeforeMessage(
+    ChatSession session,
+    int messageIndex,
+  ) {
+    final prefix = <Map<String, dynamic>>[];
+    final cappedIndex = messageIndex.clamp(0, session.messages.length).toInt();
+    for (var i = 0; i < cappedIndex; i++) {
+      final message = session.messages[i];
+      if (message.isSystemNotice) continue;
+      prefix.add(message.toApiJson());
+    }
+    return prefix;
+  }
+
+  int _safeManualSummaryPrefixCount(List<Map<String, dynamic>> messages) {
+    for (var count = messages.length; count > 0; count--) {
+      if (_isSafeManualSummaryPrefix(messages.take(count))) {
+        return count;
+      }
+    }
+    return 0;
+  }
+
+  bool _isSafeManualSummaryPrefix(Iterable<Map<String, dynamic>> messages) {
+    final toolUseIds = <String>{};
+    final toolResultIds = <String>{};
+    for (final message in messages) {
+      toolUseIds.addAll(_toolUseIds(message));
+      toolResultIds.addAll(_toolResultIds(message));
+    }
+    return toolUseIds.containsAll(toolResultIds) &&
+        toolResultIds.containsAll(toolUseIds);
+  }
+
+  Set<String> _toolUseIds(Map<String, dynamic> message) {
+    final content = message['content'];
+    if (content is! List) return const {};
+    return content
+        .whereType<Map>()
+        .where((block) => block['type'] == 'tool_use')
+        .map((block) => block['id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toSet();
+  }
+
+  Set<String> _toolResultIds(Map<String, dynamic> message) {
+    final content = message['content'];
+    if (content is! List) return const {};
+    return content
+        .whereType<Map>()
+        .where((block) => block['type'] == 'tool_result')
+        .map((block) => block['tool_use_id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toSet();
+  }
+
+  String _briefError(Object error) {
+    final text = error.toString().replaceFirst('Exception: ', '');
+    return text.length > 160 ? '${text.substring(0, 160)}...' : text;
+  }
+
+  String _sanitizeProviderErrorMessage(Object? error) {
+    final raw = (error?.toString() ?? '').replaceFirst('Exception: ', '');
+    if (raw.isEmpty) return '模型请求失败';
+    final sanitized = const LlmContentSanitizer().sanitizeText(raw).text;
+    return sanitized.length > 240
+        ? '${sanitized.substring(0, 240)}...'
+        : sanitized;
+  }
+
+  _ProviderProfileSnapshot _captureProviderProfileSnapshot() {
+    final activeProfile = _snapshotProviderProfile(_prefs.activeProfile);
+    return _ProviderProfileSnapshot(
+      activeProfileId: _prefs.activeProfileId ?? activeProfile.id,
+      activeProfile: activeProfile,
+      profiles:
+          _prefs.profiles.map(_snapshotProviderProfile).toList(growable: false),
+    );
+  }
+
+  ProviderProfile _snapshotProviderProfile(ProviderProfile profile) {
+    return profile.copyWith(
+      fallbackTargets: List<ModelFallbackTarget>.unmodifiable(
+        profile.fallbackTargets.map((target) => target.copyWith()),
+      ),
+    );
+  }
+
+  Future<bool> _tryRunModelFallback({
+    required AgentState state,
+    required ChatSession activeSession,
+    required LlmConfig primaryConfig,
+    required ContextAssemblyResult primaryAssembly,
+    required List<Map<String, dynamic>> fullApiMessages,
+    required String fullPrompt,
+    required ModelCapabilities primaryCapabilities,
+    required List<Map<String, dynamic>> primaryToolDefinitions,
+    required Object? primaryError,
+    required _ProviderProfileSnapshot providerSnapshot,
+  }) async {
+    final reason = _fallbackReasonFor(primaryError, state.errorMessage);
+    if (!_isFallbackSafeForState(state)) {
+      _recordModelFallbackEvent(activeSession.id, 'model.fallback.skipped', {
+        'reason': 'unsafe_after_partial_run',
+        'primaryReason': reason.code,
+      });
+      return false;
+    }
+    if (!reason.canFallback) {
+      _recordModelFallbackEvent(activeSession.id, 'model.fallback.skipped', {
+        'reason': reason.code,
+      });
+      return false;
+    }
+
+    final candidates = _resolveModelFallbackCandidates(
+      primaryConfig,
+      providerSnapshot,
+    );
+    if (candidates.isEmpty) {
+      _recordModelFallbackEvent(activeSession.id, 'model.fallback.skipped', {
+        'reason': 'no_configured_candidate',
+        'primaryReason': reason.code,
+      });
+      return false;
+    }
+
+    var attemptIndex = 0;
+    for (final candidate in candidates) {
+      attemptIndex++;
+      final llm = _llmServiceFactory(
+        candidate.config,
+        isInBackground: () => _appInBackground,
+      );
+      final capabilities = llm.resolvedModelProfile.capabilities;
+      final skipReason = _fallbackCapabilitySkipReason(
+        capabilities: capabilities,
+        primaryCapabilities: primaryCapabilities,
+        primaryConfig: primaryConfig,
+        candidateConfig: candidate.config,
+        primaryAssembly: primaryAssembly,
+        primaryToolDefinitions: primaryToolDefinitions,
+        fullApiMessages: fullApiMessages,
+        primaryReason: reason,
+      );
+      if (skipReason != null) {
+        llm.dispose();
+        _recordModelFallbackEvent(activeSession.id, 'model.fallback.skipped', {
+          'reason': skipReason,
+          'candidate': candidate.safeLabel,
+          'attemptIndex': attemptIndex,
+        });
+        continue;
+      }
+
+      final toolDefinitions = _toolDefinitionsForBudget(
+        candidate.config,
+        capabilities: capabilities,
+      );
+      ContextAssemblyResult? assembly;
+      Object? runResult;
+      try {
+        assembly = await _contextManager.assembleForSend(
+          ContextSendRequest(
+            sessionId: activeSession.id,
+            fullApiMessages: fullApiMessages,
+            existingSummary: activeSession.contextSummary,
+            llmConfig: candidate.config,
+            systemPrompt: fullPrompt,
+            capabilities: capabilities,
+            toolDefinitions: toolDefinitions,
+            contextTokenBudget: _prefs.contextTokenBudget,
+            autoCompact: _prefs.autoCompact,
+            activeProfileId: candidate.profile.id,
+            onSummaryGenerationStarted: () {
+              state.status = AgentStatus.thinking;
+              notifyListeners();
+              unawaited(_startAgentServiceForState(
+                state,
+                AppStrings.contextSummaryGenerating,
+              ));
+            },
+          ),
+        );
+
+        state.cachedLlm?.dispose();
+        state.cachedLlm = llm;
+        state.cachedLlmConfig = candidate.config;
+        state.agent = _createAgentService(
+          llm: llm,
+          systemPrompt: assembly.systemPrompt,
+          state: state,
+        );
+        state.status = AgentStatus.thinking;
+        state.streamingText = '';
+        state.errorMessage = null;
+        state.partialAgentResponseSaved = false;
+        notifyListeners();
+        unawaited(_startAgentServiceForState(
+          state,
+          _agentServiceThinkingText,
+        ));
+
+        _recordModelFallbackEvent(activeSession.id, 'model.fallback.attempt', {
+          'primary': _safeModelLabel(primaryConfig),
+          'candidate': candidate.safeLabel,
+          'reason': reason.code,
+          'attemptIndex': attemptIndex,
+        });
+
+        runResult = await _runAgentForState(
+          state,
+          activeSession,
+          assembly.messages,
+          assemblyId: assembly.assemblyId,
+        );
+      } catch (e) {
+        runResult = e;
+        state.status = AgentStatus.error;
+        state.errorMessage = _sanitizeProviderErrorMessage(e);
+        notifyListeners();
+      } finally {
+        if (assembly != null) {
+          _contextManager.discardCompletion(assembly.assemblyId);
+        }
+      }
+
+      final failed = state.wasCancelled ||
+          runResult != null ||
+          state.status == AgentStatus.error;
+      if (!failed) {
+        if (assembly != null) {
+          await _applyContextSessionPatch(activeSession, assembly.patch);
+        }
+        _appendModelFallbackNotice(
+          activeSession,
+          primary: _safeModelLabel(primaryConfig),
+          fallback: candidate.safeLabel,
+          reason: reason.label,
+        );
+        await _storage.saveSession(activeSession);
+        _syncCurrentSessionReference(activeSession);
+        _recordModelFallbackEvent(activeSession.id, 'model.fallback.success', {
+          'primary': _safeModelLabel(primaryConfig),
+          'fallback': candidate.safeLabel,
+          'reason': reason.code,
+          'attemptIndex': attemptIndex,
+        });
+        notifyListeners();
+        return true;
+      }
+
+      final candidateReason = _fallbackReasonFor(runResult, state.errorMessage);
+      _recordModelFallbackEvent(activeSession.id, 'model.fallback.failed', {
+        'candidate': candidate.safeLabel,
+        'reason': candidateReason.code,
+        'attemptIndex': attemptIndex,
+      });
+
+      final canContinue = _isFallbackSafeForState(state) &&
+          candidateReason.canFallback &&
+          !state.wasCancelled;
+      if (identical(state.cachedLlm, llm)) {
+        state.cachedLlm?.dispose();
+        state.cachedLlm = null;
+        state.cachedLlmConfig = null;
+      } else {
+        llm.dispose();
+      }
+      if (!canContinue) return false;
+    }
+    return false;
+  }
+
+  bool _isFallbackSafeForState(AgentState state) {
+    return !state.wasCancelled &&
+        !state.fallbackTextEmitted &&
+        !state.fallbackToolStarted &&
+        !state.fallbackMessagesPersisted;
+  }
+
+  List<_ModelFallbackCandidate> _resolveModelFallbackCandidates(
+    LlmConfig primaryConfig,
+    _ProviderProfileSnapshot providerSnapshot,
+  ) {
+    if (!_prefsInitialized) return const [];
+    final activeProfile = providerSnapshot.activeProfile;
+    final profiles = {
+      for (final profile in providerSnapshot.profiles) profile.id: profile,
+    };
+    final seen = <String>{};
+    final candidates = <_ModelFallbackCandidate>[];
+    for (final target in activeProfile.fallbackTargets) {
+      if (!target.enabled) continue;
+      final targetId = target.targetProfileId.trim();
+      if (targetId.isEmpty || targetId == activeProfile.id) continue;
+      final profile = profiles[targetId];
+      if (profile == null || profile.apiKey.trim().isEmpty) continue;
+      final config = _buildLlmConfigForProfile(
+        profile,
+        modelOverride:
+            target.hasModelOverride ? target.effectiveModelOverride : null,
+      );
+      if (_sameModelDestination(config, primaryConfig)) continue;
+      final key = [
+        profile.id,
+        config.format.name,
+        _normalizedBaseUrl(config.baseUrl),
+        config.model,
+      ].join('\n');
+      if (!seen.add(key)) continue;
+      candidates.add(_ModelFallbackCandidate(
+        profile: profile,
+        config: config,
+      ));
+    }
+    return candidates;
+  }
+
+  LlmConfig _buildLlmConfigFromSnapshot(
+    _ProviderProfileSnapshot snapshot,
+    ChatSession session,
+  ) {
+    return _buildLlmConfigForProfileSnapshot(
+      snapshot.activeProfile,
+      session,
+    );
+  }
+
+  LlmConfig _buildLlmConfigForProfileSnapshot(
+    ProviderProfile profile,
+    ChatSession session,
+  ) {
+    final formatStr = session.apiFormatOverride ?? profile.apiFormat;
     final format =
         formatStr == 'openai' ? ApiFormat.openai : ApiFormat.anthropic;
-    final activeProfile = prefs.activeProfile;
+    final baseUrl = session.baseUrlOverride ??
+        (profile.baseUrl.trim().isNotEmpty
+            ? profile.baseUrl.trim()
+            : (format == ApiFormat.anthropic
+                ? 'https://api.anthropic.com'
+                : 'https://api.openai.com'));
 
     return LlmConfig(
       format: format,
-      apiKey: prefs.apiKey!,
-      model: session.modelOverride ?? prefs.model ?? AppConstants.defaultModel,
-      baseUrl: session.baseUrlOverride ??
-          prefs.baseUrl ??
-          (format == ApiFormat.anthropic
-              ? 'https://api.anthropic.com'
-              : 'https://api.openai.com'),
-      maxTokens: prefs.maxTokens ?? AppConstants.defaultMaxTokens,
-      thinkingBudget: prefs.thinkingBudget,
-      temperature: prefs.temperature,
-      capabilityOverride: session.modelOverride == null
-          ? activeProfile.capabilityOverride
-          : null,
+      apiKey: profile.apiKey.trim(),
+      model: session.modelOverride ?? profile.effectiveModel,
+      baseUrl: baseUrl,
+      maxTokens: profile.maxTokens,
+      thinkingBudget: profile.thinkingBudget,
+      temperature: profile.temperature,
+      capabilityOverride:
+          session.modelOverride == null ? profile.capabilityOverride : null,
     );
+  }
+
+  LlmConfig _buildLlmConfigForProfile(
+    ProviderProfile profile, {
+    String? modelOverride,
+  }) {
+    final format = profile.apiFormat == ProviderProfile.openaiFormat
+        ? ApiFormat.openai
+        : ApiFormat.anthropic;
+    final model = (modelOverride?.trim().isNotEmpty ?? false)
+        ? modelOverride!.trim()
+        : profile.effectiveModel;
+    final baseUrl = profile.baseUrl.trim().isNotEmpty
+        ? profile.baseUrl.trim()
+        : (format == ApiFormat.anthropic
+            ? 'https://api.anthropic.com'
+            : 'https://api.openai.com');
+    return LlmConfig(
+      format: format,
+      apiKey: profile.apiKey.trim(),
+      model: model,
+      baseUrl: baseUrl,
+      maxTokens: profile.maxTokens,
+      thinkingBudget: profile.thinkingBudget,
+      temperature: profile.temperature,
+      capabilityOverride:
+          model == profile.effectiveModel ? profile.capabilityOverride : null,
+    );
+  }
+
+  bool _sameModelDestination(LlmConfig a, LlmConfig b) {
+    return a.format == b.format &&
+        _normalizedBaseUrl(a.baseUrl) == _normalizedBaseUrl(b.baseUrl) &&
+        a.model.trim() == b.model.trim();
+  }
+
+  String _normalizedBaseUrl(String value) {
+    return value.trim().replaceFirst(RegExp(r'/+$'), '');
+  }
+
+  String? _fallbackCapabilitySkipReason({
+    required ModelCapabilities capabilities,
+    required ModelCapabilities primaryCapabilities,
+    required LlmConfig primaryConfig,
+    required LlmConfig candidateConfig,
+    required ContextAssemblyResult primaryAssembly,
+    required List<Map<String, dynamic>> primaryToolDefinitions,
+    required List<Map<String, dynamic>> fullApiMessages,
+    required _FallbackReason primaryReason,
+  }) {
+    if (primaryToolDefinitions.isNotEmpty && !capabilities.supportsTools) {
+      return 'tools_not_supported';
+    }
+    if (_messagesContainImages(fullApiMessages) &&
+        !capabilities.supportsImages) {
+      return 'vision_not_supported';
+    }
+    if (primaryConfig.thinkingBudget > 0 &&
+        candidateConfig.thinkingBudget <= 0) {
+      return 'reasoning_budget_not_configured';
+    }
+    if (primaryConfig.thinkingBudget > 0 &&
+        !capabilities.supportsReasoningContent &&
+        !capabilities.supportsThinkingBudget) {
+      return 'reasoning_not_supported';
+    }
+    final candidateWindow = capabilities.maxContextTokens;
+    if (candidateWindow != null &&
+        candidateWindow < primaryAssembly.budget.effectiveContextTokenBudget) {
+      return 'context_window_smaller';
+    }
+    if (primaryReason.contextTooLarge) {
+      final primaryWindow = primaryCapabilities.maxContextTokens;
+      if (candidateWindow == null ||
+          primaryWindow == null ||
+          candidateWindow <= primaryWindow) {
+        return 'context_window_not_larger';
+      }
+    }
+    return null;
+  }
+
+  bool _messagesContainImages(List<Map<String, dynamic>> messages) {
+    for (final message in messages) {
+      if (_contentContainsImage(message['content'])) return true;
+    }
+    return false;
+  }
+
+  bool _contentContainsImage(Object? content) {
+    if (content is Map) {
+      final type = content['type']?.toString();
+      if (type == 'image' || type == 'image_url') return true;
+      return content.values.any(_contentContainsImage);
+    }
+    if (content is Iterable) {
+      return content.any(_contentContainsImage);
+    }
+    return false;
+  }
+
+  _FallbackReason _fallbackReasonFor(Object? error, String? message) {
+    final raw = [
+      if (error != null) error.toString(),
+      if (message?.isNotEmpty == true) message!,
+    ].join('\n');
+    final text = raw.toLowerCase();
+    if (text.contains('cancel')) {
+      return const _FallbackReason.blocked('user_cancelled', '用户取消');
+    }
+    if (_containsAny(text, const [
+      '401',
+      '403',
+      'unauthorized',
+      'forbidden',
+      'authentication',
+      'auth error',
+      'api key',
+      'apikey',
+      'invalid key',
+      'permission denied',
+    ])) {
+      return const _FallbackReason.blocked('auth_or_permission', '鉴权失败');
+    }
+    if (_containsAny(text, const [
+      'content policy',
+      'safety',
+      'refusal',
+      'refused',
+      'moderation',
+    ])) {
+      return const _FallbackReason.blocked('safety_or_refusal', '安全策略');
+    }
+    if (_containsAny(text, const [
+      'context length',
+      'context_length',
+      'maximum context',
+      'token limit',
+      'too many tokens',
+      'context too large',
+      'exceeds context',
+    ])) {
+      return const _FallbackReason.allowed(
+        'context_too_large',
+        '上下文过长',
+        contextTooLarge: true,
+      );
+    }
+    if (_containsAny(text, const [
+      'tool approval',
+      'tool execution',
+      'tool error',
+      'schema',
+      'invalid request',
+      'invalid_request',
+      'bad request',
+      '400',
+      'unsupported',
+      'unrecognized',
+      'not permitted',
+      'not allowed',
+    ])) {
+      return const _FallbackReason.blocked('invalid_or_tool_error', '请求无效');
+    }
+    if (_containsAny(text, const [
+      '429',
+      'rate limit',
+      'rate_limit',
+      'quota',
+      'too many requests',
+    ])) {
+      return const _FallbackReason.allowed('rate_limited', '限流');
+    }
+    if (_containsAny(text, const [
+      'timeout',
+      'timed out',
+      'socketexception',
+      'handshakeexception',
+      'connection closed',
+      'connection reset',
+      'network',
+      'temporarily unavailable',
+    ])) {
+      return const _FallbackReason.allowed('network_or_timeout', '网络异常');
+    }
+    if (_containsAny(text, const [
+      '500',
+      '502',
+      '503',
+      '504',
+      '529',
+      'overloaded',
+      'server error',
+      'service unavailable',
+      'bad gateway',
+      'gateway timeout',
+    ])) {
+      return const _FallbackReason.allowed('provider_unavailable', '服务不可用');
+    }
+    if ((text.contains('model') || text.contains('deployment')) &&
+        _containsAny(text, const [
+          'not found',
+          'unavailable',
+          'does not exist',
+          'not available',
+        ])) {
+      return const _FallbackReason.allowed('model_unavailable', '模型不可用');
+    }
+    return const _FallbackReason.blocked('non_retryable', '不可重试错误');
+  }
+
+  bool _containsAny(String text, List<String> needles) {
+    return needles.any(text.contains);
+  }
+
+  void _recordModelFallbackEvent(
+    String sessionId,
+    String type,
+    Map<String, Object?> data,
+  ) {
+    _recordRuntimeEvent(sessionId, type, data);
+  }
+
+  String _safeModelLabel(LlmConfig config) {
+    return '${config.format.name}/${_safeFallbackLabelText(config.model)}';
+  }
+
+  void _appendModelFallbackNotice(
+    ChatSession session, {
+    required String primary,
+    required String fallback,
+    required String reason,
+  }) {
+    final text = AppStrings.modelFallbackUsedNotice(
+      primary: primary,
+      fallback: fallback,
+      reason: reason,
+    );
+    if (session.messages.isNotEmpty) {
+      final last = session.messages.last;
+      if (last.isSystemNotice && last.textContent == text) return;
+    }
+    session.messages.add(ChatMessage.systemNotice(text));
+  }
+
+  LlmConfig _buildLlmConfig(PreferencesService prefs, ChatSession session) {
+    return _buildLlmConfigForProfileSnapshot(prefs.activeProfile, session);
   }
 
   AgentService _createAgentService({
@@ -1691,6 +2513,8 @@ class ChatProvider extends ChangeNotifier {
           state,
           request,
         ),
+        deniedToolNames: _prefs.deniedToolNames,
+        bashCommandDenyPatterns: _prefs.bashCommandDenyPatterns,
       ),
       maxIterations: _prefs.agentMaxIterations,
       privacyMode: _prefs.privacyMode,
@@ -1752,6 +2576,9 @@ class ChatProvider extends ChangeNotifier {
     state.agentCompleter = completer;
     state.agentCompletionFinalizing = false;
     state.initialApiMsgCount = apiMessages.length;
+    state.fallbackTextEmitted = false;
+    state.fallbackToolStarted = false;
+    state.fallbackMessagesPersisted = false;
     Object? errorCause;
     bool isCurrentRun() => identical(state.agentCompleter, completer);
     void completeRun() {
@@ -1773,9 +2600,11 @@ class ChatProvider extends ChangeNotifier {
             ));
 
           case AgentTextDelta(:final text):
+            if (text.isNotEmpty) state.fallbackTextEmitted = true;
             _appendStreamingDelta(state, text);
 
           case AgentToolStart(:final toolName):
+            state.fallbackToolStarted = true;
             _flushStreamingNow(state);
             state.status = AgentStatus.tooling;
             notifyListeners();
@@ -1794,6 +2623,9 @@ class ChatProvider extends ChangeNotifier {
 
           case AgentIterationDone(:final messages):
             _clearStreamingState(state);
+            if (messages.length > state.initialApiMsgCount) {
+              state.fallbackMessagesPersisted = true;
+            }
             _appendNewAgentMessages(
               state,
               activeSession,
@@ -1816,6 +2648,9 @@ class ChatProvider extends ChangeNotifier {
             ):
             _flushStreamingNow(state, notify: false);
             state.status = AgentStatus.idle;
+            if (state.agent!.messages.length > state.initialApiMsgCount) {
+              state.fallbackMessagesPersisted = true;
+            }
             _appendNewAgentMessages(
               state,
               activeSession,
@@ -1828,6 +2663,12 @@ class ChatProvider extends ChangeNotifier {
               if (activeSession.messages[i].role == 'assistant') {
                 activeSession.messages[i].inputTokens = inputTokens;
                 activeSession.messages[i].outputTokens = outputTokens;
+                activeSession.messages[i].cacheReadInputTokens =
+                    usage?.cacheReadInputTokens;
+                activeSession.messages[i].cacheCreationInputTokens =
+                    usage?.cacheCreationInputTokens;
+                activeSession.messages[i].inputTokensIncludeCache =
+                    usage?.inputTokensIncludeCache ?? false;
                 break;
               }
             }
@@ -1846,13 +2687,13 @@ class ChatProvider extends ChangeNotifier {
 
           case AgentError(:final message, :final cause):
             _clearStreamingState(state);
-            errorCause = cause;
+            errorCause = cause ?? _AgentRuntimeError(message);
             if (cause is EncryptedContentError) {
               state.status = AgentStatus.thinking;
               state.errorMessage = null;
             } else {
               state.status = AgentStatus.error;
-              state.errorMessage = message;
+              state.errorMessage = _sanitizeProviderErrorMessage(message);
             }
             notifyListeners();
             completeRun();
@@ -1870,7 +2711,7 @@ class ChatProvider extends ChangeNotifier {
           state.errorMessage = null;
         } else {
           state.status = AgentStatus.error;
-          state.errorMessage = '$e';
+          state.errorMessage = _sanitizeProviderErrorMessage(e);
         }
         notifyListeners();
         if (!state.agentCompletionFinalizing) {
@@ -1928,6 +2769,31 @@ class ChatProvider extends ChangeNotifier {
     await _storage.saveSession(session);
     _syncCurrentSessionReference(session);
     notifyListeners();
+  }
+
+  Future<bool> _restoreContextSessionPatchSnapshot(
+    ChatSession session,
+    _ContextSessionPatchSnapshot snapshot,
+    ContextSessionPatch patch,
+  ) async {
+    if (patch.isEmpty || session.messages.length < snapshot.messageCount) {
+      return false;
+    }
+    final trailing = session.messages.skip(snapshot.messageCount);
+    if (!trailing.every((message) => message.isSystemNotice)) {
+      return false;
+    }
+    session.contextSummary = snapshot.contextSummary;
+    if (session.messages.length > snapshot.messageCount) {
+      session.messages.removeRange(
+        snapshot.messageCount,
+        session.messages.length,
+      );
+    }
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+    notifyListeners();
+    return true;
   }
 
   void _appendContextCompactionNotice(
@@ -2137,6 +3003,9 @@ class ChatProvider extends ChangeNotifier {
             timestamp: msg.timestamp,
             inputTokens: msg.inputTokens,
             outputTokens: msg.outputTokens,
+            cacheReadInputTokens: msg.cacheReadInputTokens,
+            cacheCreationInputTokens: msg.cacheCreationInputTokens,
+            inputTokensIncludeCache: msg.inputTokensIncludeCache,
             alternatives: state.pendingAlternatives,
             activeAlternative: -1,
           );
@@ -2195,6 +3064,99 @@ class ChatProvider extends ChangeNotifier {
 
     return ChatMessage(role: role, content: contentList);
   }
+}
+
+class _AgentRuntimeError implements Exception {
+  final String message;
+
+  _AgentRuntimeError(Object? message)
+      : message = message?.toString() ?? 'LLM request failed';
+
+  @override
+  String toString() => message;
+}
+
+class _FallbackReason {
+  final String code;
+  final String label;
+  final bool canFallback;
+  final bool contextTooLarge;
+
+  const _FallbackReason._({
+    required this.code,
+    required this.label,
+    required this.canFallback,
+    this.contextTooLarge = false,
+  });
+
+  const _FallbackReason.allowed(
+    String code,
+    String label, {
+    bool contextTooLarge = false,
+  }) : this._(
+          code: code,
+          label: label,
+          canFallback: true,
+          contextTooLarge: contextTooLarge,
+        );
+
+  const _FallbackReason.blocked(String code, String label)
+      : this._(
+          code: code,
+          label: label,
+          canFallback: false,
+        );
+}
+
+class _ProviderProfileSnapshot {
+  final String activeProfileId;
+  final ProviderProfile activeProfile;
+  final List<ProviderProfile> profiles;
+
+  const _ProviderProfileSnapshot({
+    required this.activeProfileId,
+    required this.activeProfile,
+    required this.profiles,
+  });
+}
+
+class _ContextSessionPatchSnapshot {
+  final ContextSummary? contextSummary;
+  final int messageCount;
+
+  const _ContextSessionPatchSnapshot({
+    required this.contextSummary,
+    required this.messageCount,
+  });
+
+  factory _ContextSessionPatchSnapshot.capture(ChatSession session) {
+    return _ContextSessionPatchSnapshot(
+      contextSummary: session.contextSummary,
+      messageCount: session.messages.length,
+    );
+  }
+}
+
+class _ModelFallbackCandidate {
+  final ProviderProfile profile;
+  final LlmConfig config;
+
+  const _ModelFallbackCandidate({
+    required this.profile,
+    required this.config,
+  });
+
+  String get safeLabel => _safeFallbackLabelText(config.model);
+}
+
+String _safeFallbackLabelText(String raw) {
+  final sanitized = const LlmContentSanitizer().sanitizeText(raw).text;
+  final compact = sanitized.replaceAll(RegExp(r'\s+'), ' ').trim();
+  final label = compact.isEmpty ? 'unknown-model' : compact;
+  const maxRunes = 80;
+  final runes = label.runes.toList(growable: false);
+  if (runes.length <= maxRunes) return label;
+  return '${String.fromCharCodes(runes.take(maxRunes))}...';
 }
 
 class CompareResult {

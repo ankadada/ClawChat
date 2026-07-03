@@ -56,6 +56,19 @@ class ChatRenderWindowState {
     );
   }
 
+  ChatRenderWindowState ensureIncludes({
+    required int totalCount,
+    required int messageIndex,
+  }) {
+    if (totalCount <= 0) return this;
+    final safeIndex = messageIndex.clamp(0, totalCount - 1).toInt();
+    final requiredLimit = totalCount - safeIndex;
+    if (requiredLimit <= visibleLimit) return this;
+    return ChatRenderWindowState(
+      visibleLimit: math.min(totalCount, requiredLimit),
+    );
+  }
+
   ChatRenderWindow windowFor(int totalCount) {
     return ChatRenderWindow.forMessageCount(
       totalCount: totalCount,
@@ -82,4 +95,19 @@ double? compensatedScrollOffsetAfterPrepend({
   return (previousOffset + delta)
       .clamp(currentMinScrollExtent, currentMaxScrollExtent)
       .toDouble();
+}
+
+double estimatedReversedListOffsetForMessageIndex({
+  required ChatRenderWindow window,
+  required int messageIndex,
+  required double maxScrollExtent,
+}) {
+  if (maxScrollExtent <= 0 || window.visibleCount <= 1) return 0;
+  final clampedIndex = messageIndex
+      .clamp(window.startIndex, window.endIndexExclusive - 1)
+      .toInt();
+  final newestVisibleIndex = window.endIndexExclusive - 1;
+  final distanceFromNewest = newestVisibleIndex - clampedIndex;
+  final fraction = distanceFromNewest / (window.visibleCount - 1);
+  return (maxScrollExtent * fraction).clamp(0, maxScrollExtent).toDouble();
 }
