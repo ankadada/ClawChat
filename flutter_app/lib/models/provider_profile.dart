@@ -56,6 +56,82 @@ class ModelFallbackTarget {
   }
 }
 
+class ModelGroup {
+  final String id;
+  final String name;
+  final String primaryProfileId;
+  final List<ModelFallbackTarget> fallbackTargets;
+
+  ModelGroup({
+    String? id,
+    required this.name,
+    required this.primaryProfileId,
+    this.fallbackTargets = const [],
+  }) : id = id?.trim().isNotEmpty == true ? id!.trim() : const Uuid().v4();
+
+  String get displayName => name.trim().isEmpty ? '未命名模型组' : name.trim();
+
+  ModelGroup copyWith({
+    String? id,
+    String? name,
+    String? primaryProfileId,
+    List<ModelFallbackTarget>? fallbackTargets,
+  }) {
+    return ModelGroup(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      primaryProfileId: primaryProfileId ?? this.primaryProfileId,
+      fallbackTargets: fallbackTargets ?? this.fallbackTargets,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'primaryProfileId': primaryProfileId,
+        if (fallbackTargets.isNotEmpty)
+          'fallbackTargets':
+              fallbackTargets.map((target) => target.toJson()).toList(),
+      };
+
+  factory ModelGroup.fromJson(Map<String, dynamic> json) {
+    final id = json['id']?.toString().trim();
+    final name = json['name']?.toString().trim();
+    final primaryProfileId = json['primaryProfileId']?.toString().trim();
+    if (id == null ||
+        id.isEmpty ||
+        name == null ||
+        name.isEmpty ||
+        primaryProfileId == null ||
+        primaryProfileId.isEmpty) {
+      throw const FormatException('Invalid model group');
+    }
+    return ModelGroup(
+      id: id,
+      name: name,
+      primaryProfileId: primaryProfileId,
+      fallbackTargets: _fallbackTargets(json['fallbackTargets']),
+    );
+  }
+
+  static List<ModelFallbackTarget> _fallbackTargets(Object? value) {
+    if (value == null) return const [];
+    if (value is! List) {
+      throw const FormatException('Invalid model group fallback targets');
+    }
+    final targets = <ModelFallbackTarget>[];
+    for (final item in value) {
+      if (item is! Map) {
+        throw const FormatException('Invalid model group fallback target');
+      }
+      targets.add(
+        ModelFallbackTarget.fromJson(Map<String, dynamic>.from(item)),
+      );
+    }
+    return targets;
+  }
+}
+
 class ProviderProfile {
   static const anthropicFormat = 'anthropic';
   static const openaiFormat = 'openai';

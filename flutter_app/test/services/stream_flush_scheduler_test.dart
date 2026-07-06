@@ -37,4 +37,27 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 40));
     expect(flushes, 1);
   });
+
+  test('can batch newline-heavy reasoning deltas', () async {
+    final scheduler = StreamFlushScheduler(
+      maxDelay: const Duration(milliseconds: 30),
+    );
+    addTearDown(scheduler.cancel);
+    var flushes = 0;
+
+    scheduler.schedule(
+      delta: 'line one\n',
+      flushOnBoundary: false,
+      flush: () => flushes++,
+    );
+    scheduler.schedule(
+      delta: 'line two\n',
+      flushOnBoundary: false,
+      flush: () => flushes++,
+    );
+
+    expect(flushes, 0);
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+    expect(flushes, 1);
+  });
 }

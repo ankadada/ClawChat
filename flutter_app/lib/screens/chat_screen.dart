@@ -25,6 +25,7 @@ import '../services/tools/tool_policy.dart';
 import '../services/usage_summary_service.dart';
 import '../services/voice_input_state.dart';
 import '../widgets/streaming_text.dart';
+import '../widgets/reasoning_text_panel.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/agent_status_bar.dart';
 import '../widgets/compare_view.dart';
@@ -47,6 +48,8 @@ enum _NativeSpeechOutcome {
   timedOut,
   failed,
 }
+
+const _defaultNewChatModelGroupSelection = '__default_provider_profile__';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -734,6 +737,68 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     provider.sendMessage(text, attachments: attachments);
   }
 
+  Future<void> _createNewChat() async {
+    final provider = context.read<ChatProvider>();
+    final groups = provider.modelGroups;
+    String? modelGroupId;
+    if (groups.isNotEmpty) {
+      final selected = await _showModelGroupPicker(groups);
+      if (!mounted || selected == null) return;
+      if (selected != _defaultNewChatModelGroupSelection) {
+        modelGroupId = selected;
+      }
+    }
+    await provider.createSession(modelGroupId: modelGroupId);
+  }
+
+  Future<String?> _showModelGroupPicker(List<ModelGroup> groups) {
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text(AppStrings.selectModelGroup),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.tune),
+                title: const Text(AppStrings.defaultModelGroup),
+                subtitle: const Text(AppStrings.defaultModelGroupSubtitle),
+                onTap: () => Navigator.pop(
+                  dialogContext,
+                  _defaultNewChatModelGroupSelection,
+                ),
+              ),
+              for (final group in groups)
+                ListTile(
+                  leading: const Icon(Icons.account_tree_outlined),
+                  title: Text(
+                    group.displayName,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  subtitle: Text(
+                    AppStrings.modelGroupFallbackCount(
+                      group.fallbackTargets
+                          .where((target) => target.enabled)
+                          .length,
+                    ),
+                  ),
+                  onTap: () => Navigator.pop(dialogContext, group.id),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text(AppStrings.cancel),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _handleSharedContent(SharedContent content) async {
     if (!mounted || !content.hasPayload) return;
     final prepared = await _sharedContentPreparer.prepare(content);
@@ -1325,7 +1390,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           IconButton(
             icon: const Icon(Icons.add),
             tooltip: AppStrings.newChat,
-            onPressed: () => context.read<ChatProvider>().createSession(),
+            onPressed: () => unawaited(_createNewChat()),
           ),
           PopupMenuButton<String>(
             onSelected: (value) {
@@ -1494,12 +1559,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       AgentStatus status,
                       String? sessionId,
                       int messageVersion,
-                      String modelLabel
+                      String modelLabel,
                     })>(
                   selector: (_, p) => (
                     messages: p.currentSession?.messages ?? [],
                     hasStreaming: p.agentStatus == AgentStatus.streaming ||
-                        p.streamingText.isNotEmpty,
+                        p.streamingText.isNotEmpty ||
+                        p.streamingReasoningTotalLength > 0,
                     status: p.agentStatus,
                     sessionId: p.currentSession?.id,
                     messageVersion: p.messageVersion,
@@ -1582,6 +1648,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                         provider.streamingText,
                                         theme,
                                         maxContentWidth,
+                                        reasoningText:
+                                            provider.streamingReasoningText,
+                                        reasoningTotalLength: provider
+                                            .streamingReasoningTotalLength,
                                         previousRole: messages.isEmpty
                                             ? null
                                             : messages.last.role,
@@ -1918,6 +1988,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ),
             ),
           ),
+          if (!isUser && message.assistantError != null)
+            _buildAssistantErrorBanner(
+              message,
+              messageIndex,
+              theme,
+              maxContentWidth,
+            ),
           for (final content in visibleContent)
             _buildContentBlock(
               content,
@@ -1953,6 +2030,110 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ),
       child: bubble,
     );
+  }
+
+  Widget _buildAssistantErrorBanner(
+    ChatMessage message,
+    int messageIndex,
+    ThemeData theme,
+    double maxContentWidth,
+  ) {
+    final error = message.assistantError!;
+    final color = theme.colorScheme.error;
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxContentWidth),
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 6),
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.errorContainer.withAlpha(85),
+          borderRadius: _bubbleRadius(false),
+          border: Border.all(color: color.withAlpha(90)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Icon(Icons.error_outline, size: 18, color: color),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        AppStrings.assistantErrorTitle,
+                        style: theme.textTheme.labelLarge?.copyWith(
+                          color: color,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        error.message,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onErrorContainer,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (error.canRetry)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: FilledButton.icon(
+                  onPressed: () => _retryAssistantMessage(messageIndex),
+                  icon: const Icon(Icons.refresh, size: 16),
+                  label: const Text(AppStrings.retry),
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    minimumSize: const Size(0, 38),
+                  ),
+                ),
+              )
+            else
+              Text(
+                AppStrings.assistantErrorRetryUnavailable,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.colorScheme.onErrorContainer.withAlpha(185),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _retryAssistantMessage(int messageIndex) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final status =
+        await context.read<ChatProvider>().retryAssistantMessage(messageIndex);
+    if (!mounted) return;
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(_assistantRetryStatusText(status)),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  String _assistantRetryStatusText(AssistantRetryStatus status) {
+    return switch (status) {
+      AssistantRetryStatus.started => AppStrings.assistantRetryStarted,
+      AssistantRetryStatus.invalidMessage => AppStrings.assistantRetryFailed,
+      AssistantRetryStatus.notRetryable => AppStrings.assistantRetryUnavailable,
+      AssistantRetryStatus.busy => AppStrings.assistantRetryBusy,
+      AssistantRetryStatus.missingApiKey =>
+        AppStrings.assistantRetryMissingApiKey,
+    };
   }
 
   Widget _buildSystemNotice(ChatMessage message, ThemeData theme) {
@@ -2511,7 +2692,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     List<ChatMessage>? messages,
   }) {
     switch (content) {
-      case TextContent(:final text):
+      case TextContent(:final text, :final reasoningContent):
         return Semantics(
           label: isUser ? '用户消息' : 'AI 消息',
           child: _buildBubbleWithAction(
@@ -2535,7 +2716,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       : theme.colorScheme.outline.withAlpha(50),
                 ),
               ),
-              child: StreamingText(text: text),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (!isUser && reasoningContent?.isNotEmpty == true) ...[
+                    ReasoningTextPanel(text: reasoningContent!),
+                    if (text.isNotEmpty) const SizedBox(height: 12),
+                  ],
+                  if (text.isNotEmpty) StreamingText(text: text),
+                ],
+              ),
             ),
           ),
         );
@@ -2645,6 +2835,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     String text,
     ThemeData theme,
     double maxContentWidth, {
+    String reasoningText = '',
+    int reasoningTotalLength = 0,
     String? previousRole,
   }) {
     return Padding(
@@ -2674,7 +2866,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 color: theme.colorScheme.outline.withAlpha(50),
               ),
             ),
-            child: StreamingText(text: text, isStreaming: true),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (reasoningText.isNotEmpty || reasoningTotalLength > 0) ...[
+                  ReasoningTextPanel(
+                    text: reasoningText,
+                    totalLength: reasoningTotalLength,
+                    isStreaming: true,
+                  ),
+                  if (text.isNotEmpty) const SizedBox(height: 12),
+                ],
+                if (text.isNotEmpty)
+                  StreamingText(text: text, isStreaming: true),
+              ],
+            ),
           ),
         ],
       ),

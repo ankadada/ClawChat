@@ -277,6 +277,11 @@ class TextDelta extends StreamEvent {
   TextDelta(this.text);
 }
 
+class ReasoningDelta extends StreamEvent {
+  final String text;
+  ReasoningDelta(this.text);
+}
+
 class ToolUseStart extends StreamEvent {
   final String id;
   final String name;
@@ -842,6 +847,7 @@ class LlmService {
 
     final List<ContentBlock> collectedBlocks = [];
     String currentText = '';
+    StringBuffer currentReasoningContent = StringBuffer();
     String currentToolId = '';
     String currentToolName = '';
     StringBuffer currentToolInput = StringBuffer();
@@ -855,18 +861,21 @@ class LlmService {
     bool streamFailed = false;
     int textSkipRemaining = 0;
     int toolInputSkipRemaining = 0;
+    int reasoningSkipRemaining = 0;
     int toolStartSkipRemaining = 0;
     int completedToolBlockSkipRemaining = 0;
     int emittedTextLength = 0;
     int emittedToolInputLength = 0;
+    int emittedReasoningLength = 0;
     int emittedToolStarts = 0;
     int completedToolBlocks = 0;
     bool suppressCurrentToolBlock = false;
+    bool activeContentBlock = false;
 
-    void finishCurrentAnthropicBlock() {
+    String? finishCurrentAnthropicBlock() {
       if (isThinkingBlock) {
         isThinkingBlock = false;
-        return;
+        return null;
       }
       if (currentToolName.isNotEmpty && currentToolId.isNotEmpty) {
         final shouldSuppressToolBlock = suppressCurrentToolBlock;
@@ -876,7 +885,7 @@ class LlmService {
           final inputStr = currentToolInput.toString();
           if (inputStr.isNotEmpty) input = jsonDecode(inputStr);
         } catch (_) {
-          // Malformed tool input JSON - proceed with empty input
+          return 'Anthropic stream interrupted: incomplete tool call JSON';
         }
         if (!shouldSuppressToolBlock) {
           final rawToolInputJson = currentToolInput.toString();
@@ -894,19 +903,40 @@ class LlmService {
         currentToolName = '';
         currentToolInput = StringBuffer();
       } else if (currentText.isNotEmpty) {
-        collectedBlocks.add(ContentBlock(type: 'text', text: currentText));
+        final reasoningText = currentReasoningContent.toString();
+        collectedBlocks.add(ContentBlock(
+          type: 'text',
+          text: currentText,
+          reasoningContent: reasoningText.isEmpty ? null : reasoningText,
+        ));
+        currentReasoningContent = StringBuffer();
         currentText = '';
       }
+      return null;
     }
 
     Iterable<StreamEvent> parseAnthropicSseData(String data) sync* {
-      if (data == '[DONE]') {
-        receivedMessageStop = true;
+      final frame = data.trim();
+      if (frame.isEmpty || frame == '[DONE]') {
+        return;
+      }
+
+      late final Map<String, dynamic> event;
+      try {
+        final decoded = jsonDecode(frame);
+        if (decoded is! Map) {
+          throw const FormatException('Expected JSON object');
+        }
+        event = Map<String, dynamic>.from(decoded);
+      } catch (_) {
+        streamFailed = true;
+        yield StreamError(
+          'Anthropic stream interrupted: malformed SSE JSON frame',
+        );
         return;
       }
 
       try {
-        final event = jsonDecode(data) as Map<String, dynamic>;
         final type = event['type'] as String?;
 
         switch (type) {
@@ -928,18 +958,38 @@ class LlmService {
 
           case 'content_block_start':
             final block = event['content_block'] as Map<String, dynamic>;
+            if (activeContentBlock) {
+              streamFailed = true;
+              yield StreamError(
+                'Anthropic stream interrupted: content block was incomplete',
+              );
+              return;
+            }
+            activeContentBlock = true;
             if (block['type'] == 'thinking') {
               isThinkingBlock = true;
             } else if (block['type'] == 'tool_use') {
               isThinkingBlock = false;
+              final blockId = block['id'] as String?;
+              final blockName = block['name'] as String?;
+              if (blockId == null ||
+                  blockId.isEmpty ||
+                  blockName == null ||
+                  blockName.isEmpty) {
+                streamFailed = true;
+                yield StreamError(
+                  'Anthropic stream interrupted: incomplete tool call metadata',
+                );
+                return;
+              }
               final duplicateToolStart = toolStartSkipRemaining > 0;
               final duplicateCompletedToolBlock =
                   completedToolBlockSkipRemaining > 0;
               if (!duplicateToolStart ||
                   duplicateCompletedToolBlock ||
                   currentToolId.isEmpty) {
-                currentToolId = block['id'] as String;
-                currentToolName = block['name'] as String;
+                currentToolId = blockId;
+                currentToolName = blockName;
               }
               if (!duplicateToolStart || duplicateCompletedToolBlock) {
                 currentToolInput = StringBuffer();
@@ -960,8 +1010,28 @@ class LlmService {
             break;
 
           case 'content_block_delta':
-            if (isThinkingBlock) break;
             final delta = event['delta'] as Map<String, dynamic>;
+            if (isThinkingBlock) {
+              if (delta['type'] == 'thinking_delta') {
+                final thinking = delta['thinking'] as String? ?? '';
+                var thinkingToEmit = thinking;
+                if (reasoningSkipRemaining > 0) {
+                  if (reasoningSkipRemaining >= thinking.length) {
+                    reasoningSkipRemaining -= thinking.length;
+                    thinkingToEmit = '';
+                  } else {
+                    thinkingToEmit = thinking.substring(reasoningSkipRemaining);
+                    reasoningSkipRemaining = 0;
+                  }
+                }
+                if (thinkingToEmit.isNotEmpty) {
+                  currentReasoningContent.write(thinkingToEmit);
+                  emittedReasoningLength += thinkingToEmit.length;
+                  yield ReasoningDelta(thinkingToEmit);
+                }
+              }
+              break;
+            }
             if (delta['type'] == 'text_delta') {
               final text = delta['text'] as String;
               var textToEmit = text;
@@ -1000,7 +1070,20 @@ class LlmService {
             break;
 
           case 'content_block_stop':
-            finishCurrentAnthropicBlock();
+            if (!activeContentBlock) {
+              streamFailed = true;
+              yield StreamError(
+                'Anthropic stream interrupted: content block stop was unexpected',
+              );
+              return;
+            }
+            activeContentBlock = false;
+            final blockError = finishCurrentAnthropicBlock();
+            if (blockError != null) {
+              streamFailed = true;
+              yield StreamError(blockError);
+              return;
+            }
             break;
 
           case 'message_delta':
@@ -1019,6 +1102,13 @@ class LlmService {
             break;
 
           case 'message_stop':
+            if (activeContentBlock) {
+              streamFailed = true;
+              yield StreamError(
+                'Anthropic stream interrupted: content block was incomplete',
+              );
+              return;
+            }
             receivedMessageStop = true;
             break;
 
@@ -1041,7 +1131,10 @@ class LlmService {
             return;
         }
       } catch (_) {
-        // Malformed SSE event JSON - skip and continue to next event
+        streamFailed = true;
+        yield StreamError(
+          'Anthropic stream interrupted: malformed SSE JSON frame',
+        );
       }
     }
 
@@ -1052,6 +1145,7 @@ class LlmService {
         isInBackground: _isInBackground,
         onRetry: (_, __) {
           textSkipRemaining = emittedTextLength;
+          reasoningSkipRemaining = emittedReasoningLength;
           toolInputSkipRemaining = emittedToolInputLength;
           toolStartSkipRemaining = emittedToolStarts;
           completedToolBlockSkipRemaining = completedToolBlocks;
@@ -1071,11 +1165,27 @@ class LlmService {
       return;
     }
 
-    finishCurrentAnthropicBlock();
-
-    if (!receivedMessageStop && collectedBlocks.isEmpty) {
-      yield StreamError('Anthropic stream ended without message_stop event');
+    if (activeContentBlock) {
+      yield StreamError(
+        'Anthropic stream interrupted: content block was incomplete',
+      );
       return;
+    }
+
+    if (!receivedMessageStop) {
+      yield StreamError(
+        'Anthropic stream interrupted: ended without message_stop event',
+      );
+      return;
+    }
+
+    final trailingReasoning = currentReasoningContent.toString();
+    if (trailingReasoning.isNotEmpty) {
+      collectedBlocks.add(ContentBlock(
+        type: 'text',
+        text: '',
+        reasoningContent: trailingReasoning,
+      ));
     }
 
     final usage = LlmUsage(
@@ -1300,7 +1410,7 @@ class LlmService {
     }
 
     String currentText = '';
-    String currentReasoningContent = '';
+    final currentReasoningContent = StringBuffer();
     final List<ContentBlock> collectedBlocks = [];
     final Map<int, Map<String, String>> toolCallsAccum = {};
     String stopReason = 'stop';
@@ -1313,15 +1423,35 @@ class LlmService {
     int emittedTextLength = 0;
     int emittedReasoningLength = 0;
     final Map<int, int> toolArgumentSkipRemaining = {};
+    bool receivedFinishReason = false;
+    bool streamFailed = false;
 
     Iterable<StreamEvent> parseOpenAiSseData(String data) sync* {
-      if (data == '[DONE]') {
+      final frame = data.trim();
+      if (frame.isEmpty) {
+        return;
+      }
+      if (frame == '[DONE]') {
         receivedDone = true;
         return;
       }
 
+      late final Map<String, dynamic> event;
       try {
-        final event = jsonDecode(data) as Map<String, dynamic>;
+        final decoded = jsonDecode(frame);
+        if (decoded is! Map) {
+          throw const FormatException('Expected JSON object');
+        }
+        event = Map<String, dynamic>.from(decoded);
+      } catch (_) {
+        streamFailed = true;
+        yield StreamError(
+          'OpenAI stream interrupted: malformed SSE JSON frame',
+        );
+        return;
+      }
+
+      try {
         // Parse usage from streaming chunk (OpenAI sends it in final chunk)
         final usage = event['usage'] as Map<String, dynamic>?;
         if (usage != null) {
@@ -1338,7 +1468,10 @@ class LlmService {
         final delta = choice['delta'] as Map<String, dynamic>?;
         final finishReason = choice['finish_reason'] as String?;
 
-        if (finishReason != null) stopReason = finishReason;
+        if (finishReason != null) {
+          stopReason = finishReason;
+          receivedFinishReason = true;
+        }
         if (delta == null) return;
 
         final content = delta['content'] as String?;
@@ -1373,8 +1506,9 @@ class LlmService {
             }
           }
           if (reasoningToAppend.isNotEmpty) {
-            currentReasoningContent += reasoningToAppend;
+            currentReasoningContent.write(reasoningToAppend);
             emittedReasoningLength += reasoningToAppend.length;
+            yield ReasoningDelta(reasoningToAppend);
           }
         }
 
@@ -1424,7 +1558,10 @@ class LlmService {
           }
         }
       } catch (_) {
-        // Malformed SSE event JSON - skip and continue to next event
+        streamFailed = true;
+        yield StreamError(
+          'OpenAI stream interrupted: malformed SSE JSON frame',
+        );
       }
     }
 
@@ -1449,6 +1586,7 @@ class LlmService {
         for (final event in parseOpenAiSseData(data)) {
           yield event;
         }
+        if (streamFailed) return;
         if (receivedDone) break;
       }
     } catch (e) {
@@ -1456,23 +1594,45 @@ class LlmService {
       return;
     }
 
-    if (currentText.isNotEmpty || currentReasoningContent.isNotEmpty) {
+    if (!receivedFinishReason) {
+      yield StreamError(
+        'OpenAI stream interrupted: ended without finish_reason',
+      );
+      return;
+    }
+
+    final reasoningText = currentReasoningContent.toString();
+    if (currentText.isNotEmpty || reasoningText.isNotEmpty) {
       collectedBlocks.add(ContentBlock(
         type: 'text',
         text: currentText,
-        reasoningContent:
-            currentReasoningContent.isEmpty ? null : currentReasoningContent,
+        reasoningContent: reasoningText.isEmpty ? null : reasoningText,
       ));
+    }
+
+    if (toolCallsAccum.isNotEmpty && stopReason != 'tool_calls') {
+      yield StreamError(
+        'OpenAI stream interrupted: tool call ended without tool_calls finish_reason',
+      );
+      return;
     }
 
     for (final entry in toolCallsAccum.entries) {
       final tc = entry.value;
-      if (tc['id']!.isEmpty || tc['name']!.isEmpty) continue;
+      if (tc['id']!.isEmpty || tc['name']!.isEmpty) {
+        yield StreamError(
+          'OpenAI stream interrupted: incomplete tool call metadata',
+        );
+        return;
+      }
       Map<String, dynamic> args = {};
       try {
         if (tc['arguments']!.isNotEmpty) args = jsonDecode(tc['arguments']!);
       } catch (_) {
-        // Malformed tool arguments JSON — proceed with empty args
+        yield StreamError(
+          'OpenAI stream interrupted: incomplete tool call JSON',
+        );
+        return;
       }
       collectedBlocks.add(ContentBlock(
         type: 'tool_use',
@@ -1481,11 +1641,6 @@ class LlmService {
         toolInput: args,
         rawToolInputJson: tc['arguments']!.isEmpty ? null : tc['arguments']!,
       ));
-    }
-
-    if (!receivedDone && collectedBlocks.isEmpty) {
-      yield StreamError('OpenAI stream ended without [DONE] marker');
-      return;
     }
 
     final mappedStopReason = switch (stopReason) {

@@ -486,6 +486,223 @@ void main() {
     });
   });
 
+  group('persistent assistant error retry state', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('reload restores sanitized provider failure retry state', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      const sensitiveCredential = 'credential-value-that-must-not-persist';
+      final firstProvider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamError(
+            'OpenAI API error (503): api_key=$sensitiveCredential unavailable',
+            cause: Exception(
+              'OpenAI API error (503): api_key=$sensitiveCredential unavailable',
+            ),
+          ),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        firstProvider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await firstProvider.createSession();
+      await firstProvider.sendMessage('hello');
+
+      final failed = firstProvider.currentSession!.messages.last;
+      expect(failed.hasAssistantError, isTrue);
+      expect(failed.assistantError!.canRetry, isTrue);
+      expect(failed.assistantError!.message, contains('[redacted: api_key]'));
+      expect(
+        failed.assistantError!.message,
+        isNot(contains(sensitiveCredential)),
+      );
+      expect(firstProvider.currentSession!.toApiMessages(), [
+        {'role': 'user', 'content': 'hello'},
+      ]);
+
+      final secondProvider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'unused')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        secondProvider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await secondProvider.selectSession(session.id);
+
+      expect(secondProvider.agentStatus, AgentStatus.error);
+      expect(secondProvider.errorMessage, contains('[redacted: api_key]'));
+      expect(
+        secondProvider.errorMessage,
+        isNot(contains(sensitiveCredential)),
+      );
+      expect(secondProvider.currentSession!.messages.last.hasAssistantError,
+          isTrue);
+    });
+
+    test('retry removes stale failure marker and does not duplicate history',
+        () async {
+      final capturedRequests = <List<Map<String, dynamic>>>[];
+      var requestCount = 0;
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            requestCount++;
+            capturedRequests.add(messages);
+            if (requestCount == 1) {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'retry ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('hello');
+      final failedIndex = provider.currentSession!.messages.length - 1;
+
+      final status = await provider.retryAssistantMessage(failedIndex);
+
+      expect(status, AssistantRetryStatus.started);
+      expect(provider.errorMessage, isNull);
+      expect(requestCount, 2);
+      expect(provider.currentSession!.messages, hasLength(2));
+      expect(
+        provider.currentSession!.messages.where((m) => m.role == 'user'),
+        hasLength(1),
+      );
+      expect(
+        provider.currentSession!.messages.where((m) => m.hasAssistantError),
+        isEmpty,
+      );
+      expect(provider.currentSession!.messages.last.textContent, 'retry ok');
+      expect(capturedRequests.last, [
+        {'role': 'user', 'content': 'hello'},
+      ]);
+    });
+
+    test('safety and invalid request failures persist non-fallback markers',
+        () async {
+      for (final scenario in const [
+        ('safety', 'content policy safety refusal', 'safety_or_refusal'),
+        (
+          'invalid',
+          'invalid_request 400 schema unsupported',
+          'invalid_or_tool_error',
+        ),
+      ]) {
+        final attemptedModels = <String>[];
+        final provider = ChatProvider(
+          llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+            config,
+            onMessages: (_) {
+              attemptedModels.add(config.model);
+              return StreamError(
+                scenario.$2,
+                cause: Exception(scenario.$2),
+              );
+            },
+          ),
+        );
+        addTearDown(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+          provider.dispose();
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+
+        await provider.createSession();
+        await provider.sendMessage('hello ${scenario.$1}');
+
+        expect(attemptedModels, ['claude-sonnet-4-20250514']);
+        final marker = provider.currentSession!.messages.last;
+        expect(marker.hasAssistantError, isTrue);
+        expect(marker.assistantError!.code, scenario.$3);
+        expect(marker.assistantError!.fallbackReasonCode, scenario.$3);
+        expect(marker.assistantError!.canRetry, isTrue);
+      }
+    });
+
+    test('cancel does not persist assistant retry marker', () async {
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final sendFuture = provider.sendMessage('slow prompt');
+      await started.future.timeout(const Duration(seconds: 2));
+
+      provider.cancelAgent(sessionId: session.id, savePartial: false);
+      await sendFuture.timeout(const Duration(seconds: 2));
+
+      expect(
+        provider.currentSession!.messages.where((m) => m.hasAssistantError),
+        isEmpty,
+      );
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        reloaded.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+
+      expect(reloaded.agentStatus, AgentStatus.idle);
+      expect(
+        reloaded.currentSession!.messages.where((m) => m.hasAssistantError),
+        isEmpty,
+      );
+    });
+  });
+
   group('message edit branching', () {
     setUp(() async {
       await installPlatformMocks();
@@ -585,6 +802,177 @@ void main() {
       final payload = jsonEncode(capturedMessages);
       expect(payload, contains('edited prompt'));
       expect(payload, isNot(contains('obsolete answer')));
+    });
+
+    test('edit branch preserves user image attachments', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      List<Map<String, dynamic>>? capturedMessages;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            capturedMessages = messages;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'edited image')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      session.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.userContent([
+            TextContent('describe original'),
+            ImageContent(
+              data: 'aGk=',
+              mediaType: 'image/png',
+              filename: 'tiny.png',
+            ),
+          ]),
+          ChatMessage.assistant([
+            {'type': 'text', 'text': 'obsolete answer'},
+          ]),
+        ]);
+      await storage.saveSession(session);
+
+      final status = await provider.editUserMessageAndResend(
+        0,
+        'describe edited',
+      );
+
+      expect(status, EditUserMessageBranchStatus.started);
+      final branchUser = provider.currentSession!.messages
+          .firstWhere((message) => message.role == 'user');
+      expect(branchUser.textContent, 'describe edited');
+      expect(branchUser.content.whereType<ImageContent>(), hasLength(1));
+      final payload = jsonEncode(capturedMessages);
+      expect(payload, contains('describe edited'));
+      expect(payload, contains('"type":"image"'));
+      expect(payload, isNot(contains('describe original')));
+    });
+
+    test('regenerate preserves user image attachments and alternatives',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      List<Map<String, dynamic>>? capturedMessages;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            capturedMessages = messages;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'new image answer')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      session.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.userContent([
+            TextContent('describe image'),
+            ImageContent(
+              data: 'aGk=',
+              mediaType: 'image/png',
+              filename: 'tiny.png',
+            ),
+          ]),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('old image answer')],
+          ),
+        ]);
+      await storage.saveSession(session);
+
+      await provider.regenerateLastResponse();
+
+      final messages = provider.currentSession!.messages;
+      expect(messages, hasLength(2));
+      expect(messages.first.content.whereType<ImageContent>(), hasLength(1));
+      expect(messages.last.textContent, 'new image answer');
+      expect(messages.last.alternatives, contains('old image answer'));
+      final payload = jsonEncode(capturedMessages);
+      expect(payload, contains('describe image'));
+      expect(payload, contains('"type":"image"'));
+    });
+
+    test('assistant retry preserves user image attachments', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      List<Map<String, dynamic>>? capturedMessages;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            capturedMessages = messages;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'retry image answer')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      session.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.userContent([
+            TextContent('retry image'),
+            ImageContent(
+              data: 'aGk=',
+              mediaType: 'image/png',
+              filename: 'tiny.png',
+            ),
+          ]),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('failed answer')],
+            assistantError: const AssistantErrorMetadata(
+              message: 'temporary model error',
+              code: 'provider_error',
+              canRetry: true,
+            ),
+          ),
+        ]);
+      await storage.saveSession(session);
+
+      final status = await provider.retryAssistantMessage(1);
+
+      expect(status, AssistantRetryStatus.started);
+      final messages = provider.currentSession!.messages;
+      expect(messages, hasLength(2));
+      expect(messages.first.content.whereType<ImageContent>(), hasLength(1));
+      expect(messages.last.textContent, 'retry image answer');
+      final payload = jsonEncode(capturedMessages);
+      expect(payload, contains('retry image'));
+      expect(payload, contains('"type":"image"'));
     });
 
     test('rejects empty edited text without creating a branch', () async {
@@ -828,6 +1216,90 @@ void main() {
       );
     });
 
+    test('model group session uses group primary and fallback chain', () async {
+      final active = ProviderProfile.defaults(name: 'Active').copyWith(
+        id: 'active',
+        apiKey: 'sk-test-active',
+        apiFormat: ProviderProfile.anthropicFormat,
+        baseUrl: 'http://active.test',
+        model: 'active-model',
+      );
+      final groupPrimary =
+          ProviderProfile.defaults(name: 'Group Primary').copyWith(
+        id: 'group-primary',
+        apiKey: 'sk-test-group-primary',
+        apiFormat: ProviderProfile.anthropicFormat,
+        baseUrl: 'http://group-primary.test',
+        model: 'group-primary-model',
+      );
+      final groupFallback =
+          ProviderProfile.defaults(name: 'Group Fallback').copyWith(
+        id: 'group-fallback',
+        apiKey: 'sk-test-group-fallback',
+        apiFormat: ProviderProfile.anthropicFormat,
+        baseUrl: 'http://group-fallback.test',
+        model: 'group-fallback-model',
+      );
+      final group = ModelGroup(
+        id: 'analysis-group',
+        name: 'Analysis Group',
+        primaryProfileId: 'group-primary',
+        fallbackTargets: const [
+          ModelFallbackTarget(targetProfileId: 'group-fallback'),
+        ],
+      );
+      secureStorage['provider_profiles'] = jsonEncode([
+        active.toJson(),
+        groupPrimary.toJson(),
+        groupFallback.toJson(),
+      ]);
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'active',
+        'model_groups': jsonEncode([group.toJson()]),
+        'context_token_budget': 65536,
+      });
+
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            if (config.model == 'group-primary-model') {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception(
+                  'OpenAI API error (503): temporarily unavailable',
+                ),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'group fallback ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession(modelGroupId: 'analysis-group');
+      await provider.sendMessage('hello');
+
+      expect(provider.currentSession!.modelGroupId, 'analysis-group');
+      expect(attemptedModels, ['group-primary-model', 'group-fallback-model']);
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant')
+            .single
+            .textContent,
+        'group fallback ok',
+      );
+    });
+
     test('rolls back primary context patch before fallback success', () async {
       configureModelFallbackProfiles(contextTokenBudget: 4096);
       final summaryModels = <String>[];
@@ -876,6 +1348,46 @@ void main() {
               message.isSystemNotice && message.textContent.contains('已压缩为摘要'))
           .length;
       expect(contextNoticeCount, 1);
+    });
+
+    test('stream completeness error before visible output can fallback',
+        () async {
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            if (config.model == 'claude-primary-200k') {
+              return StreamError(
+                'OpenAI stream interrupted: ended without finish_reason',
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'fallback ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('hello');
+
+      expect(provider.errorMessage, isNull);
+      expect(attemptedModels, ['claude-primary-200k', 'claude-fallback-200k']);
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant')
+            .single
+            .textContent,
+        'fallback ok',
+      );
     });
 
     test('stream failure rolls back primary patch and blocks fallback',
@@ -949,8 +1461,13 @@ void main() {
       expect(
         provider.currentSession!.messages
             .where((message) => message.role == 'assistant'),
-        hasLength(assistantCountBefore),
+        hasLength(assistantCountBefore + 1),
       );
+      final errorMarker = provider.currentSession!.messages.last;
+      expect(errorMarker.hasAssistantError, isTrue);
+      expect(errorMarker.assistantError!.fallbackReasonCode,
+          'unsafe_after_partial_run');
+      expect(errorMarker.assistantError!.canRetry, isTrue);
       expect(
         provider.currentSession!.messages
             .map((message) => message.textContent)
@@ -1250,7 +1767,14 @@ void main() {
       expect(attemptedModels, ['claude-primary-200k']);
       expect(provider.errorMessage, contains('[redacted: api_key]'));
       expect(provider.errorMessage, isNot(contains(secret)));
-      expect(provider.currentSession!.messages, hasLength(1));
+      expect(provider.currentSession!.messages, hasLength(2));
+      final errorMarker = provider.currentSession!.messages.last;
+      expect(errorMarker.hasAssistantError, isTrue);
+      expect(errorMarker.assistantError!.code, 'auth_or_permission');
+      expect(errorMarker.assistantError!.canRetry, isTrue);
+      expect(
+          errorMarker.assistantError!.message, contains('[redacted: api_key]'));
+      expect(errorMarker.assistantError!.message, isNot(contains(secret)));
       expect(
         provider.currentSession!.messages
             .where((message) => message.isSystemNotice),

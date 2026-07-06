@@ -440,6 +440,7 @@ class SessionStorage {
       apiFormatOverride: source.apiFormatOverride,
       systemPrompt: source.systemPrompt,
       folder: source.folder,
+      modelGroupId: source.modelGroupId,
     );
     await saveSession(fork);
     return fork;
@@ -469,6 +470,7 @@ class SessionStorage {
       apiFormatOverride: source.apiFormatOverride,
       systemPrompt: source.systemPrompt,
       folder: source.folder,
+      modelGroupId: source.modelGroupId,
     );
     await saveSession(fork);
     return fork;

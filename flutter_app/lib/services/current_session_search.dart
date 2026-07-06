@@ -47,6 +47,11 @@ class CurrentSessionSearch {
     if (message.isViewingAlternative) return message.textContent;
 
     final parts = <String>[];
+    final assistantError = message.assistantError;
+    if (assistantError != null) {
+      parts.add(assistantError.message);
+      parts.add(assistantError.code);
+    }
     for (final content in message.content) {
       switch (content) {
         case TextContent(:final text):

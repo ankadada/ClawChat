@@ -30,11 +30,17 @@ class AgentState {
   AgentService? agent;
   AgentStatus status = AgentStatus.idle;
   String streamingText = '';
+  String streamingReasoningText = '';
+  int streamingReasoningTotalLength = 0;
   String? errorMessage;
   StringBuffer streamBuffer = StringBuffer();
+  StringBuffer reasoningPreviewBuffer = StringBuffer();
   StreamSubscription<AgentEvent>? agentSubscription;
   Completer<void>? agentCompleter;
   final StreamFlushScheduler streamFlushScheduler = StreamFlushScheduler();
+  final StreamFlushScheduler reasoningFlushScheduler = StreamFlushScheduler(
+    maxDelay: const Duration(milliseconds: 240),
+  );
   Timer? messageQueueDrainTimer;
   LlmService? cachedLlm;
   LlmConfig? cachedLlmConfig;
@@ -57,6 +63,7 @@ class AgentState {
 
   void dispose() {
     streamFlushScheduler.cancel();
+    reasoningFlushScheduler.cancel();
     messageQueueDrainTimer?.cancel();
     agentSubscription?.cancel();
     if (agentCompleter != null && !agentCompleter!.isCompleted) {

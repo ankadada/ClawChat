@@ -7,6 +7,29 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('AgentService tool safety', () {
+    test('forwards reasoning deltas separately from visible text', () async {
+      final service = AgentService(
+        llm: _ReasoningStreamLlmService(_config),
+        tools: ToolRegistry(),
+        systemPrompt: 'system',
+      );
+
+      final agentEvents = <AgentEvent>[];
+      await for (final event in service.runAgentLoop([])) {
+        agentEvents.add(event);
+      }
+
+      expect(agentEvents.whereType<AgentReasoningDelta>().map((e) => e.text), [
+        'hidden step ',
+        'hidden state',
+      ]);
+      expect(agentEvents.whereType<AgentTextDelta>().map((e) => e.text), [
+        'visible',
+      ]);
+      expect(
+          agentEvents.whereType<AgentComplete>().single.finalText, 'visible');
+    });
+
     test('denies configured tools before approval and execution', () async {
       var approvalCount = 0;
       final tool = _RecordingTool(name: 'bash');
@@ -150,6 +173,36 @@ void main() {
       expect(done.isError, isTrue);
       expect(done.output, contains('blocked'));
     });
+
+    test('does not execute tools from incomplete streamed tool calls',
+        () async {
+      var approvalCount = 0;
+      final tool = _RecordingTool(name: 'bash');
+      final tools = ToolRegistry()..register(tool, risk: ToolRisk.dangerous);
+      final service = AgentService(
+        llm: _IncompleteToolStreamLlmService(_config),
+        tools: tools,
+        systemPrompt: 'system',
+        toolPolicy: ToolPolicy(
+          onApprovalRequired: (_) {
+            approvalCount++;
+            return true;
+          },
+        ),
+      );
+
+      final agentEvents = <AgentEvent>[];
+      await for (final event in service.runAgentLoop([])) {
+        agentEvents.add(event);
+      }
+
+      expect(approvalCount, 0);
+      expect(tool.executedInputs, isEmpty);
+      expect(agentEvents.whereType<AgentToolStart>(), isEmpty);
+      expect(agentEvents.whereType<AgentToolDone>(), isEmpty);
+      final error = agentEvents.whereType<AgentError>().single;
+      expect(error.message, contains('incomplete tool call JSON'));
+    });
   });
 }
 
@@ -195,6 +248,48 @@ class _ToolCallLlmService extends LlmService {
     yield StreamDone(const LlmResponse(
       stopReason: 'end_turn',
       content: [ContentBlock(type: 'text', text: 'done')],
+    ));
+  }
+}
+
+class _IncompleteToolStreamLlmService extends LlmService {
+  _IncompleteToolStreamLlmService(super.config);
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    yield ToolUseStart('call_1', 'bash');
+    yield ToolInputDelta('{"command":');
+    yield StreamError(
+      'OpenAI stream interrupted: incomplete tool call JSON',
+    );
+  }
+}
+
+class _ReasoningStreamLlmService extends LlmService {
+  _ReasoningStreamLlmService(super.config);
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    yield ReasoningDelta('hidden step ');
+    yield TextDelta('visible');
+    yield ReasoningDelta('hidden state');
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [
+        ContentBlock(
+          type: 'text',
+          text: 'visible',
+          reasoningContent: 'hidden step hidden state',
+        ),
+      ],
     ));
   }
 }

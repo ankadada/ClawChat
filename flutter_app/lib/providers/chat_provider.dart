@@ -42,6 +42,14 @@ enum EditUserMessageBranchStatus {
   failed,
 }
 
+enum AssistantRetryStatus {
+  started,
+  invalidMessage,
+  notRetryable,
+  busy,
+  missingApiKey,
+}
+
 class ManualContextSummaryResult {
   final bool success;
   final String message;
@@ -138,6 +146,8 @@ class ChatProvider extends ChangeNotifier {
   static const _agentServiceThinkingText = 'AI 正在思考...';
   static const _agentServiceToolingText = 'AI 正在执行命令...';
   static const _agentServiceStreamingText = 'AI 正在回复...';
+  static const _liveReasoningPreviewMaxChars = 12000;
+  static const _liveReasoningPreviewTrimAt = 14000;
 
   AgentState _getOrCreateState(String sessionId) {
     return _agentStates.putIfAbsent(sessionId, () => AgentState(sessionId));
@@ -156,7 +166,16 @@ class ChatProvider extends ChangeNotifier {
   String get streamingText =>
       _getState(currentSession?.id)?.streamingText ?? '';
 
+  String get streamingReasoningText =>
+      _getState(currentSession?.id)?.streamingReasoningText ?? '';
+
+  int get streamingReasoningTotalLength =>
+      _getState(currentSession?.id)?.streamingReasoningTotalLength ?? 0;
+
   ContextSummary? get currentContextSummary => currentSession?.contextSummary;
+
+  List<ModelGroup> get modelGroups =>
+      _prefsInitialized ? _prefs.modelGroups : const [];
 
   bool get isCurrentContextSummaryRebuilding {
     final session = currentSession;
@@ -432,20 +451,36 @@ class ChatProvider extends ChangeNotifier {
     if (notify && !_disposed) notifyListeners();
   }
 
+  void _flushStreamingReasoningState(
+    AgentState state, {
+    bool notify = true,
+  }) {
+    state.streamingReasoningText = state.reasoningPreviewBuffer.toString();
+    if (notify && !_disposed) notifyListeners();
+  }
+
   void _cancelStreamingFlush(AgentState state) {
     state.streamFlushScheduler.cancel();
+    state.reasoningFlushScheduler.cancel();
   }
 
   void _flushStreamingNow(AgentState state, {bool notify = true}) {
     state.streamFlushScheduler.flushNow(() {
-      _flushStreamingState(state, notify: notify);
+      _flushStreamingState(state, notify: false);
     });
+    state.reasoningFlushScheduler.flushNow(() {
+      _flushStreamingReasoningState(state, notify: false);
+    });
+    if (notify && !_disposed) notifyListeners();
   }
 
   void _clearStreamingState(AgentState state, {bool notify = false}) {
     _cancelStreamingFlush(state);
     state.streamingText = '';
+    state.streamingReasoningText = '';
+    state.streamingReasoningTotalLength = 0;
     state.streamBuffer = StringBuffer();
+    state.reasoningPreviewBuffer = StringBuffer();
     if (notify && !_disposed) notifyListeners();
   }
 
@@ -460,6 +495,24 @@ class ChatProvider extends ChangeNotifier {
           state,
           _agentServiceStreamingText,
         ));
+      },
+    );
+  }
+
+  void _appendStreamingReasoningDelta(AgentState state, String text) {
+    state.streamingReasoningTotalLength += text.length;
+    state.reasoningPreviewBuffer.write(text);
+    if (state.reasoningPreviewBuffer.length > _liveReasoningPreviewTrimAt) {
+      final current = state.reasoningPreviewBuffer.toString();
+      state.reasoningPreviewBuffer = StringBuffer(
+        current.substring(current.length - _liveReasoningPreviewMaxChars),
+      );
+    }
+    state.reasoningFlushScheduler.schedule(
+      delta: text,
+      flushOnBoundary: false,
+      flush: () {
+        _flushStreamingReasoningState(state);
       },
     );
   }
@@ -580,8 +633,19 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
-  Future<ChatSession> createSession() async {
-    final session = ChatSession(id: _uuid.v4());
+  Future<ChatSession> createSession({String? modelGroupId}) async {
+    String? resolvedModelGroupId;
+    final requestedModelGroupId = modelGroupId?.trim();
+    if (requestedModelGroupId != null && requestedModelGroupId.isNotEmpty) {
+      await _ensurePrefs();
+      if (_prefs.modelGroupById(requestedModelGroupId) != null) {
+        resolvedModelGroupId = requestedModelGroupId;
+      }
+    }
+    final session = ChatSession(
+      id: _uuid.v4(),
+      modelGroupId: resolvedModelGroupId,
+    );
     await _storage.saveSession(session);
     sessions.insert(
         0,
@@ -609,6 +673,9 @@ class ChatProvider extends ChangeNotifier {
     }
     try {
       currentSession = await _storage.getSession(id);
+      if (currentSession != null) {
+        _restorePersistedAssistantErrorState(currentSession!);
+      }
       await _startupRestoreGuard.recordStartupSuccess();
       notifyListeners();
     } catch (e) {
@@ -653,7 +720,7 @@ class ChatProvider extends ChangeNotifier {
             baseUrlOverride: _prefs.baseUrl,
             apiFormatOverride: _prefs.apiFormat,
           );
-      final llmConfig = _buildLlmConfig(_prefs, session);
+      final llmConfig = _buildLlmConfig(session);
       final llm = _llmServiceFactory(
         llmConfig,
         isInBackground: () => _appInBackground,
@@ -950,7 +1017,7 @@ class ChatProvider extends ChangeNotifier {
       return EditUserMessageBranchStatus.busy;
     }
 
-    final attachments = _editableAttachmentsFor(sourceMessage);
+    final attachments = _retryableAttachmentsFor(sourceMessage);
     final branch = await _storage.forkSessionBeforeMessage(
       source.id,
       messageIndex,
@@ -981,7 +1048,7 @@ class ChatProvider extends ChangeNotifier {
         message.toolResults.isEmpty;
   }
 
-  List<MessageContent> _editableAttachmentsFor(ChatMessage message) {
+  List<MessageContent> _retryableAttachmentsFor(ChatMessage message) {
     final copied = ChatMessage.fromJson(message.toJson());
     return copied.content
         .where((content) =>
@@ -1005,7 +1072,6 @@ class ChatProvider extends ChangeNotifier {
     AgentState? activeState;
     try {
       await _ensurePrefs();
-      final providerSnapshot = _captureProviderProfileSnapshot();
       try {
         _attachmentBudget.checkMessageAttachments(attachments);
       } on AttachmentBudgetException catch (e) {
@@ -1042,6 +1108,7 @@ class ChatProvider extends ChangeNotifier {
         return;
       }
 
+      final providerSnapshot = _captureProviderProfileSnapshot(session);
       final apiKey = providerSnapshot.activeProfile.apiKey.trim();
       if (apiKey.isEmpty) {
         if (sessionState != null) {
@@ -1225,6 +1292,12 @@ class ChatProvider extends ChangeNotifier {
             );
             state.status = AgentStatus.error;
             state.errorMessage = emptyRecoveryError;
+            await _persistAssistantFailureMarker(
+              state: state,
+              session: activeSession,
+              error: originalError,
+              source: 'encrypted_recovery_empty',
+            );
             notifyListeners();
           } else {
             state.agent = _createAgentService(
@@ -1269,6 +1342,12 @@ class ChatProvider extends ChangeNotifier {
                 AppStrings.encryptedContentRecoveryFailed,
                 if (recoveryError?.isNotEmpty == true) recoveryError!,
               ].join('\n');
+              await _persistAssistantFailureMarker(
+                state: state,
+                session: activeSession,
+                error: runResult ?? _AgentRuntimeError(state.errorMessage),
+                source: 'encrypted_recovery_failed',
+              );
               notifyListeners();
             } else {
               _recordRuntimeEvent(
@@ -1294,7 +1373,7 @@ class ChatProvider extends ChangeNotifier {
           if (!preservingPrimaryPatchForRecovery) {
             await rollbackPrimaryPatchIfSafe();
           }
-          await _tryRunModelFallback(
+          final fallbackOutcome = await _tryRunModelFallback(
             state: state,
             activeSession: activeSession,
             primaryConfig: llmConfig,
@@ -1306,11 +1385,26 @@ class ChatProvider extends ChangeNotifier {
             primaryError: runResult ?? _AgentRuntimeError(state.errorMessage),
             providerSnapshot: providerSnapshot,
           );
+          if (!fallbackOutcome.success && !state.wasCancelled) {
+            await _persistAssistantFailureMarker(
+              state: state,
+              session: activeSession,
+              error: runResult ?? _AgentRuntimeError(state.errorMessage),
+              source: 'provider_failure',
+              fallbackReasonCode: fallbackOutcome.reasonCode,
+            );
+          }
         }
       } catch (e) {
         await rollbackPrimaryPatchIfSafe();
         state.status = AgentStatus.error;
         state.errorMessage = _sanitizeProviderErrorMessage(e);
+        await _persistAssistantFailureMarker(
+          state: state,
+          session: activeSession,
+          error: e,
+          source: 'provider_exception',
+        );
         notifyListeners();
       } finally {
         _contextManager.discardCompletion(assembly.assemblyId);
@@ -1530,15 +1624,18 @@ class ChatProvider extends ChangeNotifier {
       }
     }
 
-    // Find the last user message text
+    // Find the last user message text and retryable attachments.
     String? lastUserText;
+    ChatMessage? lastUserMessage;
     for (int i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role == 'user' && messages[i].textContent.isNotEmpty) {
         lastUserText = messages[i].textContent;
+        lastUserMessage = messages[i];
         break;
       }
     }
     if (lastUserText == null) return;
+    final retryAttachments = _retryableAttachmentsFor(lastUserMessage!);
 
     // Save the old assistant text for reuse after regeneration
     List<String>? pendingAlternatives;
@@ -1566,7 +1663,92 @@ class ChatProvider extends ChangeNotifier {
     await _storage.saveSession(currentSession!);
     notifyListeners();
 
-    await sendMessage(lastUserText, pendingAlternatives: pendingAlternatives);
+    await sendMessage(
+      lastUserText,
+      attachments: retryAttachments,
+      pendingAlternatives: pendingAlternatives,
+    );
+  }
+
+  Future<AssistantRetryStatus> retryAssistantMessage(int messageIndex) async {
+    final session = currentSession;
+    if (session == null ||
+        messageIndex < 0 ||
+        messageIndex >= session.messages.length) {
+      return AssistantRetryStatus.invalidMessage;
+    }
+
+    final state = _getState(session.id);
+    if ((state?.isSending ?? false) ||
+        (state?.messageQueue.isNotEmpty ?? false)) {
+      return AssistantRetryStatus.busy;
+    }
+
+    final failedMessage = session.messages[messageIndex];
+    final error = failedMessage.assistantError;
+    if (error == null || !error.canRetry) {
+      return AssistantRetryStatus.notRetryable;
+    }
+
+    final lastContentIndex = _lastNonSystemMessageIndex(session.messages);
+    if (lastContentIndex != messageIndex) {
+      return AssistantRetryStatus.notRetryable;
+    }
+
+    final userIndex = _retryUserMessageIndexBefore(session, messageIndex);
+    if (userIndex == null) return AssistantRetryStatus.invalidMessage;
+
+    await _ensurePrefs();
+    if (_prefs.activeProfile.apiKey.trim().isEmpty) {
+      return AssistantRetryStatus.missingApiKey;
+    }
+    final activeCount = _activeAgentStates.length;
+    if (activeCount >= maxConcurrentAgents) {
+      return AssistantRetryStatus.busy;
+    }
+
+    final userMessage =
+        ChatMessage.fromJson(session.messages[userIndex].toJson());
+    final retryText = userMessage.textContent.trim();
+    final retryAttachments = _retryableAttachmentsFor(userMessage);
+    if (retryText.isEmpty && retryAttachments.isEmpty) {
+      return AssistantRetryStatus.invalidMessage;
+    }
+
+    session.messages.removeRange(userIndex, session.messages.length);
+    session.updatedAt = DateTime.now();
+    final retryState = _getOrCreateState(session.id);
+    retryState.status = AgentStatus.idle;
+    retryState.errorMessage = null;
+    retryState.wasCancelled = false;
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+    notifyListeners();
+
+    await sendMessage(retryText, attachments: retryAttachments);
+    return AssistantRetryStatus.started;
+  }
+
+  int? _lastNonSystemMessageIndex(List<ChatMessage> messages) {
+    for (var i = messages.length - 1; i >= 0; i--) {
+      if (!messages[i].isSystemNotice) return i;
+    }
+    return null;
+  }
+
+  int? _retryUserMessageIndexBefore(ChatSession session, int messageIndex) {
+    for (var i = messageIndex - 1; i >= 0; i--) {
+      final message = session.messages[i];
+      if (message.isSystemNotice) continue;
+      if (message.role == 'user' &&
+          (message.textContent.trim().isNotEmpty ||
+              message.content.any((content) =>
+                  content is! TextContent && content is! ToolResultContent))) {
+        return i;
+      }
+      return null;
+    }
+    return null;
   }
 
   void switchAlternative(int messageIndex, int altIndex) {
@@ -1594,6 +1776,7 @@ class ChatProvider extends ChangeNotifier {
       alternatives: msg.alternatives,
       activeAlternative: activeAlternative,
       isSystemNotice: msg.isSystemNotice,
+      assistantError: msg.assistantError,
     );
 
     _messageVersion++;
@@ -1862,7 +2045,7 @@ class ChatProvider extends ChangeNotifier {
         ContextManualSummaryRequest(
           sessionId: session.id,
           apiPrefixMessages: safePrefix,
-          llmConfig: _buildLlmConfig(_prefs, session),
+          llmConfig: _buildLlmConfig(session),
           contextTokenBudget: _prefs.contextTokenBudget,
         ),
       );
@@ -1966,13 +2149,89 @@ class ChatProvider extends ChangeNotifier {
         : sanitized;
   }
 
-  _ProviderProfileSnapshot _captureProviderProfileSnapshot() {
-    final activeProfile = _snapshotProviderProfile(_prefs.activeProfile);
+  void _restorePersistedAssistantErrorState(ChatSession session) {
+    final lastIndex = _lastNonSystemMessageIndex(session.messages);
+    if (lastIndex == null) return;
+    final error = session.messages[lastIndex].assistantError;
+    if (error == null) return;
+    final state = _getOrCreateState(session.id);
+    if (state.isSending) return;
+    state.status = AgentStatus.error;
+    state.errorMessage = error.message;
+    state.wasCancelled = false;
+  }
+
+  Future<void> _persistAssistantFailureMarker({
+    required AgentState state,
+    required ChatSession session,
+    required Object? error,
+    required String source,
+    String? fallbackReasonCode,
+  }) async {
+    if (state.wasCancelled) return;
+    final sanitizedMessage = _sanitizeProviderErrorMessage(
+      state.errorMessage ?? error,
+    );
+    final reason = _fallbackReasonFor(error, sanitizedMessage);
+    final metadata = AssistantErrorMetadata(
+      message: sanitizedMessage,
+      code: reason.code,
+      canRetry: _canRetryAssistantFailure(state, reason),
+      source: source,
+      fallbackReasonCode: fallbackReasonCode,
+      fallbackReasonLabel: fallbackReasonCode == null ? null : reason.label,
+    );
+
+    _removeTrailingAssistantErrorMarkers(session);
+    session.messages.add(ChatMessage.assistantError(error: metadata));
+    session.updatedAt = DateTime.now();
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+  }
+
+  bool _canRetryAssistantFailure(AgentState state, _FallbackReason reason) {
+    if (state.wasCancelled || reason.code == 'user_cancelled') return false;
+    if (state.fallbackToolStarted || state.fallbackMessagesPersisted) {
+      return false;
+    }
+    return true;
+  }
+
+  void _removeTrailingAssistantErrorMarkers(ChatSession session) {
+    while (session.messages.isNotEmpty &&
+        session.messages.last.hasAssistantError) {
+      session.messages.removeLast();
+    }
+  }
+
+  _ProviderProfileSnapshot _captureProviderProfileSnapshot(
+    ChatSession? session,
+  ) {
+    final profiles =
+        _prefs.profiles.map(_snapshotProviderProfile).toList(growable: false);
+    var activeProfile = _snapshotProviderProfile(_prefs.activeProfile);
+    var activeProfileId = _prefs.activeProfileId ?? activeProfile.id;
+
+    final group = _prefs.modelGroupById(session?.modelGroupId);
+    if (group != null) {
+      final profileById = {
+        for (final profile in profiles) profile.id: profile,
+      };
+      final primaryProfile = profileById[group.primaryProfileId];
+      if (primaryProfile != null) {
+        activeProfile = primaryProfile.copyWith(
+          fallbackTargets: List<ModelFallbackTarget>.unmodifiable(
+            group.fallbackTargets.map((target) => target.copyWith()),
+          ),
+        );
+        activeProfileId = primaryProfile.id;
+      }
+    }
+
     return _ProviderProfileSnapshot(
-      activeProfileId: _prefs.activeProfileId ?? activeProfile.id,
+      activeProfileId: activeProfileId,
       activeProfile: activeProfile,
-      profiles:
-          _prefs.profiles.map(_snapshotProviderProfile).toList(growable: false),
+      profiles: profiles,
     );
   }
 
@@ -1984,7 +2243,7 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
-  Future<bool> _tryRunModelFallback({
+  Future<_ModelFallbackOutcome> _tryRunModelFallback({
     required AgentState state,
     required ChatSession activeSession,
     required LlmConfig primaryConfig,
@@ -2002,13 +2261,13 @@ class ChatProvider extends ChangeNotifier {
         'reason': 'unsafe_after_partial_run',
         'primaryReason': reason.code,
       });
-      return false;
+      return const _ModelFallbackOutcome.failed('unsafe_after_partial_run');
     }
     if (!reason.canFallback) {
       _recordModelFallbackEvent(activeSession.id, 'model.fallback.skipped', {
         'reason': reason.code,
       });
-      return false;
+      return _ModelFallbackOutcome.failed(reason.code);
     }
 
     final candidates = _resolveModelFallbackCandidates(
@@ -2020,10 +2279,11 @@ class ChatProvider extends ChangeNotifier {
         'reason': 'no_configured_candidate',
         'primaryReason': reason.code,
       });
-      return false;
+      return const _ModelFallbackOutcome.failed('no_configured_candidate');
     }
 
     var attemptIndex = 0;
+    var lastFailureReason = reason.code;
     for (final candidate in candidates) {
       attemptIndex++;
       final llm = _llmServiceFactory(
@@ -2048,6 +2308,7 @@ class ChatProvider extends ChangeNotifier {
           'candidate': candidate.safeLabel,
           'attemptIndex': attemptIndex,
         });
+        lastFailureReason = skipReason;
         continue;
       }
 
@@ -2145,10 +2406,11 @@ class ChatProvider extends ChangeNotifier {
           'attemptIndex': attemptIndex,
         });
         notifyListeners();
-        return true;
+        return const _ModelFallbackOutcome.success();
       }
 
       final candidateReason = _fallbackReasonFor(runResult, state.errorMessage);
+      lastFailureReason = candidateReason.code;
       _recordModelFallbackEvent(activeSession.id, 'model.fallback.failed', {
         'candidate': candidate.safeLabel,
         'reason': candidateReason.code,
@@ -2165,9 +2427,9 @@ class ChatProvider extends ChangeNotifier {
       } else {
         llm.dispose();
       }
-      if (!canContinue) return false;
+      if (!canContinue) return _ModelFallbackOutcome.failed(lastFailureReason);
     }
-    return false;
+    return _ModelFallbackOutcome.failed(lastFailureReason);
   }
 
   bool _isFallbackSafeForState(AgentState state) {
@@ -2431,6 +2693,9 @@ class ChatProvider extends ChangeNotifier {
       'connection closed',
       'connection reset',
       'network',
+      'stream interrupted',
+      'ended without finish_reason',
+      'ended without message_stop',
       'temporarily unavailable',
     ])) {
       return const _FallbackReason.allowed('network_or_timeout', '网络异常');
@@ -2495,8 +2760,9 @@ class ChatProvider extends ChangeNotifier {
     session.messages.add(ChatMessage.systemNotice(text));
   }
 
-  LlmConfig _buildLlmConfig(PreferencesService prefs, ChatSession session) {
-    return _buildLlmConfigForProfileSnapshot(prefs.activeProfile, session);
+  LlmConfig _buildLlmConfig(ChatSession session) {
+    final snapshot = _captureProviderProfileSnapshot(session);
+    return _buildLlmConfigForProfileSnapshot(snapshot.activeProfile, session);
   }
 
   AgentService _createAgentService({
@@ -2602,6 +2868,11 @@ class ChatProvider extends ChangeNotifier {
           case AgentTextDelta(:final text):
             if (text.isNotEmpty) state.fallbackTextEmitted = true;
             _appendStreamingDelta(state, text);
+
+          case AgentReasoningDelta(:final text):
+            if (text.isNotEmpty) {
+              _appendStreamingReasoningDelta(state, text);
+            }
 
           case AgentToolStart(:final toolName):
             state.fallbackToolStarted = true;
@@ -3147,6 +3418,21 @@ class _ModelFallbackCandidate {
   });
 
   String get safeLabel => _safeFallbackLabelText(config.model);
+}
+
+class _ModelFallbackOutcome {
+  final bool success;
+  final String? reasonCode;
+
+  const _ModelFallbackOutcome._({
+    required this.success,
+    this.reasonCode,
+  });
+
+  const _ModelFallbackOutcome.success() : this._(success: true);
+
+  const _ModelFallbackOutcome.failed(String reasonCode)
+      : this._(success: false, reasonCode: reasonCode);
 }
 
 String _safeFallbackLabelText(String raw) {

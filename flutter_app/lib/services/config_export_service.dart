@@ -104,11 +104,6 @@ class ConfigExportService {
     var mcpServersSkipped = 0;
     var settingsApplied = false;
 
-    if (parsed.settings != null) {
-      prefs.importAllSettings(parsed.settings!);
-      settingsApplied = true;
-    }
-
     final secrets = parsed.secrets;
     if (secrets != null) {
       if (secrets.providerProfiles != null) {
@@ -160,6 +155,11 @@ class ConfigExportService {
       }
     }
 
+    if (parsed.settings != null) {
+      prefs.importAllSettings(parsed.settings!);
+      settingsApplied = true;
+    }
+
     return ConfigImportResult(
       profilesImported: profilesImported,
       profilesSkipped: profilesSkipped,
@@ -189,6 +189,7 @@ class ConfigExportService {
         : rawSettings == null
             ? null
             : <String, dynamic>{};
+    _validateSettings(settings);
     final warnings = <String>[];
     final rawSecrets = data['secrets'];
     final secrets = rawSecrets is Map
@@ -255,6 +256,15 @@ class ConfigExportService {
       envVars: _parseEnvVars(secretsContent['envVars']),
       mcpServers: mcpServers,
     );
+  }
+
+  static void _validateSettings(Map<String, dynamic>? settings) {
+    if (settings == null || !settings.containsKey('modelGroups')) return;
+    final modelGroups = _parseModelGroups(settings['modelGroups']);
+    if (modelGroups != null) {
+      settings['modelGroups'] =
+          modelGroups.map((group) => group.toJson()).toList();
+    }
   }
 
   static Map<String, dynamic> _encryptSecrets(
@@ -372,6 +382,28 @@ class ConfigExportService {
       throw const FormatException('模型配置无效');
     }
     return profiles;
+  }
+
+  static List<ModelGroup>? _parseModelGroups(Object? rawGroups) {
+    if (rawGroups == null) return null;
+    if (rawGroups is! List) {
+      throw const FormatException('模型组配置无效');
+    }
+
+    final groups = <ModelGroup>[];
+    try {
+      for (final item in rawGroups) {
+        if (item is! Map) {
+          throw const FormatException('Invalid model group');
+        }
+        groups.add(
+          ModelGroup.fromJson(Map<String, dynamic>.from(item)),
+        );
+      }
+    } catch (_) {
+      throw const FormatException('模型组配置无效');
+    }
+    return groups;
   }
 
   static List<McpServerConfig>? _parseMcpServers(

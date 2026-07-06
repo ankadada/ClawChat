@@ -69,6 +69,7 @@ class ChatSession {
   String? apiFormatOverride; // null = use global default
   String? systemPrompt; // null = use global default
   String? folder; // null = ungrouped
+  String? modelGroupId; // null = use active provider profile
   ContextSummary? contextSummary;
 
   ChatSession({
@@ -82,6 +83,7 @@ class ChatSession {
     this.apiFormatOverride,
     this.systemPrompt,
     this.folder,
+    this.modelGroupId,
     this.contextSummary,
   })  : createdAt = createdAt ?? DateTime.now(),
         updatedAt = updatedAt ?? DateTime.now(),
@@ -99,7 +101,7 @@ class ChatSession {
 
   List<Map<String, dynamic>> toApiMessages() {
     return messages
-        .where((m) => !m.isSystemNotice)
+        .where((m) => !m.isSystemNotice && !m.hasAssistantError)
         .map((m) => m.toApiJson())
         .toList();
   }
@@ -115,6 +117,7 @@ class ChatSession {
         if (apiFormatOverride != null) 'apiFormatOverride': apiFormatOverride,
         if (systemPrompt != null) 'systemPrompt': systemPrompt,
         if (folder != null) 'folder': folder,
+        if (modelGroupId != null) 'modelGroupId': modelGroupId,
         if (contextSummary != null) 'contextSummary': contextSummary!.toJson(),
       };
 
@@ -135,6 +138,7 @@ class ChatSession {
       apiFormatOverride: json['apiFormatOverride'] as String?,
       systemPrompt: json['systemPrompt'] as String?,
       folder: json['folder'] as String?,
+      modelGroupId: json['modelGroupId'] as String?,
       contextSummary: rawSummary is Map
           ? ContextSummary.fromJson(Map<String, dynamic>.from(rawSummary))
           : null,
@@ -157,8 +161,10 @@ class ChatSession {
     String? apiFormatOverride,
     String? systemPrompt,
     String? folder,
+    String? modelGroupId,
     ContextSummary? contextSummary,
     bool clearFolder = false,
+    bool clearModelGroup = false,
     bool clearContextSummary = false,
   }) {
     return ChatSession(
@@ -172,6 +178,8 @@ class ChatSession {
       apiFormatOverride: apiFormatOverride ?? this.apiFormatOverride,
       systemPrompt: systemPrompt ?? this.systemPrompt,
       folder: clearFolder ? null : (folder ?? this.folder),
+      modelGroupId:
+          clearModelGroup ? null : (modelGroupId ?? this.modelGroupId),
       contextSummary:
           clearContextSummary ? null : (contextSummary ?? this.contextSummary),
     );
@@ -190,6 +198,7 @@ class ChatMessage {
   final List<String>? alternatives; // previous generation texts
   int activeAlternative; // -1 = current content, 0+ = index into alternatives
   final bool isSystemNotice;
+  final AssistantErrorMetadata? assistantError;
 
   ChatMessage({
     required this.role,
@@ -203,7 +212,20 @@ class ChatMessage {
     this.alternatives,
     this.activeAlternative = -1,
     this.isSystemNotice = false,
+    this.assistantError,
   }) : timestamp = timestamp ?? DateTime.now();
+
+  factory ChatMessage.assistantError({
+    required AssistantErrorMetadata error,
+    DateTime? timestamp,
+  }) {
+    return ChatMessage(
+      role: 'assistant',
+      content: const [],
+      timestamp: timestamp,
+      assistantError: error,
+    );
+  }
 
   /// Total number of versions (current + alternatives).
   int get totalVersions => 1 + (alternatives?.length ?? 0);
@@ -308,6 +330,8 @@ class ChatMessage {
   List<ToolResultContent> get toolResults =>
       content.whereType<ToolResultContent>().toList();
 
+  bool get hasAssistantError => role == 'assistant' && assistantError != null;
+
   Map<String, dynamic> toApiJson() {
     if (isViewingAlternative) {
       return {
@@ -357,6 +381,7 @@ class ChatMessage {
           'alternatives': alternatives,
         if (activeAlternative != -1) 'activeAlternative': activeAlternative,
         if (isSystemNotice) 'isSystemNotice': true,
+        if (assistantError != null) 'assistant_error': assistantError!.toJson(),
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
@@ -398,6 +423,7 @@ class ChatMessage {
           .toList();
     }
     final altsList = json['alternatives'] as List?;
+    final rawAssistantError = json['assistant_error'];
     return ChatMessage(
       role: json['role'] as String,
       content: content,
@@ -412,6 +438,11 @@ class ChatMessage {
       alternatives: altsList?.map((e) => e as String).toList(),
       activeAlternative: json['activeAlternative'] as int? ?? -1,
       isSystemNotice: json['isSystemNotice'] as bool? ?? false,
+      assistantError: rawAssistantError is Map
+          ? AssistantErrorMetadata.fromJson(
+              Map<String, dynamic>.from(rawAssistantError),
+            )
+          : null,
     );
   }
 
@@ -424,6 +455,74 @@ class ChatMessage {
           as String,
       filename: block['filename'] as String?,
     );
+  }
+}
+
+class AssistantErrorMetadata {
+  static const int currentVersion = 1;
+
+  final String message;
+  final String code;
+  final bool canRetry;
+  final String? source;
+  final String? fallbackReasonCode;
+  final String? fallbackReasonLabel;
+
+  const AssistantErrorMetadata({
+    required this.message,
+    required this.code,
+    required this.canRetry,
+    this.source,
+    this.fallbackReasonCode,
+    this.fallbackReasonLabel,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'version': currentVersion,
+        'message': message,
+        'code': code,
+        'can_retry': canRetry,
+        if (source?.isNotEmpty == true) 'source': source,
+        if (fallbackReasonCode?.isNotEmpty == true)
+          'fallback_reason_code': fallbackReasonCode,
+        if (fallbackReasonLabel?.isNotEmpty == true)
+          'fallback_reason_label': fallbackReasonLabel,
+      };
+
+  factory AssistantErrorMetadata.fromJson(Map<String, dynamic> json) {
+    return AssistantErrorMetadata(
+      message: _safeText(json['message'], fallback: '模型请求失败'),
+      code: _safeCode(json['code'], fallback: 'provider_error'),
+      canRetry: json['can_retry'] as bool? ?? false,
+      source: _optionalSafeText(json['source']),
+      fallbackReasonCode: _optionalSafeCode(json['fallback_reason_code']),
+      fallbackReasonLabel: _optionalSafeText(json['fallback_reason_label']),
+    );
+  }
+
+  static String _safeText(Object? value, {required String fallback}) {
+    final text = value?.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (text == null || text.isEmpty) return fallback;
+    const maxRunes = 280;
+    final runes = text.runes.toList(growable: false);
+    if (runes.length <= maxRunes) return text;
+    return '${String.fromCharCodes(runes.take(maxRunes))}...';
+  }
+
+  static String? _optionalSafeText(Object? value) {
+    final text = _safeText(value, fallback: '');
+    return text.isEmpty ? null : text;
+  }
+
+  static String _safeCode(Object? value, {required String fallback}) {
+    final raw = value?.toString().trim() ?? '';
+    final safe = raw.replaceAll(RegExp(r'[^a-zA-Z0-9_.-]'), '_');
+    return safe.isEmpty ? fallback : safe;
+  }
+
+  static String? _optionalSafeCode(Object? value) {
+    final code = _safeCode(value, fallback: '');
+    return code.isEmpty ? null : code;
   }
 }
 

@@ -17,6 +17,11 @@ class AgentTextDelta extends AgentEvent {
   AgentTextDelta(this.text);
 }
 
+class AgentReasoningDelta extends AgentEvent {
+  final String text;
+  AgentReasoningDelta(this.text);
+}
+
 class AgentToolStart extends AgentEvent {
   final String toolUseId;
   final String toolName;
@@ -145,6 +150,8 @@ class AgentService {
           if (event is TextDelta) {
             textBuffer.write(event.text);
             yield AgentTextDelta(event.text);
+          } else if (event is ReasoningDelta) {
+            yield AgentReasoningDelta(event.text);
           } else if (event is StreamDone) {
             response = event.response;
           } else if (event is StreamError) {

@@ -69,6 +69,32 @@ void main() {
       );
     });
 
+    test('preserves very long reasoning content through session JSON', () {
+      final longReasoning = List.generate(
+        2000,
+        (index) => 'reasoning step $index',
+      ).join('\n');
+      final session = ChatSession(
+        id: 'long_reasoning_session',
+        messages: [
+          ChatMessage.assistant([
+            {
+              'type': 'text',
+              'text': 'final answer',
+              'reasoning_content': longReasoning,
+            },
+          ]),
+        ],
+      );
+
+      final restored = ChatSession.fromJson(session.toJson());
+      final textContent = restored.messages.single.content.single;
+
+      expect(restored.messages.single.textContent, 'final answer');
+      expect(textContent, isA<TextContent>());
+      expect((textContent as TextContent).reasoningContent, longReasoning);
+    });
+
     test('loads legacy string content with top-level reasoning content', () {
       final restored = ChatMessage.fromJson({
         'role': 'assistant',
@@ -113,6 +139,54 @@ void main() {
         'role': 'user',
         'content': 'question',
       });
+    });
+  });
+
+  group('AssistantErrorMetadata', () {
+    test('persists sanitized assistant error metadata through message JSON',
+        () {
+      final message = ChatMessage.assistantError(
+        error: const AssistantErrorMetadata(
+          message: 'OpenAI API error (503): temporarily unavailable',
+          code: 'provider_unavailable',
+          canRetry: true,
+          source: 'provider_failure',
+          fallbackReasonCode: 'no_configured_candidate',
+        ),
+        timestamp: DateTime.utc(2026, 1, 3),
+      );
+
+      final restored = ChatMessage.fromJson(message.toJson());
+
+      expect(restored.hasAssistantError, isTrue);
+      expect(restored.assistantError!.message, contains('503'));
+      expect(restored.assistantError!.code, 'provider_unavailable');
+      expect(restored.assistantError!.canRetry, isTrue);
+      expect(restored.assistantError!.source, 'provider_failure');
+      expect(
+        restored.assistantError!.fallbackReasonCode,
+        'no_configured_candidate',
+      );
+    });
+
+    test('session API messages omit assistant error markers', () {
+      final session = ChatSession(
+        id: 'failed_session',
+        messages: [
+          ChatMessage.user('hello'),
+          ChatMessage.assistantError(
+            error: const AssistantErrorMetadata(
+              message: 'provider failed',
+              code: 'provider_unavailable',
+              canRetry: true,
+            ),
+          ),
+        ],
+      );
+
+      expect(session.toApiMessages(), [
+        {'role': 'user', 'content': 'hello'},
+      ]);
     });
   });
 

@@ -44,6 +44,11 @@ class AppStrings {
 
   // ── Chat screen ──────────────────────────────────────────────────
   static const newChat = '新对话';
+  static const selectModelGroup = '选择模型组';
+  static const defaultModelGroup = '默认模型配置';
+  static const defaultModelGroupSubtitle = '使用当前启用的 Provider Profile';
+  static String modelGroupFallbackCount(int count) =>
+      count == 0 ? '无备用模型' : '$count 个备用模型';
   static const settings = '设置';
   static const switchModel = '切换模型';
   static const editSystemPrompt = '编辑系统提示词';
@@ -178,6 +183,7 @@ class AppStrings {
   static const model = '模型';
   static const providerProfiles = 'Provider Profiles';
   static const addProviderProfile = '新增配置';
+  static const modelGroups = 'Model Groups';
   static const newProviderProfile = '新配置';
   static const providerProfileDetails = '配置详情';
   static const providerProfileName = '配置名称';
@@ -311,6 +317,13 @@ class AppStrings {
   static const thinkingMedium = '中';
   static const thinkingHigh = '高';
   static const thinkingMax = '最大';
+  static const reasoningPanelTitle = '思考过程';
+  static const reasoningPanelStreaming = '正在接收思考过程';
+  static const reasoningPanelCollapsed = '已折叠思考过程';
+  static const reasoningPanelExpand = '展开';
+  static const reasoningPanelCollapse = '收起';
+  static const reasoningPanelShowingRecent = '仅显示最近内容，完整内容已保存在消息中';
+  static String reasoningPanelCharacters(int count) => '$count 字符';
 
   // ── Advanced LLM config ────────────────────────────────────────────
   static const contextLength = '上下文长度';
@@ -423,6 +436,13 @@ class AppStrings {
 
   // ── Regenerate ─────────────────────────────────────────────────────
   static const regenerate = '重新生成';
+  static const assistantErrorTitle = '回复失败';
+  static const assistantErrorRetryUnavailable = '这次失败不适合直接重试';
+  static const assistantRetryStarted = '已重新发送';
+  static const assistantRetryUnavailable = '当前失败状态无法重试';
+  static const assistantRetryBusy = '当前会话正在处理，请稍后再试';
+  static const assistantRetryMissingApiKey = '请先配置 API Key 后再重试';
+  static const assistantRetryFailed = '重试失败';
 
   // ── Voice ──────────────────────────────────────────────────────────
   static const voiceUnavailable = '语音识别不可用';

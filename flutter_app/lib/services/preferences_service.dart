@@ -102,6 +102,8 @@ class PreferencesService {
   static const _keyTtsModel = 'tts_model';
   static const _keyProviderProfiles = 'provider_profiles';
   static const _keyActiveProfileId = 'active_provider_profile_id';
+  static const _keyModelGroups = 'model_groups';
+  static const _keyActiveModelGroupId = 'active_model_group_id';
   static const _keyPromptProfiles = 'prompt_profiles';
   static const _keyMcpServers = 'mcp_servers';
 
@@ -123,8 +125,10 @@ class PreferencesService {
   static PreferencesService? _instance;
   Map<String, String> _cachedEnvVars = {};
   List<ProviderProfile> _cachedProfiles = [];
+  List<ModelGroup> _cachedModelGroups = [];
   List<McpServerConfig> _cachedMcpServers = [];
   String? _cachedActiveProfileId;
+  String? _cachedActiveModelGroupId;
 
   late SharedPreferences _prefs;
   bool _initialized = false;
@@ -146,6 +150,7 @@ class PreferencesService {
     await _migrateApiKeyToSecureStorage();
     await _migrateEnvVarsToSecureStorage();
     await _loadProviderProfiles();
+    await _loadModelGroups();
     _cachedEnvVars =
         _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
     await _loadMcpServers();
@@ -394,6 +399,117 @@ class PreferencesService {
     }).toList(growable: false);
   }
 
+  Future<void> _loadModelGroups() async {
+    final rawGroups = _prefs.getString(_keyModelGroups);
+    if (rawGroups != null && rawGroups.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawGroups);
+        if (decoded is List) {
+          _cachedModelGroups = decoded
+              .whereType<Map>()
+              .map((item) => ModelGroup.fromJson(
+                    Map<String, dynamic>.from(item),
+                  ))
+              .toList();
+        }
+      } catch (e) {
+        debugPrint('Failed to read model groups: $e');
+        _cachedModelGroups = [];
+      }
+    }
+    _cachedActiveModelGroupId = _prefs.getString(_keyActiveModelGroupId);
+    await _sanitizeCachedModelGroups();
+  }
+
+  Future<void> _sanitizeCachedModelGroups() async {
+    final before =
+        jsonEncode(_cachedModelGroups.map((g) => g.toJson()).toList());
+    final beforeActive = _cachedActiveModelGroupId;
+    _cachedModelGroups = _sanitizeModelGroups(_cachedModelGroups);
+    if (_cachedActiveModelGroupId != null &&
+        !_cachedModelGroups
+            .any((group) => group.id == _cachedActiveModelGroupId)) {
+      _cachedActiveModelGroupId = null;
+    }
+    final after =
+        jsonEncode(_cachedModelGroups.map((g) => g.toJson()).toList());
+    if (before != after) {
+      await _persistModelGroups();
+    }
+    if (beforeActive != _cachedActiveModelGroupId) {
+      await _persistActiveModelGroupId();
+    }
+  }
+
+  List<ModelGroup> _sanitizeModelGroups(List<ModelGroup> groups) {
+    if (groups.isEmpty || _cachedProfiles.isEmpty) return const [];
+    final profileIds = _cachedProfiles.map((profile) => profile.id).toSet();
+    final seenGroups = <String>{};
+    final sanitized = <ModelGroup>[];
+    for (final group in groups) {
+      final groupId = group.id.trim();
+      final primaryProfileId = group.primaryProfileId.trim();
+      if (groupId.isEmpty ||
+          primaryProfileId.isEmpty ||
+          !profileIds.contains(primaryProfileId) ||
+          !seenGroups.add(groupId)) {
+        continue;
+      }
+      final seenTargets = <String>{};
+      final targets = <ModelFallbackTarget>[];
+      for (final target in group.fallbackTargets) {
+        final targetId = target.targetProfileId.trim();
+        if (targetId.isEmpty ||
+            targetId == primaryProfileId ||
+            !profileIds.contains(targetId)) {
+          continue;
+        }
+        final modelOverride = target.modelOverride.trim();
+        final key = '$targetId\n$modelOverride';
+        if (!seenTargets.add(key)) continue;
+        targets.add(target.copyWith(
+          targetProfileId: targetId,
+          modelOverride: modelOverride,
+        ));
+      }
+      sanitized.add(group.copyWith(
+        id: groupId,
+        name: group.displayName,
+        primaryProfileId: primaryProfileId,
+        fallbackTargets: targets,
+      ));
+    }
+    return sanitized;
+  }
+
+  Future<void> _persistModelGroups() {
+    if (_cachedModelGroups.isEmpty) {
+      return _prefs.remove(_keyModelGroups);
+    }
+    return _prefs.setString(
+      _keyModelGroups,
+      jsonEncode(_cachedModelGroups.map((group) => group.toJson()).toList()),
+    );
+  }
+
+  Future<void> _persistActiveModelGroupId() {
+    final id = _cachedActiveModelGroupId;
+    if (id == null || id.isEmpty) {
+      return _prefs.remove(_keyActiveModelGroupId);
+    }
+    return _prefs.setString(_keyActiveModelGroupId, id);
+  }
+
+  List<ModelGroup> _copyModelGroups(List<ModelGroup> groups) {
+    return groups
+        .map((group) => group.copyWith(
+              fallbackTargets: group.fallbackTargets
+                  .map((target) => target.copyWith())
+                  .toList(),
+            ))
+        .toList();
+  }
+
   List<ProviderProfile> get profiles {
     return _cachedProfiles.map((p) => p.copyWith()).toList();
   }
@@ -407,18 +523,30 @@ class PreferencesService {
   Future<void> setProfiles(List<ProviderProfile> value) async {
     final previousProfiles = _copyProfiles(_cachedProfiles);
     final previousActiveProfileId = _cachedActiveProfileId;
+    final previousModelGroups = _copyModelGroups(_cachedModelGroups);
+    final previousActiveModelGroupId = _cachedActiveModelGroupId;
 
     _cachedProfiles = _sanitizeProviderFallbacks(value);
     if (!_cachedProfiles.any((p) => p.id == _cachedActiveProfileId)) {
       _cachedActiveProfileId = _cachedProfiles.first.id;
     }
+    _cachedModelGroups = _sanitizeModelGroups(_cachedModelGroups);
+    if (_cachedActiveModelGroupId != null &&
+        !_cachedModelGroups
+            .any((group) => group.id == _cachedActiveModelGroupId)) {
+      _cachedActiveModelGroupId = null;
+    }
 
     try {
       await _persistProfiles();
       await _prefs.setString(_keyActiveProfileId, _cachedActiveProfileId!);
+      await _persistModelGroups();
+      await _persistActiveModelGroupId();
     } catch (e) {
       _cachedProfiles = previousProfiles;
       _cachedActiveProfileId = previousActiveProfileId;
+      _cachedModelGroups = previousModelGroups;
+      _cachedActiveModelGroupId = previousActiveModelGroupId;
       debugPrint('Reverted provider profiles after setProfiles failure: $e');
       rethrow;
     }
@@ -466,6 +594,63 @@ class PreferencesService {
   }
 
   ProviderProfile get activeProfile => _activeProfile.copyWith();
+
+  List<ModelGroup> get modelGroups => _copyModelGroups(_cachedModelGroups);
+
+  String? get activeModelGroupId => _cachedActiveModelGroupId;
+
+  ModelGroup? modelGroupById(String? id) {
+    final normalized = id?.trim();
+    if (normalized == null || normalized.isEmpty) return null;
+    for (final group in _cachedModelGroups) {
+      if (group.id == normalized) {
+        return group.copyWith(
+          fallbackTargets:
+              group.fallbackTargets.map((target) => target.copyWith()).toList(),
+        );
+      }
+    }
+    return null;
+  }
+
+  Future<void> setModelGroups(List<ModelGroup> value) async {
+    final previousGroups = _copyModelGroups(_cachedModelGroups);
+    final previousActiveModelGroupId = _cachedActiveModelGroupId;
+    _cachedModelGroups = _sanitizeModelGroups(value);
+    if (_cachedActiveModelGroupId != null &&
+        !_cachedModelGroups
+            .any((group) => group.id == _cachedActiveModelGroupId)) {
+      _cachedActiveModelGroupId = null;
+    }
+    try {
+      await _persistModelGroups();
+      await _persistActiveModelGroupId();
+    } catch (e) {
+      _cachedModelGroups = previousGroups;
+      _cachedActiveModelGroupId = previousActiveModelGroupId;
+      debugPrint('Reverted model groups after persist failure: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> setActiveModelGroupId(String? value) async {
+    final previousActiveModelGroupId = _cachedActiveModelGroupId;
+    final normalized = value?.trim();
+    if (normalized != null &&
+        normalized.isNotEmpty &&
+        _cachedModelGroups.any((group) => group.id == normalized)) {
+      _cachedActiveModelGroupId = normalized;
+    } else {
+      _cachedActiveModelGroupId = null;
+    }
+    try {
+      await _persistActiveModelGroupId();
+    } catch (e) {
+      _cachedActiveModelGroupId = previousActiveModelGroupId;
+      debugPrint('Reverted active model group after persist failure: $e');
+      rethrow;
+    }
+  }
 
   Future<void> updateActiveProfile(ProviderProfile profile) async {
     final previousProfiles = _copyProfiles(_cachedProfiles);
@@ -1024,6 +1209,8 @@ class PreferencesService {
   Map<String, dynamic> exportAllSettings() {
     return {
       'activeProfileId': activeProfileId,
+      'activeModelGroupId': activeModelGroupId,
+      'modelGroups': modelGroups.map((group) => group.toJson()).toList(),
       'systemPrompt': _prefs.getString(_keySystemPrompt),
       'themeMode': themeMode,
       'fontScale': fontScale,
@@ -1127,6 +1314,33 @@ class PreferencesService {
     }
     final importedTemperature = _finiteDouble(settings['temperature']);
     if (importedTemperature != null) temperature = importedTemperature;
+    final importedModelGroups = _modelGroupList(settings['modelGroups']);
+    if (importedModelGroups != null) {
+      final previousGroups = _copyModelGroups(_cachedModelGroups);
+      final previousActiveModelGroupId = _cachedActiveModelGroupId;
+      _cachedModelGroups = _sanitizeModelGroups(importedModelGroups);
+      if (_cachedActiveModelGroupId != null &&
+          !_cachedModelGroups
+              .any((group) => group.id == _cachedActiveModelGroupId)) {
+        _cachedActiveModelGroupId = null;
+      }
+      unawaited(_persistModelGroups().catchError((Object e) {
+        _cachedModelGroups = previousGroups;
+        _cachedActiveModelGroupId = previousActiveModelGroupId;
+        debugPrint('Reverted imported model groups after persist failure: $e');
+      }));
+    }
+    if (settings.containsKey('activeModelGroupId')) {
+      final value = settings['activeModelGroupId']?.toString().trim();
+      _cachedActiveModelGroupId = value != null &&
+              value.isNotEmpty &&
+              _cachedModelGroups.any((group) => group.id == value)
+          ? value
+          : null;
+      unawaited(_persistActiveModelGroupId().catchError((Object e) {
+        debugPrint('Failed to persist imported active model group: $e');
+      }));
+    }
   }
 
   Future<({int imported, int skipped})> importProfiles(
@@ -1190,5 +1404,24 @@ class PreferencesService {
         .map((item) => item?.toString().trim() ?? '')
         .where((item) => item.isNotEmpty)
         .toList(growable: false);
+  }
+
+  List<ModelGroup>? _modelGroupList(Object? value) {
+    if (value == null) return null;
+    if (value is! List) return null;
+    try {
+      final groups = <ModelGroup>[];
+      for (final item in value) {
+        if (item is! Map) {
+          throw const FormatException('Invalid model group');
+        }
+        groups.add(
+          ModelGroup.fromJson(Map<String, dynamic>.from(item)),
+        );
+      }
+      return groups;
+    } catch (_) {
+      return null;
+    }
   }
 }

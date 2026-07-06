@@ -186,6 +186,70 @@ void main() {
         importedPrimary.fallbackTargets.single.modelOverride, 'backup-model');
   });
 
+  test('encrypted export and import preserves model groups after profiles',
+      () async {
+    final prefs = await initPrefs();
+    final active = ProviderProfile.defaults(name: 'Active').copyWith(
+      id: 'active',
+      apiKey: 'active-key',
+      model: 'active-model',
+    );
+    final primary = ProviderProfile.defaults(name: 'Primary').copyWith(
+      id: 'primary',
+      apiKey: 'primary-key',
+      model: 'primary-model',
+    );
+    final backup = ProviderProfile.defaults(name: 'Backup').copyWith(
+      id: 'backup',
+      apiKey: 'backup-key',
+      model: 'backup-model',
+    );
+    await prefs.setProfiles([active, primary, backup]);
+    await prefs.setActiveProfileId('active');
+    await prefs.setModelGroups([
+      ModelGroup(
+        id: 'group',
+        name: 'Coding Group',
+        primaryProfileId: 'primary',
+        fallbackTargets: const [
+          ModelFallbackTarget(
+            targetProfileId: 'backup',
+            modelOverride: 'backup-override',
+          ),
+        ],
+      ),
+    ]);
+    await prefs.setActiveModelGroupId('group');
+
+    final exported = await ConfigExportService.exportConfig(
+      password: 'backup-password',
+    );
+    expect(exported, isNot(contains('active-key')));
+    expect(exported, isNot(contains('primary-key')));
+    expect(exported, isNot(contains('backup-key')));
+
+    resetDevice();
+    await ConfigExportService.importConfig(
+      exported,
+      password: 'backup-password',
+      conflictResolution: ConflictResolution.replace,
+    );
+
+    final importedPrefs = await initPrefs();
+    expect(importedPrefs.activeProfileId, 'active');
+    expect(importedPrefs.modelGroups, hasLength(1));
+    final importedGroup = importedPrefs.modelGroups.single;
+    expect(importedGroup.id, 'group');
+    expect(importedGroup.primaryProfileId, 'primary');
+    expect(importedGroup.fallbackTargets, hasLength(1));
+    expect(importedGroup.fallbackTargets.single.targetProfileId, 'backup');
+    expect(
+      importedGroup.fallbackTargets.single.modelOverride,
+      'backup-override',
+    );
+    expect(importedPrefs.activeModelGroupId, 'group');
+  });
+
   test('failed encrypted import leaves existing config untouched', () async {
     final prefs = await initPrefs();
     prefs.systemPrompt = 'keep system prompt';
@@ -312,6 +376,148 @@ void main() {
     expect(prefs.profiles.single.id, 'existing');
     expect(prefs.profiles.single.apiKey, 'existing-key');
     expect(prefs.profiles.single.model, 'existing-model');
+  });
+
+  test('plaintext malformed model groups leave config untouched', () async {
+    final prefs = await initPrefs();
+    prefs.systemPrompt = 'keep system prompt';
+    prefs.themeMode = 'dark';
+    prefs.envVars = {'KEEP_ENV': 'keep-value'};
+    final primary = ProviderProfile.defaults(name: 'Primary').copyWith(
+      id: 'primary',
+      apiKey: 'primary-key',
+      model: 'primary-model',
+    );
+    final backup = ProviderProfile.defaults(name: 'Backup').copyWith(
+      id: 'backup',
+      apiKey: 'backup-key',
+      model: 'backup-model',
+    );
+    await prefs.setProfiles([primary, backup]);
+    await prefs.setActiveProfileId('primary');
+    await prefs.setModelGroups([
+      ModelGroup(
+        id: 'keep-group',
+        name: 'Keep Group',
+        primaryProfileId: 'primary',
+        fallbackTargets: const [
+          ModelFallbackTarget(targetProfileId: 'backup'),
+        ],
+      ),
+    ]);
+    await prefs.setActiveModelGroupId('keep-group');
+
+    final malformedExport = jsonEncode({
+      'version': 1,
+      'exportedAt': DateTime.utc(2026).toIso8601String(),
+      'settings': {
+        'systemPrompt': 'mutated system prompt',
+        'themeMode': 'light',
+        'activeModelGroupId': 'mutated-group',
+        'modelGroups': [
+          {'id': 'mutated-group'},
+        ],
+      },
+      'secrets': {
+        'encrypted': false,
+        'providerProfiles': [
+          ProviderProfile.defaults(name: 'Incoming')
+              .copyWith(
+                id: 'incoming',
+                apiKey: 'incoming-key',
+                model: 'incoming-model',
+              )
+              .toJson(),
+        ],
+        'envVars': {'MUTATED_ENV': 'mutated-value'},
+      },
+    });
+
+    await expectLater(
+      ConfigExportService.importConfig(
+        malformedExport,
+        conflictResolution: ConflictResolution.replace,
+      ),
+      throwsA(isA<FormatException>()),
+    );
+
+    expect(prefs.systemPrompt, 'keep system prompt');
+    expect(prefs.themeMode, 'dark');
+    expect(prefs.envVars, {'KEEP_ENV': 'keep-value'});
+    expect(prefs.profiles.map((profile) => profile.id), ['primary', 'backup']);
+    expect(prefs.modelGroups, hasLength(1));
+    expect(prefs.modelGroups.single.id, 'keep-group');
+    expect(prefs.activeModelGroupId, 'keep-group');
+  });
+
+  test('encrypted malformed model groups leave config untouched', () async {
+    var prefs = await initPrefs();
+    final incoming = ProviderProfile.defaults(name: 'Incoming').copyWith(
+      id: 'incoming',
+      apiKey: 'incoming-key',
+      model: 'incoming-model',
+    );
+    await prefs.setProfiles([incoming]);
+    prefs.systemPrompt = 'incoming system prompt';
+    prefs.envVars = {'INCOMING_ENV': 'incoming-value'};
+
+    final encryptedExport = await ConfigExportService.exportConfig(
+      password: 'backup-password',
+    );
+
+    resetDevice();
+    prefs = await initPrefs();
+    prefs.systemPrompt = 'keep system prompt';
+    prefs.themeMode = 'dark';
+    prefs.envVars = {'KEEP_ENV': 'keep-value'};
+    final primary = ProviderProfile.defaults(name: 'Primary').copyWith(
+      id: 'primary',
+      apiKey: 'primary-key',
+      model: 'primary-model',
+    );
+    final backup = ProviderProfile.defaults(name: 'Backup').copyWith(
+      id: 'backup',
+      apiKey: 'backup-key',
+      model: 'backup-model',
+    );
+    await prefs.setProfiles([primary, backup]);
+    await prefs.setActiveProfileId('primary');
+    await prefs.setModelGroups([
+      ModelGroup(
+        id: 'keep-group',
+        name: 'Keep Group',
+        primaryProfileId: 'primary',
+        fallbackTargets: const [
+          ModelFallbackTarget(targetProfileId: 'backup'),
+        ],
+      ),
+    ]);
+    await prefs.setActiveModelGroupId('keep-group');
+
+    final importData = jsonDecode(encryptedExport) as Map<String, dynamic>;
+    importData['settings'] = {
+      'systemPrompt': 'mutated system prompt',
+      'themeMode': 'light',
+      'activeModelGroupId': 'mutated-group',
+      'modelGroups': ['not-a-model-group'],
+    };
+
+    await expectLater(
+      ConfigExportService.importConfig(
+        jsonEncode(importData),
+        password: 'backup-password',
+        conflictResolution: ConflictResolution.replace,
+      ),
+      throwsA(isA<FormatException>()),
+    );
+
+    expect(prefs.systemPrompt, 'keep system prompt');
+    expect(prefs.themeMode, 'dark');
+    expect(prefs.envVars, {'KEEP_ENV': 'keep-value'});
+    expect(prefs.profiles.map((profile) => profile.id), ['primary', 'backup']);
+    expect(prefs.modelGroups, hasLength(1));
+    expect(prefs.modelGroups.single.id, 'keep-group');
+    expect(prefs.activeModelGroupId, 'keep-group');
   });
 
   test('MCP import normalizes env keys', () async {

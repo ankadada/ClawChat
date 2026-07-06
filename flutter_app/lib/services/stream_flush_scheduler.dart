@@ -13,8 +13,9 @@ class StreamFlushScheduler {
   void schedule({
     required String delta,
     required void Function() flush,
+    bool flushOnBoundary = true,
   }) {
-    if (_isBoundaryDelta(delta)) {
+    if (flushOnBoundary && _isBoundaryDelta(delta)) {
       flushNow(flush);
       return;
     }

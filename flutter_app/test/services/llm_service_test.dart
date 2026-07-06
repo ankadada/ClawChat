@@ -1333,8 +1333,7 @@ void main() {
       expect(error.message, endsWith('...'));
     });
 
-    test(
-        'accepts Anthropic stream ending without final delimiter or stop event',
+    test('rejects Anthropic stream ending without message_stop event',
         () async {
       final events = await collectAnthropicStreamEvents([
         sseData({
@@ -1363,13 +1362,86 @@ void main() {
         }, delimiter: false),
       ]);
 
-      expect(events.whereType<StreamError>().map((e) => e.message), isEmpty);
+      final error = events.whereType<StreamError>().single;
+      expect(error.message, contains('without message_stop'));
+      expect(events.whereType<StreamDone>(), isEmpty);
+    });
+
+    test('rejects Anthropic done sentinel without message_stop', () async {
+      final events = await collectAnthropicStreamEvents([
+        sseData({'type': 'message_start', 'message': {}}),
+        sseData({
+          'type': 'content_block_start',
+          'content_block': {'type': 'text'},
+        }),
+        sseData({
+          'type': 'content_block_delta',
+          'delta': {'type': 'text_delta', 'text': 'ok'},
+        }),
+        sseData({'type': 'content_block_stop'}),
+        'data: [DONE]\n\n',
+      ]);
+
+      final error = events.whereType<StreamError>().single;
+      expect(error.message, contains('without message_stop'));
+      expect(events.whereType<StreamDone>(), isEmpty);
+    });
+
+    test('rejects malformed Anthropic SSE JSON frame', () async {
+      final events = await collectAnthropicStreamEvents([
+        sseData({'type': 'message_start', 'message': {}}),
+        'data: {"type":\n\n',
+      ]);
+
+      final error = events.whereType<StreamError>().single;
+      expect(error.message, contains('malformed SSE JSON frame'));
+      expect(events.whereType<StreamDone>(), isEmpty);
+    });
+
+    test('streams Anthropic thinking deltas separately from answer text',
+        () async {
+      final events = await collectAnthropicStreamEvents([
+        sseData({'type': 'message_start', 'message': {}}),
+        sseData({
+          'type': 'content_block_start',
+          'content_block': {'type': 'thinking'},
+        }),
+        sseData({
+          'type': 'content_block_delta',
+          'delta': {'type': 'thinking_delta', 'thinking': 'step one\n'},
+        }),
+        sseData({
+          'type': 'content_block_delta',
+          'delta': {'type': 'thinking_delta', 'thinking': 'step two'},
+        }),
+        sseData({'type': 'content_block_stop'}),
+        sseData({
+          'type': 'content_block_start',
+          'content_block': {'type': 'text'},
+        }),
+        sseData({
+          'type': 'content_block_delta',
+          'delta': {'type': 'text_delta', 'text': 'answer'},
+        }),
+        sseData({'type': 'content_block_stop'}),
+        sseData({
+          'type': 'message_delta',
+          'delta': {'stop_reason': 'end_turn'},
+        }),
+        sseData({'type': 'message_stop'}, delimiter: false),
+      ]);
+
+      expect(events.whereType<ReasoningDelta>().map((e) => e.text), [
+        'step one\n',
+        'step two',
+      ]);
+      expect(events.whereType<TextDelta>().map((e) => e.text), ['answer']);
       final done = events.whereType<StreamDone>().single;
-      expect(done.response.content.single.text, 'ok');
-      expect(done.response.inputTokens, 1);
-      expect(done.response.outputTokens, 1);
-      expect(done.response.usage?.cacheReadInputTokens, 2);
-      expect(done.response.usage?.cacheCreationInputTokens, 3);
+      expect(done.response.content.single.text, 'answer');
+      expect(
+        done.response.content.single.reasoningContent,
+        'step one\nstep two',
+      );
     });
 
     test('accepts OpenAI stream ending without final delimiter or done marker',
@@ -1407,6 +1479,82 @@ void main() {
       expect(done.response.inputTokens, 1);
       expect(done.response.outputTokens, 1);
       expect(done.response.usage?.cacheReadInputTokens, 2);
+    });
+
+    test('rejects OpenAI stream ending without finish_reason', () async {
+      final events = await collectOpenAiStreamEvents([
+        sseData({
+          'choices': [
+            {
+              'delta': {'content': 'partial'},
+              'finish_reason': null,
+            }
+          ],
+        }),
+      ]);
+
+      expect(events.whereType<TextDelta>().map((event) => event.text),
+          ['partial']);
+      final error = events.whereType<StreamError>().single;
+      expect(error.message, contains('without finish_reason'));
+      expect(events.whereType<StreamDone>(), isEmpty);
+    });
+
+    test('rejects malformed OpenAI SSE JSON frame', () async {
+      final events = await collectOpenAiStreamEvents([
+        sseData({
+          'choices': [
+            {
+              'delta': {'content': 'partial'},
+              'finish_reason': null,
+            }
+          ],
+        }),
+        'data: {"choices":\n\n',
+      ]);
+
+      expect(events.whereType<TextDelta>().map((event) => event.text),
+          ['partial']);
+      final error = events.whereType<StreamError>().single;
+      expect(error.message, contains('malformed SSE JSON frame'));
+      expect(events.whereType<StreamDone>(), isEmpty);
+    });
+
+    test('rejects OpenAI incomplete tool call JSON before StreamDone',
+        () async {
+      final events = await collectOpenAiStreamEvents([
+        sseData({
+          'choices': [
+            {
+              'delta': {
+                'tool_calls': [
+                  {
+                    'index': 0,
+                    'id': 'call_1',
+                    'function': {'name': 'echo', 'arguments': '{"text":'},
+                  }
+                ],
+              },
+              'finish_reason': null,
+            }
+          ],
+        }),
+        sseData({
+          'choices': [
+            {
+              'delta': {},
+              'finish_reason': 'tool_calls',
+            }
+          ],
+        }),
+        'data: [DONE]\n\n',
+      ]);
+
+      expect(events.whereType<ToolUseStart>(), hasLength(1));
+      expect(events.whereType<ToolInputDelta>(), hasLength(1));
+      final error = events.whereType<StreamError>().single;
+      expect(error.message, contains('incomplete tool call JSON'));
+      expect(events.whereType<StreamDone>(), isEmpty);
     });
 
     test('retries OpenAI stream without stream_options when unsupported',
@@ -1498,6 +1646,10 @@ void main() {
       ]);
 
       expect(events.whereType<TextDelta>().map((e) => e.text), ['visible']);
+      expect(events.whereType<ReasoningDelta>().map((e) => e.text), [
+        'hidden ',
+        'state',
+      ]);
       final done = events.whereType<StreamDone>().single;
       final textBlock = done.response.content.single;
       expect(textBlock.text, 'visible');

@@ -7,10 +7,13 @@ import 'package:provider/provider.dart';
 
 import '../app.dart';
 import '../models/chat_models.dart';
+import '../models/provider_profile.dart';
 import '../providers/chat_provider.dart';
 import '../services/native_bridge.dart';
 import '../services/session_storage.dart';
 import '../l10n/app_strings.dart';
+
+const _defaultNewChatModelGroupSelection = '__default_provider_profile__';
 
 class ChatSessionsScreen extends StatefulWidget {
   final bool embedded;
@@ -34,6 +37,71 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     _searchDebounce?.cancel();
     _searchController.dispose();
     super.dispose();
+  }
+
+  Future<void> _createNewChat({bool closeAfterCreate = false}) async {
+    final provider = context.read<ChatProvider>();
+    final groups = provider.modelGroups;
+    String? modelGroupId;
+    if (groups.isNotEmpty) {
+      final selected = await _showModelGroupPicker(groups);
+      if (!mounted || selected == null) return;
+      if (selected != _defaultNewChatModelGroupSelection) {
+        modelGroupId = selected;
+      }
+    }
+    await provider.createSession(modelGroupId: modelGroupId);
+    if (closeAfterCreate && mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
+  Future<String?> _showModelGroupPicker(List<ModelGroup> groups) {
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text(AppStrings.selectModelGroup),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.tune),
+                title: const Text(AppStrings.defaultModelGroup),
+                subtitle: const Text(AppStrings.defaultModelGroupSubtitle),
+                onTap: () => Navigator.pop(
+                  dialogContext,
+                  _defaultNewChatModelGroupSelection,
+                ),
+              ),
+              for (final group in groups)
+                ListTile(
+                  leading: const Icon(Icons.account_tree_outlined),
+                  title: Text(
+                    group.displayName,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  subtitle: Text(
+                    AppStrings.modelGroupFallbackCount(
+                      group.fallbackTargets
+                          .where((target) => target.enabled)
+                          .length,
+                    ),
+                  ),
+                  onTap: () => Navigator.pop(dialogContext, group.id),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text(AppStrings.cancel),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _exportSession(SessionSummary session) async {
@@ -379,9 +447,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                   IconButton(
                     icon: const Icon(Icons.add),
                     tooltip: AppStrings.newChat,
-                    onPressed: () {
-                      context.read<ChatProvider>().createSession();
-                    },
+                    onPressed: () => unawaited(_createNewChat()),
                   ),
                 ],
               ),
@@ -405,10 +471,9 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           IconButton(
             icon: const Icon(Icons.add),
             tooltip: AppStrings.newChat,
-            onPressed: () {
-              context.read<ChatProvider>().createSession();
-              Navigator.of(context).pop();
-            },
+            onPressed: () => unawaited(
+              _createNewChat(closeAfterCreate: true),
+            ),
           ),
         ],
       ),

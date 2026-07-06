@@ -549,6 +549,86 @@ void main() {
     expect(sanitized.fallbackTargets.single.targetProfileId, 'backup');
   });
 
+  test('model groups persist and sanitize profile references', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+    final primary = ProviderProfile.defaults(name: 'Primary').copyWith(
+      id: 'primary',
+    );
+    final backup = ProviderProfile.defaults(name: 'Backup').copyWith(
+      id: 'backup',
+    );
+    await service.setProfiles([primary, backup]);
+    await service.setModelGroups([
+      ModelGroup(
+        id: 'group',
+        name: '  Coding Group  ',
+        primaryProfileId: 'primary',
+        fallbackTargets: const [
+          ModelFallbackTarget(targetProfileId: 'primary'),
+          ModelFallbackTarget(targetProfileId: 'missing'),
+          ModelFallbackTarget(targetProfileId: 'backup'),
+          ModelFallbackTarget(targetProfileId: 'backup'),
+        ],
+      ),
+      ModelGroup(
+        id: 'missing-primary',
+        name: 'Missing',
+        primaryProfileId: 'missing',
+      ),
+    ]);
+    await service.setActiveModelGroupId('group');
+
+    final group = service.modelGroups.single;
+    expect(group.id, 'group');
+    expect(group.displayName, 'Coding Group');
+    expect(group.primaryProfileId, 'primary');
+    expect(group.fallbackTargets, hasLength(1));
+    expect(group.fallbackTargets.single.targetProfileId, 'backup');
+    expect(service.activeModelGroupId, 'group');
+
+    PreferencesService.resetForTesting();
+    final reloaded = PreferencesService();
+    await reloaded.init();
+
+    expect(reloaded.modelGroups, hasLength(1));
+    expect(reloaded.modelGroups.single.id, 'group');
+    expect(reloaded.activeModelGroupId, 'group');
+  });
+
+  test('setProfiles drops model groups with removed primary profiles',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final service = PreferencesService();
+    await service.init();
+    final primary = ProviderProfile.defaults(name: 'Primary').copyWith(
+      id: 'primary',
+    );
+    final backup = ProviderProfile.defaults(name: 'Backup').copyWith(
+      id: 'backup',
+    );
+    await service.setProfiles([primary, backup]);
+    await service.setModelGroups([
+      ModelGroup(
+        id: 'group',
+        name: 'Group',
+        primaryProfileId: 'primary',
+        fallbackTargets: const [
+          ModelFallbackTarget(targetProfileId: 'backup'),
+        ],
+      ),
+    ]);
+    await service.setActiveModelGroupId('group');
+
+    await service.setProfiles([backup]);
+
+    expect(service.modelGroups, isEmpty);
+    expect(service.activeModelGroupId, isNull);
+  });
+
   test('setProfiles propagates write failures and reverts in-memory state',
       () async {
     final first = ProviderProfile.defaults(name: 'First').copyWith(
