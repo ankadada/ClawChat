@@ -8,7 +8,9 @@ import 'tools/tool_argument_preflight.dart';
 import 'tools/tool_policy.dart';
 import 'tools/tool_registry.dart';
 
-sealed class AgentEvent {}
+sealed class AgentEvent {
+  const AgentEvent();
+}
 
 class AgentThinking extends AgentEvent {}
 
@@ -20,6 +22,10 @@ class AgentTextDelta extends AgentEvent {
 class AgentReasoningDelta extends AgentEvent {
   final String text;
   AgentReasoningDelta(this.text);
+}
+
+class AgentStreamReset extends AgentEvent {
+  const AgentStreamReset();
 }
 
 class AgentToolStart extends AgentEvent {
@@ -152,6 +158,9 @@ class AgentService {
             yield AgentTextDelta(event.text);
           } else if (event is ReasoningDelta) {
             yield AgentReasoningDelta(event.text);
+          } else if (event is StreamReset) {
+            textBuffer.clear();
+            yield const AgentStreamReset();
           } else if (event is StreamDone) {
             response = event.response;
           } else if (event is StreamError) {

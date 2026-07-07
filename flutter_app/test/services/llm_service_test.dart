@@ -1656,8 +1656,7 @@ void main() {
       expect(textBlock.reasoningContent, 'hidden state');
     });
 
-    test('reconnects OpenAI streams without duplicating emitted text',
-        () async {
+    test('reconnects OpenAI streams by resetting emitted text', () async {
       var requestCount = 0;
       final events = await collectOpenAiStreamEventsWithHandler(
         (request) async {
@@ -1667,7 +1666,7 @@ void main() {
             request.response.write(sseData({
               'choices': [
                 {
-                  'delta': {'content': 'hel'},
+                  'delta': {'content': 'old partial'},
                   'finish_reason': null,
                 }
               ],
@@ -1680,7 +1679,7 @@ void main() {
           request.response.write(sseData({
             'choices': [
               {
-                'delta': {'content': 'hel'},
+                'delta': {'content': 'new '},
                 'finish_reason': null,
               }
             ],
@@ -1688,7 +1687,7 @@ void main() {
           request.response.write(sseData({
             'choices': [
               {
-                'delta': {'content': 'lo'},
+                'delta': {'content': 'answer'},
                 'finish_reason': null,
               }
             ],
@@ -1712,13 +1711,31 @@ void main() {
 
       expect(requestCount, 2);
       expect(events.whereType<StreamError>().map((e) => e.message), isEmpty);
-      expect(events.whereType<TextDelta>().map((e) => e.text).join(), 'hello');
+      final resetIndex = events.indexWhere((event) => event is StreamReset);
+      expect(resetIndex, isNonNegative);
+      if (resetIndex > 0) {
+        expect(
+          events
+              .take(resetIndex)
+              .whereType<TextDelta>()
+              .map((e) => e.text)
+              .join(),
+          'old partial',
+        );
+      }
+      expect(
+        events
+            .skip(resetIndex + 1)
+            .whereType<TextDelta>()
+            .map((e) => e.text)
+            .join(),
+        'new answer',
+      );
       final done = events.whereType<StreamDone>().single;
-      expect(done.response.content.single.text, 'hello');
+      expect(done.response.content.single.text, 'new answer');
     });
 
-    test('reconnects Anthropic streams without duplicating emitted text',
-        () async {
+    test('reconnects Anthropic streams by resetting emitted text', () async {
       var requestCount = 0;
       final events = await collectAnthropicStreamEventsWithHandler(
         (request) async {
@@ -1738,7 +1755,10 @@ void main() {
           }));
           request.response.write(sseData({
             'type': 'content_block_delta',
-            'delta': {'type': 'text_delta', 'text': 'hel'},
+            'delta': {
+              'type': 'text_delta',
+              'text': requestCount == 1 ? 'old partial' : 'new answer',
+            },
           }));
           await request.response.flush();
 
@@ -1747,10 +1767,6 @@ void main() {
             return;
           }
 
-          request.response.write(sseData({
-            'type': 'content_block_delta',
-            'delta': {'type': 'text_delta', 'text': 'lo'},
-          }));
           request.response.write(sseData({'type': 'content_block_stop'}));
           request.response.write(sseData({
             'type': 'message_delta',
@@ -1764,9 +1780,90 @@ void main() {
 
       expect(requestCount, 2);
       expect(events.whereType<StreamError>().map((e) => e.message), isEmpty);
-      expect(events.whereType<TextDelta>().map((e) => e.text).join(), 'hello');
+      final resetIndex = events.indexWhere((event) => event is StreamReset);
+      expect(resetIndex, isNonNegative);
+      if (resetIndex > 0) {
+        expect(
+          events
+              .take(resetIndex)
+              .whereType<TextDelta>()
+              .map((e) => e.text)
+              .join(),
+          'old partial',
+        );
+      }
+      expect(
+        events
+            .skip(resetIndex + 1)
+            .whereType<TextDelta>()
+            .map((e) => e.text)
+            .join(),
+        'new answer',
+      );
       final done = events.whereType<StreamDone>().single;
-      expect(done.response.content.single.text, 'hello');
+      expect(done.response.content.single.text, 'new answer');
+    });
+
+    test('reconnect reset prevents Anthropic tool input splicing', () async {
+      var requestCount = 0;
+      final events = await collectAnthropicStreamEventsWithHandler(
+        (request) async {
+          requestCount++;
+          if (requestCount == 1) {
+            request.response.contentLength = 1024;
+          }
+          request.response.write(sseData({
+            'type': 'message_start',
+            'message': {
+              'usage': {'input_tokens': 1},
+            },
+          }));
+          request.response.write(sseData({
+            'type': 'content_block_start',
+            'content_block': {
+              'type': 'tool_use',
+              'id': requestCount == 1 ? 'tool-old' : 'tool-new',
+              'name': 'lookup',
+            },
+          }));
+          request.response.write(sseData({
+            'type': 'content_block_delta',
+            'delta': {
+              'type': 'input_json_delta',
+              'partial_json': requestCount == 1 ? '{"q":"old' : '{"q":"new"}',
+            },
+          }));
+          await request.response.flush();
+          if (requestCount == 1) {
+            await closeIncompleteResponse(request.response);
+            return;
+          }
+          request.response.write(sseData({'type': 'content_block_stop'}));
+          request.response.write(sseData({
+            'type': 'message_delta',
+            'delta': {'stop_reason': 'tool_use'},
+          }));
+          request.response.write(sseData({'type': 'message_stop'}));
+          await request.response.close();
+        },
+      );
+
+      expect(requestCount, 2);
+      final resetIndex = events.indexWhere((event) => event is StreamReset);
+      expect(resetIndex, isNonNegative);
+      expect(
+        events
+            .skip(resetIndex + 1)
+            .whereType<ToolInputDelta>()
+            .map((e) => e.json)
+            .join(),
+        '{"q":"new"}',
+      );
+      final done = events.whereType<StreamDone>().single;
+      final toolBlock = done.response.content.single;
+      expect(toolBlock.toolUseId, 'tool-new');
+      expect(toolBlock.rawToolInputJson, '{"q":"new"}');
+      expect(toolBlock.toolInput, {'q': 'new'});
     });
   });
 }

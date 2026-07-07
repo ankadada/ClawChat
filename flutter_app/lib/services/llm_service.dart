@@ -270,7 +270,9 @@ class ToolDefinition {
       };
 }
 
-sealed class StreamEvent {}
+sealed class StreamEvent {
+  const StreamEvent();
+}
 
 class TextDelta extends StreamEvent {
   final String text;
@@ -293,6 +295,10 @@ class ToolInputDelta extends StreamEvent {
   ToolInputDelta(this.json);
 }
 
+class StreamReset extends StreamEvent {
+  const StreamReset();
+}
+
 class StreamDone extends StreamEvent {
   final LlmResponse response;
   StreamDone(this.response);
@@ -302,6 +308,19 @@ class StreamError extends StreamEvent {
   final String message;
   final Object? cause;
   StreamError(this.message, {this.cause});
+}
+
+sealed class _ResilientSseEvent {
+  const _ResilientSseEvent();
+}
+
+class _ResilientSseData extends _ResilientSseEvent {
+  final String data;
+  const _ResilientSseData(this.data);
+}
+
+class _ResilientSseRetry extends _ResilientSseEvent {
+  const _ResilientSseRetry();
 }
 
 class LlmService {
@@ -722,10 +741,9 @@ class LlmService {
     return controller.stream;
   }
 
-  Stream<String> _resilientSseDataStream({
+  Stream<_ResilientSseEvent> _resilientSseDataStream({
     required Future<http.StreamedResponse> Function() openStream,
     required bool Function(String data) isDoneData,
-    void Function(int attempt, Object error)? onRetry,
     bool Function()? isInBackground,
   }) async* {
     for (int attempt = 0; attempt <= _maxStreamReconnects; attempt++) {
@@ -751,7 +769,7 @@ class LlmService {
           if (line.trim().isEmpty && sseDataLines.isNotEmpty) {
             final data = sseDataLines.join('\n').trim();
             sseDataLines.clear();
-            yield data;
+            yield _ResilientSseData(data);
             if (isDoneData(data)) return;
           }
         }
@@ -759,7 +777,7 @@ class LlmService {
         if (sseDataLines.isNotEmpty) {
           final data = sseDataLines.join('\n').trim();
           sseDataLines.clear();
-          yield data;
+          yield _ResilientSseData(data);
           if (isDoneData(data)) return;
         }
         return;
@@ -767,7 +785,7 @@ class LlmService {
         if (attempt >= _maxStreamReconnects || !_isRetryableStreamError(e)) {
           rethrow;
         }
-        onRetry?.call(attempt + 1, e);
+        yield const _ResilientSseRetry();
         await _delayBeforeStreamReconnect(attempt);
       }
     }
@@ -859,18 +877,25 @@ class LlmService {
     int? cacheReadInputTokens;
     int? cacheCreationInputTokens;
     bool streamFailed = false;
-    int textSkipRemaining = 0;
-    int toolInputSkipRemaining = 0;
-    int reasoningSkipRemaining = 0;
-    int toolStartSkipRemaining = 0;
-    int completedToolBlockSkipRemaining = 0;
-    int emittedTextLength = 0;
-    int emittedToolInputLength = 0;
-    int emittedReasoningLength = 0;
-    int emittedToolStarts = 0;
-    int completedToolBlocks = 0;
-    bool suppressCurrentToolBlock = false;
     bool activeContentBlock = false;
+
+    void resetAnthropicStreamState() {
+      collectedBlocks.clear();
+      currentText = '';
+      currentReasoningContent = StringBuffer();
+      currentToolId = '';
+      currentToolName = '';
+      currentToolInput = StringBuffer();
+      stopReason = 'end_turn';
+      receivedMessageStop = false;
+      isThinkingBlock = false;
+      inputTokens = null;
+      outputTokens = null;
+      cacheReadInputTokens = null;
+      cacheCreationInputTokens = null;
+      streamFailed = false;
+      activeContentBlock = false;
+    }
 
     String? finishCurrentAnthropicBlock() {
       if (isThinkingBlock) {
@@ -878,8 +903,6 @@ class LlmService {
         return null;
       }
       if (currentToolName.isNotEmpty && currentToolId.isNotEmpty) {
-        final shouldSuppressToolBlock = suppressCurrentToolBlock;
-        suppressCurrentToolBlock = false;
         Map<String, dynamic> input = {};
         try {
           final inputStr = currentToolInput.toString();
@@ -887,18 +910,14 @@ class LlmService {
         } catch (_) {
           return 'Anthropic stream interrupted: incomplete tool call JSON';
         }
-        if (!shouldSuppressToolBlock) {
-          final rawToolInputJson = currentToolInput.toString();
-          collectedBlocks.add(ContentBlock(
-            type: 'tool_use',
-            toolUseId: currentToolId,
-            toolName: currentToolName,
-            toolInput: input,
-            rawToolInputJson:
-                rawToolInputJson.isEmpty ? null : rawToolInputJson,
-          ));
-          completedToolBlocks++;
-        }
+        final rawToolInputJson = currentToolInput.toString();
+        collectedBlocks.add(ContentBlock(
+          type: 'tool_use',
+          toolUseId: currentToolId,
+          toolName: currentToolName,
+          toolInput: input,
+          rawToolInputJson: rawToolInputJson.isEmpty ? null : rawToolInputJson,
+        ));
         currentToolId = '';
         currentToolName = '';
         currentToolInput = StringBuffer();
@@ -982,28 +1001,10 @@ class LlmService {
                 );
                 return;
               }
-              final duplicateToolStart = toolStartSkipRemaining > 0;
-              final duplicateCompletedToolBlock =
-                  completedToolBlockSkipRemaining > 0;
-              if (!duplicateToolStart ||
-                  duplicateCompletedToolBlock ||
-                  currentToolId.isEmpty) {
-                currentToolId = blockId;
-                currentToolName = blockName;
-              }
-              if (!duplicateToolStart || duplicateCompletedToolBlock) {
-                currentToolInput = StringBuffer();
-              }
-              suppressCurrentToolBlock = duplicateCompletedToolBlock;
-              if (duplicateCompletedToolBlock) {
-                completedToolBlockSkipRemaining--;
-              }
-              if (duplicateToolStart) {
-                toolStartSkipRemaining--;
-              } else {
-                emittedToolStarts++;
-                yield ToolUseStart(currentToolId, currentToolName);
-              }
+              currentToolId = blockId;
+              currentToolName = blockName;
+              currentToolInput = StringBuffer();
+              yield ToolUseStart(currentToolId, currentToolName);
             } else {
               isThinkingBlock = false;
             }
@@ -1014,57 +1015,24 @@ class LlmService {
             if (isThinkingBlock) {
               if (delta['type'] == 'thinking_delta') {
                 final thinking = delta['thinking'] as String? ?? '';
-                var thinkingToEmit = thinking;
-                if (reasoningSkipRemaining > 0) {
-                  if (reasoningSkipRemaining >= thinking.length) {
-                    reasoningSkipRemaining -= thinking.length;
-                    thinkingToEmit = '';
-                  } else {
-                    thinkingToEmit = thinking.substring(reasoningSkipRemaining);
-                    reasoningSkipRemaining = 0;
-                  }
-                }
-                if (thinkingToEmit.isNotEmpty) {
-                  currentReasoningContent.write(thinkingToEmit);
-                  emittedReasoningLength += thinkingToEmit.length;
-                  yield ReasoningDelta(thinkingToEmit);
+                if (thinking.isNotEmpty) {
+                  currentReasoningContent.write(thinking);
+                  yield ReasoningDelta(thinking);
                 }
               }
               break;
             }
             if (delta['type'] == 'text_delta') {
               final text = delta['text'] as String;
-              var textToEmit = text;
-              if (textSkipRemaining > 0) {
-                if (textSkipRemaining >= text.length) {
-                  textSkipRemaining -= text.length;
-                  textToEmit = '';
-                } else {
-                  textToEmit = text.substring(textSkipRemaining);
-                  textSkipRemaining = 0;
-                }
-              }
-              if (textToEmit.isNotEmpty) {
-                currentText += textToEmit;
-                emittedTextLength += textToEmit.length;
-                yield TextDelta(textToEmit);
+              if (text.isNotEmpty) {
+                currentText += text;
+                yield TextDelta(text);
               }
             } else if (delta['type'] == 'input_json_delta') {
               final json = delta['partial_json'] as String;
-              var jsonToEmit = json;
-              if (toolInputSkipRemaining > 0) {
-                if (toolInputSkipRemaining >= json.length) {
-                  toolInputSkipRemaining -= json.length;
-                  jsonToEmit = '';
-                } else {
-                  jsonToEmit = json.substring(toolInputSkipRemaining);
-                  toolInputSkipRemaining = 0;
-                }
-              }
-              if (jsonToEmit.isNotEmpty) {
-                currentToolInput.write(jsonToEmit);
-                emittedToolInputLength += jsonToEmit.length;
-                yield ToolInputDelta(jsonToEmit);
+              if (json.isNotEmpty) {
+                currentToolInput.write(json);
+                yield ToolInputDelta(json);
               }
             }
             break;
@@ -1143,15 +1111,16 @@ class LlmService {
         openStream: openStream,
         isDoneData: (data) => data == '[DONE]',
         isInBackground: _isInBackground,
-        onRetry: (_, __) {
-          textSkipRemaining = emittedTextLength;
-          reasoningSkipRemaining = emittedReasoningLength;
-          toolInputSkipRemaining = emittedToolInputLength;
-          toolStartSkipRemaining = emittedToolStarts;
-          completedToolBlockSkipRemaining = completedToolBlocks;
-        },
       )) {
-        for (final event in parseAnthropicSseData(data)) {
+        if (data is _ResilientSseRetry) {
+          resetAnthropicStreamState();
+          yield const StreamReset();
+          continue;
+        }
+        if (data is! _ResilientSseData) {
+          continue;
+        }
+        for (final event in parseAnthropicSseData(data.data)) {
           yield event;
         }
         if (streamFailed) return;
@@ -1410,7 +1379,7 @@ class LlmService {
     }
 
     String currentText = '';
-    final currentReasoningContent = StringBuffer();
+    StringBuffer currentReasoningContent = StringBuffer();
     final List<ContentBlock> collectedBlocks = [];
     final Map<int, Map<String, String>> toolCallsAccum = {};
     String stopReason = 'stop';
@@ -1418,13 +1387,22 @@ class LlmService {
     int? inputTokens;
     int? outputTokens;
     int? cacheReadInputTokens;
-    int textSkipRemaining = 0;
-    int reasoningSkipRemaining = 0;
-    int emittedTextLength = 0;
-    int emittedReasoningLength = 0;
-    final Map<int, int> toolArgumentSkipRemaining = {};
     bool receivedFinishReason = false;
     bool streamFailed = false;
+
+    void resetOpenAiStreamState() {
+      currentText = '';
+      currentReasoningContent = StringBuffer();
+      collectedBlocks.clear();
+      toolCallsAccum.clear();
+      stopReason = 'stop';
+      receivedDone = false;
+      inputTokens = null;
+      outputTokens = null;
+      cacheReadInputTokens = null;
+      receivedFinishReason = false;
+      streamFailed = false;
+    }
 
     Iterable<StreamEvent> parseOpenAiSseData(String data) sync* {
       final frame = data.trim();
@@ -1476,39 +1454,16 @@ class LlmService {
 
         final content = delta['content'] as String?;
         if (content != null) {
-          var contentToEmit = content;
-          if (textSkipRemaining > 0) {
-            if (textSkipRemaining >= content.length) {
-              textSkipRemaining -= content.length;
-              contentToEmit = '';
-            } else {
-              contentToEmit = content.substring(textSkipRemaining);
-              textSkipRemaining = 0;
-            }
-          }
-          if (contentToEmit.isNotEmpty) {
-            currentText += contentToEmit;
-            emittedTextLength += contentToEmit.length;
-            yield TextDelta(contentToEmit);
+          if (content.isNotEmpty) {
+            currentText += content;
+            yield TextDelta(content);
           }
         }
         final reasoningContent = delta['reasoning_content'] as String?;
         if (reasoningContent != null) {
-          var reasoningToAppend = reasoningContent;
-          if (reasoningSkipRemaining > 0) {
-            if (reasoningSkipRemaining >= reasoningContent.length) {
-              reasoningSkipRemaining -= reasoningContent.length;
-              reasoningToAppend = '';
-            } else {
-              reasoningToAppend =
-                  reasoningContent.substring(reasoningSkipRemaining);
-              reasoningSkipRemaining = 0;
-            }
-          }
-          if (reasoningToAppend.isNotEmpty) {
-            currentReasoningContent.write(reasoningToAppend);
-            emittedReasoningLength += reasoningToAppend.length;
-            yield ReasoningDelta(reasoningToAppend);
+          if (reasoningContent.isNotEmpty) {
+            currentReasoningContent.write(reasoningContent);
+            yield ReasoningDelta(reasoningContent);
           }
         }
 
@@ -1537,21 +1492,9 @@ class LlmService {
               }
               if (func['arguments'] != null) {
                 final arguments = func['arguments'] as String;
-                var argumentsToEmit = arguments;
-                final skipRemaining = toolArgumentSkipRemaining[index] ?? 0;
-                if (skipRemaining > 0) {
-                  if (skipRemaining >= arguments.length) {
-                    toolArgumentSkipRemaining[index] =
-                        skipRemaining - arguments.length;
-                    argumentsToEmit = '';
-                  } else {
-                    argumentsToEmit = arguments.substring(skipRemaining);
-                    toolArgumentSkipRemaining[index] = 0;
-                  }
-                }
-                if (argumentsToEmit.isNotEmpty) {
-                  entry['arguments'] = entry['arguments']! + argumentsToEmit;
-                  yield ToolInputDelta(argumentsToEmit);
+                if (arguments.isNotEmpty) {
+                  entry['arguments'] = entry['arguments']! + arguments;
+                  yield ToolInputDelta(arguments);
                 }
               }
             }
@@ -1570,20 +1513,16 @@ class LlmService {
         openStream: openStream,
         isDoneData: (data) => data == '[DONE]',
         isInBackground: _isInBackground,
-        onRetry: (_, __) {
-          textSkipRemaining = emittedTextLength;
-          reasoningSkipRemaining = emittedReasoningLength;
-          toolArgumentSkipRemaining
-            ..clear()
-            ..addEntries(toolCallsAccum.entries.map(
-              (entry) => MapEntry(
-                entry.key,
-                entry.value['arguments']?.length ?? 0,
-              ),
-            ));
-        },
       )) {
-        for (final event in parseOpenAiSseData(data)) {
+        if (data is _ResilientSseRetry) {
+          resetOpenAiStreamState();
+          yield const StreamReset();
+          continue;
+        }
+        if (data is! _ResilientSseData) {
+          continue;
+        }
+        for (final event in parseOpenAiSseData(data.data)) {
           yield event;
         }
         if (streamFailed) return;

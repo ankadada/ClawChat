@@ -2865,6 +2865,9 @@ class ChatProvider extends ChangeNotifier {
               _agentServiceThinkingText,
             ));
 
+          case AgentStreamReset():
+            _clearStreamingState(state, notify: true);
+
           case AgentTextDelta(:final text):
             if (text.isNotEmpty) state.fallbackTextEmitted = true;
             _appendStreamingDelta(state, text);
