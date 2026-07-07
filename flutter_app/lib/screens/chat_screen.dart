@@ -1546,6 +1546,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               );
             },
           ),
+          Selector<ChatProvider, AgentRunRecoveryMarker?>(
+            selector: (_, provider) => provider.currentInterruptedAgentRun,
+            builder: (context, marker, __) {
+              if (marker == null) return const SizedBox.shrink();
+              return _buildInterruptedRunBanner(theme);
+            },
+          ),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -2029,6 +2036,50 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
       ),
       child: bubble,
+    );
+  }
+
+  Widget _buildInterruptedRunBanner(ThemeData theme) {
+    final colors = theme.colorScheme;
+    return Material(
+      color: colors.tertiaryContainer,
+      child: SafeArea(
+        bottom: false,
+        child: ListTile(
+          leading: Icon(
+            Icons.history_toggle_off,
+            color: colors.onTertiaryContainer,
+          ),
+          title: Text(
+            '上次任务被中断',
+            style: theme.textTheme.titleSmall?.copyWith(
+              color: colors.onTertiaryContainer,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          subtitle: Text(
+            '生成过程没有正常结束，未保存的流式内容已丢失。',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: colors.onTertiaryContainer,
+            ),
+          ),
+          trailing: Wrap(
+            spacing: 8,
+            children: [
+              TextButton(
+                onPressed: () =>
+                    context.read<ChatProvider>().dismissInterruptedAgentRun(),
+                child: const Text('忽略'),
+              ),
+              FilledButton.tonal(
+                onPressed: () =>
+                    context.read<ChatProvider>().continueInterruptedAgentRun(),
+                child: const Text('继续'),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 

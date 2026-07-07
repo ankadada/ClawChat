@@ -3,12 +3,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:clawchat/constants.dart';
+import 'package:clawchat/l10n/app_strings.dart';
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/models/model_capabilities.dart' as caps;
 import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
 import 'package:clawchat/services/config_export_service.dart';
+import 'package:clawchat/services/context_manager.dart';
 import 'package:clawchat/services/context_summary_service.dart';
 import 'package:clawchat/services/startup_restore_guard.dart';
 import 'package:clawchat/services/llm_service.dart';
@@ -484,6 +486,47 @@ void main() {
       expect(provider.isSessionSending(session.id), isFalse);
       await sendFuture;
     });
+
+    test('agent run marker persists while active and clears on cancel',
+        () async {
+      final streamStarted = Completer<void>();
+      final releaseStream = Completer<void>();
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: streamStarted,
+          release: releaseStream,
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseStream.isCompleted) releaseStream.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final sendFuture = provider.sendMessage('slow prompt');
+      await streamStarted.future.timeout(const Duration(seconds: 2));
+
+      expect(
+        (await storage.getSession(session.id))!.inFlightAgentRun,
+        isNotNull,
+      );
+
+      provider.cancelAgent(sessionId: session.id, savePartial: false);
+      await sendFuture.timeout(const Duration(seconds: 2));
+      await _waitUntil(() => !provider.isSessionSending(session.id));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(
+        (await storage.getSession(session.id))!.inFlightAgentRun,
+        isNull,
+      );
+    });
   });
 
   group('persistent assistant error retry state', () {
@@ -559,6 +602,79 @@ void main() {
       );
       expect(secondProvider.currentSession!.messages.last.hasAssistantError,
           isTrue);
+    });
+
+    test('dismiss interrupted run marker clears persisted state', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'interrupted-dismiss',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          startedAt: DateTime.utc(2026, 7, 7),
+        ),
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(storage: storage);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+      expect(provider.currentInterruptedAgentRun, isNotNull);
+
+      await provider.dismissInterruptedAgentRun();
+
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+    });
+
+    test('continue interrupted run injects recovery prompt and clears marker',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'interrupted-continue',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          startedAt: DateTime.utc(2026, 7, 7),
+        ),
+      );
+      await storage.saveSession(session);
+      List<Map<String, dynamic>>? capturedMessages;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            capturedMessages = messages;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'continued')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+      expect(provider.currentInterruptedAgentRun, isNotNull);
+
+      await provider.continueInterruptedAgentRun();
+
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+      expect(
+        capturedMessages!.last['content'],
+        contains('上次任务被中断'),
+      );
+      expect(provider.currentSession!.messages.last.textContent, 'continued');
     });
 
     test('retry removes stale failure marker and does not duplicate history',
@@ -1461,7 +1577,7 @@ void main() {
       expect(
         provider.currentSession!.messages
             .where((message) => message.role == 'assistant'),
-        hasLength(assistantCountBefore + 1),
+        hasLength(assistantCountBefore + 2),
       );
       final errorMarker = provider.currentSession!.messages.last;
       expect(errorMarker.hasAssistantError, isTrue);
@@ -1472,13 +1588,167 @@ void main() {
         provider.currentSession!.messages
             .map((message) => message.textContent)
             .join('\n'),
-        isNot(contains('partial streamed text')),
+        contains('partial streamed text\n\n[回复中断，内容可能不完整。]'),
       );
       expect(
         provider.runtimeDebugEvents.recent().any((event) =>
             event.type == 'model.fallback.skipped' &&
             event.data['reason'] == 'unsafe_after_partial_run'),
         isTrue,
+      );
+    });
+
+    test('stream reset discards dirty partial before error persistence',
+        () async {
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'unused')],
+          )),
+          onMessageEvents: (_) => [
+            TextDelta('dirty first attempt'),
+            const StreamReset(),
+            TextDelta('clean retry partial'),
+            StreamError(
+              'OpenAI API error (503): temporarily unavailable',
+              cause: Exception('OpenAI API error (503)'),
+            ),
+          ],
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('hello');
+
+      final transcript = provider.currentSession!.messages
+          .map((message) => message.textContent)
+          .join('\n');
+      expect(transcript, isNot(contains('dirty first attempt')));
+      expect(
+        transcript,
+        contains('clean retry partial\n\n[回复中断，内容可能不完整。]'),
+      );
+      expect(provider.currentSession!.messages.last.hasAssistantError, isTrue);
+    });
+
+    test('stream reset shows reconnecting notice until retry text arrives',
+        () async {
+      final resetEmitted = Completer<void>();
+      final continueAfterReset = Completer<void>();
+      final cleanTokenEmitted = Completer<void>();
+      final finishStream = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ResetPauseLlmService(
+          config,
+          resetEmitted: resetEmitted,
+          continueAfterReset: continueAfterReset,
+          cleanTokenEmitted: cleanTokenEmitted,
+          finishStream: finishStream,
+        ),
+      );
+      addTearDown(() async {
+        if (!continueAfterReset.isCompleted) continueAfterReset.complete();
+        if (!finishStream.isCompleted) finishStream.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      final sendFuture = provider.sendMessage('hello');
+
+      await resetEmitted.future.timeout(const Duration(seconds: 2));
+      await _waitUntil(() => provider.streamingText.contains('连接中断'));
+      expect(provider.agentStatus, AgentStatus.thinking);
+      expect(provider.streamingText, isNot(contains('dirty first attempt')));
+
+      continueAfterReset.complete();
+      await cleanTokenEmitted.future.timeout(const Duration(seconds: 2));
+      await _waitUntil(() => provider.streamingText == 'clean retry text');
+      expect(provider.agentStatus, AgentStatus.streaming);
+
+      finishStream.complete();
+      await sendFuture.timeout(const Duration(seconds: 2));
+      expect(provider.currentSession!.messages.last.textContent,
+          'clean retry text');
+    });
+
+    test('context patch rollback preserves interleaved non-patch messages', () {
+      const notices = [
+        ContextNotice.summaryCompacted(4),
+        ContextNotice.truncated(
+          droppedMessageCount: 2,
+          droppedBlockCount: 0,
+          estimatedTokens: 128,
+        ),
+      ];
+      final summaryNotice = AppStrings.contextSummaryCompactedNotice(4);
+      final truncationNotice = AppStrings.contextCompactedNotice(2, 128);
+
+      final assistantBetweenNotices = [
+        ChatMessage.user('before patch'),
+        ChatMessage.systemNotice(summaryNotice),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('partial assistant survives')],
+        ),
+        ChatMessage.systemNotice(truncationNotice),
+        ChatMessage.systemNotice('unrelated notice survives'),
+      ];
+
+      expect(
+        ChatProvider.removeContextPatchNoticesForTesting(
+          assistantBetweenNotices,
+          startIndex: 1,
+          notices: notices,
+        ),
+        2,
+      );
+      expect(
+        assistantBetweenNotices.map((message) => message.textContent),
+        [
+          'before patch',
+          'partial assistant survives',
+          'unrelated notice survives',
+        ],
+      );
+
+      final unrelatedNoticeBetweenPatchNotices = [
+        ChatMessage.user('before patch'),
+        ChatMessage.systemNotice('unrelated notice before patch'),
+        ChatMessage.systemNotice(summaryNotice),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('partial assistant still survives')],
+        ),
+        ChatMessage.systemNotice('unrelated notice between patch notices'),
+        ChatMessage.systemNotice(truncationNotice),
+      ];
+
+      expect(
+        ChatProvider.removeContextPatchNoticesForTesting(
+          unrelatedNoticeBetweenPatchNotices,
+          startIndex: 1,
+          notices: notices,
+        ),
+        2,
+      );
+      expect(
+        unrelatedNoticeBetweenPatchNotices
+            .map((message) => message.textContent),
+        [
+          'before patch',
+          'unrelated notice before patch',
+          'partial assistant still survives',
+          'unrelated notice between patch notices',
+        ],
       );
     });
 
@@ -4924,6 +5194,40 @@ class _ScriptedLlmService extends LlmService {
   void dispose() {
     onDispose?.call();
     super.dispose();
+  }
+}
+
+class _ResetPauseLlmService extends LlmService {
+  final Completer<void> resetEmitted;
+  final Completer<void> continueAfterReset;
+  final Completer<void> cleanTokenEmitted;
+  final Completer<void> finishStream;
+
+  _ResetPauseLlmService(
+    super.config, {
+    required this.resetEmitted,
+    required this.continueAfterReset,
+    required this.cleanTokenEmitted,
+    required this.finishStream,
+  });
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    yield TextDelta('dirty first attempt');
+    yield const StreamReset();
+    if (!resetEmitted.isCompleted) resetEmitted.complete();
+    await continueAfterReset.future;
+    yield TextDelta('clean retry text');
+    if (!cleanTokenEmitted.isCompleted) cleanTokenEmitted.complete();
+    await finishStream.future;
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'clean retry text')],
+    ));
   }
 }
 

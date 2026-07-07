@@ -146,8 +146,11 @@ class ChatProvider extends ChangeNotifier {
   static const _agentServiceThinkingText = 'AI 正在思考...';
   static const _agentServiceToolingText = 'AI 正在执行命令...';
   static const _agentServiceStreamingText = 'AI 正在回复...';
+  static const _agentServiceReconnectingText = '连接中断，正在重新生成...';
   static const _liveReasoningPreviewMaxChars = 12000;
   static const _liveReasoningPreviewTrimAt = 14000;
+  static const _agentRunRecoveryPrompt =
+      '上次任务被中断。请基于当前会话继续完成被中断的任务；如果已有部分内容，请不要重复已经完成的部分。';
 
   AgentState _getOrCreateState(String sessionId) {
     return _agentStates.putIfAbsent(sessionId, () => AgentState(sessionId));
@@ -173,6 +176,9 @@ class ChatProvider extends ChangeNotifier {
       _getState(currentSession?.id)?.streamingReasoningTotalLength ?? 0;
 
   ContextSummary? get currentContextSummary => currentSession?.contextSummary;
+
+  AgentRunRecoveryMarker? get currentInterruptedAgentRun =>
+      currentSession?.inFlightAgentRun;
 
   List<ModelGroup> get modelGroups =>
       _prefsInitialized ? _prefs.modelGroups : const [];
@@ -425,6 +431,7 @@ class ChatProvider extends ChangeNotifier {
     AgentState state,
     String finalText,
     Completer<void>? completer,
+    Future<void>? persistCompletion,
   ) async {
     try {
       await _updateAgentNativeStatusForState(
@@ -437,6 +444,7 @@ class ChatProvider extends ChangeNotifier {
         await Future.delayed(const Duration(seconds: 2));
       }
     } finally {
+      await persistCompletion;
       await _stopAgentServiceForState(state);
       if (completer != null && !completer.isCompleted) {
         completer.complete();
@@ -485,8 +493,18 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _appendStreamingDelta(AgentState state, String text) {
+    final replacingReconnectNotice =
+        text.isNotEmpty && state.streamingText == _agentServiceReconnectingText;
     state.status = AgentStatus.streaming;
     state.streamBuffer.write(text);
+    if (replacingReconnectNotice) {
+      _flushStreamingState(state);
+      unawaited(_startAgentServiceForState(
+        state,
+        _agentServiceStreamingText,
+      ));
+      return;
+    }
     state.streamFlushScheduler.schedule(
       delta: text,
       flush: () {
@@ -543,8 +561,13 @@ class ChatProvider extends ChangeNotifier {
             diagnosticsExportService ?? const DiagnosticsExportService(),
         _attachmentBudget = attachmentBudget ?? const AttachmentBudget() {
     _contextManager = ContextManager(
-      contextSummaryServiceFactory:
-          contextSummaryServiceFactory ?? ContextSummaryService.new,
+      contextSummaryServiceFactory: contextSummaryServiceFactory ??
+          () => ContextSummaryService(
+                llmFactory: (config) => _llmServiceFactory(
+                  config,
+                  isInBackground: () => _appInBackground,
+                ),
+              ),
       providerTransformPreflight: providerTransformPreflight ??
           const ProviderMessageTransform().transformCanonical,
       runtimeDebugEvents: this.runtimeDebugEvents,
@@ -687,6 +710,26 @@ class ChatProvider extends ChangeNotifier {
       _fallbackErrorMessage = '会话恢复失败，已进入安全打开状态: $e';
       notifyListeners();
     }
+  }
+
+  Future<void> dismissInterruptedAgentRun() async {
+    final session = currentSession;
+    if (session?.inFlightAgentRun == null) return;
+    session!.inFlightAgentRun = null;
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+    notifyListeners();
+  }
+
+  Future<void> continueInterruptedAgentRun() async {
+    final session = currentSession;
+    if (session?.inFlightAgentRun == null) return;
+    final sessionId = session!.id;
+    session.inFlightAgentRun = null;
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+    notifyListeners();
+    await sendMessage(_agentRunRecoveryPrompt, targetSessionId: sessionId);
   }
 
   Future<StartupRestoreGuardState> _recordStartupFailureBestEffort() async {
@@ -1150,6 +1193,9 @@ class ChatProvider extends ChangeNotifier {
         if (trimmedText.isNotEmpty) TextContent(trimmedText),
         ...attachments,
       ]));
+      activeSession.inFlightAgentRun = AgentRunRecoveryMarker(
+        startedAt: DateTime.now(),
+      );
       activeSession.autoTitle();
       state.sessionTitle = activeSession.title;
       await _storage.saveSession(activeSession);
@@ -1360,6 +1406,7 @@ class ChatProvider extends ChangeNotifier {
               );
               _persistSanitizedMessages(activeSession);
               _appendEncryptedContentRecoveryNotice(activeSession);
+              activeSession.inFlightAgentRun = null;
               await _storage.saveSession(activeSession);
               _syncCurrentSessionReference(activeSession);
               notifyListeners();
@@ -1369,6 +1416,8 @@ class ChatProvider extends ChangeNotifier {
           if (!preservingPrimaryPatchForRecovery) {
             await rollbackPrimaryPatchIfSafe();
           }
+          activeSession.inFlightAgentRun = null;
+          await _storage.saveSession(activeSession);
         } else if (runResult != null || state.status == AgentStatus.error) {
           if (!preservingPrimaryPatchForRecovery) {
             await rollbackPrimaryPatchIfSafe();
@@ -1399,6 +1448,7 @@ class ChatProvider extends ChangeNotifier {
         await rollbackPrimaryPatchIfSafe();
         state.status = AgentStatus.error;
         state.errorMessage = _sanitizeProviderErrorMessage(e);
+        activeSession.inFlightAgentRun = null;
         await _persistAssistantFailureMarker(
           state: state,
           session: activeSession,
@@ -1446,8 +1496,9 @@ class ChatProvider extends ChangeNotifier {
     state.agentSubscription = null;
     if (savePartial) {
       _flushStreamingNow(state, notify: false);
-      _savePartialAgentResponse(state);
+      _savePartialAgentResponse(state, interruptionNote: '回复已取消，内容可能不完整。');
     }
+    _clearInFlightAgentRun(state);
     _clearStreamingState(state);
     if (state.agentCompleter != null && !state.agentCompleter!.isCompleted) {
       state.agentCompleter!.complete();
@@ -1548,7 +1599,10 @@ class ChatProvider extends ChangeNotifier {
     sendMessage(next.text, attachments: next.attachments, targetSessionId: id);
   }
 
-  void _savePartialAgentResponse(AgentState state) {
+  void _savePartialAgentResponse(
+    AgentState state, {
+    String? interruptionNote,
+  }) {
     if (state.partialAgentResponseSaved || state.agentCompletionFinalizing) {
       return;
     }
@@ -1560,24 +1614,33 @@ class ChatProvider extends ChangeNotifier {
     final session =
         currentSession?.id == state.sessionId ? currentSession : null;
     if (session != null) {
-      _savePartialAgentResponseToSession(state, session, agent, partialText);
+      _savePartialAgentResponseToSession(
+        state,
+        session,
+        agent,
+        partialText,
+        interruptionNote: interruptionNote,
+      );
       return;
     }
 
     unawaited(_storage.getSession(state.sessionId).then((session) {
       if (session == null) return;
-      _savePartialAgentResponseToSession(state, session, agent, partialText);
+      _savePartialAgentResponseToSession(
+        state,
+        session,
+        agent,
+        partialText,
+        interruptionNote: interruptionNote,
+      );
     }).catchError((Object e) {
       debugPrint('Failed to load session for partial agent response: $e');
     }));
   }
 
-  void _savePartialAgentResponseToSession(
-    AgentState state,
-    ChatSession session,
-    AgentService agent,
-    String partialText,
-  ) {
+  void _savePartialAgentResponseToSession(AgentState state, ChatSession session,
+      AgentService agent, String partialText,
+      {String? interruptionNote}) {
     _appendNewAgentMessages(
       state,
       session,
@@ -1589,9 +1652,13 @@ class ChatProvider extends ChangeNotifier {
     final lastMsgIsAssistant =
         lastAgentMsg != null && lastAgentMsg['role'] == 'assistant';
     if (partialText.isNotEmpty && !lastMsgIsAssistant) {
+      final savedText = _partialTextWithInterruptionNote(
+        partialText,
+        interruptionNote,
+      );
       session.messages.add(ChatMessage(
         role: 'assistant',
-        content: [TextContent(partialText)],
+        content: [TextContent(savedText)],
         alternatives: state.pendingAlternatives,
         activeAlternative: -1,
       ));
@@ -1601,6 +1668,33 @@ class ChatProvider extends ChangeNotifier {
     _syncCurrentSessionReference(session);
     unawaited(_storage.saveSession(session).catchError((Object e) {
       debugPrint('Failed to save partial agent response: $e');
+    }));
+  }
+
+  String _partialTextWithInterruptionNote(String text, String? note) {
+    final trimmedNote = note?.trim();
+    if (trimmedNote == null || trimmedNote.isEmpty) return text;
+    return '$text\n\n[$trimmedNote]';
+  }
+
+  void _clearInFlightAgentRun(AgentState state) {
+    final session =
+        currentSession?.id == state.sessionId ? currentSession : null;
+    if (session != null) {
+      session.inFlightAgentRun = null;
+      _syncCurrentSessionReference(session);
+      unawaited(_storage.saveSession(session).catchError((Object e) {
+        debugPrint('Failed to clear in-flight agent run: $e');
+      }));
+      return;
+    }
+
+    unawaited(_storage.getSession(state.sessionId).then((session) async {
+      if (session == null) return;
+      session.inFlightAgentRun = null;
+      await _storage.saveSession(session);
+    }).catchError((Object e) {
+      debugPrint('Failed to clear in-flight agent run: $e');
     }));
   }
 
@@ -2184,6 +2278,7 @@ class ChatProvider extends ChangeNotifier {
 
     _removeTrailingAssistantErrorMarkers(session);
     session.messages.add(ChatMessage.assistantError(error: metadata));
+    session.inFlightAgentRun = null;
     session.updatedAt = DateTime.now();
     await _storage.saveSession(session);
     _syncCurrentSessionReference(session);
@@ -2397,6 +2492,7 @@ class ChatProvider extends ChangeNotifier {
           fallback: candidate.safeLabel,
           reason: reason.label,
         );
+        activeSession.inFlightAgentRun = null;
         await _storage.saveSession(activeSession);
         _syncCurrentSessionReference(activeSession);
         _recordModelFallbackEvent(activeSession.id, 'model.fallback.success', {
@@ -2865,6 +2961,16 @@ class ChatProvider extends ChangeNotifier {
               _agentServiceThinkingText,
             ));
 
+          case AgentStreamReset():
+            _clearStreamingState(state, notify: false);
+            state.status = AgentStatus.thinking;
+            state.streamingText = _agentServiceReconnectingText;
+            notifyListeners();
+            unawaited(_startAgentServiceForState(
+              state,
+              _agentServiceReconnectingText,
+            ));
+
           case AgentTextDelta(:final text):
             if (text.isNotEmpty) state.fallbackTextEmitted = true;
             _appendStreamingDelta(state, text);
@@ -2919,6 +3025,7 @@ class ChatProvider extends ChangeNotifier {
             ):
             _flushStreamingNow(state, notify: false);
             state.status = AgentStatus.idle;
+            activeSession.inFlightAgentRun = null;
             if (state.agent!.messages.length > state.initialApiMsgCount) {
               state.fallbackMessagesPersisted = true;
             }
@@ -2949,15 +3056,33 @@ class ChatProvider extends ChangeNotifier {
               hadToolCalls: hadToolCalls,
             );
             _syncCurrentSessionReference(activeSession);
-            _storage.saveSession(activeSession).then((_) {
+            final persistCompletion =
+                _storage.saveSession(activeSession).then((_) {
               if (!_disposed) notifyListeners();
+            }).catchError((Object e) {
+              debugPrint('Failed to persist completed agent response: $e');
             });
             state.agentCompletionFinalizing = true;
             _clearStreamingState(state);
-            unawaited(_finishAgentComplete(state, finalText, completer));
+            unawaited(_finishAgentComplete(
+              state,
+              finalText,
+              completer,
+              persistCompletion,
+            ));
 
           case AgentError(:final message, :final cause):
-            _clearStreamingState(state);
+            if (cause is EncryptedContentError) {
+              _clearStreamingState(state);
+            } else {
+              _flushStreamingNow(state, notify: false);
+              _savePartialAgentResponse(
+                state,
+                interruptionNote: '回复中断，内容可能不完整。',
+              );
+              activeSession.inFlightAgentRun = null;
+              _clearStreamingState(state);
+            }
             errorCause = cause ?? _AgentRuntimeError(message);
             if (cause is EncryptedContentError) {
               state.status = AgentStatus.thinking;
@@ -2976,7 +3101,17 @@ class ChatProvider extends ChangeNotifier {
       onError: (Object e) {
         if (!isCurrentRun()) return;
         errorCause = e;
-        _clearStreamingState(state);
+        if (e is EncryptedContentError) {
+          _clearStreamingState(state);
+        } else {
+          _flushStreamingNow(state, notify: false);
+          _savePartialAgentResponse(
+            state,
+            interruptionNote: '回复中断，内容可能不完整。',
+          );
+          activeSession.inFlightAgentRun = null;
+          _clearStreamingState(state);
+        }
         if (e is EncryptedContentError) {
           state.status = AgentStatus.thinking;
           state.errorMessage = null;
@@ -3050,21 +3185,68 @@ class ChatProvider extends ChangeNotifier {
     if (patch.isEmpty || session.messages.length < snapshot.messageCount) {
       return false;
     }
-    final trailing = session.messages.skip(snapshot.messageCount);
-    if (!trailing.every((message) => message.isSystemNotice)) {
-      return false;
-    }
     session.contextSummary = snapshot.contextSummary;
-    if (session.messages.length > snapshot.messageCount) {
-      session.messages.removeRange(
-        snapshot.messageCount,
-        session.messages.length,
-      );
-    }
+    _removeContextPatchNotices(
+      session.messages,
+      startIndex: snapshot.messageCount,
+      notices: patch.notices,
+    );
     await _storage.saveSession(session);
     _syncCurrentSessionReference(session);
     notifyListeners();
     return true;
+  }
+
+  @visibleForTesting
+  static int removeContextPatchNoticesForTesting(
+    List<ChatMessage> messages, {
+    required int startIndex,
+    required List<ContextNotice> notices,
+  }) {
+    return _removeContextPatchNotices(
+      messages,
+      startIndex: startIndex,
+      notices: notices,
+    );
+  }
+
+  static int _removeContextPatchNotices(
+    List<ChatMessage> messages, {
+    required int startIndex,
+    required List<ContextNotice> notices,
+  }) {
+    var removedNotices = 0;
+    for (final notice in notices) {
+      final expectedText = _contextNoticeText(notice);
+      var index = startIndex;
+      while (index < messages.length) {
+        final message = messages[index];
+        if (message.isSystemNotice && message.textContent == expectedText) {
+          messages.removeAt(index);
+          removedNotices++;
+          break;
+        }
+        index++;
+      }
+    }
+    return removedNotices;
+  }
+
+  static String _contextNoticeText(ContextNotice notice) {
+    return switch (notice.type) {
+      ContextNoticeType.summaryCompacted =>
+        AppStrings.contextSummaryCompactedNotice(notice.coveredMessageCount),
+      ContextNoticeType.summaryFailed => AppStrings.contextSummaryFailed,
+      ContextNoticeType.truncated => notice.droppedMessageCount > 0
+          ? AppStrings.contextCompactedNotice(
+              notice.droppedMessageCount,
+              notice.estimatedTokens,
+            )
+          : AppStrings.contextToolCallsCleanedNotice(
+              notice.droppedBlockCount,
+              notice.estimatedTokens,
+            ),
+    };
   }
 
   void _appendContextCompactionNotice(

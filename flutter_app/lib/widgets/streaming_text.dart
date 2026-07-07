@@ -38,10 +38,16 @@ class StreamingText extends StatefulWidget {
 
 class _StreamingTextState extends State<StreamingText>
     with SingleTickerProviderStateMixin {
+  static const int _longTextCollapseThreshold =
+      _MarkdownSpanCache.maxCharacters ~/ 3;
+  static const int _longTextTailCharacters = 24000;
+  static const int _expandedPlainTextSegmentCharacters = 12000;
+
   List<InlineSpan>? _cachedSpans;
   String? _cachedText;
   double? _cachedMaxWidth;
   int _lastParseEnd = 0;
+  bool _expandedLongText = false;
   final List<TapGestureRecognizer> _recognizers = [];
   late final AnimationController _cursorController = AnimationController(
     vsync: this,
@@ -84,21 +90,132 @@ class _StreamingTextState extends State<StreamingText>
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final shouldProtectLongText =
+        !widget.isStreaming && widget.text.length > _longTextCollapseThreshold;
 
     return LayoutBuilder(
       builder: (context, constraints) {
         final maxInlineWidth = constraints.hasBoundedWidth
             ? constraints.maxWidth
             : MediaQuery.sizeOf(context).width * 0.78;
+        if (shouldProtectLongText) {
+          return _buildProtectedLongText(
+            context,
+            theme,
+            maxInlineWidth,
+          );
+        }
         final spans =
             _getOrParseSpans(widget.text, context, theme, maxInlineWidth);
 
-        return SelectableText.rich(
+        return Text.rich(
           TextSpan(children: spans),
           style: theme.textTheme.bodyMedium,
         );
       },
     );
+  }
+
+  Widget _buildProtectedLongText(
+    BuildContext context,
+    ThemeData theme,
+    double maxInlineWidth,
+  ) {
+    if (_expandedLongText) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _longTextToggle(theme, expanded: true),
+          const SizedBox(height: 8),
+          ..._plainTextSegments(widget.text).map(
+            (segment) => Text(
+              segment,
+              style: theme.textTheme.bodyMedium,
+            ),
+          ),
+        ],
+      );
+    }
+
+    final tailLength =
+        _longTextTailCharacters.clamp(0, widget.text.length).toInt();
+    final omittedCharacters = widget.text.length - tailLength;
+    final tailStart = widget.text.length - tailLength;
+    final tailText = widget.text.substring(tailStart);
+    final spans = _getOrParseSpans(tailText, context, theme, maxInlineWidth);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _longTextToggle(
+          theme,
+          expanded: false,
+          omittedCharacters: omittedCharacters,
+        ),
+        const SizedBox(height: 8),
+        Text.rich(
+          TextSpan(children: spans),
+          style: theme.textTheme.bodyMedium,
+        ),
+      ],
+    );
+  }
+
+  Widget _longTextToggle(
+    ThemeData theme, {
+    required bool expanded,
+    int omittedCharacters = 0,
+  }) {
+    final colors = theme.colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: colors.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colors.outline.withAlpha(80)),
+      ),
+      child: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 8,
+        runSpacing: 4,
+        children: [
+          Icon(
+            expanded ? Icons.subject : Icons.vertical_align_bottom,
+            size: 16,
+            color: colors.onSurfaceVariant,
+          ),
+          Text(
+            expanded
+                ? '已展开全文'
+                : '已折叠前 ${_formatCharacterCount(omittedCharacters)} 字符',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: colors.onSurfaceVariant,
+            ),
+          ),
+          TextButton(
+            onPressed: () {
+              setState(() => _expandedLongText = !expanded);
+            },
+            child: Text(expanded ? '收起' : '展开全文'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Iterable<String> _plainTextSegments(String text) sync* {
+    for (var start = 0; start < text.length;) {
+      final end = (start + _expandedPlainTextSegmentCharacters)
+          .clamp(0, text.length)
+          .toInt();
+      yield text.substring(start, end);
+      start = end;
+    }
+  }
+
+  String _formatCharacterCount(int count) {
+    if (count < 10000) return count.toString();
+    final value = count / 10000;
+    return '${value.toStringAsFixed(value >= 10 ? 0 : 1)}万';
   }
 
   List<InlineSpan> _getOrParseSpans(
@@ -559,6 +676,9 @@ class _StreamingTextState extends State<StreamingText>
     super.didUpdateWidget(oldWidget);
     if (oldWidget.isStreaming != widget.isStreaming) {
       _syncCursorAnimation();
+    }
+    if (oldWidget.text != widget.text) {
+      _expandedLongText = false;
     }
     // Only invalidate cache when text is completely different (not append)
     // Incremental parsing handles appends without cache invalidation

@@ -50,6 +50,36 @@ void main() {
     });
   });
 
+  group('AgentRunRecoveryMarker', () {
+    test('persists through ChatSession JSON', () {
+      final startedAt = DateTime.utc(2026, 7, 7, 1, 2, 3);
+      final session = ChatSession(
+        id: 'agent_run_marker',
+        messages: [ChatMessage.user('hello')],
+        inFlightAgentRun: AgentRunRecoveryMarker(startedAt: startedAt),
+      );
+
+      final restored = ChatSession.fromJson(session.toJson());
+
+      expect(restored.inFlightAgentRun, isNotNull);
+      expect(restored.inFlightAgentRun!.startedAt, startedAt);
+    });
+
+    test('loads legacy session without marker', () {
+      final restored = ChatSession.fromJson({
+        'id': 'legacy_marker',
+        'title': 'Legacy',
+        'createdAt': DateTime(2026).toIso8601String(),
+        'updatedAt': DateTime(2026).toIso8601String(),
+        'messages': [
+          ChatMessage.user('old').toJson(),
+        ],
+      });
+
+      expect(restored.inFlightAgentRun, isNull);
+    });
+  });
+
   group('ChatMessage reasoning_content', () {
     test('persists assistant text reasoning content through JSON', () {
       final message = ChatMessage.assistant([
