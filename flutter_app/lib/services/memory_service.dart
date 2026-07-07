@@ -46,13 +46,6 @@ class MemoryService {
   static Map<String, SessionMemoryMode> _sessionModes = {};
   static bool _loaded = false;
   static bool _sessionModesLoaded = false;
-  static String? _currentSessionId;
-
-  static String? get currentSessionId => _currentSessionId;
-
-  static void setCurrentSessionId(String? sessionId) {
-    _currentSessionId = sessionId;
-  }
 
   static Future<List<String>> getMemories() async {
     await _loadSessionModes();
@@ -162,9 +155,8 @@ class MemoryService {
     await _saveSessionModes();
   }
 
-  static bool isEnabledForCurrentSessionSync() {
+  static bool isEnabledForSessionSync(String? sessionId) {
     final global = PreferencesService().memoryEnabled;
-    final sessionId = _currentSessionId;
     if (sessionId == null || sessionId.isEmpty) return global;
     final mode = _sessionModes[sessionId] ?? SessionMemoryMode.followGlobal;
     return switch (mode) {
@@ -174,13 +166,25 @@ class MemoryService {
     };
   }
 
+  static Future<void> auditMemoryToolRejected(
+    String toolName, {
+    required String source,
+    required String? sessionId,
+    required String reason,
+  }) {
+    return _audit('memory_tool_rejected', source, sessionId, {
+      'toolName': toolName,
+      'reason': reason,
+    });
+  }
+
   static Future<void> _save() async {
     await NativeBridge.writeRootfsFile(
         _memoryPath, jsonEncode(_cachedMemories));
   }
 
-  static String buildMemoryPrompt() {
-    if (!isEnabledForCurrentSessionSync() || _cachedMemories.isEmpty) {
+  static String buildMemoryPrompt({String? sessionId}) {
+    if (!isEnabledForSessionSync(sessionId) || _cachedMemories.isEmpty) {
       return '';
     }
     final memoryList = _cachedMemories.map((m) => '- $m').join('\n');
@@ -282,6 +286,5 @@ class MemoryService {
     _sessionModes = {};
     _loaded = false;
     _sessionModesLoaded = false;
-    _currentSessionId = null;
   }
 }

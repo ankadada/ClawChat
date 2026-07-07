@@ -38,15 +38,21 @@ void main() {
   });
 
   test('memory tools write, read, delete, and audit changes', () async {
-    MemoryService.setCurrentSessionId('session-1');
-
     final write = jsonDecode(
-      await MemoryWriteTool().execute({'fact': 'prefers concise answers'}),
+      await MemoryWriteTool().executeWithContext(
+        {'fact': 'prefers concise answers'},
+        sessionId: 'session-1',
+      ),
     ) as Map<String, dynamic>;
-    final read =
-        jsonDecode(await MemoryGetTool().execute({})) as Map<String, dynamic>;
-    final del = jsonDecode(await MemoryDeleteTool().execute({'index': 0}))
-        as Map<String, dynamic>;
+    final read = jsonDecode(
+      await MemoryGetTool().executeWithContext({}, sessionId: 'session-1'),
+    ) as Map<String, dynamic>;
+    final del = jsonDecode(
+      await MemoryDeleteTool().executeWithContext(
+        {'index': 0},
+        sessionId: 'session-1',
+      ),
+    ) as Map<String, dynamic>;
 
     expect(write['ok'], isTrue);
     expect(read['memories'], ['prefers concise answers']);
@@ -58,7 +64,6 @@ void main() {
   });
 
   test('limits entries and truncates oversized facts', () async {
-    MemoryService.setCurrentSessionId('session-1');
     final longFact = 'x' * (MemoryService.maxMemoryChars + 50);
 
     final first = await MemoryService.addMemory(longFact);
@@ -73,17 +78,56 @@ void main() {
   });
 
   test('session disable hides memory tools and disables execution', () async {
-    MemoryService.setCurrentSessionId('session-1');
     await MemoryService.setSessionMemoryMode(
       'session-1',
       SessionMemoryMode.disabled,
     );
     final registry = ToolRegistry.withDefaults();
 
-    expect(registry.availableTools, isNot(contains('memory_get')));
-    final result =
-        jsonDecode(await MemoryGetTool().execute({})) as Map<String, dynamic>;
+    expect(
+      registry.availableToolsForSession(sessionId: 'session-1'),
+      isNot(contains('memory_get')),
+    );
+    final result = jsonDecode(
+      await MemoryGetTool().executeWithContext({}, sessionId: 'session-1'),
+    ) as Map<String, dynamic>;
     expect(result['ok'], isFalse);
     expect(result['error'], 'memory_disabled');
+  });
+
+  test('memory tools use caller session instead of last UI session', () async {
+    await MemoryService.setSessionMemoryMode(
+      'session-A',
+      SessionMemoryMode.disabled,
+    );
+    await MemoryService.setSessionMemoryMode(
+      'session-B',
+      SessionMemoryMode.enabled,
+    );
+    final registry = ToolRegistry.withDefaults();
+
+    expect(
+      registry.availableToolsForSession(sessionId: 'session-A'),
+      isNot(contains('memory_write')),
+    );
+    expect(
+      registry.availableToolsForSession(sessionId: 'session-B'),
+      contains('memory_write'),
+    );
+
+    final output = await registry.executeTool(
+      'memory_write',
+      const {'fact': 'do not write from disabled session'},
+      sessionId: 'session-A',
+    );
+    final result = jsonDecode(output) as Map<String, dynamic>;
+    final audit = files['root/.clawchat_memory_audit.jsonl'] ?? '';
+
+    expect(result['ok'], isFalse);
+    expect(result['error'], 'memory_disabled');
+    expect(await MemoryService.getMemories(), isEmpty);
+    expect(audit, contains('memory_tool_rejected'));
+    expect(audit, contains('"sessionId":"session-A"'));
+    expect(audit, isNot(contains('"sessionId":"session-B"')));
   });
 }

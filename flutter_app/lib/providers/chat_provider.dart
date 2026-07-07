@@ -1179,7 +1179,8 @@ class ChatProvider extends ChangeNotifier {
           _prefs.systemPrompt ??
           AppConstants.defaultSystemPrompt;
       final skillIndex = SkillService.buildSkillIndex(_skills);
-      final memoryPrompt = MemoryService.buildMemoryPrompt();
+      final memoryPrompt =
+          MemoryService.buildMemoryPrompt(sessionId: activeSession.id);
       final fullPrompt = basePrompt + skillIndex + memoryPrompt;
 
       state.status = AgentStatus.thinking;
@@ -1846,10 +1847,11 @@ class ChatProvider extends ChangeNotifier {
 
       _skills = await SkillService.scanSkills();
       await MemoryService.getMemories();
-      final skillIndex = SkillService.buildSkillIndex(_skills);
-      final memoryPrompt = MemoryService.buildMemoryPrompt();
-
       final session = currentSession!;
+      final skillIndex = SkillService.buildSkillIndex(_skills);
+      final memoryPrompt =
+          MemoryService.buildMemoryPrompt(sessionId: session.id);
+
       final formatStr =
           session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
       final format =

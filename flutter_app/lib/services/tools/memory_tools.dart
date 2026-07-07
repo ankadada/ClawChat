@@ -19,7 +19,15 @@ class MemoryGetTool extends Tool {
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
-    if (!MemoryService.isEnabledForCurrentSessionSync()) {
+    return executeWithContext(input);
+  }
+
+  @override
+  Future<String> executeWithContext(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) async {
+    if (!MemoryService.isEnabledForSessionSync(sessionId)) {
       return jsonEncode({'ok': false, 'error': 'memory_disabled'});
     }
     final memories = await MemoryService.getMemories();
@@ -33,7 +41,7 @@ class MemoryWriteTool extends Tool {
 
   @override
   String get description =>
-      'Request adding a durable user memory. Requires user approval and writes an audit entry.';
+      'Request adding a durable user memory; writes an audit entry when executed. The app may ask for confirmation depending on the tool approval policy.';
 
   @override
   Map<String, dynamic> get inputSchema => const {
@@ -49,14 +57,28 @@ class MemoryWriteTool extends Tool {
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
-    if (!MemoryService.isEnabledForCurrentSessionSync()) {
+    return executeWithContext(input);
+  }
+
+  @override
+  Future<String> executeWithContext(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) async {
+    if (!MemoryService.isEnabledForSessionSync(sessionId)) {
+      await MemoryService.auditMemoryToolRejected(
+        name,
+        source: 'agent_tool',
+        sessionId: sessionId,
+        reason: 'memory_disabled',
+      );
       return jsonEncode({'ok': false, 'error': 'memory_disabled'});
     }
     final fact = input['fact']?.toString() ?? '';
     final result = await MemoryService.addMemory(
       fact,
       source: 'agent_tool',
-      sessionId: MemoryService.currentSessionId,
+      sessionId: sessionId,
     );
     return jsonEncode({
       'ok': result.added,
@@ -74,7 +96,7 @@ class MemoryDeleteTool extends Tool {
 
   @override
   String get description =>
-      'Request deleting a durable user memory by index or exact fact. Requires user approval and writes an audit entry.';
+      'Request deleting a durable user memory by index or exact fact; writes an audit entry when executed. The app may ask for confirmation depending on the tool approval policy.';
 
   @override
   Map<String, dynamic> get inputSchema => const {
@@ -93,7 +115,21 @@ class MemoryDeleteTool extends Tool {
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
-    if (!MemoryService.isEnabledForCurrentSessionSync()) {
+    return executeWithContext(input);
+  }
+
+  @override
+  Future<String> executeWithContext(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) async {
+    if (!MemoryService.isEnabledForSessionSync(sessionId)) {
+      await MemoryService.auditMemoryToolRejected(
+        name,
+        source: 'agent_tool',
+        sessionId: sessionId,
+        reason: 'memory_disabled',
+      );
       return jsonEncode({'ok': false, 'error': 'memory_disabled'});
     }
     final rawIndex = input['index'];
@@ -102,13 +138,13 @@ class MemoryDeleteTool extends Tool {
       result = await MemoryService.removeMemory(
         rawIndex.toInt(),
         source: 'agent_tool',
-        sessionId: MemoryService.currentSessionId,
+        sessionId: sessionId,
       );
     } else {
       result = await MemoryService.deleteMemoryText(
         input['fact']?.toString() ?? '',
         source: 'agent_tool',
-        sessionId: MemoryService.currentSessionId,
+        sessionId: sessionId,
       );
     }
     return jsonEncode({

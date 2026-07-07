@@ -1604,7 +1604,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
                     // Sync draft when session changes via Selector rebuild
                     final currentId = data.sessionId;
-                    MemoryService.setCurrentSessionId(currentId);
                     if (currentId != null && currentId != _lastSessionId) {
                       _syncDraftForSession();
                     }
@@ -3043,7 +3042,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final session = provider.currentSession;
     if (session == null) return;
     final sessionId = session.id;
-    MemoryService.setCurrentSessionId(sessionId);
     var mode = await MemoryService.getSessionMemoryMode(sessionId);
     if (!mounted) return;
 

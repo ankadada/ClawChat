@@ -23,8 +23,18 @@ abstract class Tool {
 
   Future<String> execute(Map<String, dynamic> input);
 
-  Future<ToolResultPayload> executeResult(Map<String, dynamic> input) async {
-    final output = await execute(input);
+  Future<String> executeWithContext(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) {
+    return execute(input);
+  }
+
+  Future<ToolResultPayload> executeResult(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) async {
+    final output = await executeWithContext(input, sessionId: sessionId);
     return ToolResultFormatter.format(
       toolName: name,
       input: input,
@@ -82,9 +92,9 @@ class ToolRegistry {
     _risks.remove(name);
   }
 
-  List<ToolDefinition> getToolDefinitions() {
+  List<ToolDefinition> getToolDefinitions({String? sessionId}) {
     return _tools.values
-        .where(_isToolAvailableForSession)
+        .where((tool) => _isToolAvailableForSession(tool, sessionId))
         .map((t) => t.toDefinition())
         .toList();
   }
@@ -108,21 +118,35 @@ class ToolRegistry {
     await _mcpService?.dispose();
   }
 
-  Map<String, dynamic>? inputSchemaFor(String name) =>
-      _tools[name]?.inputSchema;
+  Map<String, dynamic>? inputSchemaFor(String name, {String? sessionId}) {
+    final tool = _tools[name];
+    if (tool == null || !_isToolAvailableForSession(tool, sessionId)) {
+      return null;
+    }
+    return tool.inputSchema;
+  }
 
-  Future<String> executeTool(String name, Map<String, dynamic> input) async {
-    final payload = await executeToolResult(name, input);
+  Future<String> executeTool(
+    String name,
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) async {
+    final payload = await executeToolResult(
+      name,
+      input,
+      sessionId: sessionId,
+    );
     return payload.forUser;
   }
 
   Future<ToolResultPayload> executeToolResult(
     String name,
-    Map<String, dynamic> input,
-  ) async {
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) async {
     final tool = _tools[name];
     if (tool == null) throw Exception('Unknown tool: $name');
-    return tool.executeResult(input);
+    return tool.executeResult(input, sessionId: sessionId);
   }
 
   static String sanitizeToolOutput(String output) {
@@ -133,14 +157,16 @@ class ToolRegistry {
 
   ToolRisk riskFor(String name) => _risks[name] ?? ToolRisk.dangerous;
 
-  List<String> get availableTools => _tools.values
-      .where(_isToolAvailableForSession)
+  List<String> get availableTools => availableToolsForSession();
+
+  List<String> availableToolsForSession({String? sessionId}) => _tools.values
+      .where((tool) => _isToolAvailableForSession(tool, sessionId))
       .map((tool) => tool.name)
       .toList();
 
-  bool _isToolAvailableForSession(Tool tool) {
+  bool _isToolAvailableForSession(Tool tool, String? sessionId) {
     if (tool.name.startsWith('memory_')) {
-      return MemoryService.isEnabledForCurrentSessionSync();
+      return MemoryService.isEnabledForSessionSync(sessionId);
     }
     return true;
   }
