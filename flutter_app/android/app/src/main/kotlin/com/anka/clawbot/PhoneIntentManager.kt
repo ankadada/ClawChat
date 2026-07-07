@@ -2,6 +2,7 @@ package com.anka.clawbot
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
@@ -14,6 +15,7 @@ import android.os.Build
 import android.telephony.SmsManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.util.concurrent.CountDownLatch
 import java.util.TimeZone
 
 class PhoneIntentManager(private val activity: Activity) {
@@ -156,7 +158,9 @@ class PhoneIntentManager(private val activity: Activity) {
 
     private fun ensurePermission(perm: String): Boolean {
         if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) return true
-        ActivityCompat.requestPermissions(activity, arrayOf(perm), PERMISSION_REQUEST)
+        activity.runOnUiThread {
+            ActivityCompat.requestPermissions(activity, arrayOf(perm), PERMISSION_REQUEST)
+        }
         return false
     }
 
@@ -305,6 +309,9 @@ class PhoneIntentManager(private val activity: Activity) {
         }
         val number = validatePhoneNumber(p["number"] as? String ?: error("number required"))
         val body = p["body"] as? String ?: error("body required")
+        if (!confirmSmsSend(number, body)) {
+            return mapOf("ok" to false, "error" to "cancelled", "message" to "SMS send cancelled by user")
+        }
         val sm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             activity.getSystemService(SmsManager::class.java)!!
         } else {
@@ -314,6 +321,37 @@ class PhoneIntentManager(private val activity: Activity) {
         val parts = sm.divideMessage(body)
         sm.sendMultipartTextMessage(number, null, parts, null, null)
         return mapOf("ok" to true, "parts" to parts.size)
+    }
+
+    private fun confirmSmsSend(number: String, body: String): Boolean {
+        val latch = CountDownLatch(1)
+        var approved = false
+        activity.runOnUiThread {
+            if (activity.isFinishing || activity.isDestroyed) {
+                latch.countDown()
+                return@runOnUiThread
+            }
+            AlertDialog.Builder(activity)
+                .setTitle("确认发送短信")
+                .setMessage("收件人：$number\n\n内容：\n$body")
+                .setNegativeButton("取消") { dialog, _ ->
+                    approved = false
+                    dialog.dismiss()
+                    latch.countDown()
+                }
+                .setPositiveButton("发送") { dialog, _ ->
+                    approved = true
+                    dialog.dismiss()
+                    latch.countDown()
+                }
+                .setOnCancelListener {
+                    approved = false
+                    latch.countDown()
+                }
+                .show()
+        }
+        latch.await()
+        return approved
     }
 
     companion object {

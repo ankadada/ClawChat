@@ -11,11 +11,15 @@ class PreparedAttachment {
   final MessageContent content;
   final String inputText;
   final bool includeAsContentBlock;
+  final bool containsSensitiveText;
+  final String? sensitiveWarning;
 
   const PreparedAttachment({
     required this.content,
     required this.inputText,
     required this.includeAsContentBlock,
+    this.containsSensitiveText = false,
+    this.sensitiveWarning,
   });
 }
 
@@ -72,7 +76,20 @@ class FileAttachmentService {
     'gradle',
     'properties',
     'env',
+    'pem',
+    'key',
+    'crt',
+    'cer',
+    'credential',
+    'credentials',
   };
+
+  static final RegExp _sensitiveTextFilePattern = RegExp(
+    r'(^|[._-])env($|[._-])|\.env($|[._-])|'
+    r'\.(pem|key|crt|cer)$|'
+    r'credential|credentials|secret|token',
+    caseSensitive: false,
+  );
 
   /// Pick files from device storage.
   /// Returns list of picked files, or empty list if cancelled.
@@ -145,6 +162,8 @@ class FileAttachmentService {
         content: TextContent('File: $safeName\n$fence\n$text\n$fence'),
         inputText: 'File: $safeName\n$fence\n$text\n$fence',
         includeAsContentBlock: false,
+        containsSensitiveText: requiresSensitiveTextConfirmation(file),
+        sensitiveWarning: sensitiveTextWarning(file),
       );
     }
 
@@ -156,6 +175,19 @@ class FileAttachmentService {
       inputText: marker,
       includeAsContentBlock: false,
     );
+  }
+
+  static bool requiresSensitiveTextConfirmation(PlatformFile file) {
+    final safeName = sanitizeFileName(file.name);
+    final extension = _extensionFor(safeName);
+    if (!_textExtensions.contains(extension)) return false;
+    return _sensitiveTextFilePattern.hasMatch(safeName);
+  }
+
+  static String? sensitiveTextWarning(PlatformFile file) {
+    if (!requiresSensitiveTextConfirmation(file)) return null;
+    return '文件 ${sanitizeFileName(file.name)} 看起来可能包含密钥或凭据。'
+        '确认后才会把全文注入提示词。';
   }
 
   /// Copy a picked file into the proot workspace.

@@ -403,7 +403,7 @@ class MainActivity : FlutterActivity() {
                         result.error("INVALID_ARGS", "action required", null)
                     } else if (action in setOf("callPhone", "sendSms") && !allowed) {
                         result.error("DISABLED", "Action $action is disabled by user setting", null)
-                    } else if (action in setOf("listCalendarEvents", "listContacts", "insertCalendarEvent")) {
+                    } else if (action in setOf("listCalendarEvents", "listContacts", "insertCalendarEvent", "sendSms")) {
                         // Content provider queries run off the main thread
                         Thread {
                             try {
