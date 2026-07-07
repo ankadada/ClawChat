@@ -91,6 +91,33 @@ void main() {
     expect(exported, contains('********'));
   });
 
+  test('redacted export import rejects sensitive restore path', () async {
+    final prefs = await initPrefs();
+    await prefs.setProfiles([
+      ProviderProfile.defaults(name: 'Primary').copyWith(
+        id: 'primary',
+        apiKey: 'primary-key',
+      ),
+    ]);
+
+    final exported = await ConfigExportService.exportConfig();
+
+    resetDevice();
+    expect(
+      () => ConfigExportService.importConfig(
+        exported,
+        conflictResolution: ConflictResolution.replace,
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('脱敏'),
+        ),
+      ),
+    );
+  });
+
   test('explicit plaintext export includes secrets after caller confirmation',
       () async {
     final prefs = await initPrefs();

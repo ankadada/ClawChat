@@ -487,6 +487,32 @@ void main() {
       expect(payload.last.toString(), isNot(contains('cache_control')));
     });
 
+    test('does not add cache_control for non-Anthropic providers', () {
+      final payload = transform.toProviderPayload(
+        [
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'text',
+                'text': 'stable prefix',
+                'cache_control': {'type': 'ephemeral'},
+              },
+            ],
+          },
+          {'role': 'assistant', 'content': 'stable answer'},
+          {'role': 'user', 'content': 'latest question'},
+        ],
+        const ProviderTransformOptions(
+          apiFormat: 'openai',
+          modelId: 'gpt-test',
+          capabilities: ModelCapabilities(supportsPromptCache: true),
+        ),
+      );
+
+      expect(payload.toString(), isNot(contains('cache_control')));
+    });
+
     test('Anthropic prompt cache setting disables cache_control passthrough',
         () {
       PromptCacheSettings.setAnthropicPromptCacheEnabledForProcess(false);
