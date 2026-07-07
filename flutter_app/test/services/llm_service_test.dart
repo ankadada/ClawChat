@@ -198,6 +198,28 @@ void main() {
 
       expect(response.content.single.text, 'ok after background');
     });
+
+    test('fails at max wall clock across repeated backgrounding', () async {
+      var isInBackground = false;
+      final toggler = Timer.periodic(const Duration(milliseconds: 20), (timer) {
+        isInBackground = !isInBackground;
+      });
+      addTearDown(toggler.cancel);
+
+      await expectLater(
+        delayedOpenAiChat(
+          isInBackground: () => isInBackground,
+          responseDelay: const Duration(seconds: 2),
+          requestTimeout: const Duration(milliseconds: 80),
+          requestMaxWallClock: const Duration(milliseconds: 140),
+        ),
+        throwsA(isA<TimeoutException>().having(
+          (error) => error.message,
+          'message',
+          contains('maximum wall-clock timeout'),
+        )),
+      );
+    });
   });
 
   group('LlmService OpenAI reasoning_content 400 fallback', () {
@@ -1948,6 +1970,7 @@ Future<LlmResponse> delayedOpenAiChat({
   required bool Function() isInBackground,
   required Duration responseDelay,
   required Duration requestTimeout,
+  Duration? requestMaxWallClock,
 }) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.listen((request) async {
@@ -1974,6 +1997,7 @@ Future<LlmResponse> delayedOpenAiChat({
     ),
     isInBackground: isInBackground,
     requestTimeout: requestTimeout,
+    requestMaxWallClock: requestMaxWallClock,
   );
   try {
     return await service.chat(system: '', messages: const [], tools: const []);

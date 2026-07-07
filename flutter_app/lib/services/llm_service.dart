@@ -328,6 +328,7 @@ class LlmService {
   final http.Client _client;
   final bool Function()? _isInBackground;
   final Duration _requestTimeoutDuration;
+  final Duration _requestMaxWallClockDuration;
   final CapabilityRegistry _capabilityRegistry;
   bool _disposed = false;
 
@@ -355,9 +356,12 @@ class LlmService {
     bool Function()? isInBackground,
     CapabilityRegistry capabilityRegistry = CapabilityRegistry.instance,
     Duration? requestTimeout,
+    Duration? requestMaxWallClock,
   })  : _capabilityRegistry = capabilityRegistry,
         _isInBackground = isInBackground,
         _requestTimeoutDuration = requestTimeout ?? _requestTimeout,
+        _requestMaxWallClockDuration =
+            requestMaxWallClock ?? _requestMaxWallClockTimeout,
         _client = _createPinnedClient();
 
   /// Creates an HTTP client that rejects bad TLS certificates (self-signed,
@@ -588,9 +592,12 @@ class LlmService {
   }
 
   static const Duration _requestTimeout = Duration(seconds: 120);
+  static const Duration _requestMaxWallClockTimeout = Duration(minutes: 30);
   static const Duration _streamChunkTimeout = Duration(seconds: 60);
   static const Duration _streamReconnectBaseDelay = Duration(seconds: 2);
   static const Duration _foregroundTimeoutPollInterval = Duration(seconds: 1);
+  static const String _requestMaxWallClockTimeoutMessage =
+      'Request exceeded maximum wall-clock timeout';
   static const int _maxRetries = 3;
   static const int _maxStreamReconnects = 2;
   static const Map<String, String> _keepAliveHeaders = {
@@ -600,24 +607,68 @@ class LlmService {
 
   /// Runs [fn] with exponential backoff retry on 429 and 5xx errors.
   Future<T> _retryWithBackoff<T>(Future<T> Function() fn) async {
+    final requestStartedAt = DateTime.now();
     for (int attempt = 0; attempt <= _maxRetries; attempt++) {
       try {
-        return await _withForegroundTimeout(fn());
-      } on TimeoutException {
+        return await _withForegroundTimeout(fn(), startedAt: requestStartedAt);
+      } on TimeoutException catch (e) {
+        if (_isRequestMaxWallClockTimeout(e)) rethrow;
         if (attempt == _maxRetries) rethrow;
       } catch (e) {
         final isRetryable = e is http.ClientException ||
             (e is Exception && _isRetryableHttpError(e.toString()));
         if (!isRetryable || attempt == _maxRetries) rethrow;
       }
-      await Future.delayed(Duration(seconds: (1 << attempt) * 2));
+      final delay = Duration(seconds: (1 << attempt) * 2);
+      final wallRemaining = _remainingRequestWallClock(requestStartedAt);
+      if (wallRemaining <= Duration.zero) {
+        throw _requestMaxWallClockTimeoutException(
+          _requestMaxWallClockDuration,
+        );
+      }
+      await Future.delayed(delay <= wallRemaining ? delay : wallRemaining);
     }
     throw StateError('unreachable');
   }
 
-  Future<T> _withForegroundTimeout<T>(Future<T> future) {
+  static bool _isRequestMaxWallClockTimeout(TimeoutException error) {
+    return error.message?.contains(_requestMaxWallClockTimeoutMessage) ?? false;
+  }
+
+  static TimeoutException _requestMaxWallClockTimeoutException(
+    Duration duration,
+  ) {
+    return TimeoutException(
+      '$_requestMaxWallClockTimeoutMessage: $duration',
+      duration,
+    );
+  }
+
+  Duration _remainingRequestWallClock(DateTime startedAt) {
+    return _requestMaxWallClockDuration - DateTime.now().difference(startedAt);
+  }
+
+  Future<T> _withForegroundTimeout<T>(
+    Future<T> future, {
+    required DateTime startedAt,
+  }) {
     final isInBackground = _isInBackground;
     if (isInBackground == null) {
+      final wallRemaining = _remainingRequestWallClock(startedAt);
+      if (wallRemaining <= Duration.zero) {
+        return Future<T>.error(
+          _requestMaxWallClockTimeoutException(_requestMaxWallClockDuration),
+          StackTrace.current,
+        );
+      }
+      if (wallRemaining < _requestTimeoutDuration) {
+        return future.timeout(
+          wallRemaining,
+          onTimeout: () => throw _requestMaxWallClockTimeoutException(
+            _requestMaxWallClockDuration,
+          ),
+        );
+      }
       return future.timeout(_requestTimeoutDuration);
     }
 
@@ -656,14 +707,24 @@ class LlmService {
       ),
     );
 
-    void failWithTimeout() {
+    void failWithTimeout(String message, Duration duration) {
       completeError(
         TimeoutException(
-          'No response received within $_requestTimeoutDuration',
-          _requestTimeoutDuration,
+          message,
+          duration,
         ),
         StackTrace.current,
       );
+    }
+
+    Duration remainingWallClock(DateTime now) {
+      return _requestMaxWallClockDuration - now.difference(startedAt);
+    }
+
+    Duration nextDelay(Duration preferred, DateTime now) {
+      final wallRemaining = remainingWallClock(now);
+      if (wallRemaining <= Duration.zero) return Duration.zero;
+      return minDuration(preferred, wallRemaining);
     }
 
     void scheduleTimeout([Duration? delay]) {
@@ -672,11 +733,20 @@ class LlmService {
       timer = Timer(delay ?? _requestTimeoutDuration, () {
         if (settled) return;
         final now = DateTime.now();
+        final wallRemaining = remainingWallClock(now);
+        if (wallRemaining <= Duration.zero) {
+          failWithTimeout(
+            '$_requestMaxWallClockTimeoutMessage: '
+            '$_requestMaxWallClockDuration',
+            _requestMaxWallClockDuration,
+          );
+          return;
+        }
         if (isInBackground()) {
           wasInBackground = true;
           foregroundElapsed = Duration.zero;
           lastCheck = now;
-          scheduleTimeout(pollInterval);
+          scheduleTimeout(nextDelay(pollInterval, now));
           return;
         }
         if (wasInBackground) {
@@ -684,7 +754,7 @@ class LlmService {
           foregroundElapsed = Duration.zero;
           lastCheck = now;
           scheduleTimeout(
-            minDuration(_requestTimeoutDuration, pollInterval),
+            nextDelay(minDuration(_requestTimeoutDuration, pollInterval), now),
           );
           return;
         }
@@ -692,17 +762,23 @@ class LlmService {
         lastCheck = now;
         final remaining = _requestTimeoutDuration - foregroundElapsed;
         if (remaining <= Duration.zero) {
-          failWithTimeout();
+          failWithTimeout(
+            'No response received within $_requestTimeoutDuration',
+            _requestTimeoutDuration,
+          );
           return;
         }
         scheduleTimeout(
-          minDuration(remaining, pollInterval),
+          nextDelay(minDuration(remaining, pollInterval), now),
         );
       });
     }
 
     scheduleTimeout(
-      minDuration(_requestTimeoutDuration, pollInterval),
+      nextDelay(
+        minDuration(_requestTimeoutDuration, pollInterval),
+        DateTime.now(),
+      ),
     );
     future.then(completeValue, onError: completeError);
     return completer.future;
