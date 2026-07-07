@@ -1,8 +1,10 @@
 import 'dart:convert';
 
+import '../../models/chat_models.dart';
 import '../native_bridge.dart';
 import '../preferences_service.dart';
 import 'tool_registry.dart';
+import 'tool_result_formatter.dart';
 
 class PhoneIntentTool extends Tool {
   final PreferencesService _prefs;
@@ -36,29 +38,35 @@ class PhoneIntentTool extends Tool {
 
   @override
   Map<String, dynamic> get inputSchema => {
-    'type': 'object',
-    'properties': {
-      'action': {
-        'type': 'string',
-        'description': 'The action to perform (see tool description for the full list).',
-      },
-      'params': {
         'type': 'object',
-        'description': 'Action-specific parameters.',
-      },
-    },
-    'required': ['action'],
-  };
+        'properties': {
+          'action': {
+            'type': 'string',
+            'description':
+                'The action to perform (see tool description for the full list).',
+          },
+          'params': {
+            'type': 'object',
+            'description': 'Action-specific parameters.',
+          },
+        },
+        'required': ['action'],
+      };
 
   static const _restrictedActions = {'callPhone', 'sendSms'};
   static final Map<String, DateTime> _lastCallTime = {};
   static const _minInterval = Duration(seconds: 30);
 
+  static void resetRateLimitForTesting() {
+    _lastCallTime.clear();
+  }
+
   @override
   Future<String> execute(Map<String, dynamic> input) async {
     final action = input['action'] as String?;
     if (action == null || action.isEmpty) {
-      return jsonEncode({'ok': false, 'error': 'invalid_args', 'message': 'action required'});
+      return jsonEncode(
+          {'ok': false, 'error': 'invalid_args', 'message': 'action required'});
     }
 
     final isRestricted = _restrictedActions.contains(action);
@@ -90,12 +98,42 @@ class PhoneIntentTool extends Tool {
       _lastCallTime[action] = now;
     }
 
-    final params = (input['params'] as Map?)?.cast<String, dynamic>() ?? const {};
+    final params =
+        (input['params'] as Map?)?.cast<String, dynamic>() ?? const {};
     try {
-      final result = await NativeBridge.phoneIntent(action, params, allowed: isRestricted);
+      final result =
+          await NativeBridge.phoneIntent(action, params, allowed: isRestricted);
       return jsonEncode(result);
     } catch (e) {
-      return jsonEncode({'ok': false, 'error': 'exception', 'message': e.toString()});
+      return jsonEncode(
+          {'ok': false, 'error': 'exception', 'message': e.toString()});
     }
+  }
+
+  @override
+  Future<ToolResultPayload> executeResult(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) async {
+    final output = await executeWithContext(input, sessionId: sessionId);
+    return ToolResultFormatter.format(
+      toolName: name,
+      input: input,
+      output: output,
+      isError: _isFailureOutput(output),
+    );
+  }
+
+  static bool _isFailureOutput(String output) {
+    try {
+      final decoded = jsonDecode(output);
+      if (decoded is Map<String, dynamic>) {
+        if (decoded['ok'] == false) return true;
+        return decoded['ok'] != true && decoded['error'] != null;
+      }
+    } catch (_) {
+      return false;
+    }
+    return false;
   }
 }
