@@ -191,6 +191,7 @@ class CapabilityRegistry {
         systemPromptMode: SystemPromptMode.topLevel,
         defaultTokenLimitParameter: TokenLimitParameter.maxTokens,
         streamingUsageMode: StreamingUsageMode.nativeEvents,
+        defaultSupportsPromptCache: true,
       );
     }
 
@@ -264,9 +265,8 @@ class CapabilityRegistry {
         baseUrl: baseUrl,
         modelId: modelId,
       ),
-      // P8a is conservative: cache_control remains stripped by the provider
-      // transform until a later phase adds a narrow provider-safe whitelist.
-      supportsPromptCache: false,
+      supportsPromptCache: provider.kind == ProviderKind.anthropicNative &&
+          provider.defaultSupportsPromptCache,
       supportsSystemPrompt: provider.systemPromptMode != SystemPromptMode.none,
       supportsStreamingUsage: streamingUsageMode != StreamingUsageMode.none,
       acceptsTemperature: !reasoningModel,

@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:clawchat/models/model_capabilities.dart';
 import 'package:clawchat/services/model_capability_registry.dart';
 import 'package:clawchat/services/llm_service.dart';
+import 'package:clawchat/services/prompt_cache_settings.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -12,6 +13,7 @@ void main() {
   setUp(() {
     SharedPreferences.setMockInitialValues({});
     CapabilityRegistry.instance.clearRuntimeOverridesForTesting();
+    PromptCacheSettings.setAnthropicPromptCacheEnabledForProcess(false);
   });
 
   group('LlmService error sanitization', () {
@@ -537,6 +539,23 @@ void main() {
       ]);
       expect(captured.body['max_tokens'], 8192);
       expect(jsonDecode(jsonEncode(captured.body)), captured.body);
+    });
+
+    test('adds Anthropic prompt cache breakpoint to request body', () async {
+      PromptCacheSettings.setAnthropicPromptCacheEnabledForProcess(true);
+      final captured = await captureAnthropicRequest(
+        model: 'claude-sonnet-4-20250514${LlmService.presetModelSuffix}',
+        system: 'You are concise.',
+        messages: const [
+          {'role': 'user', 'content': 'old question'},
+          {'role': 'assistant', 'content': 'stable answer'},
+          {'role': 'user', 'content': 'latest question'},
+        ],
+        baseUrlForPort: (port) => 'http://127.0.0.1:$port/v1/messages',
+      );
+
+      final cachedContent = captured.body['messages'][1]['content'] as List;
+      expect(cachedContent.single['cache_control'], {'type': 'ephemeral'});
     });
 
     test('builds valid OpenAI-compatible simple text request body', () async {

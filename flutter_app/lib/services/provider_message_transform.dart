@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import '../models/model_capabilities.dart';
 import 'llm_content_sanitizer.dart';
+import 'prompt_cache_settings.dart';
 
 enum ProviderTransformMode { normal, recovery, compare }
 
@@ -26,7 +27,9 @@ class ProviderTransformOptions {
   bool get supportsImages => capabilities.supportsImages;
   bool get supportsReasoningContent => capabilities.supportsReasoningContent;
   bool get supportsTools => capabilities.supportsTools;
-  bool get supportsPromptCache => capabilities.supportsPromptCache;
+  bool get supportsPromptCache =>
+      capabilities.supportsPromptCache &&
+      PromptCacheSettings.anthropicPromptCacheEnabled;
 }
 
 class ProviderTransformResult {
@@ -93,9 +96,14 @@ class ProviderMessageTransform {
       transformed.add(clean);
     }
 
+    final cacheReadyMessages = _withAnthropicPromptCacheBreakpoints(
+      transformed,
+      options,
+    );
+
     final cleanup = options.isRecovery
-        ? _dropUnpairedToolBlocks(transformed, warnings)
-        : _warnUnpairedToolBlocks(transformed, warnings);
+        ? _dropUnpairedToolBlocks(cacheReadyMessages, warnings)
+        : _warnUnpairedToolBlocks(cacheReadyMessages, warnings);
     droppedBlockCount += cleanup.droppedBlockCount;
 
     return ProviderTransformResult(
@@ -267,6 +275,11 @@ class ProviderMessageTransform {
     SensitiveDataStatsBuilder sensitiveStats,
   ) {
     if (value is! Map) return null;
+    final rawBlock = Map<dynamic, dynamic>.from(value);
+    final cacheControl = _allowedAnthropicCacheControl(
+      rawBlock['cache_control'],
+      options,
+    );
     final block = removeUnsafeMetadata(value);
     if (block is! Map<String, dynamic>) return null;
     final type = block['type'];
@@ -290,6 +303,7 @@ class ProviderMessageTransform {
           sensitiveStats,
         );
       }
+      if (cacheControl != null) clean['cache_control'] = cacheControl;
       return clean;
     }
 
@@ -302,7 +316,9 @@ class ProviderMessageTransform {
               '[Attachment omitted: images are not supported by this provider]',
         };
       }
-      return _sanitizeImageLikeBlock(block, sensitiveStats);
+      final clean = _sanitizeImageLikeBlock(block, sensitiveStats);
+      if (cacheControl != null) clean['cache_control'] = cacheControl;
+      return clean;
     }
 
     if (type == 'tool_use') {
@@ -323,7 +339,7 @@ class ProviderMessageTransform {
           sensitiveStats: sensitiveStats,
         );
       }
-      return {
+      final clean = {
         ...block,
         'type': 'tool_use',
         'id': scrubbedId,
@@ -333,6 +349,8 @@ class ProviderMessageTransform {
           sensitiveStats,
         ),
       };
+      if (cacheControl != null) clean['cache_control'] = cacheControl;
+      return clean;
     }
 
     if (type == 'tool_result') {
@@ -351,7 +369,7 @@ class ProviderMessageTransform {
           sensitiveStats: sensitiveStats,
         );
       }
-      return {
+      final clean = {
         'type': 'tool_result',
         'tool_use_id': scrubbedId,
         'content': _sanitizeText(
@@ -362,6 +380,8 @@ class ProviderMessageTransform {
         ),
         if (block['is_error'] == true) 'is_error': true,
       };
+      if (cacheControl != null) clean['cache_control'] = cacheControl;
+      return clean;
     }
 
     return null;
@@ -582,6 +602,10 @@ class ProviderMessageTransform {
       return {
         'type': 'text',
         'text': text,
+        if (block['cache_control'] != null)
+          'cache_control': Map<String, dynamic>.from(
+            block['cache_control'] as Map,
+          ),
       };
     }
     if (type == 'image') {
@@ -596,6 +620,10 @@ class ProviderMessageTransform {
         'id': block['id'],
         'name': block['name'],
         'input': Map<String, dynamic>.from(block['input'] as Map? ?? {}),
+        if (block['cache_control'] != null)
+          'cache_control': Map<String, dynamic>.from(
+            block['cache_control'] as Map,
+          ),
       };
     }
     if (type == 'tool_result') {
@@ -606,6 +634,10 @@ class ProviderMessageTransform {
           block['for_llm'] ?? block['content'] ?? block['output'],
         ),
         if (block['is_error'] == true) 'is_error': true,
+        if (block['cache_control'] != null)
+          'cache_control': Map<String, dynamic>.from(
+            block['cache_control'] as Map,
+          ),
       };
     }
     return null;
@@ -654,6 +686,85 @@ class ProviderMessageTransform {
     }
     return clean;
   }
+
+  List<Map<String, dynamic>> _withAnthropicPromptCacheBreakpoints(
+    List<Map<String, dynamic>> messages,
+    ProviderTransformOptions options,
+  ) {
+    if (!options.isAnthropic ||
+        !options.supportsPromptCache ||
+        options.isRecovery ||
+        messages.isEmpty) {
+      return messages;
+    }
+
+    final targetIndex = _promptCacheTargetMessageIndex(messages);
+    if (targetIndex < 0) return messages;
+    final target = messages[targetIndex];
+    final content = target['content'];
+    final updatedContent = _withCacheControlOnLastBlock(content);
+    if (identical(updatedContent, content)) return messages;
+
+    final copy = messages
+        .map((message) => Map<String, dynamic>.from(message))
+        .toList(growable: false);
+    copy[targetIndex]['content'] = updatedContent;
+    return copy;
+  }
+
+  int _promptCacheTargetMessageIndex(List<Map<String, dynamic>> messages) {
+    final lastIndex = messages.length - 1;
+    if (messages[lastIndex]['role'] == 'user' && messages.length > 1) {
+      return lastIndex - 1;
+    }
+    return lastIndex;
+  }
+
+  Object? _withCacheControlOnLastBlock(Object? content) {
+    if (content is String) {
+      if (content.isEmpty) return content;
+      return [
+        {
+          'type': 'text',
+          'text': content,
+          'cache_control': _ephemeralCacheControl(),
+        }
+      ];
+    }
+    if (content is! List || content.isEmpty) return content;
+    final blocks = content
+        .whereType<Map>()
+        .map((block) => Map<String, dynamic>.from(block))
+        .toList(growable: false);
+    if (blocks.isEmpty) return content;
+    for (var i = blocks.length - 1; i >= 0; i--) {
+      final type = blocks[i]['type'];
+      if (type == 'text' || type == 'tool_use' || type == 'tool_result') {
+        blocks[i]['cache_control'] = _ephemeralCacheControl();
+        return blocks;
+      }
+    }
+    return content;
+  }
+
+  Map<String, dynamic>? _allowedAnthropicCacheControl(
+    Object? value,
+    ProviderTransformOptions options,
+  ) {
+    if (!options.isAnthropic ||
+        !options.supportsPromptCache ||
+        options.isRecovery ||
+        value is! Map) {
+      return null;
+    }
+    final type = value['type']?.toString();
+    if (type != 'ephemeral') return null;
+    return _ephemeralCacheControl();
+  }
+
+  Map<String, dynamic> _ephemeralCacheControl() => const {
+        'type': 'ephemeral',
+      };
 
   Map<String, dynamic>? _openAIImageBlockToAnthropic(
     Map<dynamic, dynamic> block,
