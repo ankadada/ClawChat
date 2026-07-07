@@ -3,12 +3,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:clawchat/constants.dart';
+import 'package:clawchat/l10n/app_strings.dart';
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/models/model_capabilities.dart' as caps;
 import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
 import 'package:clawchat/services/config_export_service.dart';
+import 'package:clawchat/services/context_manager.dart';
 import 'package:clawchat/services/context_summary_service.dart';
 import 'package:clawchat/services/startup_restore_guard.dart';
 import 'package:clawchat/services/llm_service.dart';
@@ -1634,6 +1636,120 @@ void main() {
         contains('clean retry partial\n\n[回复中断，内容可能不完整。]'),
       );
       expect(provider.currentSession!.messages.last.hasAssistantError, isTrue);
+    });
+
+    test('stream reset shows reconnecting notice until retry text arrives',
+        () async {
+      final resetEmitted = Completer<void>();
+      final continueAfterReset = Completer<void>();
+      final cleanTokenEmitted = Completer<void>();
+      final finishStream = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ResetPauseLlmService(
+          config,
+          resetEmitted: resetEmitted,
+          continueAfterReset: continueAfterReset,
+          cleanTokenEmitted: cleanTokenEmitted,
+          finishStream: finishStream,
+        ),
+      );
+      addTearDown(() async {
+        if (!continueAfterReset.isCompleted) continueAfterReset.complete();
+        if (!finishStream.isCompleted) finishStream.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      final sendFuture = provider.sendMessage('hello');
+
+      await resetEmitted.future.timeout(const Duration(seconds: 2));
+      await _waitUntil(() => provider.streamingText.contains('连接中断'));
+      expect(provider.agentStatus, AgentStatus.thinking);
+      expect(provider.streamingText, isNot(contains('dirty first attempt')));
+
+      continueAfterReset.complete();
+      await cleanTokenEmitted.future.timeout(const Duration(seconds: 2));
+      await _waitUntil(() => provider.streamingText == 'clean retry text');
+      expect(provider.agentStatus, AgentStatus.streaming);
+
+      finishStream.complete();
+      await sendFuture.timeout(const Duration(seconds: 2));
+      expect(provider.currentSession!.messages.last.textContent,
+          'clean retry text');
+    });
+
+    test('context patch rollback preserves interleaved non-patch messages', () {
+      const notices = [
+        ContextNotice.summaryCompacted(4),
+        ContextNotice.truncated(
+          droppedMessageCount: 2,
+          droppedBlockCount: 0,
+          estimatedTokens: 128,
+        ),
+      ];
+      final summaryNotice = AppStrings.contextSummaryCompactedNotice(4);
+      final truncationNotice = AppStrings.contextCompactedNotice(2, 128);
+
+      final assistantBetweenNotices = [
+        ChatMessage.user('before patch'),
+        ChatMessage.systemNotice(summaryNotice),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('partial assistant survives')],
+        ),
+        ChatMessage.systemNotice(truncationNotice),
+        ChatMessage.systemNotice('unrelated notice survives'),
+      ];
+
+      expect(
+        ChatProvider.removeContextPatchNoticesForTesting(
+          assistantBetweenNotices,
+          startIndex: 1,
+          notices: notices,
+        ),
+        2,
+      );
+      expect(
+        assistantBetweenNotices.map((message) => message.textContent),
+        [
+          'before patch',
+          'partial assistant survives',
+          'unrelated notice survives',
+        ],
+      );
+
+      final unrelatedNoticeBetweenPatchNotices = [
+        ChatMessage.user('before patch'),
+        ChatMessage.systemNotice('unrelated notice before patch'),
+        ChatMessage.systemNotice(summaryNotice),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('partial assistant still survives')],
+        ),
+        ChatMessage.systemNotice('unrelated notice between patch notices'),
+        ChatMessage.systemNotice(truncationNotice),
+      ];
+
+      expect(
+        ChatProvider.removeContextPatchNoticesForTesting(
+          unrelatedNoticeBetweenPatchNotices,
+          startIndex: 1,
+          notices: notices,
+        ),
+        2,
+      );
+      expect(
+        unrelatedNoticeBetweenPatchNotices
+            .map((message) => message.textContent),
+        [
+          'before patch',
+          'unrelated notice before patch',
+          'partial assistant still survives',
+          'unrelated notice between patch notices',
+        ],
+      );
     });
 
     test('cancel before persisted messages rolls back primary patch', () async {
@@ -5078,6 +5194,40 @@ class _ScriptedLlmService extends LlmService {
   void dispose() {
     onDispose?.call();
     super.dispose();
+  }
+}
+
+class _ResetPauseLlmService extends LlmService {
+  final Completer<void> resetEmitted;
+  final Completer<void> continueAfterReset;
+  final Completer<void> cleanTokenEmitted;
+  final Completer<void> finishStream;
+
+  _ResetPauseLlmService(
+    super.config, {
+    required this.resetEmitted,
+    required this.continueAfterReset,
+    required this.cleanTokenEmitted,
+    required this.finishStream,
+  });
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    yield TextDelta('dirty first attempt');
+    yield const StreamReset();
+    if (!resetEmitted.isCompleted) resetEmitted.complete();
+    await continueAfterReset.future;
+    yield TextDelta('clean retry text');
+    if (!cleanTokenEmitted.isCompleted) cleanTokenEmitted.complete();
+    await finishStream.future;
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'clean retry text')],
+    ));
   }
 }
 

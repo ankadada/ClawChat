@@ -146,6 +146,7 @@ class ChatProvider extends ChangeNotifier {
   static const _agentServiceThinkingText = 'AI 正在思考...';
   static const _agentServiceToolingText = 'AI 正在执行命令...';
   static const _agentServiceStreamingText = 'AI 正在回复...';
+  static const _agentServiceReconnectingText = '连接中断，正在重新生成...';
   static const _liveReasoningPreviewMaxChars = 12000;
   static const _liveReasoningPreviewTrimAt = 14000;
   static const _agentRunRecoveryPrompt =
@@ -492,8 +493,18 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _appendStreamingDelta(AgentState state, String text) {
+    final replacingReconnectNotice =
+        text.isNotEmpty && state.streamingText == _agentServiceReconnectingText;
     state.status = AgentStatus.streaming;
     state.streamBuffer.write(text);
+    if (replacingReconnectNotice) {
+      _flushStreamingState(state);
+      unawaited(_startAgentServiceForState(
+        state,
+        _agentServiceStreamingText,
+      ));
+      return;
+    }
     state.streamFlushScheduler.schedule(
       delta: text,
       flush: () {
@@ -2951,7 +2962,14 @@ class ChatProvider extends ChangeNotifier {
             ));
 
           case AgentStreamReset():
-            _clearStreamingState(state, notify: true);
+            _clearStreamingState(state, notify: false);
+            state.status = AgentStatus.thinking;
+            state.streamingText = _agentServiceReconnectingText;
+            notifyListeners();
+            unawaited(_startAgentServiceForState(
+              state,
+              _agentServiceReconnectingText,
+            ));
 
           case AgentTextDelta(:final text):
             if (text.isNotEmpty) state.fallbackTextEmitted = true;
@@ -3168,21 +3186,67 @@ class ChatProvider extends ChangeNotifier {
       return false;
     }
     session.contextSummary = snapshot.contextSummary;
-    var removedNotices = 0;
-    var index = snapshot.messageCount;
-    while (index < session.messages.length &&
-        removedNotices < patch.notices.length) {
-      if (session.messages[index].isSystemNotice) {
-        session.messages.removeAt(index);
-        removedNotices++;
-      } else {
-        index++;
-      }
-    }
+    _removeContextPatchNotices(
+      session.messages,
+      startIndex: snapshot.messageCount,
+      notices: patch.notices,
+    );
     await _storage.saveSession(session);
     _syncCurrentSessionReference(session);
     notifyListeners();
     return true;
+  }
+
+  @visibleForTesting
+  static int removeContextPatchNoticesForTesting(
+    List<ChatMessage> messages, {
+    required int startIndex,
+    required List<ContextNotice> notices,
+  }) {
+    return _removeContextPatchNotices(
+      messages,
+      startIndex: startIndex,
+      notices: notices,
+    );
+  }
+
+  static int _removeContextPatchNotices(
+    List<ChatMessage> messages, {
+    required int startIndex,
+    required List<ContextNotice> notices,
+  }) {
+    var removedNotices = 0;
+    for (final notice in notices) {
+      final expectedText = _contextNoticeText(notice);
+      var index = startIndex;
+      while (index < messages.length) {
+        final message = messages[index];
+        if (message.isSystemNotice && message.textContent == expectedText) {
+          messages.removeAt(index);
+          removedNotices++;
+          break;
+        }
+        index++;
+      }
+    }
+    return removedNotices;
+  }
+
+  static String _contextNoticeText(ContextNotice notice) {
+    return switch (notice.type) {
+      ContextNoticeType.summaryCompacted =>
+        AppStrings.contextSummaryCompactedNotice(notice.coveredMessageCount),
+      ContextNoticeType.summaryFailed => AppStrings.contextSummaryFailed,
+      ContextNoticeType.truncated => notice.droppedMessageCount > 0
+          ? AppStrings.contextCompactedNotice(
+              notice.droppedMessageCount,
+              notice.estimatedTokens,
+            )
+          : AppStrings.contextToolCallsCleanedNotice(
+              notice.droppedBlockCount,
+              notice.estimatedTokens,
+            ),
+    };
   }
 
   void _appendContextCompactionNotice(

@@ -141,7 +141,6 @@ class AgentService {
       yield AgentThinking();
 
       LlmResponse? response;
-      final textBuffer = StringBuffer();
 
       try {
         await for (final event in _llm.chatStream(
@@ -154,12 +153,10 @@ class AgentService {
           if (_cancelled) return;
 
           if (event is TextDelta) {
-            textBuffer.write(event.text);
             yield AgentTextDelta(event.text);
           } else if (event is ReasoningDelta) {
             yield AgentReasoningDelta(event.text);
           } else if (event is StreamReset) {
-            textBuffer.clear();
             yield const AgentStreamReset();
           } else if (event is StreamDone) {
             response = event.response;
