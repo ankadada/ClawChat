@@ -63,6 +63,53 @@ void main() {
     PreferencesService.resetForTesting();
   }
 
+  test('default unencrypted export redacts secrets', () async {
+    final prefs = await initPrefs();
+    await prefs.setProfiles([
+      ProviderProfile.defaults(name: 'Primary').copyWith(
+        id: 'primary',
+        apiKey: 'primary-key',
+      ),
+    ]);
+    prefs.envVars = {'TOKEN': 'env-token'};
+    await prefs.saveMcpServer(
+      displayName: 'Local MCP',
+      enabled: true,
+      command: 'node',
+      env: {'MCP_TOKEN': 'mcp-token'},
+    );
+
+    final exported = await ConfigExportService.exportConfig();
+    final data = jsonDecode(exported) as Map<String, dynamic>;
+    final secrets = data['secrets'] as Map<String, dynamic>;
+
+    expect(secrets['encrypted'], isFalse);
+    expect(secrets['redacted'], isTrue);
+    expect(exported, isNot(contains('primary-key')));
+    expect(exported, isNot(contains('env-token')));
+    expect(exported, isNot(contains('mcp-token')));
+    expect(exported, contains('********'));
+  });
+
+  test('explicit plaintext export includes secrets after caller confirmation',
+      () async {
+    final prefs = await initPrefs();
+    await prefs.setProfiles([
+      ProviderProfile.defaults(name: 'Primary').copyWith(
+        id: 'primary',
+        apiKey: 'primary-key',
+      ),
+    ]);
+    prefs.envVars = {'TOKEN': 'env-token'};
+
+    final exported = await ConfigExportService.exportConfig(
+      includePlaintextSecrets: true,
+    );
+
+    expect(exported, contains('primary-key'));
+    expect(exported, contains('env-token'));
+  });
+
   test('encrypted export and import restores prompt profiles', () async {
     final prefs = await initPrefs();
     await prefs.savePromptProfile(

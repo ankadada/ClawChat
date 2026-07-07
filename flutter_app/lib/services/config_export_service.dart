@@ -13,7 +13,10 @@ class ConfigExportService {
   static const int _currentVersion = 1;
   static const int _pbkdf2Iterations = 100000;
 
-  static Future<String> exportConfig({String? password}) async {
+  static Future<String> exportConfig({
+    String? password,
+    bool includePlaintextSecrets = false,
+  }) async {
     final prefs = PreferencesService();
     await prefs.init();
 
@@ -29,10 +32,16 @@ class ConfigExportService {
     final Map<String, dynamic> secrets;
     if (password != null && password.isNotEmpty) {
       secrets = _encryptSecrets(jsonEncode(secretsContent), password);
-    } else {
+    } else if (includePlaintextSecrets) {
       secrets = {
         'encrypted': false,
         ...secretsContent,
+      };
+    } else {
+      secrets = {
+        'encrypted': false,
+        'redacted': true,
+        ..._redactSecretsContent(secretsContent),
       };
     }
 
@@ -214,6 +223,10 @@ class ConfigExportService {
   }) {
     late final Map<String, dynamic> secretsContent;
     final encrypted = secrets['encrypted'] == true;
+    final redacted = secrets['redacted'] == true;
+    if (redacted) {
+      throw StateError('配置文件已脱敏，无法导入敏感信息');
+    }
     if (encrypted) {
       if (password == null || password.isEmpty) {
         throw StateError('配置文件已加密，请输入密码');
@@ -291,6 +304,53 @@ class ConfigExportService {
       'data': encrypted.base64,
     };
   }
+
+  static Map<String, dynamic> _redactSecretsContent(
+    Map<String, dynamic> secretsContent,
+  ) {
+    return {
+      'providerProfiles': (secretsContent['providerProfiles'] as List)
+          .map((profile) => _redactProviderProfile(
+                Map<String, dynamic>.from(profile as Map),
+              ))
+          .toList(),
+      'promptProfiles': secretsContent['promptProfiles'],
+      'envVars': _redactStringMap(secretsContent['envVars'] as Map),
+      'mcpServers': (secretsContent['mcpServers'] as List)
+          .map((server) => _redactMcpServer(
+                Map<String, dynamic>.from(server as Map),
+              ))
+          .toList(),
+    };
+  }
+
+  static Map<String, dynamic> _redactProviderProfile(
+    Map<String, dynamic> profile,
+  ) {
+    if ((profile['apiKey']?.toString() ?? '').isNotEmpty) {
+      profile['apiKey'] = _redactedValue;
+    }
+    return profile;
+  }
+
+  static Map<String, dynamic> _redactMcpServer(Map<String, dynamic> server) {
+    final env = server['env'];
+    if (env is Map) {
+      server['env'] = _redactStringMap(env);
+    }
+    return server;
+  }
+
+  static Map<String, String> _redactStringMap(Map values) {
+    return values.map<String, String>(
+      (key, value) => MapEntry(
+        key.toString(),
+        value?.toString().isEmpty == true ? '' : _redactedValue,
+      ),
+    );
+  }
+
+  static const _redactedValue = '********';
 
   static String _decryptSecrets(
     Map<String, dynamic> envelope,
