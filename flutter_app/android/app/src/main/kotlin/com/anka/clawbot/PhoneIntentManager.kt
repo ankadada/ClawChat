@@ -16,9 +16,13 @@ import android.telephony.SmsManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.TimeZone
 
-class PhoneIntentManager(private val activity: Activity) {
+class PhoneIntentManager(
+    private val activity: Activity,
+    private val isActivityResumed: () -> Boolean = { true },
+) {
 
     fun dispatch(action: String, params: Map<String, Any?>): Map<String, Any?> {
         return try {
@@ -324,10 +328,13 @@ class PhoneIntentManager(private val activity: Activity) {
     }
 
     private fun confirmSmsSend(number: String, body: String): Boolean {
+        if (!canShowConfirmationDialog()) {
+            return false
+        }
         val latch = CountDownLatch(1)
         var approved = false
         activity.runOnUiThread {
-            if (activity.isFinishing || activity.isDestroyed) {
+            if (!canShowConfirmationDialog()) {
                 latch.countDown()
                 return@runOnUiThread
             }
@@ -350,8 +357,15 @@ class PhoneIntentManager(private val activity: Activity) {
                 }
                 .show()
         }
-        latch.await()
+        if (!latch.await(60, TimeUnit.SECONDS)) {
+            return false
+        }
         return approved
+    }
+
+    private fun canShowConfirmationDialog(): Boolean {
+        if (activity.isFinishing || activity.isDestroyed) return false
+        return isActivityResumed()
     }
 
     companion object {

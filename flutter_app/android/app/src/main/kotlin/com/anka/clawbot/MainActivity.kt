@@ -43,6 +43,7 @@ class MainActivity : FlutterActivity() {
     private var pendingShareIntent: Map<String, Any?>? = null
     private var shareCallbackChannel: MethodChannel? = null
     private var mediaPlayer: MediaPlayer? = null
+    private var activityResumed = false
 
     private fun safeRunOnUiThread(action: () -> Unit) {
         if (isDestroyed || isFinishing) return
@@ -59,7 +60,7 @@ class MainActivity : FlutterActivity() {
 
         bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
         processManager = ProcessManager(filesDir, nativeLibDir)
-        phoneIntentManager = PhoneIntentManager(this)
+        phoneIntentManager = PhoneIntentManager(this) { activityResumed }
 
         if (setupDone.compareAndSet(false, true)) {
             // Keep bootstrap preflight on a plain background thread to avoid
@@ -664,6 +665,16 @@ class MainActivity : FlutterActivity() {
         setIntent(intent)
         handleNavigateToSession(intent)
         handleShareIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activityResumed = true
+    }
+
+    override fun onPause() {
+        activityResumed = false
+        super.onPause()
     }
 
     private fun handleShareIntent(intent: Intent?) {
