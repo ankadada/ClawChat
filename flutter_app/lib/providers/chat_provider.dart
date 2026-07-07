@@ -148,6 +148,8 @@ class ChatProvider extends ChangeNotifier {
   static const _agentServiceStreamingText = 'AI 正在回复...';
   static const _liveReasoningPreviewMaxChars = 12000;
   static const _liveReasoningPreviewTrimAt = 14000;
+  static const _agentRunRecoveryPrompt =
+      '上次任务被中断。请基于当前会话继续完成被中断的任务；如果已有部分内容，请不要重复已经完成的部分。';
 
   AgentState _getOrCreateState(String sessionId) {
     return _agentStates.putIfAbsent(sessionId, () => AgentState(sessionId));
@@ -173,6 +175,9 @@ class ChatProvider extends ChangeNotifier {
       _getState(currentSession?.id)?.streamingReasoningTotalLength ?? 0;
 
   ContextSummary? get currentContextSummary => currentSession?.contextSummary;
+
+  AgentRunRecoveryMarker? get currentInterruptedAgentRun =>
+      currentSession?.inFlightAgentRun;
 
   List<ModelGroup> get modelGroups =>
       _prefsInitialized ? _prefs.modelGroups : const [];
@@ -425,6 +430,7 @@ class ChatProvider extends ChangeNotifier {
     AgentState state,
     String finalText,
     Completer<void>? completer,
+    Future<void>? persistCompletion,
   ) async {
     try {
       await _updateAgentNativeStatusForState(
@@ -437,6 +443,7 @@ class ChatProvider extends ChangeNotifier {
         await Future.delayed(const Duration(seconds: 2));
       }
     } finally {
+      await persistCompletion;
       await _stopAgentServiceForState(state);
       if (completer != null && !completer.isCompleted) {
         completer.complete();
@@ -692,6 +699,26 @@ class ChatProvider extends ChangeNotifier {
       _fallbackErrorMessage = '会话恢复失败，已进入安全打开状态: $e';
       notifyListeners();
     }
+  }
+
+  Future<void> dismissInterruptedAgentRun() async {
+    final session = currentSession;
+    if (session?.inFlightAgentRun == null) return;
+    session!.inFlightAgentRun = null;
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+    notifyListeners();
+  }
+
+  Future<void> continueInterruptedAgentRun() async {
+    final session = currentSession;
+    if (session?.inFlightAgentRun == null) return;
+    final sessionId = session!.id;
+    session.inFlightAgentRun = null;
+    await _storage.saveSession(session);
+    _syncCurrentSessionReference(session);
+    notifyListeners();
+    await sendMessage(_agentRunRecoveryPrompt, targetSessionId: sessionId);
   }
 
   Future<StartupRestoreGuardState> _recordStartupFailureBestEffort() async {
@@ -1155,6 +1182,9 @@ class ChatProvider extends ChangeNotifier {
         if (trimmedText.isNotEmpty) TextContent(trimmedText),
         ...attachments,
       ]));
+      activeSession.inFlightAgentRun = AgentRunRecoveryMarker(
+        startedAt: DateTime.now(),
+      );
       activeSession.autoTitle();
       state.sessionTitle = activeSession.title;
       await _storage.saveSession(activeSession);
@@ -1365,6 +1395,7 @@ class ChatProvider extends ChangeNotifier {
               );
               _persistSanitizedMessages(activeSession);
               _appendEncryptedContentRecoveryNotice(activeSession);
+              activeSession.inFlightAgentRun = null;
               await _storage.saveSession(activeSession);
               _syncCurrentSessionReference(activeSession);
               notifyListeners();
@@ -1374,6 +1405,8 @@ class ChatProvider extends ChangeNotifier {
           if (!preservingPrimaryPatchForRecovery) {
             await rollbackPrimaryPatchIfSafe();
           }
+          activeSession.inFlightAgentRun = null;
+          await _storage.saveSession(activeSession);
         } else if (runResult != null || state.status == AgentStatus.error) {
           if (!preservingPrimaryPatchForRecovery) {
             await rollbackPrimaryPatchIfSafe();
@@ -1404,6 +1437,7 @@ class ChatProvider extends ChangeNotifier {
         await rollbackPrimaryPatchIfSafe();
         state.status = AgentStatus.error;
         state.errorMessage = _sanitizeProviderErrorMessage(e);
+        activeSession.inFlightAgentRun = null;
         await _persistAssistantFailureMarker(
           state: state,
           session: activeSession,
@@ -1453,6 +1487,7 @@ class ChatProvider extends ChangeNotifier {
       _flushStreamingNow(state, notify: false);
       _savePartialAgentResponse(state, interruptionNote: '回复已取消，内容可能不完整。');
     }
+    _clearInFlightAgentRun(state);
     _clearStreamingState(state);
     if (state.agentCompleter != null && !state.agentCompleter!.isCompleted) {
       state.agentCompleter!.complete();
@@ -1629,6 +1664,27 @@ class ChatProvider extends ChangeNotifier {
     final trimmedNote = note?.trim();
     if (trimmedNote == null || trimmedNote.isEmpty) return text;
     return '$text\n\n[$trimmedNote]';
+  }
+
+  void _clearInFlightAgentRun(AgentState state) {
+    final session =
+        currentSession?.id == state.sessionId ? currentSession : null;
+    if (session != null) {
+      session.inFlightAgentRun = null;
+      _syncCurrentSessionReference(session);
+      unawaited(_storage.saveSession(session).catchError((Object e) {
+        debugPrint('Failed to clear in-flight agent run: $e');
+      }));
+      return;
+    }
+
+    unawaited(_storage.getSession(state.sessionId).then((session) async {
+      if (session == null) return;
+      session.inFlightAgentRun = null;
+      await _storage.saveSession(session);
+    }).catchError((Object e) {
+      debugPrint('Failed to clear in-flight agent run: $e');
+    }));
   }
 
   Future<void> regenerateLastResponse() async {
@@ -2211,6 +2267,7 @@ class ChatProvider extends ChangeNotifier {
 
     _removeTrailingAssistantErrorMarkers(session);
     session.messages.add(ChatMessage.assistantError(error: metadata));
+    session.inFlightAgentRun = null;
     session.updatedAt = DateTime.now();
     await _storage.saveSession(session);
     _syncCurrentSessionReference(session);
@@ -2424,6 +2481,7 @@ class ChatProvider extends ChangeNotifier {
           fallback: candidate.safeLabel,
           reason: reason.label,
         );
+        activeSession.inFlightAgentRun = null;
         await _storage.saveSession(activeSession);
         _syncCurrentSessionReference(activeSession);
         _recordModelFallbackEvent(activeSession.id, 'model.fallback.success', {
@@ -2949,6 +3007,7 @@ class ChatProvider extends ChangeNotifier {
             ):
             _flushStreamingNow(state, notify: false);
             state.status = AgentStatus.idle;
+            activeSession.inFlightAgentRun = null;
             if (state.agent!.messages.length > state.initialApiMsgCount) {
               state.fallbackMessagesPersisted = true;
             }
@@ -2979,12 +3038,20 @@ class ChatProvider extends ChangeNotifier {
               hadToolCalls: hadToolCalls,
             );
             _syncCurrentSessionReference(activeSession);
-            _storage.saveSession(activeSession).then((_) {
+            final persistCompletion =
+                _storage.saveSession(activeSession).then((_) {
               if (!_disposed) notifyListeners();
+            }).catchError((Object e) {
+              debugPrint('Failed to persist completed agent response: $e');
             });
             state.agentCompletionFinalizing = true;
             _clearStreamingState(state);
-            unawaited(_finishAgentComplete(state, finalText, completer));
+            unawaited(_finishAgentComplete(
+              state,
+              finalText,
+              completer,
+              persistCompletion,
+            ));
 
           case AgentError(:final message, :final cause):
             if (cause is EncryptedContentError) {
@@ -2995,6 +3062,7 @@ class ChatProvider extends ChangeNotifier {
                 state,
                 interruptionNote: '回复中断，内容可能不完整。',
               );
+              activeSession.inFlightAgentRun = null;
               _clearStreamingState(state);
             }
             errorCause = cause ?? _AgentRuntimeError(message);
@@ -3023,6 +3091,7 @@ class ChatProvider extends ChangeNotifier {
             state,
             interruptionNote: '回复中断，内容可能不完整。',
           );
+          activeSession.inFlightAgentRun = null;
           _clearStreamingState(state);
         }
         if (e is EncryptedContentError) {

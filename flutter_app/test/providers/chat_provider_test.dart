@@ -484,6 +484,47 @@ void main() {
       expect(provider.isSessionSending(session.id), isFalse);
       await sendFuture;
     });
+
+    test('agent run marker persists while active and clears on cancel',
+        () async {
+      final streamStarted = Completer<void>();
+      final releaseStream = Completer<void>();
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: streamStarted,
+          release: releaseStream,
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseStream.isCompleted) releaseStream.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final sendFuture = provider.sendMessage('slow prompt');
+      await streamStarted.future.timeout(const Duration(seconds: 2));
+
+      expect(
+        (await storage.getSession(session.id))!.inFlightAgentRun,
+        isNotNull,
+      );
+
+      provider.cancelAgent(sessionId: session.id, savePartial: false);
+      await sendFuture.timeout(const Duration(seconds: 2));
+      await _waitUntil(() => !provider.isSessionSending(session.id));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(
+        (await storage.getSession(session.id))!.inFlightAgentRun,
+        isNull,
+      );
+    });
   });
 
   group('persistent assistant error retry state', () {
@@ -559,6 +600,79 @@ void main() {
       );
       expect(secondProvider.currentSession!.messages.last.hasAssistantError,
           isTrue);
+    });
+
+    test('dismiss interrupted run marker clears persisted state', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'interrupted-dismiss',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          startedAt: DateTime.utc(2026, 7, 7),
+        ),
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(storage: storage);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+      expect(provider.currentInterruptedAgentRun, isNotNull);
+
+      await provider.dismissInterruptedAgentRun();
+
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+    });
+
+    test('continue interrupted run injects recovery prompt and clears marker',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'interrupted-continue',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          startedAt: DateTime.utc(2026, 7, 7),
+        ),
+      );
+      await storage.saveSession(session);
+      List<Map<String, dynamic>>? capturedMessages;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            capturedMessages = messages;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'continued')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+      expect(provider.currentInterruptedAgentRun, isNotNull);
+
+      await provider.continueInterruptedAgentRun();
+
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+      expect(
+        capturedMessages!.last['content'],
+        contains('上次任务被中断'),
+      );
+      expect(provider.currentSession!.messages.last.textContent, 'continued');
     });
 
     test('retry removes stale failure marker and does not duplicate history',

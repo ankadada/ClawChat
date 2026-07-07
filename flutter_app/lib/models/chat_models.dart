@@ -56,6 +56,25 @@ class ContextSummary {
   }
 }
 
+class AgentRunRecoveryMarker {
+  final DateTime startedAt;
+
+  const AgentRunRecoveryMarker({
+    required this.startedAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'startedAt': startedAt.toIso8601String(),
+      };
+
+  factory AgentRunRecoveryMarker.fromJson(Map<String, dynamic> json) {
+    return AgentRunRecoveryMarker(
+      startedAt: DateTime.tryParse(json['startedAt'] as String? ?? '') ??
+          DateTime.now(),
+    );
+  }
+}
+
 class ChatSession {
   static final _validIdPattern = RegExp(r'^[a-zA-Z0-9_-]+$');
 
@@ -71,6 +90,7 @@ class ChatSession {
   String? folder; // null = ungrouped
   String? modelGroupId; // null = use active provider profile
   ContextSummary? contextSummary;
+  AgentRunRecoveryMarker? inFlightAgentRun;
 
   ChatSession({
     required this.id,
@@ -85,6 +105,7 @@ class ChatSession {
     this.folder,
     this.modelGroupId,
     this.contextSummary,
+    this.inFlightAgentRun,
   })  : createdAt = createdAt ?? DateTime.now(),
         updatedAt = updatedAt ?? DateTime.now(),
         messages = messages ?? [];
@@ -119,10 +140,13 @@ class ChatSession {
         if (folder != null) 'folder': folder,
         if (modelGroupId != null) 'modelGroupId': modelGroupId,
         if (contextSummary != null) 'contextSummary': contextSummary!.toJson(),
+        if (inFlightAgentRun != null)
+          'inFlightAgentRun': inFlightAgentRun!.toJson(),
       };
 
   factory ChatSession.fromJson(Map<String, dynamic> json) {
     final rawSummary = json['contextSummary'];
+    final rawInFlightAgentRun = json['inFlightAgentRun'];
     return ChatSession(
       id: _sanitizeId(json['id']?.toString()),
       title: json['title'] as String? ?? '新对话',
@@ -141,6 +165,11 @@ class ChatSession {
       modelGroupId: json['modelGroupId'] as String?,
       contextSummary: rawSummary is Map
           ? ContextSummary.fromJson(Map<String, dynamic>.from(rawSummary))
+          : null,
+      inFlightAgentRun: rawInFlightAgentRun is Map
+          ? AgentRunRecoveryMarker.fromJson(
+              Map<String, dynamic>.from(rawInFlightAgentRun),
+            )
           : null,
     );
   }
@@ -163,9 +192,11 @@ class ChatSession {
     String? folder,
     String? modelGroupId,
     ContextSummary? contextSummary,
+    AgentRunRecoveryMarker? inFlightAgentRun,
     bool clearFolder = false,
     bool clearModelGroup = false,
     bool clearContextSummary = false,
+    bool clearInFlightAgentRun = false,
   }) {
     return ChatSession(
       id: id ?? this.id,
@@ -182,6 +213,9 @@ class ChatSession {
           clearModelGroup ? null : (modelGroupId ?? this.modelGroupId),
       contextSummary:
           clearContextSummary ? null : (contextSummary ?? this.contextSummary),
+      inFlightAgentRun: clearInFlightAgentRun
+          ? null
+          : (inFlightAgentRun ?? this.inFlightAgentRun),
     );
   }
 }
