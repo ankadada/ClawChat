@@ -327,6 +327,7 @@ class LlmService {
   final LlmConfig config;
   final http.Client _client;
   final bool Function()? _isInBackground;
+  final Duration _requestTimeoutDuration;
   final CapabilityRegistry _capabilityRegistry;
   bool _disposed = false;
 
@@ -353,8 +354,10 @@ class LlmService {
     this.config, {
     bool Function()? isInBackground,
     CapabilityRegistry capabilityRegistry = CapabilityRegistry.instance,
+    Duration? requestTimeout,
   })  : _capabilityRegistry = capabilityRegistry,
         _isInBackground = isInBackground,
+        _requestTimeoutDuration = requestTimeout ?? _requestTimeout,
         _client = _createPinnedClient();
 
   /// Creates an HTTP client that rejects bad TLS certificates (self-signed,
@@ -587,6 +590,7 @@ class LlmService {
   static const Duration _requestTimeout = Duration(seconds: 120);
   static const Duration _streamChunkTimeout = Duration(seconds: 60);
   static const Duration _streamReconnectBaseDelay = Duration(seconds: 2);
+  static const Duration _foregroundTimeoutPollInterval = Duration(seconds: 1);
   static const int _maxRetries = 3;
   static const int _maxStreamReconnects = 2;
   static const Map<String, String> _keepAliveHeaders = {
@@ -598,7 +602,7 @@ class LlmService {
   Future<T> _retryWithBackoff<T>(Future<T> Function() fn) async {
     for (int attempt = 0; attempt <= _maxRetries; attempt++) {
       try {
-        return await fn().timeout(_requestTimeout);
+        return await _withForegroundTimeout(fn());
       } on TimeoutException {
         if (attempt == _maxRetries) rethrow;
       } catch (e) {
@@ -609,6 +613,99 @@ class LlmService {
       await Future.delayed(Duration(seconds: (1 << attempt) * 2));
     }
     throw StateError('unreachable');
+  }
+
+  Future<T> _withForegroundTimeout<T>(Future<T> future) {
+    final isInBackground = _isInBackground;
+    if (isInBackground == null) {
+      return future.timeout(_requestTimeoutDuration);
+    }
+
+    final completer = Completer<T>();
+    Timer? timer;
+    var settled = false;
+    var lastCheck = DateTime.now();
+    var foregroundElapsed = Duration.zero;
+    var wasInBackground = isInBackground();
+
+    void cancelTimer() {
+      timer?.cancel();
+      timer = null;
+    }
+
+    void completeValue(T value) {
+      if (settled) return;
+      settled = true;
+      cancelTimer();
+      completer.complete(value);
+    }
+
+    void completeError(Object error, StackTrace stackTrace) {
+      if (settled) return;
+      settled = true;
+      cancelTimer();
+      completer.completeError(error, stackTrace);
+    }
+
+    Duration minDuration(Duration a, Duration b) => a <= b ? a : b;
+    final timeoutMicros = _requestTimeoutDuration.inMicroseconds;
+    final pollInterval = minDuration(
+      _foregroundTimeoutPollInterval,
+      Duration(
+        microseconds: timeoutMicros <= 4 ? 1 : (timeoutMicros + 3) ~/ 4,
+      ),
+    );
+
+    void failWithTimeout() {
+      completeError(
+        TimeoutException(
+          'No response received within $_requestTimeoutDuration',
+          _requestTimeoutDuration,
+        ),
+        StackTrace.current,
+      );
+    }
+
+    void scheduleTimeout([Duration? delay]) {
+      cancelTimer();
+      if (settled) return;
+      timer = Timer(delay ?? _requestTimeoutDuration, () {
+        if (settled) return;
+        final now = DateTime.now();
+        if (isInBackground()) {
+          wasInBackground = true;
+          foregroundElapsed = Duration.zero;
+          lastCheck = now;
+          scheduleTimeout(pollInterval);
+          return;
+        }
+        if (wasInBackground) {
+          wasInBackground = false;
+          foregroundElapsed = Duration.zero;
+          lastCheck = now;
+          scheduleTimeout(
+            minDuration(_requestTimeoutDuration, pollInterval),
+          );
+          return;
+        }
+        foregroundElapsed += now.difference(lastCheck);
+        lastCheck = now;
+        final remaining = _requestTimeoutDuration - foregroundElapsed;
+        if (remaining <= Duration.zero) {
+          failWithTimeout();
+          return;
+        }
+        scheduleTimeout(
+          minDuration(remaining, pollInterval),
+        );
+      });
+    }
+
+    scheduleTimeout(
+      minDuration(_requestTimeoutDuration, pollInterval),
+    );
+    future.then(completeValue, onError: completeError);
+    return completer.future;
   }
 
   static bool _isRetryableHttpError(String msg) {

@@ -543,8 +543,13 @@ class ChatProvider extends ChangeNotifier {
             diagnosticsExportService ?? const DiagnosticsExportService(),
         _attachmentBudget = attachmentBudget ?? const AttachmentBudget() {
     _contextManager = ContextManager(
-      contextSummaryServiceFactory:
-          contextSummaryServiceFactory ?? ContextSummaryService.new,
+      contextSummaryServiceFactory: contextSummaryServiceFactory ??
+          () => ContextSummaryService(
+                llmFactory: (config) => _llmServiceFactory(
+                  config,
+                  isInBackground: () => _appInBackground,
+                ),
+              ),
       providerTransformPreflight: providerTransformPreflight ??
           const ProviderMessageTransform().transformCanonical,
       runtimeDebugEvents: this.runtimeDebugEvents,

@@ -164,6 +164,42 @@ void main() {
     });
   });
 
+  group('LlmService non-stream foreground timeout', () {
+    test('does not time out while app is backgrounded', () async {
+      var isInBackground = true;
+      final responseFuture = delayedOpenAiChat(
+        isInBackground: () => isInBackground,
+        responseDelay: const Duration(milliseconds: 80),
+        requestTimeout: const Duration(milliseconds: 40),
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 55));
+      isInBackground = false;
+
+      final response = await responseFuture.timeout(const Duration(seconds: 2));
+
+      expect(response.content.single.text, 'ok after background');
+    });
+
+    test('pauses elapsed timeout during temporary backgrounding', () async {
+      var isInBackground = false;
+      final responseFuture = delayedOpenAiChat(
+        isInBackground: () => isInBackground,
+        responseDelay: const Duration(milliseconds: 110),
+        requestTimeout: const Duration(milliseconds: 80),
+      );
+
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      isInBackground = true;
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      isInBackground = false;
+
+      final response = await responseFuture.timeout(const Duration(seconds: 2));
+
+      expect(response.content.single.text, 'ok after background');
+    });
+  });
+
   group('LlmService OpenAI reasoning_content 400 fallback', () {
     const reasoningMessages = [
       {
@@ -1906,6 +1942,45 @@ Future<String> openAiChatError(int statusCode, String responseBody) async {
     await server.close(force: true);
   }
   fail('Expected chat request to fail');
+}
+
+Future<LlmResponse> delayedOpenAiChat({
+  required bool Function() isInBackground,
+  required Duration responseDelay,
+  required Duration requestTimeout,
+}) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((request) async {
+    await utf8.decoder.bind(request).join();
+    await Future<void>.delayed(responseDelay);
+    request.response.statusCode = 200;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode({
+      'choices': [
+        {
+          'message': {'content': 'ok after background'},
+          'finish_reason': 'stop',
+        }
+      ],
+    }));
+    await request.response.close();
+  });
+
+  final service = LlmService(
+    LlmConfig.openai(
+      apiKey: 'sk-test',
+      model: 'gpt-test',
+      baseUrl: 'http://127.0.0.1:${server.port}',
+    ),
+    isInBackground: isInBackground,
+    requestTimeout: requestTimeout,
+  );
+  try {
+    return await service.chat(system: '', messages: const [], tools: const []);
+  } finally {
+    service.dispose();
+    await server.close(force: true);
+  }
 }
 
 bool bodyContainsReasoningContent(Map<String, dynamic> body) {
