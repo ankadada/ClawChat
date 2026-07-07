@@ -366,6 +366,13 @@ void main() {
       expect(await isBlocked('dd if=.env of=/tmp/safe-name'), isTrue);
     });
 
+    test('allows normal secret words that are not sensitive file paths',
+        () async {
+      expect(await isBlocked('grep secret app.log'), isFalse);
+      expect(await isBlocked('cat secrets.md'), isFalse);
+      expect(await isBlocked('pip install foo-secret'), isFalse);
+    });
+
     test('blocks reading ssh keys', () async {
       expect(await isBlocked('cat ~/.ssh/id_rsa'), isTrue);
     });

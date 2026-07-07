@@ -2,6 +2,10 @@ import 'dart:convert';
 
 class PrivacyFilter {
   /// Masks any configured environment variable values found in [text].
+  ///
+  /// This is best-effort defense-in-depth for logs/tool output, not a security
+  /// boundary. Encoded, wrapped, or transformed values may still need upstream
+  /// controls such as command policy, confirmation gates, and sandboxing.
   static String maskEnvVarValues(String text, Map<String, String> envVars) {
     if (envVars.isEmpty) return text;
     var result = text;
@@ -27,7 +31,9 @@ class PrivacyFilter {
       for (final source in [value, '$value\n']) {
         final bytes = utf8.encode(source);
         final base64Value = base64Encode(bytes);
-        variants.add(base64Value);
+        variants
+          ..add(base64Value)
+          ..add(base64Url.encode(bytes));
         final hexValue =
             bytes.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
         variants

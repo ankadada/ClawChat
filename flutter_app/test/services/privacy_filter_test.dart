@@ -35,6 +35,19 @@ void main() {
       expect(output, isNot(contains(secret)));
     });
 
+    test('masks URL-safe base64 variants', () {
+      const secret = '?????abc';
+      final encoded = base64Url.encode(utf8.encode(secret));
+      expect(encoded, contains('_'));
+      final output = PrivacyFilter.maskEnvVarValues(
+        'token=$encoded',
+        const {'SECRET': secret},
+      );
+
+      expect(output, isNot(contains(encoded)));
+      expect(output, isNot(contains(secret)));
+    });
+
     test('masks xxd hex and ascii output from printf secret pipe', () {
       const secret = 'supersecret12345';
       const xxdLine =

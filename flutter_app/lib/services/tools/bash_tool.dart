@@ -79,13 +79,17 @@ class BashTool extends Tool {
     r'[^\n;&|]*'
     r'((^|[\s/=])\.env(\b|[.*?[\]{}-])|/etc/shadow|/etc/passwd|'
     r'\.ssh/|id_rsa\b|id_ed25519\b|\.gnupg/|\.aws/credentials|'
-    r'\.netrc\b|\.pem\b|credential(s)?\b|secret(s)?\b)'
+    r'\.netrc\b|\.(pem|key)\b|'
+    r'(^|[\s/=])\.(secret|secrets|credential|credentials)(\b|[./])|'
+    r'(^|[\s/=])(secret|secrets|credential|credentials)\.(json|env|pem|key)\b)'
     r'|'
     r'\b(cp|mv|install|dd|tar|zip|unzip|base64)\b'
     r'[^\n;&|]*'
     r'((^|[\s/=])\.env(\b|[.*?[\]{}-])|/etc/shadow|/etc/passwd|'
     r'\.ssh/|id_rsa\b|id_ed25519\b|\.gnupg/|\.aws/credentials|'
-    r'\.netrc\b|\.pem\b|credential(s)?\b|secret(s)?\b)',
+    r'\.netrc\b|\.(pem|key)\b|'
+    r'(^|[\s/=])\.(secret|secrets|credential|credentials)(\b|[./])|'
+    r'(^|[\s/=])(secret|secrets|credential|credentials)\.(json|env|pem|key)\b)',
     caseSensitive: false,
   );
 
