@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
@@ -23,11 +25,12 @@ void main() {
     ContextSummary? existingSummary,
     int summaryBudget = 400,
     int? maxInputTokens,
+    LlmConfig config = llmConfig,
   }) {
     return ContextSummaryRequest(
       messages: messages,
       existingSummary: existingSummary,
-      llmConfig: llmConfig,
+      llmConfig: config,
       summaryBudget: summaryBudget,
       coveredDigest: ChatContextUtils.digestMessages(messages),
       coveredMessageCount: messages.length,
@@ -313,6 +316,52 @@ void main() {
     expect(observedConfig!.maxTokens, 400);
     expect(observedConfig!.temperature, 0.2);
     expect(observedConfig!.thinkingBudget, 0);
+  });
+
+  test('generateSummary keeps slow LLM request alive while backgrounded',
+      () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((request) async {
+      await utf8.decoder.bind(request).join();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      request.response.statusCode = 200;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(jsonEncode({
+        'choices': [
+          {
+            'message': {
+              'content': '## Goal\nSummary after background wait',
+            },
+            'finish_reason': 'stop',
+          }
+        ],
+      }));
+      await request.response.close();
+    });
+
+    var isInBackground = true;
+    final service = ContextSummaryService(
+      llmFactory: (config) => LlmService(
+        config,
+        isInBackground: () => isInBackground,
+        requestTimeout: const Duration(milliseconds: 10),
+        requestMaxWallClock: const Duration(seconds: 10),
+      ),
+    );
+
+    final summaryFuture = service.generateSummary(request(
+      config: LlmConfig.openai(
+        apiKey: 'sk-test',
+        model: 'gpt-test',
+        baseUrl: 'http://127.0.0.1:${server.port}',
+      ),
+    ));
+
+    final summary = await summaryFuture.timeout(const Duration(seconds: 10));
+    isInBackground = false;
+
+    expect(summary.text, contains('Summary after background wait'));
   });
 
   test('truncates huge summary input before LLM call', () async {

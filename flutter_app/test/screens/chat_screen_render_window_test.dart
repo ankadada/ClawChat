@@ -112,6 +112,42 @@ void main() {
     expect(find.text(_messageText(259)), findsOneWidget);
     expect(find.text(AppStrings.loadOlderMessages(80)), findsNothing);
   });
+
+  testWidgets('shows interrupted run banner and dismisses it', (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1200, 900);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final session = ChatSession(
+      id: 'interrupted_banner_session',
+      title: 'Interrupted Banner Session',
+      messages: [ChatMessage.user('hello')],
+      inFlightAgentRun: AgentRunRecoveryMarker(
+        startedAt: DateTime.utc(2026, 1, 1),
+      ),
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreen(tester, provider);
+
+    expect(find.text('上次任务被中断'), findsOneWidget);
+    expect(find.widgetWithText(TextButton, '忽略'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '继续'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(TextButton, '忽略'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+
+    expect(find.text('上次任务被中断'), findsNothing);
+    expect(
+      (await storage.getSession(session.id))!.inFlightAgentRun,
+      isNull,
+    );
+  });
 }
 
 Future<void> testerPumpInitGap() {
