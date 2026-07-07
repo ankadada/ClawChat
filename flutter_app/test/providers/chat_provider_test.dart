@@ -1461,7 +1461,7 @@ void main() {
       expect(
         provider.currentSession!.messages
             .where((message) => message.role == 'assistant'),
-        hasLength(assistantCountBefore + 1),
+        hasLength(assistantCountBefore + 2),
       );
       final errorMarker = provider.currentSession!.messages.last;
       expect(errorMarker.hasAssistantError, isTrue);
@@ -1472,7 +1472,7 @@ void main() {
         provider.currentSession!.messages
             .map((message) => message.textContent)
             .join('\n'),
-        isNot(contains('partial streamed text')),
+        contains('partial streamed text\n\n[回复中断，内容可能不完整。]'),
       );
       expect(
         provider.runtimeDebugEvents.recent().any((event) =>
@@ -1480,6 +1480,46 @@ void main() {
             event.data['reason'] == 'unsafe_after_partial_run'),
         isTrue,
       );
+    });
+
+    test('stream reset discards dirty partial before error persistence',
+        () async {
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'unused')],
+          )),
+          onMessageEvents: (_) => [
+            TextDelta('dirty first attempt'),
+            const StreamReset(),
+            TextDelta('clean retry partial'),
+            StreamError(
+              'OpenAI API error (503): temporarily unavailable',
+              cause: Exception('OpenAI API error (503)'),
+            ),
+          ],
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      await provider.sendMessage('hello');
+
+      final transcript = provider.currentSession!.messages
+          .map((message) => message.textContent)
+          .join('\n');
+      expect(transcript, isNot(contains('dirty first attempt')));
+      expect(
+        transcript,
+        contains('clean retry partial\n\n[回复中断，内容可能不完整。]'),
+      );
+      expect(provider.currentSession!.messages.last.hasAssistantError, isTrue);
     });
 
     test('cancel before persisted messages rolls back primary patch', () async {
