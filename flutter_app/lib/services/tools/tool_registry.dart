@@ -3,8 +3,10 @@ import '../../models/chat_models.dart';
 import '../llm_content_sanitizer.dart';
 import '../mcp_service.dart';
 import '../preferences_service.dart';
+import '../memory_service.dart';
 import 'bash_tool.dart';
 import 'env_var_tool.dart';
+import 'memory_tools.dart';
 import 'phone_intent_tool.dart';
 import 'read_file_tool.dart';
 import 'tool_result_formatter.dart';
@@ -57,6 +59,9 @@ class ToolRegistry {
       EnvVarTool(prefs ?? PreferencesService()),
       risk: ToolRisk.moderate,
     );
+    registry.register(MemoryGetTool(), risk: ToolRisk.safe);
+    registry.register(MemoryWriteTool(), risk: ToolRisk.moderate);
+    registry.register(MemoryDeleteTool(), risk: ToolRisk.moderate);
     if (prefs != null) {
       registry.register(PhoneIntentTool(prefs), risk: ToolRisk.dangerous);
     }
@@ -78,7 +83,10 @@ class ToolRegistry {
   }
 
   List<ToolDefinition> getToolDefinitions() {
-    return _tools.values.map((t) => t.toDefinition()).toList();
+    return _tools.values
+        .where(_isToolAvailableForSession)
+        .map((t) => t.toDefinition())
+        .toList();
   }
 
   Future<void> refreshMcpTools() async {
@@ -125,5 +133,15 @@ class ToolRegistry {
 
   ToolRisk riskFor(String name) => _risks[name] ?? ToolRisk.dangerous;
 
-  List<String> get availableTools => _tools.keys.toList();
+  List<String> get availableTools => _tools.values
+      .where(_isToolAvailableForSession)
+      .map((tool) => tool.name)
+      .toList();
+
+  bool _isToolAvailableForSession(Tool tool) {
+    if (tool.name.startsWith('memory_')) {
+      return MemoryService.isEnabledForCurrentSessionSync();
+    }
+    return true;
+  }
 }
