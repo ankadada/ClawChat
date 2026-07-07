@@ -17,15 +17,15 @@ class CodeBlock extends StatelessWidget {
   });
 
   static final _highlightPattern = RegExp(
-    r'("(?:[^"\\]|\\.)*"|'       // double-quoted strings
-    r"'(?:[^'\\]|\\.)*'|"        // single-quoted strings
-    r'`(?:[^`\\]|\\.)*`|'        // backtick strings
-    r'//.*$|'                     // line comments
-    r'#.*$|'                      // hash comments
-    r'/\*[\s\S]*?\*/|'            // block comments
-    r'\b\d+\.?\d*\b|'            // numbers
+    r'("(?:[^"\\]|\\.)*"|' // double-quoted strings
+    r"'(?:[^'\\]|\\.)*'|" // single-quoted strings
+    r'`(?:[^`\\]|\\.)*`|' // backtick strings
+    r'//.*$|' // line comments
+    r'#.*$|' // hash comments
+    r'/\*[\s\S]*?\*/|' // block comments
+    r'\b\d+\.?\d*\b|' // numbers
     r'\b(?:if|else|for|while|return|import|from|class|function|def|const|let|var|async|await|try|catch|finally|throw|new|this|super|static|final|void|int|String|bool|double|true|false|null|None|self|print|extends|implements|abstract|enum|switch|case|break|continue|do|in|is|as|export|default|yield|with|required)\b|' // keywords
-    r'\b[a-zA-Z_]\w*(?=\s*\()'   // function calls
+    r'\b[a-zA-Z_]\w*(?=\s*\()' // function calls
     r')',
     multiLine: true,
   );
@@ -90,9 +90,13 @@ class CodeBlock extends StatelessWidget {
       }
       final text = match.group(0)!;
       TextStyle style;
-      if (text.startsWith('"') || text.startsWith("'") || text.startsWith('`')) {
+      if (text.startsWith('"') ||
+          text.startsWith("'") ||
+          text.startsWith('`')) {
         style = TextStyle(color: palette.string);
-      } else if (text.startsWith('//') || text.startsWith('#') || text.startsWith('/*')) {
+      } else if (text.startsWith('//') ||
+          text.startsWith('#') ||
+          text.startsWith('/*')) {
         style = TextStyle(color: palette.comment);
       } else if (RegExp(r'^\d').hasMatch(text)) {
         style = TextStyle(color: palette.number);
@@ -167,24 +171,27 @@ class CodeBlock extends StatelessWidget {
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   if (language.isNotEmpty)
-                    Text(language, style: theme.textTheme.labelSmall?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
-                    )),
+                    Text(language,
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        )),
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       if (showPreview)
                         IconButton(
                           tooltip: AppStrings.preview,
-                          icon: Icon(Icons.visibility, size: 18,
-                              color: theme.colorScheme.primary),
+                          icon: Icon(Icons.visibility,
+                              size: 18, color: theme.colorScheme.primary),
                           onPressed: () => _showPreview(context),
                           padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+                          constraints:
+                              const BoxConstraints(minWidth: 40, minHeight: 40),
                         ),
                       IconButton(
                         tooltip: AppStrings.copy,
-                        icon: Icon(Icons.copy, size: 18,
+                        icon: Icon(Icons.copy,
+                            size: 18,
                             color: theme.colorScheme.onSurfaceVariant),
                         onPressed: () {
                           Clipboard.setData(ClipboardData(text: code));
@@ -196,7 +203,8 @@ class CodeBlock extends StatelessWidget {
                           );
                         },
                         padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+                        constraints:
+                            const BoxConstraints(minWidth: 40, minHeight: 40),
                       ),
                     ],
                   ),
@@ -206,7 +214,7 @@ class CodeBlock extends StatelessWidget {
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.all(12),
-            child: SelectableText.rich(
+            child: Text.rich(
               TextSpan(
                 children: highlightedSpans,
                 style: const TextStyle(

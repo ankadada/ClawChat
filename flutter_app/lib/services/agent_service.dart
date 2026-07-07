@@ -124,8 +124,9 @@ class AgentService {
   }) async* {
     _cancelled = false;
     _lastMessages = messages;
-    final toolDefs =
-        supportsTools ? _tools.getToolDefinitions() : <ToolDefinition>[];
+    final toolDefs = supportsTools
+        ? _tools.getToolDefinitions(sessionId: sessionId)
+        : <ToolDefinition>[];
     final effectiveMaxIterations = maxIterations.clamp(1, 99).toInt();
     int iteration = 0;
     var hadToolCalls = false;
@@ -361,7 +362,11 @@ class AgentService {
     }
 
     try {
-      final payload = await _tools.executeToolResult(toolName, toolInput);
+      final payload = await _tools.executeToolResult(
+        toolName,
+        toolInput,
+        sessionId: sessionId,
+      );
       return _ToolResult(toolUseId, payload, false);
     } catch (e) {
       return _ToolResult(
@@ -381,7 +386,7 @@ class AgentService {
     String toolName,
     Object? rawToolInput,
   ) {
-    final schema = _tools.inputSchemaFor(toolName);
+    final schema = _tools.inputSchemaFor(toolName, sessionId: sessionId);
     if (schema == null) {
       return rawToolInput is Map
           ? Map<String, dynamic>.from(rawToolInput)

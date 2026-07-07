@@ -11,7 +11,8 @@ class BashTool extends Tool {
       'Execute a shell command in the Alpine Linux environment. '
       'Commands run inside a proot container with /root/workspace as the default directory. '
       'Shared Android storage is not mounted for agent commands. '
-      'Use this for file operations, running scripts, installing packages, etc.';
+      'Use this for file operations, running scripts, installing packages, etc. '
+      'Sensitive-file blocking is defense-in-depth only and must not be treated as a complete sandbox.';
 
   @override
   Map<String, dynamic> get inputSchema => {
@@ -74,10 +75,21 @@ class BashTool extends Tool {
   );
 
   static final _sensitiveFiles = RegExp(
-    r'cat\s+.*(\.env\b|/etc/shadow|/etc/passwd|\.ssh/|\.gnupg/|\.aws/credentials|\.netrc)'
-    r'|less\s+.*(\.env\b|/etc/shadow)'
-    r'|head\s+.*(\.env\b|/etc/shadow)'
-    r'|tail\s+.*(\.env\b|/etc/shadow)',
+    r'\b(cat|less|more|head|tail|grep|egrep|fgrep|rg|awk|sed|od|xxd|strings)\b'
+    r'[^\n;&|]*'
+    r'((^|[\s/=])\.env(\b|[.*?[\]{}-])|/etc/shadow|/etc/passwd|'
+    r'\.ssh/|id_rsa\b|id_ed25519\b|\.gnupg/|\.aws/credentials|'
+    r'\.netrc\b|\.(pem|key)\b|'
+    r'(^|[\s/=])\.(secret|secrets|credential|credentials)(\b|[./])|'
+    r'(^|[\s/=])(secret|secrets|credential|credentials)\.(json|env|pem|key)\b)'
+    r'|'
+    r'\b(cp|mv|install|dd|tar|zip|unzip|base64)\b'
+    r'[^\n;&|]*'
+    r'((^|[\s/=])\.env(\b|[.*?[\]{}-])|/etc/shadow|/etc/passwd|'
+    r'\.ssh/|id_rsa\b|id_ed25519\b|\.gnupg/|\.aws/credentials|'
+    r'\.netrc\b|\.(pem|key)\b|'
+    r'(^|[\s/=])\.(secret|secrets|credential|credentials)(\b|[./])|'
+    r'(^|[\s/=])(secret|secrets|credential|credentials)\.(json|env|pem|key)\b)',
     caseSensitive: false,
   );
 

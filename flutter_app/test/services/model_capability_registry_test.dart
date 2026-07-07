@@ -25,6 +25,7 @@ void main() {
     expect(profile.capabilities.supportsTools, isTrue);
     expect(profile.capabilities.supportsSystemPrompt, isTrue);
     expect(profile.capabilities.supportsStreamingUsage, isTrue);
+    expect(profile.capabilities.supportsPromptCache, isTrue);
     expect(profile.capabilities.streamingUsageMode,
         StreamingUsageMode.nativeEvents);
     expect(profile.capabilities.tokenLimitParameter,

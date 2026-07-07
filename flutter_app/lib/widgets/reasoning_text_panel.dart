@@ -121,7 +121,7 @@ class _ReasoningTextPanelState extends State<ReasoningTextPanel> {
                 ),
               )
             else
-              SelectableText(
+              Text(
                 displayText,
                 maxLines: 8,
                 style: theme.textTheme.bodySmall?.copyWith(

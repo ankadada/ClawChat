@@ -57,6 +57,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _privacyMode = true;
   bool _allowPhoneCall = false;
   bool _allowSms = false;
+  bool _anthropicPromptCacheEnabled = true;
+  bool _memoryEnabled = true;
   String _toolApprovalPolicy = PreferencesService.defaultToolApprovalPolicy;
   Set<String> _deniedToolNames = {};
   List<String> _bashCommandDenyPatterns = [];
@@ -77,6 +79,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     'web_fetch',
     'web_search',
     'set_env_var',
+    'memory_get',
+    'memory_write',
+    'memory_delete',
     'generate_image',
     'phone_intent',
   ];
@@ -100,6 +105,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _privacyMode = _prefs.privacyMode;
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
+      _anthropicPromptCacheEnabled = _prefs.anthropicPromptCacheEnabled;
+      _memoryEnabled = _prefs.memoryEnabled;
       _toolApprovalPolicy = _prefs.toolApprovalPolicy;
       _deniedToolNames = _prefs.deniedToolNames;
       _bashCommandDenyPatterns = _prefs.bashCommandDenyPatterns;
@@ -551,6 +558,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   _sectionAgentSkills,
                   AppStrings.settingsAgentSkills,
                   [
+                    SwitchListTile(
+                      title: const Text(AppStrings.anthropicPromptCache),
+                      subtitle:
+                          const Text(AppStrings.anthropicPromptCacheSubtitle),
+                      value: _anthropicPromptCacheEnabled,
+                      onChanged: (v) {
+                        HapticFeedback.lightImpact();
+                        setState(() => _anthropicPromptCacheEnabled = v);
+                        _prefs.anthropicPromptCacheEnabled = v;
+                      },
+                    ),
+                    _settingsDivider(theme),
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
                       child: Column(
@@ -1015,6 +1034,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onTap: _showGlobalUsageSummary,
                     ),
                     _settingsDivider(theme),
+                    SwitchListTile(
+                      title: const Text(AppStrings.memoryEnabled),
+                      subtitle: const Text(AppStrings.memoryEnabledSubtitle),
+                      value: _memoryEnabled,
+                      onChanged: (value) {
+                        HapticFeedback.lightImpact();
+                        setState(() => _memoryEnabled = value);
+                        _prefs.memoryEnabled = value;
+                      },
+                    ),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
@@ -1827,7 +1856,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final options = await _showExportConfigDialog();
       if (options == null) return;
 
-      if (!options.encrypt) {
+      if (!options.encrypt && options.includePlaintextSecrets) {
         if (!mounted) return;
         final confirmed = await showDialog<bool>(
           context: context,
@@ -1855,6 +1884,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
       final jsonStr = await ConfigExportService.exportConfig(
         password: options.encrypt ? options.password : null,
+        includePlaintextSecrets: options.includePlaintextSecrets,
       );
       final date = DateTime.now().toIso8601String().split('T').first;
       final bytes = utf8.encode(jsonStr);
@@ -1882,6 +1912,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<_ConfigExportOptions?> _showExportConfigDialog() {
     var encrypt = true;
+    var includePlaintextSecrets = false;
     final passwordController = TextEditingController();
     final confirmController = TextEditingController();
     return showDialog<_ConfigExportOptions>(
@@ -1898,8 +1929,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   title: const Text(AppStrings.encryptSecrets),
                   subtitle: const Text(AppStrings.encryptSecretsSubtitle),
                   value: encrypt,
-                  onChanged: (value) => setDialogState(() => encrypt = value),
+                  onChanged: (value) => setDialogState(() {
+                    encrypt = value;
+                    if (encrypt) includePlaintextSecrets = false;
+                  }),
                 ),
+                if (!encrypt) ...[
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 8),
+                    child: Text(AppStrings.exportConfigRedactedByDefault),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text(AppStrings.exportConfigPlaintextSecrets),
+                    subtitle: const Text(
+                      AppStrings.exportConfigPlaintextSecretsSubtitle,
+                    ),
+                    value: includePlaintextSecrets,
+                    onChanged: (value) => setDialogState(
+                      () => includePlaintextSecrets = value,
+                    ),
+                  ),
+                ],
                 if (encrypt) ...[
                   TextField(
                     controller: passwordController,
@@ -1949,6 +2000,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   _ConfigExportOptions(
                     encrypt: encrypt,
                     password: password,
+                    includePlaintextSecrets:
+                        !encrypt && includePlaintextSecrets,
                   ),
                 );
               },
@@ -2237,10 +2290,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
 class _ConfigExportOptions {
   final bool encrypt;
   final String password;
+  final bool includePlaintextSecrets;
 
   const _ConfigExportOptions({
     required this.encrypt,
     required this.password,
+    required this.includePlaintextSecrets,
   });
 }
 

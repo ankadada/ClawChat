@@ -558,6 +558,10 @@ class AppStrings {
   static const exportConfigWithoutEncryption = '不加密导出？';
   static const exportConfigPlainWarning =
       '导出文件将包含你的 API 密钥和环境变量明文，请妥善保管。确定不加密？';
+  static const exportConfigRedactedByDefault = '未加密导出默认会脱敏；只有确认后才导出明文密钥。';
+  static const exportConfigPlaintextSecrets = '导出明文密钥';
+  static const exportConfigPlaintextSecretsSubtitle =
+      '关闭时，未加密导出会打码 API 密钥、环境变量和 MCP 凭据';
   static const configExported = '配置已导出';
   static const exportConfigFailed = '导出配置失败';
   static const importConfigPreview = '导入预览';
@@ -591,6 +595,8 @@ class AppStrings {
   static const addBashDenyPattern = '添加 Bash 拒绝规则';
   static const bashDenyPatternHint = '输入正则或文本片段';
   static const noBashDenyPatterns = '暂无 Bash 拒绝规则';
+  static const anthropicPromptCache = 'Anthropic Prompt Cache';
+  static const anthropicPromptCacheSubtitle = '官方 Anthropic API 默认启用，其他提供方不生效';
 
   // ── MCP ──────────────────────────────────────────────────────────
   static const mcpServers = 'MCP 服务器';
@@ -618,6 +624,12 @@ class AppStrings {
 
   // ── Memory ────────────────────────────────────────────────────────
   static const memoryManagement = '记忆管理';
+  static const memoryEnabled = '启用记忆';
+  static const memoryEnabledSubtitle = '关闭后不会注入记忆，也不会暴露记忆工具';
+  static const sessionMemory = '本会话记忆';
+  static const sessionMemoryFollowGlobal = '跟随全局';
+  static const sessionMemoryOn = '开启';
+  static const sessionMemoryOff = '关闭';
   static const addMemory = '添加记忆';
   static const memoryHint = '输入要记住的信息...';
   static const noMemories = '暂无记忆';

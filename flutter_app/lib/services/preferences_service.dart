@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 import '../constants.dart';
 import '../models/mcp_server_config.dart';
 import '../models/provider_profile.dart';
+import 'prompt_cache_settings.dart';
 
 enum ConflictResolution { merge, replace, skip }
 
@@ -93,6 +94,9 @@ class PreferencesService {
   static const _keyMaxConcurrentAgents = 'max_concurrent_agents';
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
+  static const _keyAnthropicPromptCacheEnabled =
+      'anthropic_prompt_cache_enabled';
+  static const _keyMemoryEnabled = 'memory_enabled';
   static const _keyToolApprovalPolicy = 'tool_approval_policy';
   static const _keyDeniedToolNames = 'denied_tool_names';
   static const _keyBashCommandDenyPatterns = 'bash_command_deny_patterns';
@@ -154,6 +158,9 @@ class PreferencesService {
     _cachedEnvVars =
         _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
     await _loadMcpServers();
+    PromptCacheSettings.setAnthropicPromptCacheEnabledForProcess(
+      _prefs.getBool(_keyAnthropicPromptCacheEnabled) ?? true,
+    );
     _initialized = true;
   }
 
@@ -1101,6 +1108,18 @@ class PreferencesService {
       _initialized ? (_prefs.getBool(_keyAllowSms) ?? false) : false;
   set allowSms(bool v) => _prefs.setBool(_keyAllowSms, v);
 
+  bool get anthropicPromptCacheEnabled => _initialized
+      ? (_prefs.getBool(_keyAnthropicPromptCacheEnabled) ?? true)
+      : PromptCacheSettings.anthropicPromptCacheEnabled;
+  set anthropicPromptCacheEnabled(bool v) {
+    PromptCacheSettings.setAnthropicPromptCacheEnabledForProcess(v);
+    _prefs.setBool(_keyAnthropicPromptCacheEnabled, v);
+  }
+
+  bool get memoryEnabled =>
+      _initialized ? (_prefs.getBool(_keyMemoryEnabled) ?? true) : true;
+  set memoryEnabled(bool v) => _prefs.setBool(_keyMemoryEnabled, v);
+
   String get toolApprovalPolicy {
     return normalizeToolApprovalPolicy(
         _prefs.getString(_keyToolApprovalPolicy));
@@ -1224,6 +1243,8 @@ class PreferencesService {
       'privacyMode': privacyMode,
       'allowPhoneCall': allowPhoneCall,
       'allowSms': allowSms,
+      'anthropicPromptCacheEnabled': anthropicPromptCacheEnabled,
+      'memoryEnabled': memoryEnabled,
       'deniedToolNames': deniedToolNames.toList()..sort(),
       'bashCommandDenyPatterns': bashCommandDenyPatterns,
       'whisperModel': _prefs.getString(_keyWhisperModel),
@@ -1286,6 +1307,13 @@ class PreferencesService {
     }
     if (settings['allowSms'] is bool) {
       allowSms = settings['allowSms'] as bool;
+    }
+    if (settings['anthropicPromptCacheEnabled'] is bool) {
+      anthropicPromptCacheEnabled =
+          settings['anthropicPromptCacheEnabled'] as bool;
+    }
+    if (settings['memoryEnabled'] is bool) {
+      memoryEnabled = settings['memoryEnabled'] as bool;
     }
     final importedDeniedToolNames = _stringList(settings['deniedToolNames']);
     if (importedDeniedToolNames != null) {

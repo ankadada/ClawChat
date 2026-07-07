@@ -43,6 +43,7 @@ class MainActivity : FlutterActivity() {
     private var pendingShareIntent: Map<String, Any?>? = null
     private var shareCallbackChannel: MethodChannel? = null
     private var mediaPlayer: MediaPlayer? = null
+    private var activityResumed = false
 
     private fun safeRunOnUiThread(action: () -> Unit) {
         if (isDestroyed || isFinishing) return
@@ -59,7 +60,7 @@ class MainActivity : FlutterActivity() {
 
         bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
         processManager = ProcessManager(filesDir, nativeLibDir)
-        phoneIntentManager = PhoneIntentManager(this)
+        phoneIntentManager = PhoneIntentManager(this) { activityResumed }
 
         if (setupDone.compareAndSet(false, true)) {
             // Keep bootstrap preflight on a plain background thread to avoid
@@ -403,7 +404,7 @@ class MainActivity : FlutterActivity() {
                         result.error("INVALID_ARGS", "action required", null)
                     } else if (action in setOf("callPhone", "sendSms") && !allowed) {
                         result.error("DISABLED", "Action $action is disabled by user setting", null)
-                    } else if (action in setOf("listCalendarEvents", "listContacts", "insertCalendarEvent")) {
+                    } else if (action in setOf("listCalendarEvents", "listContacts", "insertCalendarEvent", "sendSms")) {
                         // Content provider queries run off the main thread
                         Thread {
                             try {
@@ -664,6 +665,16 @@ class MainActivity : FlutterActivity() {
         setIntent(intent)
         handleNavigateToSession(intent)
         handleShareIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activityResumed = true
+    }
+
+    override fun onPause() {
+        activityResumed = false
+        super.onPause()
     }
 
     private fun handleShareIntent(intent: Intent?) {

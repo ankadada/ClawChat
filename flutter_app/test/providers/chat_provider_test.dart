@@ -5426,7 +5426,10 @@ class _DualTrackTool extends Tool {
   }
 
   @override
-  Future<ToolResultPayload> executeResult(Map<String, dynamic> input) async {
+  Future<ToolResultPayload> executeResult(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) async {
     return const ToolResultPayload(
       forUser: 'FULL USER OUTPUT with detailed logs',
       forLlm: 'compact for llm',

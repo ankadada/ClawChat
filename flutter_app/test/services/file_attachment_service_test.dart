@@ -97,6 +97,38 @@ void main() {
       expect(prepared.includeAsContentBlock, isFalse);
     });
 
+    test('sensitive text file requires confirmation before prompt injection',
+        () async {
+      final file = await writeStringFile('.env', 'API_KEY=secret');
+      final platform = platformFile(file, '.env');
+
+      expect(
+        FileAttachmentService.requiresSensitiveTextConfirmation(platform),
+        isTrue,
+      );
+      expect(
+        FileAttachmentService.sensitiveTextWarning(platform),
+        contains('.env'),
+      );
+
+      final prepared = await FileAttachmentService.prepareForMessage(platform);
+      expect(prepared.containsSensitiveText, isTrue);
+      expect(prepared.inputText, contains('API_KEY=secret'));
+    });
+
+    test('pem text file is warned before inlining', () async {
+      final file = await writeStringFile('client.pem', 'PRIVATE KEY');
+      final platform = platformFile(file, 'client.pem');
+
+      expect(
+        FileAttachmentService.requiresSensitiveTextConfirmation(platform),
+        isTrue,
+      );
+      final prepared = await FileAttachmentService.prepareForMessage(platform);
+      expect(prepared.inputText, contains('PRIVATE KEY'));
+      expect(prepared.containsSensitiveText, isTrue);
+    });
+
     test('oversized image throws', () async {
       final file =
           await writeFile('large.png', List<int>.filled(4 * 1024 * 1024, 1));

@@ -1,9 +1,14 @@
 import 'package:clawchat/models/model_capabilities.dart';
+import 'package:clawchat/services/prompt_cache_settings.dart';
 import 'package:clawchat/services/provider_message_transform.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   const transform = ProviderMessageTransform();
+
+  setUp(() {
+    PromptCacheSettings.setAnthropicPromptCacheEnabledForProcess(true);
+  });
 
   group('ProviderMessageTransform canonical cleanup', () {
     test('filters empty content blocks and messages', () {
@@ -433,6 +438,99 @@ void main() {
       );
 
       expect(result.messages.toString(), isNot(contains('cache_control')));
+    });
+
+    test('keeps Anthropic ephemeral cache control only with capability', () {
+      final result = transform.transformCanonical(
+        [
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'text',
+                'text': 'stable prefix',
+                'cache_control': {'type': 'ephemeral'},
+              },
+            ],
+          },
+        ],
+        const ProviderTransformOptions(
+          apiFormat: 'anthropic',
+          modelId: 'claude',
+          capabilities: ModelCapabilities(supportsPromptCache: true),
+        ),
+      );
+
+      expect(result.messages.toString(), contains('cache_control'));
+      expect(result.messages.toString(), contains('ephemeral'));
+    });
+
+    test('adds Anthropic prompt cache breakpoint before latest user turn', () {
+      final payload = transform.toProviderPayload(
+        [
+          {'role': 'user', 'content': 'old question'},
+          {'role': 'assistant', 'content': 'stable answer'},
+          {'role': 'user', 'content': 'latest question'},
+        ],
+        const ProviderTransformOptions(
+          apiFormat: 'anthropic',
+          modelId: 'claude',
+          capabilities: ModelCapabilities(supportsPromptCache: true),
+        ),
+      );
+
+      expect(payload[1]['content'], isA<List>());
+      expect(
+        (payload[1]['content'] as List).single,
+        containsPair('cache_control', {'type': 'ephemeral'}),
+      );
+      expect(payload.last.toString(), isNot(contains('cache_control')));
+    });
+
+    test('does not add cache_control for non-Anthropic providers', () {
+      final payload = transform.toProviderPayload(
+        [
+          {
+            'role': 'user',
+            'content': [
+              {
+                'type': 'text',
+                'text': 'stable prefix',
+                'cache_control': {'type': 'ephemeral'},
+              },
+            ],
+          },
+          {'role': 'assistant', 'content': 'stable answer'},
+          {'role': 'user', 'content': 'latest question'},
+        ],
+        const ProviderTransformOptions(
+          apiFormat: 'openai',
+          modelId: 'gpt-test',
+          capabilities: ModelCapabilities(supportsPromptCache: true),
+        ),
+      );
+
+      expect(payload.toString(), isNot(contains('cache_control')));
+    });
+
+    test('Anthropic prompt cache setting disables cache_control passthrough',
+        () {
+      PromptCacheSettings.setAnthropicPromptCacheEnabledForProcess(false);
+
+      final payload = transform.toProviderPayload(
+        [
+          {'role': 'user', 'content': 'old question'},
+          {'role': 'assistant', 'content': 'stable answer'},
+          {'role': 'user', 'content': 'latest question'},
+        ],
+        const ProviderTransformOptions(
+          apiFormat: 'anthropic',
+          modelId: 'claude',
+          capabilities: ModelCapabilities(supportsPromptCache: true),
+        ),
+      );
+
+      expect(payload.toString(), isNot(contains('cache_control')));
     });
 
     test('keeps empty assistant content when top-level tool calls exist', () {

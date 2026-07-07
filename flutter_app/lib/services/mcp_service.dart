@@ -201,7 +201,10 @@ class McpTool extends Tool {
   }
 
   @override
-  Future<ToolResultPayload> executeResult(Map<String, dynamic> input) {
+  Future<ToolResultPayload> executeResult(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) {
     return service.callTool(
       server: server,
       tool: serverTool,
