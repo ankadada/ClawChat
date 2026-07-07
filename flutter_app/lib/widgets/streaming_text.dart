@@ -108,7 +108,7 @@ class _StreamingTextState extends State<StreamingText>
         final spans =
             _getOrParseSpans(widget.text, context, theme, maxInlineWidth);
 
-        return SelectableText.rich(
+        return Text.rich(
           TextSpan(children: spans),
           style: theme.textTheme.bodyMedium,
         );
@@ -128,7 +128,7 @@ class _StreamingTextState extends State<StreamingText>
           _longTextToggle(theme, expanded: true),
           const SizedBox(height: 8),
           ..._plainTextSegments(widget.text).map(
-            (segment) => SelectableText(
+            (segment) => Text(
               segment,
               style: theme.textTheme.bodyMedium,
             ),
@@ -152,7 +152,7 @@ class _StreamingTextState extends State<StreamingText>
           omittedCharacters: omittedCharacters,
         ),
         const SizedBox(height: 8),
-        SelectableText.rich(
+        Text.rich(
           TextSpan(children: spans),
           style: theme.textTheme.bodyMedium,
         ),
