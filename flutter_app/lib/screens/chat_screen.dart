@@ -17,6 +17,7 @@ import '../providers/chat_provider.dart';
 import '../services/preferences_service.dart';
 import '../services/current_session_search.dart';
 import '../services/file_attachment_service.dart';
+import '../services/memory_service.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/chat_render_window.dart';
@@ -1402,6 +1403,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   _showSystemPromptDialog();
                 case 'session_system_prompt':
                   _showSessionSystemPromptDialog();
+                case 'session_memory':
+                  _showSessionMemoryDialog();
                 case 'prompt_profiles':
                   _showPromptProfilesDialog();
                 case 'switch_model':
@@ -1483,6 +1486,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       title: Text(AppStrings.systemPromptTitle),
                       dense: true,
                     )),
+                if (provider.currentSession != null)
+                  const PopupMenuItem(
+                      value: 'session_memory',
+                      child: ListTile(
+                        leading: Icon(Icons.memory_outlined),
+                        title: Text(AppStrings.sessionMemory),
+                        dense: true,
+                      )),
                 const PopupMenuItem(
                     value: 'prompt_profiles',
                     child: ListTile(
@@ -1593,6 +1604,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
                     // Sync draft when session changes via Selector rebuild
                     final currentId = data.sessionId;
+                    MemoryService.setCurrentSessionId(currentId);
                     if (currentId != null && currentId != _lastSessionId) {
                       _syncDraftForSession();
                     }
@@ -1628,96 +1640,99 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     }
                     return Stack(
                       children: [
-                        NotificationListener<ScrollNotification>(
-                          onNotification: _handleScrollNotification,
-                          child: ListView.builder(
-                            key: const ValueKey('chat-message-list'),
-                            controller: _scrollController,
-                            reverse: true,
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 16, vertical: 12),
-                            itemCount: itemCount,
-                            itemBuilder: (context, index) {
-                              final virtualIndex = itemCount - 1 - index;
-                              if (virtualIndex == streamingOrTypingIndex &&
-                                  hasStreaming) {
-                                return Consumer<ChatProvider>(
-                                  builder: (_, provider, __) {
-                                    return RepaintBoundary(
-                                      child: _buildStreamingBubble(
-                                        provider.streamingText,
-                                        theme,
-                                        maxContentWidth,
-                                        reasoningText:
-                                            provider.streamingReasoningText,
-                                        reasoningTotalLength: provider
-                                            .streamingReasoningTotalLength,
-                                        previousRole: messages.isEmpty
-                                            ? null
-                                            : messages.last.role,
-                                      ),
-                                    );
-                                  },
-                                );
-                              }
-                              if (virtualIndex == streamingOrTypingIndex &&
-                                  showTyping) {
-                                return RepaintBoundary(
-                                  child: _buildTypingIndicatorBubble(
-                                    theme,
-                                    maxContentWidth,
-                                    previousRole: messages.isEmpty
-                                        ? null
-                                        : messages.last.role,
-                                  ),
-                                );
-                              }
-                              if (hasLoadOlder && virtualIndex == 0) {
-                                return _buildLoadOlderMessagesAffordance(
-                                  theme,
-                                  hiddenCount: window.hiddenBeforeCount,
-                                  totalMessageCount: messages.length,
-                                );
-                              }
-                              final visibleIndex =
-                                  virtualIndex - virtualMessageStart;
-                              final message = visibleMessages[visibleIndex];
-                              final originalIndex =
-                                  originalMessageIndexForVisibleIndex(
-                                windowStartIndex: window.startIndex,
-                                visibleIndex: visibleIndex,
-                              );
-                              final previousRole = visibleIndex > 0
-                                  ? visibleMessages[visibleIndex - 1].role
-                                  : null;
-                              final nextRole =
-                                  visibleIndex < visibleMessages.length - 1
-                                      ? visibleMessages[visibleIndex + 1].role
-                                      : null;
-                              final animationId = _messageAnimationId(message);
-                              final animate =
-                                  _seenMessageAnimationIds.add(animationId);
-                              return _AnimatedMessageEntry(
-                                key: ValueKey(animationId),
-                                animate: animate,
-                                child: KeyedSubtree(
-                                  key: _keyForMessageIndex(originalIndex),
-                                  child: RepaintBoundary(
-                                    child: _buildMessageBubble(
-                                      message,
-                                      originalIndex,
+                        SelectionArea(
+                          child: NotificationListener<ScrollNotification>(
+                            onNotification: _handleScrollNotification,
+                            child: ListView.builder(
+                              key: const ValueKey('chat-message-list'),
+                              controller: _scrollController,
+                              reverse: true,
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 16, vertical: 12),
+                              itemCount: itemCount,
+                              itemBuilder: (context, index) {
+                                final virtualIndex = itemCount - 1 - index;
+                                if (virtualIndex == streamingOrTypingIndex &&
+                                    hasStreaming) {
+                                  return Consumer<ChatProvider>(
+                                    builder: (_, provider, __) {
+                                      return RepaintBoundary(
+                                        child: _buildStreamingBubble(
+                                          provider.streamingText,
+                                          theme,
+                                          maxContentWidth,
+                                          reasoningText:
+                                              provider.streamingReasoningText,
+                                          reasoningTotalLength: provider
+                                              .streamingReasoningTotalLength,
+                                          previousRole: messages.isEmpty
+                                              ? null
+                                              : messages.last.role,
+                                        ),
+                                      );
+                                    },
+                                  );
+                                }
+                                if (virtualIndex == streamingOrTypingIndex &&
+                                    showTyping) {
+                                  return RepaintBoundary(
+                                    child: _buildTypingIndicatorBubble(
                                       theme,
                                       maxContentWidth,
-                                      messages: messages,
-                                      previousRole: previousRole,
-                                      nextRole: nextRole,
-                                      highlighted: originalIndex ==
-                                          _highlightedSearchMessageIndex,
+                                      previousRole: messages.isEmpty
+                                          ? null
+                                          : messages.last.role,
+                                    ),
+                                  );
+                                }
+                                if (hasLoadOlder && virtualIndex == 0) {
+                                  return _buildLoadOlderMessagesAffordance(
+                                    theme,
+                                    hiddenCount: window.hiddenBeforeCount,
+                                    totalMessageCount: messages.length,
+                                  );
+                                }
+                                final visibleIndex =
+                                    virtualIndex - virtualMessageStart;
+                                final message = visibleMessages[visibleIndex];
+                                final originalIndex =
+                                    originalMessageIndexForVisibleIndex(
+                                  windowStartIndex: window.startIndex,
+                                  visibleIndex: visibleIndex,
+                                );
+                                final previousRole = visibleIndex > 0
+                                    ? visibleMessages[visibleIndex - 1].role
+                                    : null;
+                                final nextRole =
+                                    visibleIndex < visibleMessages.length - 1
+                                        ? visibleMessages[visibleIndex + 1].role
+                                        : null;
+                                final animationId =
+                                    _messageAnimationId(message);
+                                final animate =
+                                    _seenMessageAnimationIds.add(animationId);
+                                return _AnimatedMessageEntry(
+                                  key: ValueKey(animationId),
+                                  animate: animate,
+                                  child: KeyedSubtree(
+                                    key: _keyForMessageIndex(originalIndex),
+                                    child: RepaintBoundary(
+                                      child: _buildMessageBubble(
+                                        message,
+                                        originalIndex,
+                                        theme,
+                                        maxContentWidth,
+                                        messages: messages,
+                                        previousRole: previousRole,
+                                        nextRole: nextRole,
+                                        highlighted: originalIndex ==
+                                            _highlightedSearchMessageIndex,
+                                      ),
                                     ),
                                   ),
-                                ),
-                              );
-                            },
+                                );
+                              },
+                            ),
                           ),
                         ),
                         Positioned(
@@ -3023,6 +3038,67 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _showSessionMemoryDialog() async {
+    final provider = context.read<ChatProvider>();
+    final session = provider.currentSession;
+    if (session == null) return;
+    final sessionId = session.id;
+    MemoryService.setCurrentSessionId(sessionId);
+    var mode = await MemoryService.getSessionMemoryMode(sessionId);
+    if (!mounted) return;
+
+    final result = await showDialog<SessionMemoryMode>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text(AppStrings.sessionMemory),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              RadioListTile<SessionMemoryMode>(
+                value: SessionMemoryMode.followGlobal,
+                groupValue: mode,
+                title: const Text(AppStrings.sessionMemoryFollowGlobal),
+                onChanged: (value) {
+                  if (value != null) setDialogState(() => mode = value);
+                },
+              ),
+              RadioListTile<SessionMemoryMode>(
+                value: SessionMemoryMode.enabled,
+                groupValue: mode,
+                title: const Text(AppStrings.sessionMemoryOn),
+                onChanged: (value) {
+                  if (value != null) setDialogState(() => mode = value);
+                },
+              ),
+              RadioListTile<SessionMemoryMode>(
+                value: SessionMemoryMode.disabled,
+                groupValue: mode,
+                title: const Text(AppStrings.sessionMemoryOff),
+                onChanged: (value) {
+                  if (value != null) setDialogState(() => mode = value);
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text(AppStrings.cancel),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, mode),
+              child: const Text(AppStrings.save),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (result == null) return;
+    await MemoryService.setSessionMemoryMode(sessionId, result);
+    if (mounted) setState(() {});
+  }
+
   Future<void> _showPromptProfilesDialog() async {
     final provider = context.read<ChatProvider>();
     final messenger = ScaffoldMessenger.of(context);
@@ -3575,6 +3651,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     for (final file in files) {
       try {
+        if (FileAttachmentService.requiresSensitiveTextConfirmation(file)) {
+          if (!mounted) return;
+          final warning = FileAttachmentService.sensitiveTextWarning(file) ??
+              '该文件可能包含密钥或凭据。确认后才会把全文注入提示词。';
+          final confirmed = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('确认附加敏感文件？'),
+              content: Text(warning),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text(AppStrings.cancel),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: const Text(AppStrings.confirm),
+                ),
+              ],
+            ),
+          );
+          if (confirmed != true) continue;
+        }
         final prepared = await FileAttachmentService.prepareForMessage(file);
         if (!mounted) return;
         final insertedText = _appendAttachmentText(prepared.inputText);
