@@ -10,13 +10,19 @@ import '../l10n/app_strings.dart';
 import '../services/capability_summary.dart';
 import '../models/provider_profile.dart';
 import '../providers/chat_provider.dart';
+import '../services/fallback_model_selection.dart';
 import '../services/llm_service.dart';
 import '../services/preferences_service.dart';
 
 class ModelApiSettingsScreen extends StatefulWidget {
   final String? initialProfileId;
+  final ModelListFetcher? modelFetcher;
 
-  const ModelApiSettingsScreen({super.key, this.initialProfileId});
+  const ModelApiSettingsScreen({
+    super.key,
+    this.initialProfileId,
+    this.modelFetcher,
+  });
 
   @override
   State<ModelApiSettingsScreen> createState() => _ModelApiSettingsScreenState();
@@ -361,78 +367,14 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     required List<ProviderProfile> candidates,
     ModelFallbackTarget? initial,
   }) async {
-    var selectedProfileId = candidates.any(
-      (profile) => profile.id == initial?.targetProfileId,
-    )
-        ? initial!.targetProfileId
-        : candidates.first.id;
-    final modelController = TextEditingController(
-      text: initial?.modelOverride.trim() ?? '',
+    return showDialog<ModelFallbackTarget>(
+      context: context,
+      builder: (ctx) => _FallbackTargetDialog(
+        candidates: candidates,
+        initial: initial,
+        modelFetcher: widget.modelFetcher ?? LlmService.fetchModels,
+      ),
     );
-    final enabled = initial?.enabled ?? true;
-    try {
-      return await showDialog<ModelFallbackTarget>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: Text(
-            initial == null
-                ? AppStrings.addFallbackTarget
-                : AppStrings.editFallbackTarget,
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              DropdownButtonFormField<String>(
-                value: selectedProfileId,
-                decoration: const InputDecoration(
-                  labelText: AppStrings.fallbackTargetProfile,
-                ),
-                items: [
-                  for (final profile in candidates)
-                    DropdownMenuItem(
-                      value: profile.id,
-                      child: Text(
-                        profile.displayName,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                ],
-                onChanged: (value) {
-                  if (value != null) selectedProfileId = value;
-                },
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: modelController,
-                decoration: const InputDecoration(
-                  labelText: AppStrings.fallbackModelOverride,
-                  helperText: AppStrings.fallbackUsesTargetModel,
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text(AppStrings.cancel),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(
-                ctx,
-                ModelFallbackTarget(
-                  targetProfileId: selectedProfileId,
-                  modelOverride: modelController.text.trim(),
-                  enabled: enabled,
-                ),
-              ),
-              child: const Text(AppStrings.save),
-            ),
-          ],
-        ),
-      );
-    } finally {
-      modelController.dispose();
-    }
   }
 
   void _replaceEditingFallbackTargets(List<ModelFallbackTarget> targets) {
@@ -533,7 +475,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
 
     setState(() => _fetchingModels = true);
     try {
-      final models = await LlmService.fetchModels(
+      final models = await (widget.modelFetcher ?? LlmService.fetchModels)(
         apiFormat: _apiFormat,
         apiKey: apiKey,
         baseUrl: _baseUrlController.text.trim().isNotEmpty
@@ -1239,5 +1181,324 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     _baseUrlController.dispose();
     _modelController.dispose();
     super.dispose();
+  }
+}
+
+class _FallbackTargetDialog extends StatefulWidget {
+  final List<ProviderProfile> candidates;
+  final ModelFallbackTarget? initial;
+  final ModelListFetcher modelFetcher;
+
+  const _FallbackTargetDialog({
+    required this.candidates,
+    this.initial,
+    required this.modelFetcher,
+  });
+
+  @override
+  State<_FallbackTargetDialog> createState() => _FallbackTargetDialogState();
+}
+
+class _FallbackTargetDialogState extends State<_FallbackTargetDialog> {
+  late String _selectedProfileId;
+  late TextEditingController _customModelController;
+  late bool _enabled;
+  var _knownModels = <String>[];
+  var _selectedModel = const FallbackModelSelection.targetDefault();
+  var _fetchingModels = false;
+  var _modelFetchGeneration = 0;
+
+  ProviderProfile get _selectedProfile {
+    return widget.candidates.firstWhere(
+      (profile) => profile.id == _selectedProfileId,
+      orElse: () => widget.candidates.first,
+    );
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    final initial = widget.initial;
+    _selectedProfileId = widget.candidates.any(
+      (profile) => profile.id == initial?.targetProfileId,
+    )
+        ? initial!.targetProfileId
+        : widget.candidates.first.id;
+    _customModelController = TextEditingController(
+      text: initial?.modelOverride.trim() ?? '',
+    );
+    _enabled = initial?.enabled ?? true;
+    _selectedModel = FallbackModelSelection.selectedValueForOverride(
+      modelOverride: _customModelController.text,
+      knownModels: _knownModels,
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_fetchTargetModels(silent: true));
+    });
+  }
+
+  @override
+  void dispose() {
+    _customModelController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _fetchTargetModels({bool silent = false}) async {
+    final profile = _selectedProfile;
+    final profileId = profile.id;
+    final requestGeneration = ++_modelFetchGeneration;
+    final apiKey = profile.apiKey.trim();
+    if (apiKey.isEmpty &&
+        profile.apiFormat != ProviderProfile.anthropicFormat) {
+      if (!silent) _showNotice(AppStrings.apiKeyRequiredToUse);
+      setState(() {
+        _knownModels = const [];
+        _fetchingModels = false;
+        _syncSelectionWithKnownModels();
+      });
+      return;
+    }
+
+    setState(() => _fetchingModels = true);
+    try {
+      final models = await widget.modelFetcher(
+        apiFormat: profile.apiFormat,
+        apiKey: apiKey,
+        baseUrl:
+            profile.baseUrl.trim().isNotEmpty ? profile.baseUrl.trim() : null,
+      );
+      if (!_isCurrentModelFetch(requestGeneration, profileId)) return;
+      setState(() {
+        _knownModels = FallbackModelSelection.normalizeKnownModels(models);
+        _fetchingModels = false;
+        _syncSelectionWithKnownModels();
+      });
+      if (!silent && models.any(LlmService.isPresetModel)) {
+        _showNotice(AppStrings.modelFetchPresetNotice);
+      }
+    } catch (e) {
+      if (!_isCurrentModelFetch(requestGeneration, profileId)) return;
+      setState(() {
+        _knownModels = const [];
+        _fetchingModels = false;
+        _syncSelectionWithKnownModels();
+      });
+      if (!silent) _showNotice(AppStrings.modelFetchFailed(_briefError(e)));
+    }
+  }
+
+  bool _isCurrentModelFetch(int requestGeneration, String profileId) {
+    return mounted &&
+        requestGeneration == _modelFetchGeneration &&
+        _selectedProfileId == profileId;
+  }
+
+  void _syncSelectionWithKnownModels() {
+    if (_selectedModel.kind == FallbackModelSelectionKind.custom) {
+      final customModel = _customModelController.text.trim();
+      if (_knownModels.contains(customModel)) {
+        _selectedModel = FallbackModelSelection.known(customModel);
+      }
+      return;
+    }
+    _selectedModel = FallbackModelSelection.selectedValueForOverride(
+      modelOverride: _customModelController.text,
+      knownModels: _knownModels,
+    );
+  }
+
+  void _selectProfile(String profileId) {
+    setState(() {
+      _selectedProfileId = profileId;
+      _knownModels = const [];
+      _customModelController.clear();
+      _selectedModel = const FallbackModelSelection.targetDefault();
+    });
+    unawaited(_fetchTargetModels(silent: true));
+  }
+
+  void _selectModel(FallbackModelSelection value) {
+    setState(() {
+      _selectedModel = value;
+      switch (value.kind) {
+        case FallbackModelSelectionKind.targetDefault:
+          _customModelController.clear();
+        case FallbackModelSelectionKind.known:
+          _customModelController.text = value.modelId!;
+        case FallbackModelSelectionKind.custom:
+          if (_knownModels.contains(_customModelController.text.trim())) {
+            _customModelController.clear();
+          }
+      }
+    });
+  }
+
+  FallbackModelSelection get _dropdownSelection {
+    if (_selectedModel.kind != FallbackModelSelectionKind.known ||
+        _knownModels.contains(_selectedModel.modelId)) {
+      return _selectedModel;
+    }
+    return const FallbackModelSelection.custom();
+  }
+
+  void _save() {
+    Navigator.pop(
+      context,
+      ModelFallbackTarget(
+        targetProfileId: _selectedProfileId,
+        modelOverride: FallbackModelSelection.modelOverrideForSelection(
+          selection: _dropdownSelection,
+          customModel: _customModelController.text,
+        ),
+        enabled: _enabled,
+      ),
+    );
+  }
+
+  void _showNotice(String message) {
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  String _briefError(Object error) {
+    final text = error.toString().replaceFirst('Exception: ', '');
+    return text.length > 160 ? '${text.substring(0, 160)}...' : text;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedProfile = _selectedProfile;
+    final dropdownSelection = _dropdownSelection;
+    final showCustomField =
+        dropdownSelection.kind == FallbackModelSelectionKind.custom;
+
+    return AlertDialog(
+      title: Text(
+        widget.initial == null
+            ? AppStrings.addFallbackTarget
+            : AppStrings.editFallbackTarget,
+      ),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            DropdownButtonFormField<String>(
+              key: const ValueKey('fallback_target_profile_selector'),
+              value: _selectedProfileId,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: AppStrings.fallbackTargetProfile,
+              ),
+              items: [
+                for (final profile in widget.candidates)
+                  DropdownMenuItem(
+                    value: profile.id,
+                    child: Text(
+                      profile.displayName,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+              ],
+              onChanged: (value) {
+                if (value != null) _selectProfile(value);
+              },
+            ),
+            const SizedBox(height: 12),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<FallbackModelSelection>(
+                    key: const ValueKey('fallback_model_selector'),
+                    value: dropdownSelection,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      labelText: AppStrings.fallbackModelSelection,
+                      helperText: AppStrings.fallbackModelSelectHelper,
+                    ),
+                    items: [
+                      DropdownMenuItem(
+                        value: const FallbackModelSelection.targetDefault(),
+                        child: Text(
+                          '${AppStrings.fallbackUseTargetDefault}: '
+                          '${selectedProfile.effectiveModel}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      for (final model in _knownModels)
+                        DropdownMenuItem(
+                          value: FallbackModelSelection.known(model),
+                          child: Text(
+                            model,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      const DropdownMenuItem(
+                        value: FallbackModelSelection.custom(),
+                        child: Text(AppStrings.fallbackCustomModel),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) _selectModel(value);
+                    },
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: AppStrings.fetchModelsButton,
+                  onPressed: _fetchingModels
+                      ? null
+                      : () => unawaited(_fetchTargetModels()),
+                  icon: _fetchingModels
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.refresh),
+                ),
+              ],
+            ),
+            if (_knownModels.isEmpty && !_fetchingModels)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    AppStrings.fallbackNoModelCatalog,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                  ),
+                ),
+              ),
+            if (showCustomField) ...[
+              const SizedBox(height: 12),
+              TextField(
+                key: const ValueKey('fallback_custom_model_input'),
+                controller: _customModelController,
+                decoration: const InputDecoration(
+                  labelText: AppStrings.fallbackCustomModelLabel,
+                  helperText: AppStrings.manualModelHint,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text(AppStrings.cancel),
+        ),
+        FilledButton(
+          key: const ValueKey('fallback_target_save'),
+          onPressed: _save,
+          child: const Text(AppStrings.save),
+        ),
+      ],
+    );
   }
 }

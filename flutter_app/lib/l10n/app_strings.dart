@@ -207,8 +207,14 @@ class AppStrings {
   static const addFallbackTarget = '添加回退目标';
   static const editFallbackTarget = '编辑回退目标';
   static const fallbackTargetProfile = '目标配置';
+  static const fallbackModelSelection = '回退模型';
+  static const fallbackUseTargetDefault = '使用目标配置默认模型';
+  static const fallbackCustomModel = '自定义模型...';
+  static const fallbackCustomModelLabel = '自定义模型';
   static const fallbackModelOverride = '模型覆盖（可选）';
   static const fallbackUsesTargetModel = '使用目标配置模型';
+  static const fallbackModelSelectHelper = '留空使用目标配置模型，也可选择已知模型';
+  static const fallbackNoModelCatalog = '未获取到模型列表，可手动输入自定义模型';
   static const noFallbackProfilesAvailable = '请先创建第二个模型配置';
   static const removeFallbackTarget = '移除回退目标';
   static const moveFallbackTargetUp = '上移回退目标';
