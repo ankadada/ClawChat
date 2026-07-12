@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ClawChat maintenance surfaces preview</title>
+  <link rel="stylesheet" href="tokens.css">
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      background: var(--color-background);
+      color: var(--color-on-surface);
+      font-family: var(--font-platform);
+      font-size: var(--font-body-size);
+    }
+    button, input { font: inherit; }
+    button { min-height: var(--touch); }
+
+    .atelier-toolbar {
+      position: fixed;
+      z-index: 20;
+      top: 12px;
+      left: 50%;
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      min-height: 36px;
+      padding: 4px 6px 4px 14px;
+      transform: translateX(-50%);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 999px;
+      background: rgba(20,20,24,.84);
+      color: white;
+      box-shadow: 0 12px 32px rgba(20,20,24,.2);
+      font: 11px/1 ui-monospace, monospace;
+    }
+    .atelier-brand { opacity: .62; letter-spacing: .18em; text-transform: uppercase; }
+    .atelier-divider { width: 1px; height: 16px; background: rgba(255,255,255,.18); }
+    .atelier-field { display: none; align-items: center; gap: var(--space-1); }
+    body[data-toolbar-fields~="viewport"] .atelier-field[data-key="viewport"] { display: flex; }
+    .atelier-field-label { opacity: .55; text-transform: uppercase; }
+    .atelier-options { display: flex; gap: 2px; }
+    .atelier-option, .atelier-hide {
+      min-height: 28px;
+      padding: 0 9px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      font: inherit;
+    }
+    .atelier-option[data-selected="true"] { background: rgba(255,255,255,.16); }
+    .atelier-hide { width: 28px; padding: 0; }
+    body.toolbar-hidden .atelier-toolbar { transform: translate(-50%, -64px); }
+
+    .atelier-frame {
+      width: min(1180px, calc(100% - 32px));
+      min-height: 760px;
+      margin: 68px auto 32px;
+      overflow: hidden;
+      border: 1px solid var(--color-border);
+      border-radius: var(--rounded-lg);
+      background: var(--color-surface);
+      box-shadow: 0 14px 40px rgba(20,20,24,.08);
+      transition: width .2s ease;
+    }
+    body[data-viewport="tablet"] .atelier-frame { width: min(760px, calc(100% - 32px)); }
+    body[data-viewport="mobile"] .atelier-frame { width: min(390px, calc(100% - 24px)); }
+
+    .app-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 64px;
+      padding: 0 var(--space-4);
+      border-bottom: 1px solid var(--color-border);
+      background: var(--color-surface);
+    }
+    .app-title { margin: 0; font-size: var(--font-title-size); line-height: 1.25; }
+    .view-tabs { display: flex; gap: var(--space-1); }
+    .view-tab {
+      border: 0;
+      border-radius: var(--rounded-md);
+      background: transparent;
+      color: var(--color-muted);
+      padding: 0 var(--space-3);
+      cursor: pointer;
+      font-size: var(--font-label-size);
+      font-weight: 600;
+    }
+    .view-tab[aria-selected="true"] { background: #eef4ff; color: var(--color-primary); }
+
+    .settings-layout { display: grid; grid-template-columns: 340px 20px minmax(0, 1fr); min-height: 696px; }
+    .hinge {
+      background: #343442;
+      box-shadow: inset 4px 0 7px rgba(0,0,0,.16), inset -4px 0 7px rgba(0,0,0,.16);
+    }
+    .index-pane, .detail-pane { min-width: 0; overflow: auto; }
+    .index-pane { padding: var(--space-3); background: var(--color-surface-alt); }
+    .search {
+      width: 100%;
+      min-height: var(--touch);
+      padding: 0 var(--space-4);
+      border: 1px solid var(--color-border);
+      border-radius: var(--rounded-md);
+      background: var(--color-surface);
+      color: var(--color-on-surface);
+    }
+    .destination-list { display: grid; gap: var(--space-1); margin-top: var(--space-3); }
+    .destination {
+      display: grid;
+      grid-template-columns: 34px 1fr auto;
+      align-items: center;
+      gap: var(--space-2);
+      width: 100%;
+      min-height: 64px;
+      padding: var(--space-2) var(--space-3);
+      border: 0;
+      border-radius: var(--rounded-md);
+      background: transparent;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+    .destination:hover, .destination[aria-current="page"] { background: #eef4ff; }
+    .destination-icon { color: var(--color-primary); font-size: 20px; text-align: center; }
+    .destination strong { display: block; font-size: var(--font-body-size); }
+    .destination small { display: block; margin-top: 3px; color: var(--color-muted); line-height: 1.35; }
+    .chevron { color: var(--color-muted); }
+    .detail-pane { padding: var(--space-4); }
+    .compact-back { display: none; }
+    .detail-heading { margin: 0 0 var(--space-4); font-size: var(--font-title-size); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .card {
+      margin-bottom: var(--space-3);
+      padding: var(--space-4);
+      border: 1px solid var(--color-border);
+      border-radius: var(--rounded-md);
+      background: var(--color-surface);
+    }
+    .card-header { display: flex; gap: var(--space-3); align-items: flex-start; }
+    .card-icon { color: var(--color-primary); font-size: 22px; }
+    .card h3 { margin: 0; font-size: 17px; }
+    .muted { margin: 4px 0 0; color: var(--color-muted); line-height: 1.5; }
+    .status-row {
+      display: grid;
+      grid-template-columns: 24px 1fr auto;
+      gap: var(--space-3);
+      align-items: center;
+      min-height: 64px;
+      margin-top: var(--space-3);
+      border-top: 1px solid var(--color-border);
+    }
+    .status-mark { color: var(--color-warning); }
+    .actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3); }
+    .primary, .secondary {
+      min-height: var(--touch);
+      padding: 0 var(--space-4);
+      border-radius: var(--rounded-md);
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .primary { border: 1px solid var(--color-primary); background: var(--color-primary); color: white; }
+    .secondary { border: 1px solid var(--color-border); background: var(--color-surface); color: var(--color-on-surface); }
+    .secondary:disabled { color: var(--color-muted); background: var(--color-surface-alt); cursor: not-allowed; }
+
+    .health-grid { display: grid; gap: var(--space-3); }
+    .health-row {
+      display: grid;
+      grid-template-columns: 28px 1fr auto;
+      gap: var(--space-3);
+      align-items: center;
+      min-height: 88px;
+      padding: var(--space-3) var(--space-4);
+      border: 1px solid var(--color-border);
+      border-radius: var(--rounded-md);
+    }
+    .health-row strong, .health-row span { display: block; }
+    .health-row span { margin-top: 4px; color: var(--color-muted); line-height: 1.4; }
+    .ready { color: var(--color-success); }
+    .unknown { color: var(--color-muted); }
+    .attention { color: var(--color-error); }
+
+    body[data-viewport="tablet"] .settings-layout {
+      grid-template-columns: 1fr;
+      grid-template-rows: 278px 20px minmax(380px, 1fr);
+    }
+    body[data-viewport="tablet"] .hinge { box-shadow: inset 0 4px 7px rgba(0,0,0,.16), inset 0 -4px 7px rgba(0,0,0,.16); }
+    body[data-viewport="tablet"] .destination-list { grid-template-columns: 1fr 1fr; }
+    body[data-viewport="tablet"] .index-pane { overflow: auto; }
+
+    body[data-viewport="mobile"] .atelier-frame { min-height: 740px; }
+    body[data-viewport="mobile"] .settings-layout { display: block; min-height: 676px; }
+    body[data-viewport="mobile"] .hinge { display: none; }
+    body[data-viewport="mobile"] .detail-pane { display: none; }
+    body[data-viewport="mobile"].detail-open .index-pane { display: none; }
+    body[data-viewport="mobile"].detail-open .detail-pane { display: block; }
+    body[data-viewport="mobile"] .compact-back {
+      display: inline-flex;
+      align-items: center;
+      min-height: var(--touch);
+      margin-bottom: var(--space-2);
+      padding: 0 var(--space-3);
+      border: 0;
+      border-radius: var(--rounded-md);
+      background: transparent;
+      color: var(--color-primary);
+      cursor: pointer;
+      font-weight: 600;
+    }
+    body[data-viewport="mobile"] .app-bar { align-items: flex-start; gap: var(--space-2); padding-block: var(--space-2); }
+    body[data-viewport="mobile"] .view-tabs { overflow-x: auto; }
+    body[data-viewport="mobile"] .view-tab { padding-inline: var(--space-2); white-space: nowrap; }
+    body[data-viewport="mobile"] .status-row, body[data-viewport="mobile"] .health-row { grid-template-columns: 24px 1fr; }
+    body[data-viewport="mobile"] .status-row button, body[data-viewport="mobile"] .health-row button { grid-column: 2; justify-self: start; }
+    @media (prefers-reduced-motion: reduce) { * { transition-duration: 0s !important; } }
+  </style>
+</head>
+<body data-toolbar-fields="viewport" data-viewport="desktop" data-viewport-options="desktop tablet mobile">
+  <div class="atelier-toolbar" role="toolbar" aria-label="Preview controls">
+    <span class="atelier-brand">atelier</span>
+    <span class="atelier-divider"></span>
+    <div class="atelier-field" data-key="viewport">
+      <span class="atelier-field-label">viewport</span>
+      <div class="atelier-options">
+        <button class="atelier-option" data-value="desktop" data-selected="true">book</button>
+        <button class="atelier-option" data-value="tablet">tabletop</button>
+        <button class="atelier-option" data-value="mobile">compact</button>
+      </div>
+    </div>
+    <button class="atelier-hide" aria-label="Hide toolbar">×</button>
+  </div>
+
+  <main class="atelier-frame">
+    <header class="app-bar">
+      <h1 class="app-title">ClawChat</h1>
+      <nav class="view-tabs" aria-label="Maintenance preview">
+        <button class="view-tab" data-view="settings" aria-selected="true">设置</button>
+        <button class="view-tab" data-view="updates" aria-selected="false">更新与扩展</button>
+        <button class="view-tab" data-view="health" aria-selected="false">系统健康</button>
+      </nav>
+    </header>
+    <section class="settings-layout">
+      <aside class="index-pane" aria-label="设置索引">
+        <input class="search" type="search" placeholder="搜索设置，例如：审批、更新、隐私" aria-label="搜索设置">
+        <div class="destination-list"></div>
+      </aside>
+      <div class="hinge" aria-hidden="true"></div>
+      <article class="detail-pane">
+        <button class="compact-back" aria-label="返回设置索引">‹ 返回设置</button>
+        <div class="panel active" data-panel="settings">
+          <h2 class="detail-heading">连接</h2>
+          <div class="card">
+            <div class="card-header"><span class="card-icon">◎</span><div><h3>模型提供商与模型组</h3><p class="muted">管理本地模型配置和分组。敏感值不会出现在搜索结果中。</p></div></div>
+            <div class="actions"><button class="secondary">管理模型</button></div>
+          </div>
+          <div class="card">
+            <div class="card-header"><span class="card-icon">↗</span><div><h3>远程 Agent</h3><p class="muted">仅在会话明确选择并完成外部处理授权后启用。</p></div></div>
+            <div class="status-row"><span class="unknown">?</span><div><strong>未启用</strong><p class="muted">当前聊天继续使用本地执行上下文。</p></div><button class="secondary">配置</button></div>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="updates">
+          <h2 class="detail-heading">更新与扩展</h2>
+          <div class="card">
+            <div class="card-header"><span class="card-icon">⬇</span><div><h3>应用更新</h3><p class="muted">当前版本 2.5.0 · 只读取本地已验证状态。</p></div></div>
+            <div class="status-row"><span class="status-mark">!</span><div><strong>已验证，可交给系统安装器</strong><p class="muted">上次检查：已完成。安装仍需明确确认。</p></div><button class="primary">打开系统安装器</button></div>
+          </div>
+          <div class="card">
+            <div class="card-header"><span class="card-icon">◇</span><div><h3>技能与扩展</h3><p class="muted">签名预览后更新；不会自动下载或安装。</p></div></div>
+            <div class="actions"><button class="secondary">更新</button><button class="secondary">历史</button><button class="secondary" disabled>回滚</button></div>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="health">
+          <h2 class="detail-heading">系统健康</h2>
+          <div class="health-grid">
+            <div class="health-row"><span class="ready">✓</span><div><strong>嵌入式运行时</strong><span>就绪 · 运行时与 Python 已就绪</span></div><button class="secondary">查看</button></div>
+            <div class="health-row"><span class="ready">✓</span><div><strong>执行上下文</strong><span>就绪 · 本地模型组</span></div><button class="secondary">管理连接</button></div>
+            <div class="health-row"><span class="unknown">?</span><div><strong>技能与扩展</strong><span>未知 · 本地检查未完成</span></div><button class="secondary">重试</button></div>
+            <div class="health-row"><span class="attention">!</span><div><strong>应用更新</strong><span>需要处理 · 已验证，等待安全安装动作</span></div><button class="primary">查看更新</button></div>
+          </div>
+          <p class="muted">只读取本地状态，不上传遥测，也不生成健康分数。</p>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const destinations = [
+      ['连接', '模型提供商、模型组与远程 Agent', '◎'],
+      ['Agent 与工具', '审批策略、拒绝规则、并发与 MCP', '⚙'],
+      ['语音', '识别、转写、朗读与电话集成', '◉'],
+      ['数据与恢复', '本地数据、导入导出与恢复', '▣'],
+      ['更新与扩展', '应用更新、技能历史与回滚', '⬇'],
+      ['隐私', '隐私模式、环境变量与本地诊断', '◇'],
+      ['开发者', '运行轨迹与高级诊断', '⌘'],
+      ['外观与关于', '主题、字号、系统信息与版本', '◐'],
+    ];
+    const list = document.querySelector('.destination-list');
+    function renderDestinations(query = '') {
+      const normalized = query.trim().toLowerCase();
+      list.innerHTML = '';
+      destinations.filter(item => item.join(' ').toLowerCase().includes(normalized)).forEach((item, index) => {
+        const button = document.createElement('button');
+        button.className = 'destination';
+        button.setAttribute('aria-current', index === 0 ? 'page' : 'false');
+        button.innerHTML = `<span class="destination-icon">${item[2]}</span><span><strong>${item[0]}</strong><small>${item[1]}</small></span><span class="chevron">›</span>`;
+        button.addEventListener('click', () => {
+          document.querySelectorAll('.destination').forEach(node => node.setAttribute('aria-current', 'false'));
+          button.setAttribute('aria-current', 'page');
+          if (item[0] === '更新与扩展') selectView('updates'); else selectView('settings');
+          if (document.body.dataset.viewport === 'mobile') document.body.classList.add('detail-open');
+        });
+        list.appendChild(button);
+      });
+    }
+    renderDestinations();
+    document.querySelector('.search').addEventListener('input', event => renderDestinations(event.target.value));
+
+    function selectView(view) {
+      document.querySelectorAll('.view-tab').forEach(tab => tab.setAttribute('aria-selected', String(tab.dataset.view === view)));
+      document.querySelectorAll('.panel').forEach(panel => panel.classList.toggle('active', panel.dataset.panel === view));
+      if (view === 'updates') {
+        document.querySelectorAll('.destination').forEach(node => node.setAttribute('aria-current', String(node.textContent.includes('更新与扩展'))));
+      }
+      if (document.body.dataset.viewport === 'mobile') document.body.classList.add('detail-open');
+    }
+    document.querySelectorAll('.view-tab').forEach(tab => tab.addEventListener('click', () => selectView(tab.dataset.view)));
+    document.querySelectorAll('.atelier-option').forEach(option => option.addEventListener('click', () => {
+      document.body.dataset.viewport = option.dataset.value;
+      document.body.classList.remove('detail-open');
+      document.querySelectorAll('.atelier-option').forEach(node => node.dataset.selected = String(node === option));
+    }));
+    document.querySelector('.atelier-hide').addEventListener('click', () => document.body.classList.toggle('toolbar-hidden'));
+    document.querySelector('.compact-back').addEventListener('click', () => document.body.classList.remove('detail-open'));
+    document.addEventListener('keydown', event => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+      document.body.classList.toggle('toolbar-hidden');
+      }
+    });
+    const previewParams = new URLSearchParams(location.search);
+    const initialViewport = previewParams.get('viewport');
+    if (['desktop', 'tablet', 'mobile'].includes(initialViewport)) {
+      document.querySelector(`.atelier-option[data-value="${initialViewport}"]`).click();
+    }
+    const initialView = previewParams.get('view');
+    if (['settings', 'updates', 'health'].includes(initialView)) selectView(initialView);
+  </script>
+</body>
+</html>

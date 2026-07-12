@@ -4,15 +4,20 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'code_block.dart';
 import 'markdown_table_view.dart';
+import '../l10n/app_strings.dart';
 
 class StreamingText extends StatefulWidget {
   final String text;
   final bool isStreaming;
+  final bool renderFullText;
+  final VoidCallback? onOpenFullResponse;
 
   const StreamingText({
     super.key,
     required this.text,
     this.isStreaming = false,
+    this.renderFullText = false,
+    this.onOpenFullResponse,
   });
 
   @override
@@ -41,13 +46,11 @@ class _StreamingTextState extends State<StreamingText>
   static const int _longTextCollapseThreshold =
       _MarkdownSpanCache.maxCharacters ~/ 3;
   static const int _longTextTailCharacters = 24000;
-  static const int _expandedPlainTextSegmentCharacters = 12000;
 
   List<InlineSpan>? _cachedSpans;
   String? _cachedText;
   double? _cachedMaxWidth;
   int _lastParseEnd = 0;
-  bool _expandedLongText = false;
   final List<TapGestureRecognizer> _recognizers = [];
   late final AnimationController _cursorController = AnimationController(
     vsync: this,
@@ -90,8 +93,9 @@ class _StreamingTextState extends State<StreamingText>
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final shouldProtectLongText =
-        !widget.isStreaming && widget.text.length > _longTextCollapseThreshold;
+    final shouldProtectLongText = !widget.isStreaming &&
+        !widget.renderFullText &&
+        widget.text.length > _longTextCollapseThreshold;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -121,22 +125,6 @@ class _StreamingTextState extends State<StreamingText>
     ThemeData theme,
     double maxInlineWidth,
   ) {
-    if (_expandedLongText) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _longTextToggle(theme, expanded: true),
-          const SizedBox(height: 8),
-          ..._plainTextSegments(widget.text).map(
-            (segment) => Text(
-              segment,
-              style: theme.textTheme.bodyMedium,
-            ),
-          ),
-        ],
-      );
-    }
-
     final tailLength =
         _longTextTailCharacters.clamp(0, widget.text.length).toInt();
     final omittedCharacters = widget.text.length - tailLength;
@@ -148,7 +136,6 @@ class _StreamingTextState extends State<StreamingText>
       children: [
         _longTextToggle(
           theme,
-          expanded: false,
           omittedCharacters: omittedCharacters,
         ),
         const SizedBox(height: 8),
@@ -162,7 +149,6 @@ class _StreamingTextState extends State<StreamingText>
 
   Widget _longTextToggle(
     ThemeData theme, {
-    required bool expanded,
     int omittedCharacters = 0,
   }) {
     final colors = theme.colorScheme;
@@ -179,37 +165,25 @@ class _StreamingTextState extends State<StreamingText>
         runSpacing: 4,
         children: [
           Icon(
-            expanded ? Icons.subject : Icons.vertical_align_bottom,
+            Icons.vertical_align_bottom,
             size: 16,
             color: colors.onSurfaceVariant,
           ),
           Text(
-            expanded
-                ? '已展开全文'
-                : '已折叠前 ${_formatCharacterCount(omittedCharacters)} 字符',
+            '已折叠前 ${_formatCharacterCount(omittedCharacters)} 字符',
             style: theme.textTheme.bodySmall?.copyWith(
               color: colors.onSurfaceVariant,
             ),
           ),
           TextButton(
             onPressed: () {
-              setState(() => _expandedLongText = !expanded);
+              widget.onOpenFullResponse?.call();
             },
-            child: Text(expanded ? '收起' : '展开全文'),
+            child: const Text(AppStrings.openFullResponse),
           ),
         ],
       ),
     );
-  }
-
-  Iterable<String> _plainTextSegments(String text) sync* {
-    for (var start = 0; start < text.length;) {
-      final end = (start + _expandedPlainTextSegmentCharacters)
-          .clamp(0, text.length)
-          .toInt();
-      yield text.substring(start, end);
-      start = end;
-    }
   }
 
   String _formatCharacterCount(int count) {
@@ -677,9 +651,7 @@ class _StreamingTextState extends State<StreamingText>
     if (oldWidget.isStreaming != widget.isStreaming) {
       _syncCursorAnimation();
     }
-    if (oldWidget.text != widget.text) {
-      _expandedLongText = false;
-    }
+    if (oldWidget.text != widget.text) {}
     // Only invalidate cache when text is completely different (not append)
     // Incremental parsing handles appends without cache invalidation
     if (oldWidget.text != widget.text &&

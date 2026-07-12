@@ -3,6 +3,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'app.dart' show ClawChatApp, initThemeFromPreferences;
 import 'l10n/app_strings.dart';
+import 'services/app_http.dart';
+import 'services/update_service.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -33,8 +35,20 @@ void main() {
   };
 
   runZonedGuarded(() async {
+    final runtimeInfo = await AppRuntimeInfo.load();
+    AppHttpOverrides.install(runtimeInfo);
+    final httpRegistry = AppHttpClientRegistry(runtimeInfo: runtimeInfo);
+    AppHttpClientRegistry.installForApp(httpRegistry);
+    try {
+      await UpdateService().reconcileAtStartup();
+    } catch (_) {
+      // Durable evidence is retained for the next idempotent reconciliation.
+    }
     await initThemeFromPreferences();
-    runApp(const ClawChatApp());
+    runApp(ClawChatApp(
+      runtimeInfo: runtimeInfo,
+      httpRegistry: httpRegistry,
+    ));
   }, (error, stackTrace) {
     if (kDebugMode) {
       debugPrint('Uncaught error: $error');

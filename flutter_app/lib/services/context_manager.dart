@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 
 import '../models/chat_models.dart';
 import '../models/model_capabilities.dart';
@@ -12,6 +14,7 @@ import 'llm_service.dart';
 import 'model_capability_registry.dart';
 import 'provider_message_transform.dart';
 import 'runtime_debug_events.dart';
+import 'skill_history_projection.dart';
 import 'token_calibration_service.dart';
 
 typedef ContextSummaryServiceFactory = ContextSummaryService Function();
@@ -260,6 +263,14 @@ class ContextManager {
   Future<ContextAssemblyResult> assembleForSend(
     ContextSendRequest request,
   ) async {
+    final trustProjectedMessages =
+        SkillHistoryProjection.project(request.fullApiMessages);
+    final assemblyStopwatch = Stopwatch()..start();
+    _recordRuntimeEvent(request.sessionId, 'context.assembly.started', {
+      'mode': ContextAssemblyMode.send.name,
+      'autoCompact': request.autoCompact,
+      'messageCount': request.fullApiMessages.length,
+    });
     final assemblyId = _nextAssemblyId();
     final estimator = _tokenEstimatorFor(
       request.llmConfig,
@@ -273,7 +284,11 @@ class ContextManager {
       toolDefinitions: request.toolDefinitions,
       contextTokenBudget: request.contextTokenBudget,
     );
-    final summaryResult = await _prepareSummaryContext(request, budget);
+    final summaryResult = await _prepareSummaryContext(
+      request,
+      budget,
+      trustProjectedMessages,
+    );
     final notices = <ContextNotice>[
       if (summaryResult.summaryGenerated)
         ContextNotice.summaryCompacted(summaryResult.coveredMessageCount)
@@ -333,6 +348,20 @@ class ContextManager {
       toolDefinitions: request.toolDefinitions,
     );
 
+    _recordRuntimeEvent(request.sessionId, 'context.assembly.completed', {
+      'mode': ContextAssemblyMode.send.name,
+      'durationMs': assemblyStopwatch.elapsedMilliseconds,
+      'messageCount': truncation.messages.length,
+      'generated': summaryResult.summaryGenerated,
+      'reused': summaryResult.summaryReused,
+      'failed': summaryResult.summaryFailed,
+      'coveredMessageCount': summaryResult.coveredMessageCount,
+      'droppedMessageCount': truncation.droppedMessageCount,
+      'droppedBlockCount': truncation.droppedBlockCount,
+      'finalTokenBudget': finalBudget.messageBudget,
+      'compressedToolResultCount': compressed.compressedCount,
+    });
+
     return ContextAssemblyResult(
       assemblyId: assemblyId,
       mode: ContextAssemblyMode.send,
@@ -370,7 +399,7 @@ class ContextManager {
       models: request.compareModels,
     );
     final baseCompareMessages = [
-      ...request.sessionApiMessages,
+      ...SkillHistoryProjection.project(request.sessionApiMessages),
       {'role': 'user', 'content': request.comparePrompt},
     ];
     final baseBudget = _resolveContextTokenBudget(
@@ -470,7 +499,7 @@ class ContextManager {
     final assemblyId = _nextAssemblyId();
     final recoveryTransformResult =
         const ProviderMessageTransform().transformCanonical(
-      request.messages,
+      SkillHistoryProjection.project(request.messages),
       ProviderTransformOptions(
         apiFormat: request.llmConfig.format == ApiFormat.anthropic
             ? 'anthropic'
@@ -520,7 +549,7 @@ class ContextManager {
   Future<ContextSummary> buildManualSummary(
     ContextManualSummaryRequest request,
   ) async {
-    final messages = request.apiPrefixMessages;
+    final messages = SkillHistoryProjection.project(request.apiPrefixMessages);
     if (messages.isEmpty) {
       throw ArgumentError.value(
         messages.length,
@@ -565,7 +594,7 @@ class ContextManager {
         'context.summary.manual.failed',
         {
           'stage': 'llm',
-          'errorType': e.runtimeType.toString(),
+          'errorCode': _safeFailureClass(e),
         },
       );
       final summary = service.extractiveFallback(summaryRequest);
@@ -633,42 +662,43 @@ class ContextManager {
   Future<_SummaryContextResult> _prepareSummaryContext(
     ContextSendRequest request,
     ContextBudgetBreakdown budget,
+    List<Map<String, dynamic>> trustProjectedMessages,
   ) async {
     final estimator = _tokenEstimatorFor(
       request.llmConfig,
       activeProfileId: request.activeProfileId,
     );
     if (!request.autoCompact ||
-        request.fullApiMessages.isEmpty ||
-        estimator.estimateMessages(request.fullApiMessages) <=
+        trustProjectedMessages.isEmpty ||
+        estimator.estimateMessages(trustProjectedMessages) <=
             budget.messageBudget) {
       return _SummaryContextResult(
         systemPrompt: request.systemPrompt,
-        messages: request.fullApiMessages,
+        messages: trustProjectedMessages,
       );
     }
 
     final plan = ChatContextUtils.planCompaction(
-      request.fullApiMessages,
+      trustProjectedMessages,
       maxTokens: budget.messageBudget,
       estimator: estimator,
     );
     if (!plan.needsSummary || plan.headForSummary.isEmpty) {
       return _SummaryContextResult(
         systemPrompt: request.systemPrompt,
-        messages: request.fullApiMessages,
+        messages: trustProjectedMessages,
       );
     }
 
     var summary = _validatedSummaryForPrefix(
       request.existingSummary,
-      request.fullApiMessages,
+      trustProjectedMessages,
     );
     var generated = false;
     var reused = false;
     var failed = false;
     var summaryChanged = false;
-    if (!_canReuseSummary(summary, plan, request.fullApiMessages)) {
+    if (!_canReuseSummary(summary, plan, trustProjectedMessages)) {
       if (request.existingSummary != null && summary == null) {
         _recordSummaryStaleEvent(
           request.sessionId,
@@ -681,7 +711,7 @@ class ContextManager {
       }
       final summaryRequest = ContextSummaryRequest(
         messages: _messagesForSummaryGeneration(
-          request.fullApiMessages,
+          trustProjectedMessages,
           plan,
           summary,
         ),
@@ -710,34 +740,35 @@ class ContextManager {
           },
         );
       } catch (e) {
-        debugPrint('Context summary generation failed: $e');
+        _logSafeFailure('context_summary_generation_failed', e);
         failed = true;
         _recordRuntimeEvent(
           request.sessionId,
           'context.summary.failed',
           {
             'stage': 'llm',
-            'errorType': e.runtimeType.toString(),
+            'errorCode': _safeFailureClass(e),
           },
         );
         try {
           summary = service.extractiveFallback(summaryRequest);
           summaryChanged = true;
         } catch (fallbackError) {
-          debugPrint(
-            'Context summary extractive fallback failed: $fallbackError',
+          _logSafeFailure(
+            'context_summary_extractive_fallback_failed',
+            fallbackError,
           );
           _recordRuntimeEvent(
             request.sessionId,
             'context.summary.failed',
             {
               'stage': 'extractive',
-              'errorType': fallbackError.runtimeType.toString(),
+              'errorCode': _safeFailureClass(fallbackError),
             },
           );
           return _SummaryContextResult(
             systemPrompt: request.systemPrompt,
-            messages: request.fullApiMessages,
+            messages: trustProjectedMessages,
             summaryFailed: true,
           );
         }
@@ -1107,7 +1138,7 @@ class ContextManager {
         _providerTransformPreflight(messages, options),
       );
     } catch (e) {
-      debugPrint('Provider transform debug preflight failed: $e');
+      _logSafeFailure('provider_transform_preflight_failed', e);
     }
   }
 
@@ -1122,7 +1153,6 @@ class ContextManager {
         {
           'stage': 'provider_payload',
           'totalCount': result.sensitiveDataStats.totalCount,
-          'countByType': result.sensitiveDataStats.toJson(),
         },
       );
     }
@@ -1132,11 +1162,43 @@ class ContextManager {
       'provider.transform.warning',
       {
         'warningCount': result.warnings.length,
-        'firstWarning': result.warnings.first,
+        'warningCode': _providerWarningCode(result.warnings.first),
         'droppedBlockCount': result.droppedBlockCount,
       },
     );
   }
+
+  void _logSafeFailure(String code, Object error) {
+    debugPrint(
+        'ContextManager failure code=$code class=${_safeFailureClass(error)}');
+  }
+
+  String _safeFailureClass(Object error) => switch (error) {
+        TimeoutException() => 'TimeoutException',
+        HandshakeException() => 'HandshakeException',
+        SocketException() => 'SocketException',
+        http.ClientException() => 'ClientException',
+        FormatException() => 'FormatException',
+        StateError() => 'StateError',
+        ArgumentError() => 'ArgumentError',
+        _ => 'Exception',
+      };
+
+  String _providerWarningCode(String warning) => switch (warning) {
+        'image content replaced because provider lacks support' =>
+          'image_unsupported',
+        'dropped tool_use with missing id or name' =>
+          'tool_use_missing_identity',
+        'dropped tool_result with missing tool_use_id' =>
+          'tool_result_missing_id',
+        'dropped orphan tool_use block' ||
+        'found orphan tool_use block' =>
+          'orphan_tool_use',
+        'dropped orphan tool_result block' ||
+        'found orphan tool_result block' =>
+          'orphan_tool_result',
+        _ => 'unknown',
+      };
 
   void _recordTokenCalibrationEvent(
     String sessionId,
@@ -1147,7 +1209,6 @@ class ContextManager {
         sessionId,
         'token.calibration.updated',
         {
-          'keyHash': _shortHash(result.key),
           'oldMultiplier': result.oldMultiplier,
           'ratio': result.ratio,
           'newMultiplier': result.newMultiplier,
@@ -1213,15 +1274,6 @@ class ContextManager {
       }
     }
     return count;
-  }
-
-  String _shortHash(String value) {
-    var hash = 0x811c9dc5;
-    for (final codeUnit in value.codeUnits) {
-      hash ^= codeUnit;
-      hash = (hash * 0x01000193) & 0xffffffff;
-    }
-    return hash.toRadixString(16).padLeft(8, '0');
   }
 
   String _nextAssemblyId() {

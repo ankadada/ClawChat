@@ -44,7 +44,8 @@ class ProgressStep extends StatelessWidget {
       borderColor = theme.colorScheme.primary.withAlpha(140);
       // Use indeterminate (spinning) when progress is 0 so the UI doesn't
       // appear frozen during long-running steps (#83).
-      final effectiveProgress = (progress != null && progress! > 0.0) ? progress : null;
+      final effectiveProgress =
+          (progress != null && progress! > 0.0) ? progress : null;
       circleChild = SizedBox(
         width: 16,
         height: 16,

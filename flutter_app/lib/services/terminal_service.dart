@@ -13,15 +13,20 @@ class TerminalService {
   static Future<Map<String, String>> getProotShellConfig({
     bool mountStorage = true,
   }) async {
-    try { await NativeBridge.setupDirs(); } catch (_) {
+    try {
+      await NativeBridge.setupDirs();
+    } catch (_) {
       // Best-effort: dirs may already exist
     }
-    try { await NativeBridge.writeResolv(); } catch (_) {
+    try {
+      await NativeBridge.writeResolv();
+    } catch (_) {
       // Best-effort: resolv.conf may already be configured
     }
 
     final filesDir = await _channel.invokeMethod<String>('getFilesDir') ?? '';
-    final nativeLibDir = await _channel.invokeMethod<String>('getNativeLibDir') ?? '';
+    final nativeLibDir =
+        await _channel.invokeMethod<String>('getNativeLibDir') ?? '';
 
     final rootfsDir = '$filesDir/rootfs/alpine';
     final tmpDir = '$filesDir/tmp';
@@ -121,7 +126,8 @@ class TerminalService {
     }
 
     args.addAll([
-      '/usr/bin/env', '-i',
+      '/usr/bin/env',
+      '-i',
       'HOME=/root',
       'USER=root',
       'LANG=C.UTF-8',

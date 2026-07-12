@@ -202,10 +202,11 @@ class _ToolCallCardState extends State<ToolCallCard> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(AppStrings.inputLabel, style: theme.textTheme.labelSmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-                fontWeight: FontWeight.w600,
-              )),
+              Text(AppStrings.inputLabel,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                  )),
               const SizedBox(height: 4),
               CodeBlock(
                 code: const JsonEncoder.withIndent('  ')
@@ -214,10 +215,11 @@ class _ToolCallCardState extends State<ToolCallCard> {
               ),
               if (output != null) ...[
                 const SizedBox(height: 12),
-                Text(AppStrings.outputLabel, style: theme.textTheme.labelSmall?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
-                  fontWeight: FontWeight.w600,
-                )),
+                Text(AppStrings.outputLabel,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w600,
+                    )),
                 const SizedBox(height: 4),
                 CodeBlock(
                   code: output,
@@ -311,10 +313,7 @@ List<SearchSource> parseSearchSources(String output) {
       continue;
     }
 
-    final title = block
-        .split('\n')
-        .map((line) => line.trim())
-        .firstWhere(
+    final title = block.split('\n').map((line) => line.trim()).firstWhere(
           (line) => line.isNotEmpty && !urlPattern.hasMatch(line),
           orElse: () => uri.host,
         );
@@ -334,8 +333,7 @@ String _cleanSearchSourceUrl(String url) {
 
 @visibleForTesting
 bool isLaunchableSearchSource(Uri uri) {
-  return (uri.scheme == 'http' || uri.scheme == 'https') &&
-      uri.host.isNotEmpty;
+  return (uri.scheme == 'http' || uri.scheme == 'https') && uri.host.isNotEmpty;
 }
 
 @visibleForTesting
@@ -372,7 +370,6 @@ class _PulsingToolBorderState extends State<_PulsingToolBorder>
   @override
   void initState() {
     super.initState();
-    _syncAnimation();
   }
 
   @override
@@ -383,8 +380,14 @@ class _PulsingToolBorderState extends State<_PulsingToolBorder>
     }
   }
 
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncAnimation();
+  }
+
   void _syncAnimation() {
-    if (widget.pulsing) {
+    if (widget.pulsing && !MediaQuery.disableAnimationsOf(context)) {
       _controller.repeat(reverse: true);
     } else {
       _controller
@@ -404,9 +407,8 @@ class _PulsingToolBorderState extends State<_PulsingToolBorder>
     return AnimatedBuilder(
       animation: _controller,
       builder: (context, child) {
-        final opacity = widget.pulsing
-            ? 0.58 + (_controller.value * 0.22)
-            : 0.9;
+        final opacity =
+            widget.pulsing ? 0.58 + (_controller.value * 0.22) : 0.9;
         return Container(
           width: 4,
           color: widget.color.withAlpha((255 * opacity).round()),

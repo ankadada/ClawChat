@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
-import 'package:google_fonts/google_fonts.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
 import '../app.dart';
@@ -19,6 +18,7 @@ class _SplashScreenState extends State<SplashScreen>
     with SingleTickerProviderStateMixin {
   final _prefs = PreferencesService();
   String _status = AppStrings.splashLoading;
+  bool _checking = false;
   late final AnimationController _fadeController;
   late final CurvedAnimation _fadeAnimation;
 
@@ -45,9 +45,12 @@ class _SplashScreenState extends State<SplashScreen>
   }
 
   Future<void> _checkAndRoute() async {
+    if (_checking) return;
+    _checking = true;
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
+      if (!mounted) return;
       setState(() => _status = AppStrings.checkingSetupStatus);
 
       try {
@@ -89,16 +92,19 @@ class _SplashScreenState extends State<SplashScreen>
           CupertinoPageRoute(builder: (_) => const SetupWizardScreen()),
         );
       }
-    } catch (e) {
+    } catch (_) {
       if (mounted) {
-        setState(() => _status = 'Error: $e');
+        setState(() {
+          _checking = false;
+          _status = AppStrings.setupStatusUnavailable;
+        });
       }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final hasError = _status.startsWith('Error:');
+    final hasError = _status == AppStrings.setupStatusUnavailable;
     return Scaffold(
       body: Center(
         child: FadeTransition(
@@ -114,7 +120,7 @@ class _SplashScreenState extends State<SplashScreen>
               const SizedBox(height: 24),
               Text(
                 AppStrings.appName,
-                style: GoogleFonts.inter(
+                style: TextStyle(
                   fontSize: 28,
                   fontWeight: FontWeight.w800,
                   letterSpacing: 1.2,

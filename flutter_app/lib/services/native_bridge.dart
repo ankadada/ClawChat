@@ -1,14 +1,49 @@
 import 'dart:convert';
-import 'dart:io' as io;
+import 'dart:io' show FileSystemException;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:crypto/crypto.dart' as crypto;
+import 'package:uuid/uuid.dart';
 import '../constants.dart';
+import '../models/workspace_import_receipt.dart';
+import 'attachment_budget.dart';
+import 'bounded_file_reader.dart';
 import 'shared_content.dart';
 
-// Private aliases to keep dart:io usage contained
-typedef _File = io.File;
-const _base64 = base64;
+typedef HostFileImportBroker = Future<Map<String, dynamic>> Function(
+  String path,
+  String destinationPath,
+  String operationId,
+  int maxBytes,
+);
+
+typedef RootfsBoundedReadBroker = Future<Uint8List?> Function(
+  String path,
+  String operationId,
+  int maxBytes,
+);
+
+typedef WorkspaceImportLifecycleBroker = Future<bool> Function(
+  WorkspaceImportReceipt receipt,
+  bool discard,
+);
+
+typedef PendingWorkspaceImportLister = Future<List<WorkspaceImportReceipt>>
+    Function();
+
+typedef UpdateSignatureVerifier = Future<bool> Function(
+  Uint8List payload,
+  String signature,
+  String algorithm,
+  String keyId,
+);
+
+typedef ApkInstallerHandoff = Future<bool> Function(
+  String path,
+  int size,
+  String sha256,
+);
 
 class NativeBridge {
   static const _channel = MethodChannel(AppConstants.channelName);
@@ -21,6 +56,16 @@ class NativeBridge {
   static Future<void> Function(SharedContent content)? _shareIntentHandler;
   static bool _agentCallbackInitialized = false;
   static bool _nativeCallbackInitialized = false;
+  static Stream<List<int>> Function(String path)? _importReadStreamForTesting;
+  static BoundedFileIdentityProbe? _importIdentityProbeForTesting;
+  static HostFileImportBroker? _hostFileImportBrokerForTesting;
+  static RootfsBoundedReadBroker? _rootfsBoundedReadBrokerForTesting;
+  static WorkspaceImportLifecycleBroker?
+      _workspaceImportLifecycleBrokerForTesting;
+  static PendingWorkspaceImportLister? _pendingWorkspaceImportListerForTesting;
+  static UpdateSignatureVerifier? _updateSignatureVerifierForTesting;
+  static ApkInstallerHandoff? _apkInstallerHandoffForTesting;
+  static final Set<String> _testWorkspaceImportOperations = {};
 
   static void setShareIntentHandler(
     Future<void> Function(SharedContent content)? handler,
@@ -116,6 +161,55 @@ class NativeBridge {
     return (await _channel.invokeMethod<String>('getNativeLibDir'))!;
   }
 
+  static Future<bool> verifyUpdateSignature({
+    required Uint8List payload,
+    required String signature,
+    required String algorithm,
+    required String keyId,
+  }) async {
+    final verifier = _updateSignatureVerifierForTesting;
+    if (verifier != null) {
+      return verifier(payload, signature, algorithm, keyId);
+    }
+    return await _channel.invokeMethod<bool>('verifyUpdateSignature', {
+          'payload': base64Encode(payload),
+          'signature': signature,
+          'algorithm': algorithm,
+          'keyId': keyId,
+        }) ??
+        false;
+  }
+
+  static Future<bool> handoffVerifiedApk({
+    required String path,
+    required int size,
+    required String sha256,
+  }) async {
+    final handoff = _apkInstallerHandoffForTesting;
+    if (handoff != null) return handoff(path, size, sha256);
+    return await _channel.invokeMethod<bool>('handoffVerifiedApk', {
+          'path': path,
+          'size': size,
+          'sha256': sha256,
+        }) ??
+        false;
+  }
+
+  @visibleForTesting
+  static void setUpdateBrokersForTesting({
+    UpdateSignatureVerifier? signatureVerifier,
+    ApkInstallerHandoff? apkInstallerHandoff,
+  }) {
+    _updateSignatureVerifierForTesting = signatureVerifier;
+    _apkInstallerHandoffForTesting = apkInstallerHandoff;
+  }
+
+  @visibleForTesting
+  static void resetUpdateBrokersForTesting() {
+    _updateSignatureVerifierForTesting = null;
+    _apkInstallerHandoffForTesting = null;
+  }
+
   static Future<bool> isBootstrapComplete() async {
     return (await _channel.invokeMethod<bool>('isBootstrapComplete'))!;
   }
@@ -147,12 +241,34 @@ class NativeBridge {
     String command, {
     int timeout = 900,
     bool mountStorage = false,
+    String? operationId,
   }) async {
     return (await _channel.invokeMethod<String>('runInProot', {
       'command': command,
       'timeout': timeout,
       'mountStorage': mountStorage,
+      if (operationId != null) 'operationId': operationId,
     }))!;
+  }
+
+  static Future<void> cancelImportOperation(String operationId) async {
+    try {
+      await _channel.invokeMethod<bool>('cancelImportOperation', {
+        'operationId': operationId,
+      });
+    } on MissingPluginException {
+      // Test and non-Android runtimes have no cancellable native operation.
+    }
+  }
+
+  static Future<void> finishImportOperation(String operationId) async {
+    try {
+      await _channel.invokeMethod<bool>('finishImportOperation', {
+        'operationId': operationId,
+      });
+    } on MissingPluginException {
+      // Test and non-Android runtimes have no native operation registry.
+    }
   }
 
   static Future<bool> setupDirs() async {
@@ -302,14 +418,42 @@ class NativeBridge {
     return (await _channel.invokeMethod<String>('getExternalStoragePath'))!;
   }
 
-  static Future<String?> readRootfsFile(String path) async {
-    return await _channel
-        .invokeMethod<String?>('readRootfsFile', {'path': path});
+  static Future<String?> readRootfsFile(
+    String path, {
+    Iterable<String>? allowedRoots,
+  }) async {
+    return await _channel.invokeMethod<String?>('readRootfsFile', {
+      'path': path,
+      if (allowedRoots != null) 'allowedRoots': allowedRoots.toList(),
+    });
   }
 
-  static Future<bool> writeRootfsFile(String path, String content) async {
-    return (await _channel.invokeMethod<bool>(
-        'writeRootfsFile', {'path': path, 'content': content}))!;
+  static Future<bool> writeRootfsFile(
+    String path,
+    String content, {
+    Iterable<String>? allowedRoots,
+    bool createNew = false,
+  }) async {
+    return (await _channel.invokeMethod<bool>('writeRootfsFile', {
+      'path': path,
+      'content': content,
+      if (allowedRoots != null) 'allowedRoots': allowedRoots.toList(),
+      'createNew': createNew,
+    }))!;
+  }
+
+  static Future<bool> writeRootfsBytes(
+    String path,
+    Uint8List bytes, {
+    Iterable<String>? allowedRoots,
+    bool createNew = false,
+  }) async {
+    return (await _channel.invokeMethod<bool>('writeRootfsBytes', {
+      'path': path,
+      'bytes': bytes,
+      if (allowedRoots != null) 'allowedRoots': allowedRoots.toList(),
+      'createNew': createNew,
+    }))!;
   }
 
   static Future<Map<String, dynamic>> phoneIntent(
@@ -366,19 +510,257 @@ class NativeBridge {
 
   /// Copy a host file into the proot workspace.
   ///
-  /// For text files, reads content as string and writes via [writeRootfsFile].
-  /// For binary files, encodes as base64, writes to a temp file, then decodes
-  /// inside proot using `base64 -d`.
+  /// Production copies are performed entirely by the Android descriptor
+  /// broker. Raw bytes never cross the MethodChannel or return to Dart.
   ///
   /// [sourcePath] is the absolute path on the host filesystem (e.g. from file_picker cache).
   /// [destFilename] is the desired filename inside /root/workspace/uploads/.
-  /// Returns the destination path inside proot.
-  static Future<String> importFileToWorkspace(
-      String sourcePath, String destFilename) async {
-    final safeName = destFilename.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+  /// Returns an unacknowledged receipt. The caller must acknowledge only after
+  /// a durable reference exists, or discard when the draft/import is abandoned.
+  static Future<WorkspaceImportReceipt> importFileToWorkspace(
+    String sourcePath,
+    String destFilename, {
+    String? operationId,
+  }) async {
+    final normalizedName =
+        destFilename.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+    final safeName = normalizedName.isEmpty ? 'attachment' : normalizedName;
     const destDir = 'root/workspace/uploads';
-    final destPath = '$destDir/$safeName';
+    final effectiveOperationId = operationId ?? _newOperationId();
+    if (!RegExp(r'^[a-f0-9]{32}$').hasMatch(effectiveOperationId)) {
+      throw ArgumentError.value(operationId, 'operationId');
+    }
+    final storedName = _operationScopedFileName(safeName, effectiveOperationId);
+    final destPath = '$destDir/$storedName';
+    final testRead = _importReadStreamForTesting != null ||
+        _importIdentityProbeForTesting != null;
+    if (testRead) {
+      final bytes = await _importFileToWorkspaceForTesting(
+        sourcePath,
+        safeName,
+        destPath,
+      );
+      final receipt = WorkspaceImportReceipt(
+        operationId: effectiveOperationId,
+        storedPath: '/root/workspace/uploads/$storedName',
+        size: bytes.length,
+        sha256: crypto.sha256.convert(bytes).toString(),
+        displayName: safeName.substring(
+          0,
+          safeName.length.clamp(0, 180).toInt(),
+        ),
+      );
+      _testWorkspaceImportOperations.add(receipt.operationId);
+      return receipt;
+    }
 
+    final broker = _hostFileImportBrokerForTesting;
+    final response = broker == null
+        ? await _channel.invokeMethod<Map<Object?, Object?>>(
+            'importHostFileToWorkspace',
+            {
+              'path': sourcePath,
+              'destinationPath': destPath,
+              'allowedRoot': '/root/workspace/uploads',
+              'operationId': effectiveOperationId,
+              'maxBytes': AttachmentBudget.maxWorkspaceImportBytes,
+            },
+          )
+        : await broker(
+            sourcePath,
+            destPath,
+            effectiveOperationId,
+            AttachmentBudget.maxWorkspaceImportBytes,
+          );
+    if (response == null) {
+      throw FileSystemException(
+        'Descriptor-bound workspace import is unavailable',
+        sourcePath,
+      );
+    }
+    final metadata = Map<String, dynamic>.from(response);
+    final storedPath = metadata['storedPath'] as String?;
+    final size = metadata['size'] as int?;
+    final sha256 = metadata['sha256'] as String?;
+    final sourceIdentity = metadata['sourceIdentity'] as String?;
+    if (storedPath != '/$destPath' ||
+        size == null ||
+        size < 0 ||
+        size > AttachmentBudget.maxWorkspaceImportBytes ||
+        sha256 == null ||
+        !RegExp(r'^[a-f0-9]{64}$').hasMatch(sha256) ||
+        sourceIdentity == null ||
+        sourceIdentity.isEmpty) {
+      throw FileSystemException(
+        'Descriptor-bound workspace import metadata is invalid',
+        sourcePath,
+      );
+    }
+    return WorkspaceImportReceipt(
+      operationId: effectiveOperationId,
+      storedPath: storedPath!,
+      size: size,
+      sha256: sha256,
+      displayName: safeName.substring(
+        0,
+        safeName.length.clamp(0, 180).toInt(),
+      ),
+    );
+  }
+
+  static Future<void> acknowledgeWorkspaceImport(
+    WorkspaceImportReceipt receipt,
+  ) async {
+    if (_testWorkspaceImportOperations.remove(receipt.operationId)) return;
+    final broker = _workspaceImportLifecycleBrokerForTesting;
+    final acknowledged = broker == null
+        ? await _channel.invokeMethod<bool>('acknowledgeHostFileImport', {
+            'operationId': receipt.operationId,
+            'storedPath': receipt.storedPath,
+            'size': receipt.size,
+            'sha256': receipt.sha256,
+          })
+        : await broker(receipt, false);
+    if (acknowledged != true) {
+      throw FileSystemException(
+        'Workspace import acknowledgement failed',
+        receipt.storedPath,
+      );
+    }
+  }
+
+  static Future<void> discardWorkspaceImport(
+    WorkspaceImportReceipt receipt,
+  ) async {
+    if (_testWorkspaceImportOperations.remove(receipt.operationId)) return;
+    final broker = _workspaceImportLifecycleBrokerForTesting;
+    final discarded = broker == null
+        ? await _channel.invokeMethod<bool>('discardHostFileImport', {
+            'operationId': receipt.operationId,
+            'storedPath': receipt.storedPath,
+            'size': receipt.size,
+            'sha256': receipt.sha256,
+          })
+        : await broker(receipt, true);
+    if (discarded != true) {
+      throw FileSystemException(
+        'Workspace import discard failed',
+        receipt.storedPath,
+      );
+    }
+  }
+
+  static Future<List<WorkspaceImportReceipt>>
+      listPendingWorkspaceImports() async {
+    final testLister = _pendingWorkspaceImportListerForTesting;
+    if (testLister != null) return testLister();
+    const limit = 64;
+    final receipts = <String, WorkspaceImportReceipt>{};
+    try {
+      for (var batchIndex = 0; batchIndex < 4; batchIndex++) {
+        final raw = await _channel.invokeMethod<List<Object?>>(
+              'listPendingWorkspaceImports',
+              {'limit': limit},
+            ) ??
+            const [];
+        var added = 0;
+        for (final item in raw) {
+          if (item is! Map) continue;
+          final map = Map<String, dynamic>.from(item);
+          final operationId = map['operationId'] as String? ?? '';
+          final storedPath = map['storedPath'] as String? ?? '';
+          final component = storedPath.split('/').last;
+          final marker = '_$operationId';
+          final markerIndex = component.lastIndexOf(marker);
+          if (markerIndex <= 0) continue;
+          final displayName =
+              '${component.substring(0, markerIndex)}${component.substring(markerIndex + marker.length)}';
+          final receipt = WorkspaceImportReceipt(
+            operationId: operationId,
+            storedPath: storedPath,
+            size: map['size'] as int? ?? -1,
+            sha256: map['sha256'] as String? ?? '',
+            displayName: displayName.substring(
+              0,
+              displayName.length.clamp(0, 180).toInt(),
+            ),
+          );
+          if (!receipts.containsKey(operationId)) added++;
+          receipts[operationId] = receipt;
+        }
+        if (raw.length < limit || added == 0) break;
+      }
+    } on MissingPluginException {
+      return const [];
+    } on PlatformException {
+      return const [];
+    } catch (_) {
+      return const [];
+    }
+    return List.unmodifiable(receipts.values);
+  }
+
+  static Future<Uint8List?> readRootfsFileBounded(
+    String path, {
+    required String operationId,
+    required int maxBytes,
+  }) async {
+    if (!RegExp(r'^[a-f0-9]{32}$').hasMatch(operationId) ||
+        maxBytes < 0 ||
+        maxBytes > 1024 * 1024) {
+      throw ArgumentError('Invalid bounded rootfs read arguments');
+    }
+    final broker = _rootfsBoundedReadBrokerForTesting;
+    final bytes = broker == null
+        ? await _channel.invokeMethod<Uint8List>('readRootfsFileBounded', {
+            'path': path,
+            'allowedRoot': '/root/workspace/.skill-import-staging',
+            'operationId': operationId,
+            'maxBytes': maxBytes,
+          })
+        : await broker(path, operationId, maxBytes);
+    if (bytes != null && bytes.length > maxBytes) {
+      throw FileSystemException('Bounded rootfs read exceeded its limit', path);
+    }
+    return bytes;
+  }
+
+  static String _newOperationId() => const Uuid().v4().replaceAll('-', '');
+
+  static String _operationScopedFileName(
+    String safeName,
+    String operationId,
+  ) {
+    final dot = safeName.lastIndexOf('.');
+    final hasExtension = dot > 0 && dot < safeName.length - 1;
+    final rawStem = hasExtension ? safeName.substring(0, dot) : safeName;
+    final rawExtension = hasExtension ? safeName.substring(dot) : '';
+    final stem = rawStem.substring(0, rawStem.length.clamp(0, 159).toInt());
+    final extension =
+        rawExtension.substring(0, rawExtension.length.clamp(0, 20).toInt());
+    return '${stem}_$operationId$extension';
+  }
+
+  static Future<Uint8List> _importFileToWorkspaceForTesting(
+    String sourcePath,
+    String safeName,
+    String destPath,
+  ) async {
+    final bytes = await BoundedFileReader.readBytes(
+      sourcePath,
+      validateBytes: (byteLength) {
+        const AttachmentBudget().checkWorkspaceImportBytes(
+          byteLength,
+          fileName: safeName,
+        );
+      },
+      streamFactory: _importReadStreamForTesting,
+      identityProbe: _importIdentityProbeForTesting,
+    );
+    const AttachmentBudget().checkWorkspaceImportBytes(
+      bytes.length,
+      fileName: safeName,
+    );
     final extension = safeName.split('.').last.toLowerCase();
     const textExtensions = {
       'txt',
@@ -401,38 +783,74 @@ class NativeBridge {
       'log',
       'sql',
     };
-
     if (textExtensions.contains(extension)) {
-      // Text file: read as string and write directly
-      final file = await _readFileAsString(sourcePath);
-      await writeRootfsFile(destPath, file);
+      await writeRootfsFile(
+        destPath,
+        utf8.decode(bytes),
+        allowedRoots: const ['/root/workspace/uploads'],
+        createNew: true,
+      );
     } else {
-      // Binary file: base64 encode, write temp, decode in proot
-      final bytes = await _readFileAsBytes(sourcePath);
-      final base64Content = _base64Encode(bytes);
-      await writeRootfsFile('$destDir/.tmp_b64', base64Content);
-      await runInProot(
-        'base64 -d /root/workspace/uploads/.tmp_b64 > "/root/workspace/uploads/$safeName" && rm /root/workspace/uploads/.tmp_b64',
+      await writeRootfsBytes(
+        destPath,
+        bytes,
+        allowedRoots: const ['/root/workspace/uploads'],
+        createNew: true,
       );
     }
-
-    return '/root/workspace/uploads/$safeName';
+    return bytes;
   }
 
-  // Helper: read file as string (isolates dart:io usage)
-  static Future<String> _readFileAsString(String path) async {
-    final file = _File(path);
-    return await file.readAsString();
+  @visibleForTesting
+  static void resetImportReadStreamForTesting() {
+    _importReadStreamForTesting = null;
+    _importIdentityProbeForTesting = null;
+    _hostFileImportBrokerForTesting = null;
+    _rootfsBoundedReadBrokerForTesting = null;
+    _workspaceImportLifecycleBrokerForTesting = null;
+    _pendingWorkspaceImportListerForTesting = null;
+    _testWorkspaceImportOperations.clear();
   }
 
-  // Helper: read file as bytes
-  static Future<List<int>> _readFileAsBytes(String path) async {
-    final file = _File(path);
-    return await file.readAsBytes();
+  @visibleForTesting
+  static void setImportReadStreamForTesting(
+    Stream<List<int>> Function(String path) streamFactory,
+  ) {
+    _importReadStreamForTesting = streamFactory;
   }
 
-  // Helper: base64 encode bytes
-  static String _base64Encode(List<int> bytes) {
-    return _base64.encode(bytes);
+  @visibleForTesting
+  static void setImportIdentityProbeForTesting(
+    BoundedFileIdentityProbe identityProbe,
+  ) {
+    _importIdentityProbeForTesting = identityProbe;
+  }
+
+  @visibleForTesting
+  static void setHostFileImportBrokerForTesting(
+    HostFileImportBroker broker,
+  ) {
+    _hostFileImportBrokerForTesting = broker;
+  }
+
+  @visibleForTesting
+  static void setWorkspaceImportLifecycleBrokerForTesting(
+    WorkspaceImportLifecycleBroker broker,
+  ) {
+    _workspaceImportLifecycleBrokerForTesting = broker;
+  }
+
+  @visibleForTesting
+  static void setPendingWorkspaceImportListerForTesting(
+    PendingWorkspaceImportLister lister,
+  ) {
+    _pendingWorkspaceImportListerForTesting = lister;
+  }
+
+  @visibleForTesting
+  static void setRootfsBoundedReadBrokerForTesting(
+    RootfsBoundedReadBroker broker,
+  ) {
+    _rootfsBoundedReadBrokerForTesting = broker;
   }
 }

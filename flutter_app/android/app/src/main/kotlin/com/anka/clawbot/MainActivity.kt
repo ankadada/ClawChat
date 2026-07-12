@@ -28,6 +28,13 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.io.ByteArrayInputStream
+import java.security.MessageDigest
+import java.security.Signature as CryptoSignature
+import java.security.cert.CertificateFactory
+import android.util.Base64
+import java.util.UUID
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.anka.clawbot/native"
@@ -36,19 +43,70 @@ class MainActivity : FlutterActivity() {
     private lateinit var processManager: ProcessManager
     private lateinit var phoneIntentManager: PhoneIntentManager
     private val setupDone = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val secureImportExecutor = Executors.newFixedThreadPool(2) { task ->
+        Thread(task, "clawchat-secure-import").apply { isDaemon = true }
+    }
     private var pendingSpeechResult: MethodChannel.Result? = null
     private var mediaRecorder: MediaRecorder? = null
     private var recordingPath: String? = null
+    private var recordingOperationId: String? = null
     private var pendingNavigateToSessionId: String? = null
     private var pendingShareIntent: Map<String, Any?>? = null
     private var shareCallbackChannel: MethodChannel? = null
     private var mediaPlayer: MediaPlayer? = null
+    private var mediaPlaybackPath: String? = null
+    private var mediaPlaybackOperationId: String? = null
     private var activityResumed = false
 
     private fun safeRunOnUiThread(action: () -> Unit) {
         if (isDestroyed || isFinishing) return
         runOnUiThread {
             if (!isDestroyed && !isFinishing) action()
+        }
+    }
+
+    private fun deleteTtsPlaybackCache(path: String?) {
+        if (path == null) return
+        try {
+            val cacheRoot = applicationContext.cacheDir.canonicalFile
+            val candidate = File(path).canonicalFile
+            val insideCache = candidate.path.startsWith(cacheRoot.path + File.separator)
+            if (insideCache && candidate.name.startsWith("tts_") && candidate.name.endsWith(".mp3")) {
+                candidate.delete()
+            }
+        } catch (_: Exception) {
+            // Cache deletion is best effort and must not mask playback state.
+        }
+    }
+
+    private fun deleteWhisperRecordingCache(path: String?) {
+        if (path == null) return
+        try {
+            val cacheRoot = applicationContext.cacheDir.canonicalFile
+            val candidate = File(path).canonicalFile
+            val insideCache = candidate.path.startsWith(cacheRoot.path + File.separator)
+            if (insideCache && candidate.name.startsWith("whisper_") && candidate.name.endsWith(".m4a")) {
+                candidate.delete()
+            }
+        } catch (_: Exception) {
+            // Recording cleanup is best effort and restricted to app-owned files.
+        }
+    }
+
+    private fun cleanupOldWhisperRecordingCache() {
+        val activePath = try { recordingPath?.let { File(it).canonicalPath } } catch (_: Exception) { null }
+        val cutoff = System.currentTimeMillis() - WHISPER_ORPHAN_MAX_AGE_MS
+        try {
+            applicationContext.cacheDir.listFiles()?.forEach { candidate ->
+                if (!candidate.name.startsWith("whisper_") || !candidate.name.endsWith(".m4a")) return@forEach
+                val canonical = try { candidate.canonicalPath } catch (_: Exception) { return@forEach }
+                if (canonical == activePath || candidate.lastModified() <= 0L || candidate.lastModified() > cutoff) {
+                    return@forEach
+                }
+                deleteWhisperRecordingCache(canonical)
+            }
+        } catch (_: Exception) {
+            // Orphan cleanup must not interfere with recording startup.
         }
     }
 
@@ -63,12 +121,18 @@ class MainActivity : FlutterActivity() {
         phoneIntentManager = PhoneIntentManager(this) { activityResumed }
 
         if (setupDone.compareAndSet(false, true)) {
-            // Keep bootstrap preflight on a plain background thread to avoid
-            // adding lifecycle coroutine dependencies for this small startup task.
-            Thread {
+            // Reconcile a few bounded journal batches off the UI thread. Each
+            // native call advances its process-local cursor and caps work.
+            secureImportExecutor.execute {
                 try { bootstrapManager.setupDirectories() } catch (e: Exception) { Log.e("ClawChat", "setupDirectories failed", e) }
                 try { bootstrapManager.writeResolvConf() } catch (e: Exception) { Log.e("ClawChat", "writeResolvConf failed", e) }
-            }.start()
+                try {
+                    val uploadsPath = bootstrapManager.prepareWorkspaceUploadsDirectory()
+                    repeat(4) { SecureImportNative.reconcileImports(uploadsPath) }
+                } catch (_: Throwable) {
+                    Log.w("ClawChat", "secure import reconciliation unavailable")
+                }
+            }
         }
 
         val mainChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
@@ -82,6 +146,197 @@ class MainActivity : FlutterActivity() {
                 "getProotPath" -> result.success(processManager.getProotPath())
                 "getArch" -> result.success(ArchUtils.getArch())
                 "getFilesDir" -> result.success(filesDir)
+                "importHostFileToWorkspace" -> {
+                    val path = call.argument<String>("path")
+                    val destinationPath = call.argument<String>("destinationPath")
+                    val allowedRoot = call.argument<String>("allowedRoot")
+                    val operationId = call.argument<String>("operationId")
+                    val requestedMaxBytes = call.argument<Number>("maxBytes")?.toLong()
+                    val maxBytes = requestedMaxBytes?.coerceAtMost(50L * 1024L * 1024L)
+                    if (path == null || destinationPath == null || allowedRoot == null ||
+                        operationId == null || !operationId.matches(Regex("^[a-f0-9]{32}$")) ||
+                        maxBytes == null || maxBytes < 0L) {
+                        result.error("INVALID_ARGS", "secure import arguments required", null)
+                    } else {
+                        secureImportExecutor.execute {
+                            try {
+                                if (allowedRoot != "/root/workspace/uploads" ||
+                                    !destinationPath.startsWith("root/workspace/uploads/")) {
+                                    throw SecurityException("invalid workspace import destination")
+                                }
+                                val finalName = destinationPath.removePrefix("root/workspace/uploads/")
+                                if (finalName.isEmpty() || finalName.contains('/')) {
+                                    throw SecurityException("invalid workspace import filename")
+                                }
+                                val uploadsPath = bootstrapManager.prepareWorkspaceUploadsDirectory()
+                                val metadata = SecureImportNative.importHostFile(
+                                    path,
+                                    uploadsPath,
+                                    finalName,
+                                    operationId,
+                                    maxBytes
+                                )
+                                safeRunOnUiThread {
+                                    result.success(
+                                        mapOf(
+                                            "storedPath" to "/$destinationPath",
+                                            "size" to metadata[0].toLong(),
+                                            "sha256" to metadata[1],
+                                            "sourceIdentity" to metadata[2]
+                                        )
+                                    )
+                                }
+                            } catch (_: Throwable) {
+                                safeRunOnUiThread {
+                                    result.error("FILE_IMPORT_ERROR", "unable to securely import source", null)
+                                }
+                            }
+                        }
+                    }
+                }
+                "cancelImportOperation" -> {
+                    val operationId = call.argument<String>("operationId")
+                    if (operationId == null) {
+                        result.error("INVALID_ARGS", "operationId required", null)
+                    } else {
+                        try { SecureImportNative.cancelOperation(operationId) } catch (_: Throwable) {}
+                        processManager.cancelOperation(operationId)
+                        result.success(true)
+                    }
+                }
+                "finishImportOperation" -> {
+                    val operationId = call.argument<String>("operationId")
+                    if (operationId == null) {
+                        result.error("INVALID_ARGS", "operationId required", null)
+                    } else {
+                        try { SecureImportNative.finishOperation(operationId) } catch (_: Throwable) {}
+                        processManager.finishOperation(operationId)
+                        result.success(true)
+                    }
+                }
+                "acknowledgeHostFileImport" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val storedPath = call.argument<String>("storedPath")
+                    val expectedSize = call.argument<Number>("size")?.toLong()
+                    val expectedSha256 = call.argument<String>("sha256")
+                    if (operationId == null || storedPath == null ||
+                        expectedSize == null || expectedSha256 == null ||
+                        !storedPath.startsWith("/root/workspace/uploads/")) {
+                        result.error("INVALID_ARGS", "import acknowledgement required", null)
+                    } else {
+                        secureImportExecutor.execute {
+                            try {
+                                val finalName = storedPath.removePrefix("/root/workspace/uploads/")
+                                if (finalName.isEmpty() || finalName.contains('/')) {
+                                    throw SecurityException("invalid acknowledgement filename")
+                                }
+                                val uploadsPath = bootstrapManager.prepareWorkspaceUploadsDirectory()
+                                SecureImportNative.acknowledgeImport(
+                                    uploadsPath,
+                                    finalName,
+                                    operationId,
+                                    expectedSize,
+                                    expectedSha256
+                                )
+                                safeRunOnUiThread { result.success(true) }
+                            } catch (_: Throwable) {
+                                safeRunOnUiThread {
+                                    result.error("IMPORT_ACK_ERROR", "unable to acknowledge import", null)
+                                }
+                            }
+                        }
+                    }
+                }
+                "discardHostFileImport" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val storedPath = call.argument<String>("storedPath")
+                    val expectedSize = call.argument<Number>("size")?.toLong()
+                    val expectedSha256 = call.argument<String>("sha256")
+                    if (operationId == null || storedPath == null || expectedSize == null ||
+                        expectedSha256 == null ||
+                        !storedPath.startsWith("/root/workspace/uploads/")) {
+                        result.error("INVALID_ARGS", "import discard receipt required", null)
+                    } else {
+                        secureImportExecutor.execute {
+                            try {
+                                val finalName = storedPath.removePrefix("/root/workspace/uploads/")
+                                if (finalName.isEmpty() || finalName.contains('/')) {
+                                    throw SecurityException("invalid discard filename")
+                                }
+                                val uploadsPath = bootstrapManager.prepareWorkspaceUploadsDirectory()
+                                SecureImportNative.discardImport(
+                                    uploadsPath,
+                                    finalName,
+                                    operationId,
+                                    expectedSize,
+                                    expectedSha256
+                                )
+                                safeRunOnUiThread { result.success(true) }
+                            } catch (_: Throwable) {
+                                safeRunOnUiThread {
+                                    result.error("IMPORT_DISCARD_ERROR", "unable to discard import", null)
+                                }
+                            }
+                        }
+                    }
+                }
+                "listPendingWorkspaceImports" -> {
+                    val requestedLimit = call.argument<Number>("limit")?.toInt() ?: 64
+                    val limit = requestedLimit.coerceIn(1, 64)
+                    secureImportExecutor.execute {
+                        try {
+                            val uploadsPath = bootstrapManager.prepareWorkspaceUploadsDirectory()
+                            val pending = SecureImportNative.listPendingImports(uploadsPath, limit)
+                                .mapNotNull { encoded ->
+                                    val fields = encoded.split('\n')
+                                    if (fields.size != 4) return@mapNotNull null
+                                    val size = fields[2].toLongOrNull() ?: return@mapNotNull null
+                                    mapOf(
+                                        "operationId" to fields[0],
+                                        "storedPath" to "/root/workspace/uploads/${fields[1]}",
+                                        "size" to size,
+                                        "sha256" to fields[3]
+                                    )
+                                }
+                            safeRunOnUiThread { result.success(pending) }
+                        } catch (_: Throwable) {
+                            safeRunOnUiThread {
+                                result.error("IMPORT_LIST_ERROR", "unable to list pending imports", null)
+                            }
+                        }
+                    }
+                }
+                "readRootfsFileBounded" -> {
+                    val path = call.argument<String>("path")
+                    val allowedRoot = call.argument<String>("allowedRoot")
+                    val operationId = call.argument<String>("operationId")
+                    val requestedMax = call.argument<Number>("maxBytes")?.toLong()
+                    val maxBytes = requestedMax?.coerceAtMost(1024L * 1024L)
+                    if (path == null || allowedRoot == null || operationId == null ||
+                        maxBytes == null || maxBytes < 0L) {
+                        result.error("INVALID_ARGS", "bounded read arguments required", null)
+                    } else {
+                        secureImportExecutor.execute {
+                            try {
+                                val location = bootstrapManager.resolveStagedImportReadPath(
+                                    path,
+                                    allowedRoot
+                                )
+                                val bytes = SecureImportNative.readFileBounded(
+                                    location.rootPath,
+                                    location.relativePath,
+                                    operationId,
+                                    maxBytes
+                                )
+                                safeRunOnUiThread { result.success(bytes) }
+                            } catch (_: Throwable) {
+                                safeRunOnUiThread {
+                                    result.error("BOUNDED_READ_ERROR", "unable to securely read staged file", null)
+                                }
+                            }
+                        }
+                    }
+                }
                 "getNativeLibDir" -> result.success(nativeLibDir)
                 "isBootstrapComplete" -> result.success(bootstrapManager.isBootstrapComplete())
                 "getBootstrapStatus" -> result.success(bootstrapManager.getBootstrapStatus())
@@ -104,13 +359,15 @@ class MainActivity : FlutterActivity() {
                     val command = call.argument<String>("command")
                     val timeout = call.argument<Int>("timeout")?.toLong() ?: 900L
                     val mountStorage = call.argument<Boolean>("mountStorage") ?: false
+                    val operationId = call.argument<String>("operationId")
                     if (command != null) {
                         Thread {
                             try {
                                 val output = processManager.runInProotSync(
                                     command,
                                     timeout,
-                                    mountStorage
+                                    mountStorage,
+                                    operationId
                                 )
                                 safeRunOnUiThread { result.success(output) }
                             } catch (e: Exception) {
@@ -366,10 +623,11 @@ class MainActivity : FlutterActivity() {
                 }
                 "readRootfsFile" -> {
                     val path = call.argument<String>("path")
+                    val allowedRoots = call.argument<List<String>>("allowedRoots") ?: listOf("/")
                     if (path != null) {
                         Thread {
                             try {
-                                val content = bootstrapManager.readRootfsFile(path)
+                                val content = bootstrapManager.readRootfsFile(path, allowedRoots)
                                 safeRunOnUiThread { result.success(content) }
                             } catch (e: Exception) {
                                 safeRunOnUiThread { result.error("ROOTFS_READ_ERROR", e.message, null) }
@@ -382,10 +640,12 @@ class MainActivity : FlutterActivity() {
                 "writeRootfsFile" -> {
                     val path = call.argument<String>("path")
                     val content = call.argument<String>("content")
+                    val allowedRoots = call.argument<List<String>>("allowedRoots") ?: listOf("/")
+                    val createNew = call.argument<Boolean>("createNew") ?: false
                     if (path != null && content != null) {
                         Thread {
                             try {
-                                bootstrapManager.writeRootfsFile(path, content)
+                                bootstrapManager.writeRootfsFile(path, content, allowedRoots, createNew)
                                 safeRunOnUiThread { result.success(true) }
                             } catch (e: Exception) {
                                 safeRunOnUiThread { result.error("ROOTFS_WRITE_ERROR", e.message, null) }
@@ -393,6 +653,24 @@ class MainActivity : FlutterActivity() {
                         }.start()
                     } else {
                         result.error("INVALID_ARGS", "path and content required", null)
+                    }
+                }
+                "writeRootfsBytes" -> {
+                    val path = call.argument<String>("path")
+                    val bytes = call.argument<ByteArray>("bytes")
+                    val allowedRoots = call.argument<List<String>>("allowedRoots") ?: listOf("/")
+                    val createNew = call.argument<Boolean>("createNew") ?: false
+                    if (path != null && bytes != null) {
+                        Thread {
+                            try {
+                                bootstrapManager.writeRootfsBytes(path, bytes, allowedRoots, createNew)
+                                safeRunOnUiThread { result.success(true) }
+                            } catch (e: Exception) {
+                                safeRunOnUiThread { result.error("ROOTFS_WRITE_ERROR", e.message, null) }
+                            }
+                        }.start()
+                    } else {
+                        result.error("INVALID_ARGS", "path and bytes required", null)
                     }
                 }
                 "phoneIntent" -> {
@@ -444,6 +722,13 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "startRecording" -> {
+                    val operationId = call.argument<String>("operationId")
+                    if (operationId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "operationId required", null)
+                        return@setMethodCallHandler
+                    }
+                    var recorder: MediaRecorder? = null
+                    var path: String? = null
                     try {
                         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                             != PackageManager.PERMISSION_GRANTED
@@ -452,39 +737,68 @@ class MainActivity : FlutterActivity() {
                             result.error("PERMISSION_DENIED", "Audio permission not granted", null)
                             return@setMethodCallHandler
                         }
-                        val path = "${applicationContext.cacheDir.absolutePath}/whisper_recording.m4a"
+                        if (mediaRecorder != null || recordingOperationId != null) {
+                            result.error("RECORD_BUSY", "A recording is already active", null)
+                            return@setMethodCallHandler
+                        }
+                        cleanupOldWhisperRecordingCache()
+                        val uniquePath = File(
+                            applicationContext.cacheDir,
+                            "whisper_${UUID.randomUUID()}.m4a"
+                        ).canonicalPath
+                        path = uniquePath
                         @Suppress("DEPRECATION")
-                        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val createdRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                             MediaRecorder(this)
                         } else {
                             MediaRecorder()
                         }
-                        recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
-                        recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                        recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                        recorder.setAudioSamplingRate(16000)
-                        recorder.setAudioEncodingBitRate(64000)
-                        recorder.setAudioChannels(1)
-                        recorder.setOutputFile(path)
-                        recorder.prepare()
-                        recorder.start()
-                        mediaRecorder = recorder
-                        recordingPath = path
-                        result.success(path)
+                        recorder = createdRecorder
+                        createdRecorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+                        createdRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                        createdRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                        createdRecorder.setAudioSamplingRate(16000)
+                        createdRecorder.setAudioEncodingBitRate(64000)
+                        createdRecorder.setAudioChannels(1)
+                        createdRecorder.setOutputFile(uniquePath)
+                        createdRecorder.prepare()
+                        createdRecorder.start()
+                        mediaRecorder = createdRecorder
+                        recordingPath = uniquePath
+                        recordingOperationId = operationId
+                        result.success(mapOf("operationId" to operationId, "path" to uniquePath))
                     } catch (e: Exception) {
-                        result.error("RECORD_ERROR", e.message, null)
+                        try { recorder?.release() } catch (_: Exception) {}
+                        if (mediaRecorder === recorder) mediaRecorder = null
+                        if (recordingOperationId == operationId) recordingOperationId = null
+                        if (recordingPath == path) recordingPath = null
+                        deleteWhisperRecordingCache(path)
+                        result.error("RECORD_ERROR", "Recording failed", null)
                     }
                 }
                 "stopRecording" -> {
+                    val operationId = call.argument<String>("operationId")
+                    if (operationId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "operationId required", null)
+                        return@setMethodCallHandler
+                    }
+                    if (operationId != recordingOperationId) {
+                        result.success(mapOf("operationId" to operationId, "path" to null, "stopped" to false))
+                        return@setMethodCallHandler
+                    }
+                    val recorder = mediaRecorder
+                    val path = recordingPath
+                    mediaRecorder = null
+                    recordingPath = null
+                    recordingOperationId = null
                     try {
-                        mediaRecorder?.stop()
-                        mediaRecorder?.release()
-                        mediaRecorder = null
-                        result.success(recordingPath ?: "")
+                        recorder?.stop()
+                        recorder?.release()
+                        result.success(mapOf("operationId" to operationId, "path" to path, "stopped" to true))
                     } catch (e: Exception) {
-                        mediaRecorder?.release()
-                        mediaRecorder = null
-                        result.error("RECORD_ERROR", e.message, null)
+                        try { recorder?.release() } catch (_: Exception) {}
+                        deleteWhisperRecordingCache(path)
+                        result.error("RECORD_ERROR", "Recording stop failed", null)
                     }
                 }
                 "startSpeechRecognition" -> {
@@ -568,16 +882,73 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                "verifyUpdateSignature" -> {
+                    val payload = call.argument<String>("payload")
+                    val encodedSignature = call.argument<String>("signature")
+                    val algorithm = call.argument<String>("algorithm")
+                    val keyId = call.argument<String>("keyId")
+                    if (payload == null || encodedSignature == null ||
+                        algorithm == null || keyId == null) {
+                        result.error("INVALID_ARGS", "signed update metadata required", null)
+                    } else {
+                        result.success(
+                            verifyUpdateSignature(payload, encodedSignature, algorithm, keyId)
+                        )
+                    }
+                }
+                "handoffVerifiedApk" -> {
+                    val path = call.argument<String>("path")
+                    val expectedSize = call.argument<Number>("size")?.toLong()
+                    val expectedSha256 = call.argument<String>("sha256")
+                    if (path == null || expectedSize == null || expectedSha256 == null) {
+                        result.error("INVALID_ARGS", "verified APK metadata required", null)
+                    } else {
+                        try {
+                            val file = verifiedUpdateApk(path, expectedSize, expectedSha256)
+                            val intentPlan = VerifiedApkUpdate.intentPlan(
+                                applicationContext.packageName
+                            )
+                            val uri = FileProvider.getUriForFile(
+                                this,
+                                intentPlan.authority,
+                                file
+                            )
+                            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, intentPlan.mimeType)
+                                if (intentPlan.grantReadPermission) {
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                            }
+                            if (installIntent.resolveActivity(packageManager) == null) {
+                                throw IllegalStateException("system package installer unavailable")
+                            }
+                            startActivity(installIntent)
+                            result.success(true)
+                        } catch (_: Throwable) {
+                            result.error("APK_HANDOFF_ERROR", "unable to hand off verified APK", null)
+                        }
+                    }
+                }
                 "playAudio" -> {
                     val path = call.argument<String>("path")
-                    if (path == null) {
-                        result.error("INVALID_ARGS", "path required", null)
+                    val operationId = call.argument<String>("operationId")
+                    if (path == null || operationId == null) {
+                        result.error("INVALID_ARGS", "path and operationId required", null)
                     } else if (!isAppOwnedPath(path)) {
                         result.error("INVALID_PATH", "path must be in app cache or files dir", null)
                     } else {
+                        var attemptedPlayer: MediaPlayer? = null
                         try {
                             mediaPlayer?.release()
-                            mediaPlayer = MediaPlayer().apply {
+                            mediaPlayer = null
+                            deleteTtsPlaybackCache(mediaPlaybackPath)
+                            mediaPlaybackOperationId = null
+                            mediaPlaybackPath = path
+                            val player = MediaPlayer()
+                            attemptedPlayer = player
+                            mediaPlayer = player
+                            mediaPlaybackOperationId = operationId
+                            player.apply {
                                 setAudioAttributes(
                                     android.media.AudioAttributes.Builder()
                                         .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
@@ -586,26 +957,48 @@ class MainActivity : FlutterActivity() {
                                 )
                                 setVolume(1.0f, 1.0f)
                                 setDataSource(path)
-                                setOnCompletionListener {
+                                setOnCompletionListener { completedPlayer ->
                                     safeRunOnUiThread {
                                         MethodChannel(
                                             flutterEngine.dartExecutor.binaryMessenger,
                                             CHANNEL
-                                        ).invokeMethod("onAudioComplete", null)
+                                        ).invokeMethod(
+                                            "onAudioComplete",
+                                            mapOf(
+                                                "operationId" to operationId,
+                                                "event" to "complete"
+                                            )
+                                        )
                                     }
-                                    release()
-                                    mediaPlayer = null
+                                    deleteTtsPlaybackCache(path)
+                                    try { completedPlayer.release() } catch (_: Exception) {}
+                                    if (mediaPlayer === completedPlayer && mediaPlaybackOperationId == operationId) {
+                                        mediaPlayer = null
+                                        mediaPlaybackPath = null
+                                        mediaPlaybackOperationId = null
+                                    }
                                 }
-                                setOnErrorListener { _, what, extra ->
-                                    Log.e("ClawChat", "MediaPlayer error: what=$what extra=$extra")
+                                setOnErrorListener { failedPlayer, what, _ ->
+                                    Log.e("ClawChat", "MediaPlayer playback error code=$what")
                                     safeRunOnUiThread {
                                         MethodChannel(
                                             flutterEngine.dartExecutor.binaryMessenger,
                                             CHANNEL
-                                        ).invokeMethod("onAudioComplete", null)
+                                        ).invokeMethod(
+                                            "onAudioComplete",
+                                            mapOf(
+                                                "operationId" to operationId,
+                                                "event" to "error"
+                                            )
+                                        )
                                     }
-                                    release()
-                                    mediaPlayer = null
+                                    deleteTtsPlaybackCache(path)
+                                    try { failedPlayer.release() } catch (_: Exception) {}
+                                    if (mediaPlayer === failedPlayer && mediaPlaybackOperationId == operationId) {
+                                        mediaPlayer = null
+                                        mediaPlaybackPath = null
+                                        mediaPlaybackOperationId = null
+                                    }
                                     true
                                 }
                                 prepare()
@@ -613,18 +1006,36 @@ class MainActivity : FlutterActivity() {
                             }
                             result.success(true)
                         } catch (e: Exception) {
-                            result.error("PLAY_ERROR", e.message, null)
+                            try { attemptedPlayer?.release() } catch (_: Exception) {}
+                            if (mediaPlayer === attemptedPlayer && mediaPlaybackOperationId == operationId) {
+                                mediaPlayer = null
+                                mediaPlaybackPath = null
+                                mediaPlaybackOperationId = null
+                            }
+                            deleteTtsPlaybackCache(path)
+                            result.error("PLAY_ERROR", "Playback failed", null)
                         }
                     }
                 }
                 "stopAudio" -> {
-                    try {
-                        mediaPlayer?.stop()
-                        mediaPlayer?.release()
-                        mediaPlayer = null
+                    val operationId = call.argument<String>("operationId")
+                    if (operationId.isNullOrBlank() || operationId != mediaPlaybackOperationId) {
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    val player = mediaPlayer
+                    val path = mediaPlaybackPath
+                    mediaPlayer = null
+                    mediaPlaybackPath = null
+                    mediaPlaybackOperationId = null
+                    var stopFailed = false
+                    try { player?.stop() } catch (_: Exception) { stopFailed = true }
+                    try { player?.release() } catch (_: Exception) { stopFailed = true }
+                    deleteTtsPlaybackCache(path)
+                    if (stopFailed) {
+                        result.error("STOP_ERROR", "Playback stop failed", null)
+                    } else {
                         result.success(true)
-                    } catch (e: Exception) {
-                        result.error("STOP_ERROR", e.message, null)
                     }
                 }
                 "bringToForeground" -> {
@@ -1042,15 +1453,83 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) { false }
     }
 
+    private fun verifyUpdateSignature(
+        payload: String,
+        encodedSignature: String,
+        algorithm: String,
+        keyId: String
+    ): Boolean {
+        if (algorithm != "SHA256withRSA" && algorithm != "SHA256withECDSA") return false
+        if (!keyId.matches(Regex("^[a-f0-9]{64}$"))) return false
+        return try {
+            val payloadBytes = Base64.decode(payload, Base64.NO_WRAP)
+            val signatureBytes = Base64.decode(encodedSignature, Base64.NO_WRAP)
+            if (payloadBytes.isEmpty() || signatureBytes.isEmpty()) return false
+            val certificateBytes = currentSigningCertificateBytes() ?: return false
+            val actualKeyId = MessageDigest.getInstance("SHA-256")
+                .digest(certificateBytes)
+                .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            if (actualKeyId != keyId) return false
+            val certificate = CertificateFactory.getInstance("X.509")
+                .generateCertificate(ByteArrayInputStream(certificateBytes))
+            val verifier = CryptoSignature.getInstance(algorithm)
+            verifier.initVerify(certificate.publicKey)
+            verifier.update(payloadBytes)
+            verifier.verify(signatureBytes)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentSigningCertificateBytes(): ByteArray? {
+        val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageManager.getPackageInfo(
+                packageName,
+                PackageManager.GET_SIGNING_CERTIFICATES
+            )
+        } else {
+            packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+        }
+        val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageInfo.signingInfo?.apkContentsSigners
+        } else {
+            packageInfo.signatures
+        }
+        return signatures?.singleOrNull()?.toByteArray()
+    }
+
+    private fun verifiedUpdateApk(
+        path: String,
+        expectedSize: Long,
+        expectedSha256: String
+    ): File {
+        return VerifiedApkUpdate.verify(
+            path,
+            File(cacheDir, "updates"),
+            expectedSize,
+            expectedSha256
+        )
+    }
+
     override fun onDestroy() {
         try { pendingSpeechResult?.success("") } catch (_: Exception) {}
         pendingSpeechResult = null
+        val abandonedRecordingPath = recordingPath
         try { mediaRecorder?.stop() } catch (_: Exception) {}
         try { mediaRecorder?.release() } catch (_: Exception) {}
         mediaRecorder = null
+        recordingPath = null
+        recordingOperationId = null
+        deleteWhisperRecordingCache(abandonedRecordingPath)
+        cleanupOldWhisperRecordingCache()
         try { mediaPlayer?.stop() } catch (_: Exception) {}
         try { mediaPlayer?.release() } catch (_: Exception) {}
         mediaPlayer = null
+        deleteTtsPlaybackCache(mediaPlaybackPath)
+        mediaPlaybackPath = null
+        mediaPlaybackOperationId = null
+        secureImportExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -1079,6 +1558,7 @@ class MainActivity : FlutterActivity() {
         const val SPEECH_REQUEST = 1005
         const val TOOL_AUTO_APPROVED_NOTIFICATION_ID = 2001
         const val AGENT_COMPLETE_NOTIFICATION_ID = 2002
+        const val WHISPER_ORPHAN_MAX_AGE_MS = 24L * 60L * 60L * 1000L
         const val SHARE_CONSUMED_EXTRA = "com.anka.clawbot.SHARE_CONSUMED"
         const val MAX_SHARED_IMAGE_BYTES = 3L * 1024L * 1024L
         const val MAX_SHARED_IMAGES = 9

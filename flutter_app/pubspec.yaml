@@ -1,7 +1,7 @@
 name: clawchat
 description: ClawChat - AI Agent Chat on Android with embedded Alpine Linux.
 publish_to: 'none'
-version: 2.4.0+5
+version: 2.5.0+6
 
 environment:
   sdk: '>=3.5.0 <4.0.0'
@@ -11,18 +11,17 @@ dependencies:
     sdk: flutter
   xterm: ^4.0.0
   flutter_pty: ^0.4.2
-  dio: ^5.4.0        # Used for file downloads with progress tracking (onReceiveProgress)
   convert: ^3.1.0     # AccumulatorSink for streaming hash computation
   crypto: ^3.0.3      # SHA256 verification for rootfs downloads
   encrypt: ^5.0.3
-  http: ^1.2.0        # Used for LLM API streaming calls (lighter weight; dio not needed for SSE)
+  http: ^1.6.0        # Shared transport plus request-local AbortableRequest cancellation
   provider: ^6.1.0
   flutter_secure_storage: ^9.0.0
   shared_preferences: ^2.2.0
   path_provider: ^2.1.0
+  package_info_plus: ^8.0.0
 
   url_launcher: ^6.2.0
-  google_fonts: ^6.1.0
   uuid: ^4.2.0
   file_picker: ^8.0.0
   speech_to_text: ^6.6.0

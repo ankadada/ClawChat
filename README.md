@@ -136,14 +136,21 @@ flutter build apk --release
 
 ### API 设置
 1. 打开 App → 设置
-2. 选择 API 格式（Anthropic / OpenAI 兼容）
-3. 输入 API Key 和 Base URL
-4. 点击刷新按钮拉取可用模型
+2. 打开“连接”
+3. 选择 API 格式（Anthropic / OpenAI 兼容）
+4. 输入 API Key 和 Base URL
+5. 点击刷新按钮拉取可用模型
 
 ### 技能安装
-1. 设置 → 技能区域 → "安装预设技能"
+1. 设置 → 更新与扩展 → 技能与扩展
 2. 或通过 URL 导入自定义技能
 3. GWS 技能需配置 `GOOGLE_ACCESS_TOKEN` 环境变量
+
+## Project documentation
+
+- [Architecture](ARCHITECTURE.md)
+- [Design and interaction contract](DESIGN.md)
+- [OpenClaw to ClawChat migration archive](docs/migrations/openclaw-to-clawchat.md)
 
 ---
 

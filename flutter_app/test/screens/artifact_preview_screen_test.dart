@@ -15,13 +15,15 @@ void main() {
 
     test('rejects non-html content', () {
       expect(isPreviewableHtml('{"html":"<html></html>"}'), isFalse);
-      expect(isPreviewableHtml('print("<html></html>")', language: 'python'), isFalse);
+      expect(isPreviewableHtml('print("<html></html>")', language: 'python'),
+          isFalse);
     });
   });
 
   group('sandboxArtifactHtml', () {
     test('injects a CSP that blocks scripts by default', () {
-      final html = sandboxArtifactHtml('<html><head></head><body></body></html>',
+      final html = sandboxArtifactHtml(
+          '<html><head></head><body></body></html>',
           allowJavaScript: false);
 
       expect(html, contains("default-src 'none'"));
@@ -33,6 +35,16 @@ void main() {
 
       expect(html, contains("script-src 'unsafe-inline'"));
       expect(html, contains('<!doctype html>'));
+    });
+
+    test('external copy and open document is always sandboxed', () {
+      final html = safeArtifactDocument(
+        '<script>window.location="https://example.invalid"</script>',
+      );
+
+      expect(html, contains("default-src 'none'"));
+      expect(html, contains("script-src 'none'"));
+      expect(html, isNot(contains("script-src 'unsafe-inline'")));
     });
   });
 }

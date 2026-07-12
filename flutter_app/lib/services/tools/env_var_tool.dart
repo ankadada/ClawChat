@@ -14,7 +14,8 @@ class EnvVarTool extends Tool {
   @override
   String get description =>
       'Set or delete an environment variable in ClawChat settings. '
-      'The variable will be available in all shell commands and proot sessions. '
+      'Values are stored for purpose-specific integrations; general shell '
+      'commands never receive them. '
       'Do not use this to expose secret values in chat output.';
 
   @override

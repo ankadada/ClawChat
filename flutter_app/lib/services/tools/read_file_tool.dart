@@ -13,26 +13,34 @@ class ReadFileTool extends Tool {
 
   @override
   Map<String, dynamic> get inputSchema => {
-    'type': 'object',
-    'properties': {
-      'path': {
-        'type': 'string',
-        'description': 'Absolute path to the file (inside proot)',
-      },
-      'offset': {
-        'type': 'integer',
-        'description': 'Start reading from this line number (1-based, default: 1)',
-      },
-      'limit': {
-        'type': 'integer',
-        'description': 'Maximum number of lines to read (default: 2000)',
-      },
-    },
-    'required': ['path'],
-  };
+        'type': 'object',
+        'properties': {
+          'path': {
+            'type': 'string',
+            'description': 'Absolute path to the file (inside proot)',
+          },
+          'offset': {
+            'type': 'integer',
+            'description':
+                'Start reading from this line number (1-based, default: 1)',
+          },
+          'limit': {
+            'type': 'integer',
+            'description': 'Maximum number of lines to read (default: 2000)',
+          },
+        },
+        'required': ['path'],
+      };
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
+    return executeWithAllowedScopes(input, const {_allowedRoot});
+  }
+
+  Future<String> executeWithAllowedScopes(
+    Map<String, dynamic> input,
+    Set<String> allowedScopes,
+  ) async {
     final path = input['path'] as String;
     final offset = input['offset'] as int? ?? 1;
     final limit = input['limit'] as int? ?? 2000;
@@ -43,8 +51,12 @@ class ReadFileTool extends Tool {
     }
 
     try {
-      final rootfsPath = resolved.startsWith('/') ? resolved.substring(1) : resolved;
-      final content = await NativeBridge.readRootfsFile(rootfsPath);
+      final rootfsPath =
+          resolved.startsWith('/') ? resolved.substring(1) : resolved;
+      final content = await NativeBridge.readRootfsFile(
+        rootfsPath,
+        allowedRoots: allowedScopes,
+      );
 
       if (content == null) return 'Error: File not found: $path';
 
@@ -83,7 +95,10 @@ class ReadFileTool extends Tool {
       }
     }
     final normalized = '/${resolved.join('/')}';
-    if (normalized != _allowedRoot && !normalized.startsWith('$_allowedRoot/')) return null;
+    if (normalized != _allowedRoot &&
+        !normalized.startsWith('$_allowedRoot/')) {
+      return null;
+    }
     return normalized;
   }
 }

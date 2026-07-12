@@ -377,6 +377,27 @@ void main() {
       absent: ['stale-b'],
     );
   });
+
+  testWidgets('initial load failure is sanitized and retryable',
+      (tester) async {
+    var attempts = 0;
+    await tester.pumpWidget(MaterialApp(
+      home: ModelApiSettingsScreen(
+        settingsLoadGate: () async {
+          if (++attempts == 1) throw StateError('private storage detail');
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    expect(find.text(AppStrings.modelSettingsLoadFailed), findsOneWidget);
+    expect(find.textContaining('private storage detail'), findsNothing);
+    await tester.tap(find.text(AppStrings.retry));
+    await tester.pumpAndSettle();
+
+    expect(find.text(AppStrings.modelSettingsLoadFailed), findsNothing);
+    expect(attempts, 2);
+  });
 }
 
 Future<void> _exerciseNoCatalogCustomSave(

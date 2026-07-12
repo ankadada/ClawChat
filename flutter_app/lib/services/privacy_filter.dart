@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 
 class PrivacyFilter {
   /// Masks any configured environment variable values found in [text].
@@ -13,7 +14,7 @@ class PrivacyFilter {
       ..sort((a, b) => b.value.length.compareTo(a.value.length));
     for (final entry in sortedEntries) {
       final value = entry.value;
-      if (value.isEmpty) continue;
+      if (!isDistinctiveSecret(value)) continue;
       for (final variant in _encodedVariants(value)) {
         result = result.replaceAll(variant, _maskValue(variant));
       }
@@ -24,6 +25,28 @@ class PrivacyFilter {
   static String _maskValue(String value) {
     return '*' * value.length.clamp(8, 128).toInt();
   }
+
+  /// Whether a value is distinctive enough for safe unstructured matching.
+  ///
+  /// Short/common values are intentionally excluded: replacing every `x`,
+  /// `true`, or `password` occurrence would corrupt unrelated user content.
+  /// Purpose-specific secret fields must still be redacted structurally.
+  static bool isDistinctiveSecret(String value) {
+    if (value.length < 8) return false;
+    final frequencies = <int, int>{};
+    for (final codeUnit in value.codeUnits) {
+      frequencies.update(codeUnit, (count) => count + 1, ifAbsent: () => 1);
+    }
+    var entropyPerCharacter = 0.0;
+    for (final count in frequencies.values) {
+      final probability = count / value.length;
+      entropyPerCharacter -= probability * _log2(probability);
+    }
+    return entropyPerCharacter * value.length >= 32;
+  }
+
+  static double _log2(double value) =>
+      value == 1 ? 0 : math.log(value) / math.ln2;
 
   static List<String> _encodedVariants(String value) {
     final variants = <String>{value};

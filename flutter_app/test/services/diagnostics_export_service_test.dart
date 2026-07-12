@@ -14,9 +14,14 @@ void main() {
         model: 'gpt-test',
       );
       final event = RuntimeDebugEvent(
-        type: 'provider.error',
+        type: 'stream.terminal',
         sessionId: 'session-1',
         data: {
+          'attempt': 1,
+          'status': 'failed',
+          'completeness': 'none',
+          'durationMs': 3,
+          'errorCode': 'provider_unavailable',
           'api_key': 'sk-secret-secret-secret',
           'prompt': 'Authorization: Bearer verysecretbearertoken123456789',
           'payload': 'data:image/png;base64,${'a' * 200}',
@@ -34,21 +39,33 @@ void main() {
       ));
 
       expect(report, contains('ClawChat diagnostics'));
-      expect(report, contains('api.example.com'));
+      expect(report, isNot(contains('api.example.com')));
+      expect(report, isNot(contains('baseUrlHost')));
       expect(report, contains('safeMode: true'));
       expect(report, isNot(contains('sk-secret-secret-secret')));
       expect(report, isNot(contains('verysecretbearertoken')));
       expect(report, isNot(contains('data:image/png;base64')));
       expect(report, isNot(contains('aaaaaaaaaaaaaaaaaaaaaaaa')));
-      expect(report, contains('messageLength'));
+      expect(report, contains('provider_unavailable'));
+      expect(report, isNot(contains('messageLength')));
+      expect(event.data.keys.toSet(), {
+        'attempt',
+        'status',
+        'completeness',
+        'durationMs',
+        'errorCode',
+      });
     });
 
-    test('redacts nested diagnostic payload keys at every depth', () {
+    test('never exports unknown aliases or nested diagnostic payloads', () {
       const service = DiagnosticsExportService();
       final event = RuntimeDebugEvent(
-        type: 'provider.debug',
+        type: 'provider.transform.warning',
         sessionId: 'session-2',
         data: {
+          'warningCount': 1,
+          'warningCode': 'tool_result_missing_id',
+          'droppedBlockCount': 1,
           'eventType': 'provider_error',
           'details': {
             'metadata': {'messageLength': 42},
@@ -71,16 +88,21 @@ void main() {
         events: [event],
       ));
 
-      expect(report, contains('eventType'));
-      expect(report, contains('provider_error'));
-      expect(report, contains('messageCount'));
-      expect(report, contains('toolCallCount'));
-      expect(report, contains('contentLength'));
-      expect(report, contains('tool_result'));
-      expect(report, contains('"request":"[redacted]"'));
-      expect(report, contains('"messages":"[redacted]"'));
-      expect(report, contains('"tool_output":"[redacted]"'));
-      expect(report, contains('"raw_provider_payload":"[redacted]"'));
+      expect(event.data, {
+        'warningCount': 1,
+        'warningCode': 'tool_result_missing_id',
+        'droppedBlockCount': 1,
+      });
+      expect(report, contains('tool_result_missing_id'));
+      expect(report, isNot(contains('eventType')));
+      expect(report, isNot(contains('provider_error')));
+      expect(report, isNot(contains('messageCount')));
+      expect(report, isNot(contains('toolCallCount')));
+      expect(report, isNot(contains('contentLength')));
+      expect(report, isNot(contains('"request"')));
+      expect(report, isNot(contains('"messages"')));
+      expect(report, isNot(contains('"tool_output"')));
+      expect(report, isNot(contains('"raw_provider_payload"')));
       expect(report, isNot(contains('synthetic nested prompt text')));
       expect(report, isNot(contains('synthetic raw request payload')));
       expect(report, isNot(contains('synthetic tool output')));

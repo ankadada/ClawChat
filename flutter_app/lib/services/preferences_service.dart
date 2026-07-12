@@ -90,6 +90,7 @@ class PreferencesService {
   static const _keyFontSize = 'font_size';
   static const _keyNotifyOnComplete = 'notify_on_complete';
   static const _keyPrivacyMode = 'privacy_mode';
+  static const _keyDeveloperMode = 'developer_mode';
   static const _keyAgentMaxIterations = 'agent_max_iterations';
   static const _keyMaxConcurrentAgents = 'max_concurrent_agents';
   static const _keyAllowPhoneCall = 'allow_phone_call';
@@ -1081,6 +1082,10 @@ class PreferencesService {
 
   bool get privacyMode => _prefs.getBool(_keyPrivacyMode) ?? true;
   set privacyMode(bool v) => _prefs.setBool(_keyPrivacyMode, v);
+
+  bool get developerMode =>
+      _initialized ? (_prefs.getBool(_keyDeveloperMode) ?? false) : false;
+  set developerMode(bool v) => _prefs.setBool(_keyDeveloperMode, v);
 
   int get agentMaxIterations =>
       (_prefs.getInt(_keyAgentMaxIterations) ?? defaultAgentMaxIterations)

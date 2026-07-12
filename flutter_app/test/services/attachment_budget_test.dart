@@ -33,6 +33,20 @@ void main() {
       );
     });
 
+    test('multiple attachments retain the aggregate message limit', () {
+      final image = ImageContent(
+        data: base64Encode(List<int>.filled(2800 * 1024, 1)),
+        mediaType: 'image/png',
+      );
+
+      expect(() => budget.checkMessageAttachments([image, image]),
+          returnsNormally);
+      expect(
+        () => budget.checkMessageAttachments([image, image, image]),
+        throwsA(isA<AttachmentBudgetException>()),
+      );
+    });
+
     test('estimates text attachment bytes using utf8', () {
       expect(
         budget.estimatedContentBytes(TextContent('中文')),

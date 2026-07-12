@@ -7,6 +7,7 @@ void main() {
 
   testWidgets('protects oversized messages with collapsed tail rendering',
       (tester) async {
+    var opened = false;
     final longText = [
       'HEAD_UNIQUE',
       'a' * (StreamingText.cacheMaxCharactersForTesting ~/ 3 + 10000),
@@ -18,21 +19,23 @@ void main() {
         body: SingleChildScrollView(
           child: SizedBox(
             width: 420,
-            child: StreamingText(text: longText),
+            child: StreamingText(
+              text: longText,
+              onOpenFullResponse: () => opened = true,
+            ),
           ),
         ),
       ),
     ));
 
-    expect(find.text('展开全文'), findsOneWidget);
+    expect(find.text('打开完整回复'), findsOneWidget);
     expect(find.textContaining('TAIL_UNIQUE'), findsOneWidget);
     expect(find.textContaining('HEAD_UNIQUE'), findsNothing);
 
-    await tester.tap(find.text('展开全文'));
+    await tester.tap(find.text('打开完整回复'));
     await tester.pumpAndSettle();
 
-    expect(find.text('收起'), findsOneWidget);
-    expect(find.textContaining('HEAD_UNIQUE'), findsOneWidget);
-    expect(find.textContaining('TAIL_UNIQUE'), findsOneWidget);
+    expect(opened, isTrue);
+    expect(find.textContaining('HEAD_UNIQUE'), findsNothing);
   });
 }

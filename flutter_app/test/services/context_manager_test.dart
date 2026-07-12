@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/models/model_capabilities.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
@@ -6,7 +8,9 @@ import 'package:clawchat/services/context_summary_service.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/runtime_debug_events.dart';
 import 'package:clawchat/services/token_calibration_service.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -92,7 +96,7 @@ void main() {
     test('summary generated returns patch/notices and summary prompt',
         () async {
       var started = false;
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(
         events: events,
         summaryFactory: () => _ScriptedContextSummaryService(
@@ -126,9 +130,92 @@ void main() {
       );
     });
 
+    test('skill instructions are projected before model or summarizer use',
+        () async {
+      ContextSummaryRequest? observedSummaryRequest;
+      final manager = await createManager(
+        summaryFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) {
+            observedSummaryRequest = request;
+            return _summaryForRequest(request);
+          },
+        ),
+      );
+      const untrustedInstructions = 'publisher-controlled-skill-instructions';
+      final messages = <Map<String, dynamic>>[
+        {
+          'role': 'assistant',
+          'content': [
+            {
+              'type': 'tool_use',
+              'id': 'skill_call',
+              'name': 'load_skill',
+              'input': {'id': 'com.example.demo'},
+            },
+          ],
+        },
+        {
+          'role': 'user',
+          'content': [
+            {
+              'type': 'tool_result',
+              'tool_use_id': 'skill_call',
+              'content': untrustedInstructions,
+            },
+          ],
+        },
+        ..._largeHistory(prefix: 'skill-summary'),
+      ];
+
+      final result = await manager.assembleForSend(
+        sendRequest(messages: messages),
+      );
+
+      expect(observedSummaryRequest, isNotNull);
+      expect(
+        observedSummaryRequest!.messages.toString(),
+        isNot(contains(untrustedInstructions)),
+      );
+      expect(
+          result.messages.toString(), isNot(contains(untrustedInstructions)));
+      expect(result.systemPrompt, isNot(contains(untrustedInstructions)));
+    });
+
+    test('pre-projection summary version is invalidated and never injected',
+        () async {
+      final manager = await createManager(
+        summaryFactory: () => _ScriptedContextSummaryService(
+          onGenerate: _summaryForRequest,
+        ),
+      );
+      final messages = _largeHistory(prefix: 'old-version');
+      final plan = ChatContextUtils.planCompaction(
+        messages,
+        maxTokens: _messageBudgetFor(messages),
+        estimator: const TokenEstimator(),
+      );
+      final stale = ContextSummary(
+        version: 1,
+        text: 'stale-skill-summary-instructions',
+        coveredMessageCount: plan.headForSummary.length,
+        coveredDigest: plan.headDigest,
+        sourceEstimatedTokens: plan.headEstimatedTokens,
+        summaryEstimatedTokens: 20,
+        createdAt: DateTime.utc(2026),
+        updatedAt: DateTime.utc(2026),
+      );
+
+      final result = await manager.assembleForSend(
+        sendRequest(messages: messages, existingSummary: stale),
+      );
+
+      expect(result.systemPrompt, isNot(contains(stale.text)));
+      expect(result.summaryOutcome.reused, isFalse);
+    });
+
     test('summary reused does not call LLM and returns no patch', () async {
       var summaryCalls = 0;
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(
         events: events,
         summaryFactory: () => _ScriptedContextSummaryService(
@@ -173,7 +260,7 @@ void main() {
     });
 
     test('summary failed falls back with notice', () async {
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(
         events: events,
         summaryFactory: () => _ScriptedContextSummaryService(
@@ -200,7 +287,7 @@ void main() {
     });
 
     test('summary double failure falls through to pure truncate', () async {
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(
         events: events,
         summaryFactory: () => _ScriptedContextSummaryService(
@@ -239,8 +326,57 @@ void main() {
       );
     });
 
+    test('failure logs contain only allowlisted classes and safe codes',
+        () async {
+      final logs = <String>[];
+      final previousDebugPrint = debugPrint;
+      debugPrint = (message, {wrapWidth}) {
+        if (message != null) logs.add(message);
+      };
+      addTearDown(() => debugPrint = previousDebugPrint);
+      final manager = await createManager(
+        summaryFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (_) => throw const SocketException(
+            'DNS failed for forbidden.example/private?key=hidden',
+          ),
+          onExtractive: (_) => throw const HandshakeException(
+            'TLS failed for tls.example/secret-path',
+          ),
+        ),
+        providerTransformPreflight: (_, __) => throw http.ClientException(
+          'client failed at client.example/v1?api_key=hidden',
+        ),
+      );
+
+      await manager.assembleForSend(
+        sendRequest(messages: _largeHistory(prefix: 'safe-log-test')),
+      );
+
+      final output = logs.join('\n');
+      expect(output, contains('code=context_summary_generation_failed'));
+      expect(output, contains('class=SocketException'));
+      expect(
+        output,
+        contains('code=context_summary_extractive_fallback_failed'),
+      );
+      expect(output, contains('class=HandshakeException'));
+      expect(output, contains('code=provider_transform_preflight_failed'));
+      expect(output, contains('class=ClientException'));
+      for (final forbidden in [
+        'forbidden.example',
+        'tls.example',
+        'client.example',
+        'private',
+        'secret-path',
+        'api_key',
+        'hidden',
+      ]) {
+        expect(output, isNot(contains(forbidden)));
+      }
+    });
+
     test('tool compression outcome is reported', () async {
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(events: events);
       final oldOutput = 'old-output-${'x' * 3000}';
       final messages = [
@@ -276,7 +412,7 @@ void main() {
     });
 
     test('provider warnings and sensitive events are preflighted', () async {
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(events: events);
 
       await manager.assembleForSend(
@@ -317,7 +453,7 @@ void main() {
 
     test('calibration update skip and discard are keyed by assembly id',
         () async {
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(events: events);
       final result = await manager.assembleForSend(
         sendRequest(messages: _calibrationHistory()),
@@ -379,7 +515,7 @@ void main() {
     });
 
     test('records skipped calibration event for tool-call turns', () async {
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(events: events);
       final result = await manager.assembleForSend(
         sendRequest(messages: _calibrationHistory()),
@@ -444,7 +580,7 @@ void main() {
 
     test('reuses valid summary and ignores stale summary for compare',
         () async {
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       final manager = await createManager(
         events: events,
         summaryFactory: () => _ScriptedContextSummaryService(

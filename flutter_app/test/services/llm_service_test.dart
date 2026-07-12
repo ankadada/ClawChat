@@ -7,6 +7,7 @@ import 'package:clawchat/services/model_capability_registry.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/prompt_cache_settings.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -166,61 +167,1109 @@ void main() {
     });
   });
 
+  group('LlmService retry attempt retirement', () {
+    test('aborts a ClientException attempt before starting its retry',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 30),
+      );
+      var attemptCount = 0;
+      var activeAttempts = 0;
+      var maxConcurrentAttempts = 0;
+      var firstAbortReceived = false;
+
+      final result = service.retryWithBackoffForTesting((attemptAbort) async {
+        attemptCount += 1;
+        activeAttempts += 1;
+        if (activeAttempts > maxConcurrentAttempts) {
+          maxConcurrentAttempts = activeAttempts;
+        }
+        if (attemptCount == 1) {
+          unawaited(attemptAbort.then((_) {
+            firstAbortReceived = true;
+            activeAttempts -= 1;
+          }));
+          throw http.ClientException('transient transport failure');
+        }
+        expect(firstAbortReceived, isTrue);
+        expect(activeAttempts, 1);
+        activeAttempts -= 1;
+        return 'ok';
+      });
+
+      await _waitUntil(() => scheduler.delayCallCount == 1);
+      expect(firstAbortReceived, isTrue);
+      expect(activeAttempts, 0);
+      scheduler.elapse(const Duration(seconds: 2));
+
+      expect(await result, 'ok');
+      expect(attemptCount, 2);
+      expect(maxConcurrentAttempts, 1);
+      service.dispose();
+    });
+
+    test('aborts a retryable provider stream-open attempt before retry',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 30),
+      );
+      var attemptCount = 0;
+      var activeAttempts = 0;
+      var maxConcurrentAttempts = 0;
+      var firstAbortReceived = false;
+
+      final result = service.resilientSseDataForTesting((attemptAbort) async {
+        attemptCount += 1;
+        activeAttempts += 1;
+        if (activeAttempts > maxConcurrentAttempts) {
+          maxConcurrentAttempts = activeAttempts;
+        }
+        if (attemptCount == 1) {
+          unawaited(attemptAbort.then((_) {
+            firstAbortReceived = true;
+            activeAttempts -= 1;
+          }));
+          throw Exception('Provider API error (503): transient');
+        }
+        expect(firstAbortReceived, isTrue);
+        expect(activeAttempts, 1);
+        activeAttempts -= 1;
+        return http.StreamedResponse(const Stream<List<int>>.empty(), 200);
+      }).toList();
+
+      await _waitUntil(() => scheduler.delayCallCount == 1);
+      expect(firstAbortReceived, isTrue);
+      expect(activeAttempts, 0);
+      scheduler.elapse(const Duration(seconds: 2));
+
+      expect(await result, isEmpty);
+      expect(attemptCount, 2);
+      expect(maxConcurrentAttempts, 1);
+      service.dispose();
+    });
+
+    test('retiring service A attempt does not abort concurrent service B',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final serviceA = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 30),
+      );
+      final serviceB = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 30),
+      );
+      final releaseB = Completer<String>();
+      var attemptA = 0;
+      var abortAReceived = false;
+      var abortBReceived = false;
+
+      final resultB = serviceB.retryWithBackoffForTesting((attemptAbort) {
+        unawaited(attemptAbort.then((_) => abortBReceived = true));
+        return releaseB.future;
+      });
+      final resultA = serviceA.retryWithBackoffForTesting((attemptAbort) async {
+        attemptA += 1;
+        if (attemptA == 1) {
+          unawaited(attemptAbort.then((_) => abortAReceived = true));
+          throw http.ClientException('service A transient failure');
+        }
+        expect(abortAReceived, isTrue);
+        expect(abortBReceived, isFalse);
+        return 'A';
+      });
+
+      await _waitUntil(() => scheduler.delayCallCount == 1);
+      expect(abortAReceived, isTrue);
+      expect(abortBReceived, isFalse);
+      scheduler.elapse(const Duration(seconds: 2));
+      expect(await resultA, 'A');
+      expect(abortBReceived, isFalse);
+
+      releaseB.complete('B');
+      expect(await resultB, 'B');
+      expect(abortBReceived, isFalse);
+      serviceA.dispose();
+      serviceB.dispose();
+    });
+  });
+
   group('LlmService non-stream foreground timeout', () {
     test('does not time out while app is backgrounded', () async {
-      var isInBackground = true;
-      final responseFuture = delayedOpenAiChat(
-        isInBackground: () => isInBackground,
-        responseDelay: const Duration(milliseconds: 80),
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: true);
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final requestStarted = Completer<void>();
+      final releaseResponse = Completer<void>();
+      server.listen((request) async {
+        await utf8.decoder.bind(request).join();
+        if (!requestStarted.isCompleted) requestStarted.complete();
+        await releaseResponse.future;
+        request.response.statusCode = 200;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(_openAiResponse('ok after background'));
+        await request.response.close();
+      });
+      final service = _timeoutTestService(
+        scheduler,
+        baseUrl: 'http://127.0.0.1:${server.port}',
         requestTimeout: const Duration(milliseconds: 40),
       );
 
-      await Future<void>.delayed(const Duration(milliseconds: 55));
-      isInBackground = false;
+      try {
+        final responseFuture =
+            service.chat(system: '', messages: const [], tools: const []);
+        await requestStarted.future.timeout(const Duration(seconds: 2));
 
-      final response = await responseFuture.timeout(const Duration(seconds: 2));
+        scheduler.elapse(const Duration(milliseconds: 400));
+        scheduler.setBackground(false);
+        releaseResponse.complete();
 
-      expect(response.content.single.text, 'ok after background');
+        final response =
+            await responseFuture.timeout(const Duration(seconds: 2));
+        expect(response.content.single.text, 'ok after background');
+      } finally {
+        if (!releaseResponse.isCompleted) releaseResponse.complete();
+        service.dispose();
+        await server.close(force: true);
+      }
     });
 
-    test('pauses elapsed timeout during temporary backgrounding', () async {
-      var isInBackground = false;
-      final responseFuture = delayedOpenAiChat(
-        isInBackground: () => isInBackground,
-        responseDelay: const Duration(milliseconds: 110),
-        requestTimeout: const Duration(milliseconds: 80),
+    test('exhausts the foreground budget deterministically', () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(milliseconds: 40),
+      );
+      final expectation = expectLater(
+        service.withForegroundTimeoutForTesting(_abortablePendingOperation),
+        throwsA(isA<TimeoutException>().having(
+          (error) => error.duration,
+          'duration',
+          const Duration(milliseconds: 40),
+        )),
       );
 
-      await Future<void>.delayed(const Duration(milliseconds: 30));
-      isInBackground = true;
-      await Future<void>.delayed(const Duration(milliseconds: 40));
-      isInBackground = false;
-
-      final response = await responseFuture.timeout(const Duration(seconds: 2));
-
-      expect(response.content.single.text, 'ok after background');
+      scheduler.elapse(const Duration(milliseconds: 40));
+      await expectation;
+      service.dispose();
     });
 
-    test('fails at max wall clock across repeated backgrounding', () async {
-      var isInBackground = false;
-      final toggler = Timer.periodic(const Duration(milliseconds: 20), (timer) {
-        isInBackground = !isInBackground;
-      });
-      addTearDown(toggler.cancel);
+    test('accumulates foreground time across multiple background cycles',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(milliseconds: 100),
+      );
+      final expectation = expectLater(
+        service.withForegroundTimeoutForTesting(_abortablePendingOperation),
+        throwsA(isA<TimeoutException>()),
+      );
 
-      await expectLater(
-        delayedOpenAiChat(
-          isInBackground: () => isInBackground,
-          responseDelay: const Duration(seconds: 2),
-          requestTimeout: const Duration(milliseconds: 80),
-          requestMaxWallClock: const Duration(milliseconds: 140),
+      scheduler.elapse(const Duration(milliseconds: 30));
+      scheduler.setBackground(true);
+      scheduler.elapse(const Duration(milliseconds: 500));
+      scheduler.setBackground(false);
+      scheduler.elapse(const Duration(milliseconds: 30));
+      scheduler.setBackground(true);
+      scheduler.elapse(const Duration(milliseconds: 500));
+      scheduler.setBackground(false);
+      scheduler.elapse(const Duration(milliseconds: 39));
+      expect(scheduler.activeTimerCount, 1);
+      scheduler.elapse(const Duration(milliseconds: 1));
+
+      await expectation;
+      service.dispose();
+    });
+
+    test('sampled fallback cannot refresh budget around one-second polls',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(
+        isInBackground: false,
+        supportsLifecycleNotifications: false,
+      );
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 2),
+      );
+      final expectation = expectLater(
+        service.withForegroundTimeoutForTesting(_abortablePendingOperation),
+        throwsA(isA<TimeoutException>()),
+      );
+
+      for (var cycle = 0; cycle < 3; cycle += 1) {
+        scheduler.elapse(const Duration(milliseconds: 900));
+        scheduler.setBackground(true);
+        scheduler.elapse(const Duration(milliseconds: 100));
+        scheduler.setBackground(false);
+      }
+
+      await expectation;
+      expect(scheduler.activeTimerCount, 0);
+      service.dispose();
+    });
+
+    test('sampled fallback does not charge stable background time', () async {
+      final scheduler = _FakeLlmTimeoutScheduler(
+        isInBackground: true,
+        supportsLifecycleNotifications: false,
+      );
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(milliseconds: 100),
+      );
+      final result = Completer<String>();
+      final wrapped = service.withForegroundTimeoutForTesting(
+        (abortTrigger) => _controlledPendingOperation(
+          abortTrigger,
+          result,
         ),
+      );
+
+      scheduler.elapse(const Duration(seconds: 2));
+      result.complete('healthy');
+
+      expect(await wrapped, 'healthy');
+      expect(scheduler.activeTimerCount, 0);
+      service.dispose();
+    });
+
+    test('multiple active requests unregister lifecycle listeners on settle',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: true);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(milliseconds: 100),
+      );
+      final first = Completer<String>();
+      final second = Completer<String>();
+      final firstResult = service.withForegroundTimeoutForTesting(
+        (abort) => _controlledPendingOperation(abort, first),
+      );
+      final secondResult = service.withForegroundTimeoutForTesting(
+        (abort) => _controlledPendingOperation(abort, second),
+      );
+
+      expect(scheduler.lifecycleListenerCount, 2);
+      scheduler.elapse(const Duration(seconds: 1));
+      first.complete('first');
+      second.complete('second');
+
+      expect(await firstResult, 'first');
+      expect(await secondResult, 'second');
+      expect(scheduler.lifecycleListenerCount, 0);
+      expect(scheduler.activeTimerCount, 0);
+      service.dispose();
+    });
+
+    test('fails at max wall clock even while backgrounded', () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: true);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(milliseconds: 80),
+        requestMaxWallClock: const Duration(milliseconds: 140),
+      );
+      final expectation = expectLater(
+        service.withForegroundTimeoutForTesting(_abortablePendingOperation),
         throwsA(isA<TimeoutException>().having(
           (error) => error.message,
           'message',
           contains('maximum wall-clock timeout'),
         )),
       );
+
+      scheduler.elapse(const Duration(milliseconds: 140));
+      await expectation;
+      service.dispose();
+    });
+
+    test('propagates request cancellation immediately while backgrounded',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: true);
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final requestStarted = Completer<void>();
+      final releaseResponse = Completer<void>();
+      server.listen((request) async {
+        await request.drain<void>();
+        requestStarted.complete();
+        await releaseResponse.future;
+        try {
+          request.response.write(_openAiResponse('too late'));
+          await request.response.close();
+        } on IOException {
+          // Expected when the abort closes the request-local connection.
+        }
+      });
+      final service = _timeoutTestService(
+        scheduler,
+        baseUrl: 'http://127.0.0.1:${server.port}',
+        requestTimeout: const Duration(milliseconds: 40),
+      );
+
+      try {
+        final result =
+            service.chat(system: '', messages: const [], tools: const []);
+        await requestStarted.future.timeout(const Duration(seconds: 2));
+        scheduler.elapse(const Duration(milliseconds: 400));
+
+        service.dispose();
+
+        await expectLater(
+          result.timeout(const Duration(seconds: 2)),
+          throwsA(isA<http.RequestAbortedException>()),
+        );
+        expect(scheduler.activeTimerCount, 0);
+        expect(scheduler.delayCallCount, 0);
+      } finally {
+        if (!releaseResponse.isCompleted) releaseResponse.complete();
+        service.dispose();
+        await server.close(force: true);
+      }
+    });
+
+    test('cancelling a background request leaves a concurrent request healthy',
+        () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final firstStarted = Completer<void>();
+      final secondStarted = Completer<void>();
+      final releaseFirst = Completer<void>();
+      final releaseSecond = Completer<void>();
+      var requestCount = 0;
+      server.listen((request) async {
+        requestCount += 1;
+        final current = requestCount;
+        await request.drain<void>();
+        if (current == 1) {
+          firstStarted.complete();
+          await releaseFirst.future;
+        } else {
+          secondStarted.complete();
+          await releaseSecond.future;
+        }
+        try {
+          request.response.write(_openAiResponse('healthy'));
+          await request.response.close();
+        } on IOException {
+          // Expected for the independently aborted first request.
+        }
+      });
+      final cancelledScheduler = _FakeLlmTimeoutScheduler(isInBackground: true);
+      final healthyScheduler = _FakeLlmTimeoutScheduler(isInBackground: true);
+      final cancelledService = _timeoutTestService(
+        cancelledScheduler,
+        baseUrl: 'http://127.0.0.1:${server.port}',
+        requestTimeout: const Duration(milliseconds: 40),
+      );
+      final healthyService = _timeoutTestService(
+        healthyScheduler,
+        baseUrl: 'http://127.0.0.1:${server.port}',
+        requestTimeout: const Duration(milliseconds: 40),
+      );
+
+      try {
+        final cancelledResult = cancelledService.chat(
+          system: '',
+          messages: const [],
+          tools: const [],
+        );
+        await firstStarted.future.timeout(const Duration(seconds: 2));
+        final healthyResult = healthyService.chat(
+          system: '',
+          messages: const [],
+          tools: const [],
+        );
+        await secondStarted.future.timeout(const Duration(seconds: 2));
+        cancelledScheduler.elapse(const Duration(milliseconds: 400));
+        healthyScheduler.elapse(const Duration(milliseconds: 400));
+
+        cancelledService.dispose();
+        releaseSecond.complete();
+
+        await expectLater(
+          cancelledResult.timeout(const Duration(seconds: 2)),
+          throwsA(isA<http.RequestAbortedException>()),
+        );
+        final response =
+            await healthyResult.timeout(const Duration(seconds: 2));
+        expect(response.content.single.text, 'healthy');
+        expect(cancelledScheduler.activeTimerCount, 0);
+        expect(healthyScheduler.activeTimerCount, 0);
+        expect(cancelledScheduler.lifecycleListenerCount, 0);
+        expect(healthyScheduler.lifecycleListenerCount, 0);
+      } finally {
+        if (!releaseFirst.isCompleted) releaseFirst.complete();
+        if (!releaseSecond.isCompleted) releaseSecond.complete();
+        cancelledService.dispose();
+        healthyService.dispose();
+        await server.close(force: true);
+      }
+    });
+  });
+
+  test('foreground timeout releases attempt before retry starts', () async {
+    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final firstRequestStarted = Completer<void>();
+    final firstDisconnected = Completer<void>();
+    final secondRequestStarted = Completer<void>();
+    var connectionCount = 0;
+    var activeConnections = 0;
+    var maxActiveConnections = 0;
+    var laterRequestArrivedBeforeDisconnect = false;
+    server.listen((socket) {
+      connectionCount += 1;
+      final connection = connectionCount;
+      activeConnections += 1;
+      if (activeConnections > maxActiveConnections) {
+        maxActiveConnections = activeConnections;
+      }
+      var requestSeen = false;
+      var connectionFinished = false;
+      final bytes = <int>[];
+      void markConnectionFinished() {
+        if (connectionFinished) return;
+        connectionFinished = true;
+        activeConnections -= 1;
+        if (connection == 1 && !firstDisconnected.isCompleted) {
+          firstDisconnected.complete();
+        }
+      }
+
+      socket.listen(
+        (chunk) async {
+          if (requestSeen) return;
+          bytes.addAll(chunk);
+          if (!utf8.decode(bytes, allowMalformed: true).contains('\r\n\r\n')) {
+            return;
+          }
+          requestSeen = true;
+          if (connection == 1) {
+            firstRequestStarted.complete();
+            return;
+          }
+          laterRequestArrivedBeforeDisconnect =
+              laterRequestArrivedBeforeDisconnect ||
+                  !firstDisconnected.isCompleted;
+          if (connection == 2) secondRequestStarted.complete();
+          final body = _openAiResponse('retry healthy');
+          final responseBytes = utf8.encode(body);
+          socket.add(utf8.encode(
+            'HTTP/1.1 200 OK\r\n'
+            'Content-Type: application/json\r\n'
+            'Content-Length: ${responseBytes.length}\r\n'
+            'Connection: close\r\n\r\n',
+          ));
+          socket.add(responseBytes);
+          await socket.flush();
+          await socket.close();
+        },
+        onError: (_) {
+          markConnectionFinished();
+          socket.destroy();
+        },
+        onDone: markConnectionFinished,
+      );
+    });
+    final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+    final service = _timeoutTestService(
+      scheduler,
+      baseUrl: 'http://127.0.0.1:${server.port}',
+      requestTimeout: const Duration(milliseconds: 40),
+    );
+    final laterService = _timeoutTestService(
+      _FakeLlmTimeoutScheduler(isInBackground: false),
+      baseUrl: 'http://127.0.0.1:${server.port}',
+      requestTimeout: const Duration(seconds: 5),
+    );
+
+    try {
+      final result =
+          service.chat(system: '', messages: const [], tools: const []);
+      await firstRequestStarted.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => throw StateError('first request did not start'),
+      );
+
+      scheduler.elapse(const Duration(milliseconds: 40));
+      await firstDisconnected.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => throw StateError('first request did not disconnect'),
+      );
+      await _waitUntil(() => scheduler.delayCallCount == 1);
+      scheduler.elapse(const Duration(seconds: 2));
+      await secondRequestStarted.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => throw StateError('retry request did not start'),
+      );
+
+      final response = await result.timeout(const Duration(seconds: 2));
+      expect(response.content.single.text, 'retry healthy');
+      final later = await laterService.chat(
+          system: '',
+          messages: const [],
+          tools: const []).timeout(const Duration(seconds: 2));
+      expect(later.content.single.text, 'retry healthy');
+      expect(laterRequestArrivedBeforeDisconnect, isFalse);
+      expect(maxActiveConnections, 1);
+      expect(connectionCount, 3);
+    } finally {
+      service.dispose();
+      laterService.dispose();
+      await server.close();
+    }
+  });
+
+  group('LlmService streaming idle timeout', () {
+    test('stalled SSE consumes monotonic foreground idle budget', () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 5),
+      );
+      final input = StreamController<List<int>>();
+      final expectation = expectLater(
+        service.linesWithForegroundTimeoutForTesting(input.stream).toList(),
+        throwsA(isA<TimeoutException>().having(
+          (error) => error.duration,
+          'duration',
+          const Duration(seconds: 60),
+        )),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      scheduler.elapse(const Duration(seconds: 60));
+
+      await expectation;
+      expect(scheduler.activeTimerCount, 0);
+      expect(scheduler.lifecycleListenerCount, 0);
+      await input.close();
+      service.dispose();
+    });
+
+    test('background pauses idle budget and resume consumes only foreground',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 5),
+      );
+      final input = StreamController<List<int>>();
+      final output =
+          service.linesWithForegroundTimeoutForTesting(input.stream).toList();
+      await Future<void>.delayed(Duration.zero);
+
+      scheduler.elapse(const Duration(seconds: 30));
+      scheduler.setBackground(true);
+      scheduler.elapse(const Duration(minutes: 2));
+      scheduler.setBackground(false);
+      scheduler.elapse(const Duration(seconds: 29));
+      input.add(utf8.encode('healthy\n'));
+      await input.close();
+
+      expect(await output, ['healthy']);
+      expect(scheduler.activeTimerCount, 0);
+      expect(scheduler.lifecycleListenerCount, 0);
+      service.dispose();
+    });
+
+    test('provider wall cap expires while stream is backgrounded', () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: true);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 5),
+        requestMaxWallClock: const Duration(seconds: 30),
+      );
+      final input = StreamController<List<int>>();
+      final expectation = expectLater(
+        service.linesWithForegroundTimeoutForTesting(input.stream).toList(),
+        throwsA(isA<TimeoutException>().having(
+          (error) => error.message,
+          'message',
+          contains('maximum wall-clock timeout'),
+        )),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      scheduler.elapse(const Duration(seconds: 30));
+
+      await expectation;
+      expect(scheduler.activeTimerCount, 0);
+      expect(scheduler.lifecycleListenerCount, 0);
+      await input.close();
+      service.dispose();
+    });
+
+    test('response error retires its still-open stream before reconnect',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 30),
+      );
+      final cancelStarted = Completer<void>();
+      final releaseCancellation = Completer<void>();
+      final cancellationSettled = Completer<void>();
+      final lifecycle = <String>[];
+      final firstInput = StreamController<List<int>>(
+        onCancel: () async {
+          lifecycle.add('cancel-started');
+          cancelStarted.complete();
+          await releaseCancellation.future;
+          lifecycle.add('cancel-settled');
+          cancellationSettled.complete();
+        },
+      );
+      final events = <String>[];
+      var openCount = 0;
+
+      final output = service.resilientSseDataForTesting((_) async {
+        openCount += 1;
+        lifecycle.add('open-$openCount');
+        if (openCount == 1) {
+          return http.StreamedResponse(firstInput.stream, 200);
+        }
+        expect(cancellationSettled.isCompleted, isTrue);
+        return http.StreamedResponse(
+          Stream<List<int>>.value(utf8.encode('data: fresh\n\n')),
+          200,
+        );
+      }).listen((event) {
+        lifecycle.add('event-$event');
+        events.add(event);
+      });
+
+      try {
+        firstInput.addError(http.ClientException('transient response error'));
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+        expect(
+          cancelStarted.isCompleted,
+          isTrue,
+          reason: 'errored response subscription must be cancelled',
+        );
+
+        expect(events, isEmpty);
+        expect(scheduler.delayCallCount, 0);
+        expect(openCount, 1);
+        firstInput.add(utf8.encode('data: stale-before-settle\n\n'));
+
+        releaseCancellation.complete();
+        await cancellationSettled.future;
+        await _waitUntil(() => events.contains('__retry__'));
+        await _waitUntil(() => scheduler.delayCallCount == 1);
+
+        expect(
+          lifecycle.indexOf('cancel-settled'),
+          lessThan(lifecycle.indexOf('event-__retry__')),
+        );
+        firstInput.add(utf8.encode('data: stale-after-settle\n\n'));
+        scheduler.elapse(const Duration(seconds: 2));
+
+        await output.asFuture<void>();
+        expect(events, ['__retry__', 'fresh']);
+        expect(openCount, 2);
+      } finally {
+        if (!releaseCancellation.isCompleted) releaseCancellation.complete();
+        await firstInput.close();
+        scheduler.elapse(const Duration(minutes: 1));
+        await Future<void>.delayed(Duration.zero);
+        await output.cancel();
+        service.dispose();
+      }
+    });
+
+    test('reconnect delay cannot reset the provider wall-clock budget',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 5),
+        requestMaxWallClock: const Duration(seconds: 61),
+      );
+      final firstInput = StreamController<List<int>>();
+      final firstOutput = Completer<void>();
+      final streamDone = Completer<void>();
+      final events = <String>[];
+      var openCount = 0;
+
+      try {
+        final subscription =
+            service.resilientSseDataForTesting((attemptAbortTrigger) async {
+          openCount += 1;
+          return http.StreamedResponse(firstInput.stream, 200);
+        }).listen((event) {
+          events.add(event);
+          if (event != '__retry__' && !firstOutput.isCompleted) {
+            firstOutput.complete();
+          }
+        }, onError: (Object error, StackTrace stackTrace) {
+          if (!streamDone.isCompleted) {
+            streamDone.completeError(error, stackTrace);
+          }
+        }, onDone: () {
+          if (!streamDone.isCompleted) streamDone.complete();
+        });
+        firstInput.add(utf8.encode('data: first\n\n'));
+        await firstOutput.future;
+        await Future<void>.delayed(Duration.zero);
+
+        scheduler.elapse(const Duration(seconds: 60));
+        await _waitUntil(() => events.contains('__retry__'));
+        expect(scheduler.delayCallCount, 1);
+        scheduler.elapse(const Duration(seconds: 1));
+
+        await expectLater(
+          streamDone.future,
+          throwsA(isA<TimeoutException>().having(
+            (error) => error.message,
+            'message',
+            contains('maximum wall-clock timeout'),
+          )),
+        );
+        await subscription.cancel();
+        expect(openCount, 1);
+        expect(events, ['first', '__retry__']);
+        expect(scheduler.activeTimerCount, 0);
+        expect(scheduler.lifecycleListenerCount, 0);
+      } finally {
+        await firstInput.close();
+        service.dispose();
+      }
+    });
+
+    test('multiple reconnect backoffs cumulatively share one wall deadline',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 30),
+        requestMaxWallClock: const Duration(seconds: 5),
+      );
+      var openCount = 0;
+      final expectation = expectLater(
+        service.resilientSseDataForTesting((attemptAbortTrigger) async {
+          openCount += 1;
+          return http.StreamedResponse(
+            Stream<List<int>>.error(
+              http.ClientException('transient response failure'),
+            ),
+            200,
+          );
+        }).toList(),
+        throwsA(isA<TimeoutException>().having(
+          (error) => error.message,
+          'message',
+          contains('maximum wall-clock timeout'),
+        )),
+      );
+
+      await _waitUntil(() => scheduler.delayCallCount == 1);
+      scheduler.elapse(const Duration(seconds: 2));
+      await _waitUntil(() => scheduler.delayCallCount == 2);
+      scheduler.elapse(const Duration(seconds: 3));
+
+      await expectation;
+      expect(openCount, 2);
+      expect(scheduler.activeTimerCount, 0);
+      expect(scheduler.lifecycleListenerCount, 0);
+      service.dispose();
+    });
+
+    test('hung reconnect handshake aborts at original stream deadline',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 30),
+        requestMaxWallClock: const Duration(seconds: 70),
+      );
+      final firstInput = StreamController<List<int>>();
+      final secondOpenStarted = Completer<void>();
+      final secondOpenAborted = Completer<void>();
+      final streamError = Completer<Object>();
+      final events = <String>[];
+      var openCount = 0;
+
+      final subscription = service.resilientSseDataForTesting(
+        (attemptAbortTrigger) async {
+          openCount += 1;
+          if (openCount == 1) {
+            return http.StreamedResponse(firstInput.stream, 200);
+          }
+          if (openCount == 2) {
+            secondOpenStarted.complete();
+            await attemptAbortTrigger;
+            secondOpenAborted.complete();
+            throw http.RequestAbortedException();
+          }
+          throw StateError('unexpected late reconnect');
+        },
+      ).listen(
+        events.add,
+        onError: (Object error, StackTrace stackTrace) {
+          if (!streamError.isCompleted) streamError.complete(error);
+        },
+      );
+
+      try {
+        firstInput.add(utf8.encode('data: first\n\n'));
+        await _waitUntil(() => events.contains('first'));
+        await Future<void>.delayed(Duration.zero);
+
+        scheduler.elapse(const Duration(seconds: 60));
+        await _waitUntil(() => events.contains('__retry__'));
+        scheduler.elapse(const Duration(seconds: 2));
+        await secondOpenStarted.future;
+        scheduler.setBackground(true);
+        scheduler.elapse(const Duration(seconds: 8));
+
+        await secondOpenAborted.future;
+        final error = await streamError.future;
+        expect(
+          error,
+          isA<TimeoutException>().having(
+            (value) => value.message,
+            'message',
+            contains('maximum wall-clock timeout'),
+          ),
+        );
+        expect(openCount, 2);
+        expect(events, ['first', '__retry__']);
+        expect(scheduler.activeTimerCount, 0);
+        expect(scheduler.lifecycleListenerCount, 0);
+      } finally {
+        await subscription.cancel();
+        await firstInput.close();
+        service.dispose();
+      }
+    });
+
+    test('loopback server observes reconnect abort at logical deadline',
+        () async {
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      final sockets = <Socket>{};
+      final secondRequestStarted = Completer<void>();
+      final secondDisconnected = Completer<void>();
+      var connectionCount = 0;
+      server.listen((socket) {
+        sockets.add(socket);
+        connectionCount += 1;
+        final connection = connectionCount;
+        var requestSeen = false;
+        final requestBytes = <int>[];
+        socket.listen(
+          (chunk) {
+            if (requestSeen) return;
+            requestBytes.addAll(chunk);
+            if (!utf8
+                .decode(requestBytes, allowMalformed: true)
+                .contains('\r\n\r\n')) {
+              return;
+            }
+            requestSeen = true;
+            if (connection == 1) {
+              final sse = sseData({
+                'choices': [
+                  {
+                    'delta': {'content': 'first'},
+                    'finish_reason': null,
+                  }
+                ],
+              });
+              socket.add(utf8.encode(
+                'HTTP/1.1 200 OK\r\n'
+                'Content-Type: text/event-stream\r\n'
+                'Content-Length: 4096\r\n'
+                'Connection: close\r\n\r\n'
+                '$sse',
+              ));
+            } else if (connection == 2) {
+              secondRequestStarted.complete();
+            }
+          },
+          onDone: () {
+            sockets.remove(socket);
+            if (connection == 2 && !secondDisconnected.isCompleted) {
+              secondDisconnected.complete();
+            }
+          },
+          onError: (_) {
+            sockets.remove(socket);
+            if (connection == 2 && !secondDisconnected.isCompleted) {
+              secondDisconnected.complete();
+            }
+            socket.destroy();
+          },
+        );
+      });
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        baseUrl: 'http://127.0.0.1:${server.port}',
+        requestTimeout: const Duration(seconds: 30),
+        requestMaxWallClock: const Duration(seconds: 70),
+      );
+      final events = <StreamEvent>[];
+      final streamDone = Completer<void>();
+      final subscription = service.chatStream(
+          system: '',
+          messages: const [],
+          tools: const []).listen(events.add, onDone: streamDone.complete);
+
+      try {
+        await _waitUntil(
+          () => events
+              .whereType<TextDelta>()
+              .any((event) => event.text == 'first'),
+        );
+        await Future<void>.delayed(Duration.zero);
+        scheduler.elapse(const Duration(seconds: 60));
+        await _waitUntil(() => events.any((event) => event is StreamReset));
+        scheduler.elapse(const Duration(seconds: 2));
+        await secondRequestStarted.future.timeout(const Duration(seconds: 2));
+        scheduler.setBackground(true);
+        scheduler.elapse(const Duration(seconds: 8));
+
+        await secondDisconnected.future.timeout(const Duration(seconds: 2));
+        await streamDone.future.timeout(const Duration(seconds: 2));
+        expect(connectionCount, 2);
+        expect(
+          events.whereType<StreamError>().single.message,
+          contains('maximum wall-clock timeout'),
+        );
+      } finally {
+        await subscription.cancel();
+        service.dispose();
+        for (final socket in sockets.toList(growable: false)) {
+          socket.destroy();
+        }
+        await server.close();
+      }
+    });
+
+    test('initial handshake backoffs share one logical stream deadline',
+        () async {
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        requestTimeout: const Duration(seconds: 30),
+        requestMaxWallClock: const Duration(seconds: 5),
+      );
+      var openCount = 0;
+      final expectation = expectLater(
+        service.resilientSseDataForTesting((attemptAbortTrigger) async {
+          openCount += 1;
+          throw http.ClientException('transient handshake failure');
+        }).toList(),
+        throwsA(isA<TimeoutException>().having(
+          (error) => error.message,
+          'message',
+          contains('maximum wall-clock timeout'),
+        )),
+      );
+
+      await _waitUntil(() => scheduler.delayCallCount == 1);
+      scheduler.elapse(const Duration(seconds: 2));
+      await _waitUntil(() => scheduler.delayCallCount == 2);
+      scheduler.elapse(const Duration(seconds: 3));
+
+      await expectation;
+      expect(openCount, 2);
+      expect(scheduler.activeTimerCount, 0);
+      service.dispose();
+    });
+
+    test('OpenAI compatibility retry handshake shares stream deadline',
+        () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final firstRequestStarted = Completer<void>();
+      final releaseFirstResponse = Completer<void>();
+      final compatibilityRequestStarted = Completer<void>();
+      final releaseCompatibilityResponse = Completer<void>();
+      var requestCount = 0;
+      server.listen((request) async {
+        requestCount += 1;
+        final current = requestCount;
+        await request.drain<void>();
+        if (current == 1) {
+          firstRequestStarted.complete();
+          await releaseFirstResponse.future;
+          request.response.statusCode = HttpStatus.badRequest;
+          request.response.headers.contentType = ContentType.json;
+          request.response.write(jsonEncode({
+            'error': {'message': 'max_tokens is unsupported'},
+          }));
+          await request.response.close();
+          return;
+        }
+        if (current == 2) {
+          compatibilityRequestStarted.complete();
+          await releaseCompatibilityResponse.future;
+          try {
+            request.response.headers.contentType =
+                ContentType('text', 'event-stream', charset: 'utf-8');
+            request.response.write('data: [DONE]\n\n');
+            await request.response.close();
+          } on HttpException {
+            // Expected after the shared logical deadline aborts this retry.
+          }
+          return;
+        }
+        request.response.statusCode = HttpStatus.internalServerError;
+        await request.response.close();
+      });
+      final scheduler = _FakeLlmTimeoutScheduler(isInBackground: false);
+      final service = _timeoutTestService(
+        scheduler,
+        baseUrl: 'http://127.0.0.1:${server.port}',
+        requestTimeout: const Duration(seconds: 60),
+        requestMaxWallClock: const Duration(seconds: 30),
+      );
+
+      try {
+        final eventsFuture = service.chatStream(
+            system: '', messages: const [], tools: const []).toList();
+        await firstRequestStarted.future.timeout(const Duration(seconds: 2));
+        scheduler.elapse(const Duration(seconds: 29));
+        releaseFirstResponse.complete();
+        await compatibilityRequestStarted.future
+            .timeout(const Duration(seconds: 2));
+        scheduler.setBackground(true);
+        scheduler.elapse(const Duration(seconds: 1));
+
+        final events = await eventsFuture.timeout(const Duration(seconds: 2));
+        expect(requestCount, 2);
+        expect(
+          events.whereType<StreamError>().single.message,
+          contains('maximum wall-clock timeout'),
+        );
+      } finally {
+        if (!releaseFirstResponse.isCompleted) releaseFirstResponse.complete();
+        if (!releaseCompatibilityResponse.isCompleted) {
+          releaseCompatibilityResponse.complete();
+        }
+        service.dispose();
+        LlmService.clearTokenKeyOverrides();
+        await server.close(force: true);
+      }
+    });
+
+    test('stream idle code has no wall-clock DateTime sampling', () async {
+      final source = await File('lib/services/llm_service.dart').readAsString();
+      final start =
+          source.indexOf('Stream<String> _linesWithForegroundTimeout');
+      final end = source.indexOf(
+        'Stream<_ResilientSseEvent> _resilientSseDataStream',
+        start,
+      );
+      final idleSource = source.substring(start, end);
+
+      expect(idleSource, contains('_timeoutScheduler.now()'));
+      expect(idleSource, isNot(contains('DateTime.now()')));
+      expect(source, contains('Stopwatch()..start()'));
     });
   });
 
@@ -1985,44 +3034,170 @@ Future<String> openAiChatError(int statusCode, String responseBody) async {
   fail('Expected chat request to fail');
 }
 
-Future<LlmResponse> delayedOpenAiChat({
-  required bool Function() isInBackground,
-  required Duration responseDelay,
+LlmService _timeoutTestService(
+  _FakeLlmTimeoutScheduler scheduler, {
+  String baseUrl = 'http://127.0.0.1:1',
   required Duration requestTimeout,
   Duration? requestMaxWallClock,
-}) async {
-  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-  server.listen((request) async {
-    await utf8.decoder.bind(request).join();
-    await Future<void>.delayed(responseDelay);
-    request.response.statusCode = 200;
-    request.response.headers.contentType = ContentType.json;
-    request.response.write(jsonEncode({
-      'choices': [
-        {
-          'message': {'content': 'ok after background'},
-          'finish_reason': 'stop',
-        }
-      ],
-    }));
-    await request.response.close();
-  });
-
-  final service = LlmService(
+}) {
+  return LlmService(
     LlmConfig.openai(
       apiKey: 'sk-test',
       model: 'gpt-test',
-      baseUrl: 'http://127.0.0.1:${server.port}',
+      baseUrl: baseUrl,
     ),
-    isInBackground: isInBackground,
+    isInBackground: () => scheduler.isInBackground,
     requestTimeout: requestTimeout,
     requestMaxWallClock: requestMaxWallClock,
+    timeoutScheduler: scheduler,
   );
-  try {
-    return await service.chat(system: '', messages: const [], tools: const []);
-  } finally {
-    service.dispose();
-    await server.close(force: true);
+}
+
+Future<String> _abortablePendingOperation(Future<void> abortTrigger) async {
+  await abortTrigger;
+  throw http.RequestAbortedException();
+}
+
+Future<String> _controlledPendingOperation(
+  Future<void> abortTrigger,
+  Completer<String> result,
+) {
+  abortTrigger.then((_) {
+    if (!result.isCompleted) {
+      result.completeError(http.RequestAbortedException());
+    }
+  });
+  return result.future;
+}
+
+Future<void> _waitUntil(bool Function() predicate) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 2));
+  while (!predicate()) {
+    if (DateTime.now().isAfter(deadline)) {
+      throw TimeoutException('Condition did not become true');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 1));
+  }
+}
+
+String _openAiResponse(String content) {
+  return jsonEncode({
+    'choices': [
+      {
+        'message': {'content': content},
+        'finish_reason': 'stop',
+      }
+    ],
+  });
+}
+
+final class _FakeLlmTimeoutScheduler implements LlmTimeoutScheduler {
+  _FakeLlmTimeoutScheduler({
+    required this.isInBackground,
+    this.supportsLifecycleNotifications = true,
+  });
+
+  DateTime _now = DateTime.utc(2026);
+  final List<_FakeTimer> _timers = <_FakeTimer>[];
+  final Set<void Function(LlmLifecycleTransition)> _lifecycleListeners = {};
+  bool isInBackground;
+  final bool supportsLifecycleNotifications;
+  int delayCallCount = 0;
+
+  int get activeTimerCount => _timers.where((timer) => timer.isActive).length;
+  int get lifecycleListenerCount => _lifecycleListeners.length;
+
+  @override
+  DateTime now() => _now;
+
+  @override
+  Timer schedule(Duration duration, void Function() callback) {
+    final normalized = duration.isNegative ? Duration.zero : duration;
+    final timer = _FakeTimer(
+      dueAt: _now.add(normalized),
+      callback: callback,
+    );
+    _timers.add(timer);
+    return timer;
+  }
+
+  @override
+  Future<void> delay(Duration duration) {
+    delayCallCount += 1;
+    final completer = Completer<void>();
+    schedule(duration, completer.complete);
+    return completer.future;
+  }
+
+  @override
+  void Function()? registerLifecycleListener(
+    void Function(LlmLifecycleTransition transition) listener,
+  ) {
+    if (!supportsLifecycleNotifications) return null;
+    _lifecycleListeners.add(listener);
+    return () => _lifecycleListeners.remove(listener);
+  }
+
+  void setBackground(bool value) {
+    if (isInBackground == value) return;
+    isInBackground = value;
+    for (final listener in _lifecycleListeners.toList(growable: false)) {
+      listener(LlmLifecycleTransition(
+        isInBackground: value,
+        timestamp: _now,
+      ));
+    }
+  }
+
+  void elapse(Duration duration) {
+    if (duration.isNegative) {
+      throw ArgumentError.value(duration, 'duration', 'must not be negative');
+    }
+    final target = _now.add(duration);
+    var callbacks = 0;
+    while (true) {
+      _FakeTimer? next;
+      for (final timer in _timers) {
+        if (!timer.isActive || timer.dueAt.isAfter(target)) continue;
+        if (next == null || timer.dueAt.isBefore(next.dueAt)) {
+          next = timer;
+        }
+      }
+      if (next == null) break;
+      _now = next.dueAt;
+      next.fire();
+      callbacks += 1;
+      if (callbacks > 10000) {
+        throw StateError('Fake timeout scheduler did not settle');
+      }
+    }
+    _now = target;
+  }
+}
+
+final class _FakeTimer implements Timer {
+  _FakeTimer({required this.dueAt, required void Function() callback})
+      : _callback = callback;
+
+  final DateTime dueAt;
+  final void Function() _callback;
+  bool _isActive = true;
+  int _tick = 0;
+
+  @override
+  bool get isActive => _isActive;
+
+  @override
+  int get tick => _tick;
+
+  @override
+  void cancel() => _isActive = false;
+
+  void fire() {
+    if (!_isActive) return;
+    _isActive = false;
+    _tick = 1;
+    _callback();
   }
 }
 

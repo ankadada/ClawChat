@@ -25,8 +25,13 @@ class QueuedMessage {
 class AgentState {
   final String sessionId;
   String sessionTitle = '';
+  bool sessionExecutionMetadataKnown = false;
+  bool isRemoteSessionExecution = false;
+  String? safeExecutionDisplayName;
 
   bool isSending = false;
+  int runGeneration = 0;
+  String? activeRunAttemptId;
   AgentService? agent;
   AgentStatus status = AgentStatus.idle;
   String streamingText = '';
@@ -42,6 +47,8 @@ class AgentState {
     maxDelay: const Duration(milliseconds: 240),
   );
   Timer? messageQueueDrainTimer;
+  String? messageQueueDrainHeadId;
+  int messageQueueDrainEpoch = 0;
   LlmService? cachedLlm;
   LlmConfig? cachedLlmConfig;
   bool agentServiceActive = false;
@@ -51,10 +58,12 @@ class AgentState {
   bool partialAgentResponseSaved = false;
   int initialApiMsgCount = 0;
   final Set<String> sessionApprovedTools = {};
+  bool forceToolApprovalForRun = false;
   final List<QueuedMessage> messageQueue = [];
   bool wasCancelled = false;
   List<String>? pendingAlternatives;
   bool agentOverlayPermissionRequestStarted = false;
+  bool fallbackGuardedOutputObserved = false;
   bool fallbackTextEmitted = false;
   bool fallbackToolStarted = false;
   bool fallbackMessagesPersisted = false;
@@ -65,6 +74,9 @@ class AgentState {
     streamFlushScheduler.cancel();
     reasoningFlushScheduler.cancel();
     messageQueueDrainTimer?.cancel();
+    messageQueueDrainTimer = null;
+    messageQueueDrainHeadId = null;
+    messageQueueDrainEpoch++;
     agentSubscription?.cancel();
     if (agentCompleter != null && !agentCompleter!.isCompleted) {
       agentCompleter!.complete();

@@ -5,22 +5,30 @@ import 'dart:io';
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/l10n/app_strings.dart';
 import 'package:clawchat/models/chat_models.dart';
+import 'package:clawchat/models/agent_run_center.dart';
+import 'package:clawchat/models/extension_manifest.dart';
 import 'package:clawchat/models/model_capabilities.dart' as caps;
 import 'package:clawchat/models/provider_profile.dart';
+import 'package:clawchat/models/workspace_import_receipt.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/services/chat_context_utils.dart';
 import 'package:clawchat/services/config_export_service.dart';
 import 'package:clawchat/services/context_manager.dart';
 import 'package:clawchat/services/context_summary_service.dart';
+import 'package:clawchat/services/attachment_budget.dart';
 import 'package:clawchat/services/startup_restore_guard.dart';
 import 'package:clawchat/services/llm_service.dart';
+import 'package:clawchat/services/native_bridge.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/provider_message_transform.dart';
 import 'package:clawchat/services/runtime_debug_events.dart';
 import 'package:clawchat/services/session_storage.dart';
+import 'package:clawchat/services/skill_capability_policy.dart';
+import 'package:clawchat/services/skill_service.dart';
 import 'package:clawchat/services/token_calibration_service.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:clawchat/services/tools/tool_registry.dart';
+import 'package:clawchat/services/tools/env_var_tool.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -46,6 +54,19 @@ Future<void> _waitUntil(
 }) async {
   final deadline = DateTime.now().add(timeout);
   while (!condition()) {
+    if (DateTime.now().isAfter(deadline)) {
+      throw TimeoutException('condition was not met');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+}
+
+Future<void> _waitUntilAsync(
+  Future<bool> Function() condition, {
+  Duration timeout = const Duration(seconds: 2),
+}) async {
+  final deadline = DateTime.now().add(timeout);
+  while (!await condition()) {
     if (DateTime.now().isAfter(deadline)) {
       throw TimeoutException('condition was not met');
     }
@@ -130,6 +151,7 @@ void main() {
 
   void configureAnthropicProfile({
     required String baseUrl,
+    bool developerMode = true,
   }) {
     final profile = ProviderProfile.defaults().copyWith(
       id: 'profile',
@@ -142,6 +164,7 @@ void main() {
     SharedPreferences.setMockInitialValues({
       'active_provider_profile_id': 'profile',
       'context_token_budget': 65536,
+      'developer_mode': developerMode,
     });
   }
 
@@ -150,6 +173,7 @@ void main() {
     List<ModelFallbackTarget>? targets,
     int primaryThinkingBudget = 0,
     int contextTokenBudget = 65536,
+    bool developerMode = true,
   }) {
     final configuredTargets = targets ??
         const [
@@ -181,6 +205,7 @@ void main() {
     SharedPreferences.setMockInitialValues({
       'active_provider_profile_id': 'primary',
       'context_token_budget': contextTokenBudget,
+      'developer_mode': developerMode,
     });
   }
 
@@ -264,6 +289,534 @@ void main() {
       expect(provider.sessions.single.title, 'Renamed');
       expect(provider.sessions.single.folder, 'Work');
     });
+  });
+
+  group('message queue undo', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(clearPlatformMocks);
+
+    test('remove and clear restore exact order and attachment ownership',
+        () async {
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      final active = provider.sendMessage('active');
+      await started.future;
+      unawaited(provider.sendMessage(
+        'queued one',
+        attachments: [TextContent('local attachment')],
+      ));
+      unawaited(provider.sendMessage('queued two'));
+      await _waitUntil(() => provider.messageQueue.length == 2);
+      final original = List<QueuedMessage>.from(provider.messageQueue);
+
+      final one = provider.removeQueuedMessage(original.first.id)!;
+      expect(provider.messageQueue.map((message) => message.id),
+          [original.last.id]);
+      expect(provider.restoreMessageQueue(one), isTrue);
+      expect(provider.messageQueue.map((message) => message.id),
+          original.map((message) => message.id));
+      expect(
+          identical(provider.messageQueue.first.attachments.first,
+              original.first.attachments.first),
+          isTrue);
+
+      final all = provider.clearMessageQueue()!;
+      expect(provider.messageQueue, isEmpty);
+      expect(provider.restoreMessageQueue(all), isTrue);
+      expect(provider.messageQueue.map((message) => message.id),
+          original.map((message) => message.id));
+
+      final afterDeletion = provider.clearMessageQueue()!;
+      await provider.deleteSession(session.id);
+      expect(provider.restoreMessageQueue(afterDeletion), isFalse);
+      if (!release.isCompleted) release.complete();
+      await active;
+    });
+
+    test('removing drain head reschedules once and sends only the next head',
+        () async {
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final timers = _ManualTimerScheduler();
+      final provider = ChatProvider(
+        messageQueueDrainTimerFactory: timers.schedule,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.createSession();
+      final active = provider.sendMessage('active');
+      await started.future;
+      unawaited(provider.sendMessage('queued head'));
+      unawaited(provider.sendMessage('queued next'));
+      await _waitUntil(() => provider.messageQueue.length == 2);
+      final original = List<QueuedMessage>.from(provider.messageQueue);
+
+      if (!release.isCompleted) release.complete();
+      await active;
+      expect(timers.activeCount, 1);
+      expect(timers.createdCount, 1);
+
+      provider.removeQueuedMessage(original.first.id);
+      expect(provider.messageQueue.single.id, original.last.id);
+      expect(timers.activeCount, 1);
+      expect(timers.createdCount, 2);
+
+      timers.fireAll();
+      await _waitUntil(() => provider.messageQueue.isEmpty);
+      await _waitUntil(
+        () => provider.currentSession!.messages
+            .where((message) => message.role == 'user')
+            .any((message) => message.textContent == 'queued next'),
+      );
+      final userMessages = provider.currentSession!.messages
+          .where((message) => message.role == 'user')
+          .map((message) => message.textContent);
+      expect(userMessages.where((text) => text == 'queued next'), hasLength(1));
+      expect(userMessages, isNot(contains('queued head')));
+    });
+
+    test('removing a non-head preserves the current drain timer', () async {
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final timers = _ManualTimerScheduler();
+      final provider = ChatProvider(
+        messageQueueDrainTimerFactory: timers.schedule,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.createSession();
+      final active = provider.sendMessage('active');
+      await started.future;
+      unawaited(provider.sendMessage('queued head'));
+      unawaited(provider.sendMessage('queued tail'));
+      await _waitUntil(() => provider.messageQueue.length == 2);
+      final original = List<QueuedMessage>.from(provider.messageQueue);
+
+      release.complete();
+      await active;
+      expect(timers.createdCount, 1);
+      provider.removeQueuedMessage(original.last.id);
+      expect(timers.createdCount, 1);
+
+      timers.fireAll();
+      await _waitUntil(() => provider.messageQueue.isEmpty);
+      final userMessages = provider.currentSession!.messages
+          .where((message) => message.role == 'user')
+          .map((message) => message.textContent);
+      expect(userMessages.where((text) => text == 'queued head'), hasLength(1));
+      expect(userMessages, isNot(contains('queued tail')));
+    });
+
+    test('capacity-limited undo retains remaining order and attachments',
+        () async {
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      final active = provider.sendMessage('active');
+      await started.future;
+      final attachment = TextContent('retained attachment');
+      unawaited(provider.sendMessage('original one'));
+      unawaited(provider.sendMessage(
+        'original two',
+        attachments: [attachment],
+      ));
+      unawaited(provider.sendMessage('original three'));
+      await _waitUntil(
+        () => provider.messageQueue.length == ChatProvider.maxQueuedMessages,
+      );
+      final original = List<QueuedMessage>.from(provider.messageQueue);
+      final undo = provider.clearMessageQueue()!;
+
+      unawaited(provider.sendMessage('new one'));
+      unawaited(provider.sendMessage('new two'));
+      await _waitUntil(() => provider.messageQueue.length == 2);
+      final newItems = List<QueuedMessage>.from(provider.messageQueue);
+      final partial = provider.restoreMessageQueueWithResult(undo);
+      expect(partial.restoredCount, 1);
+      expect(partial.remainingCount, 2);
+      expect(provider.messageQueue, hasLength(ChatProvider.maxQueuedMessages));
+      expect(provider.messageQueue.first.id, original.first.id);
+      expect(
+        identical(partial.remainingUndo!.messages.first.attachments.first,
+            attachment),
+        isTrue,
+      );
+
+      provider.removeQueuedMessage(newItems.first.id);
+      provider.removeQueuedMessage(newItems.last.id);
+      final completed =
+          provider.restoreMessageQueueWithResult(partial.remainingUndo!);
+      expect(completed.remainingUndo, isNull);
+      expect(
+        provider.messageQueue.map((message) => message.id),
+        original.map((message) => message.id),
+      );
+      expect(
+        identical(provider.messageQueue[1].attachments.first, attachment),
+        isTrue,
+      );
+
+      final fullUndo = provider.clearMessageQueue()!;
+      unawaited(provider.sendMessage('replacement one'));
+      unawaited(provider.sendMessage('replacement two'));
+      unawaited(provider.sendMessage('replacement three'));
+      await _waitUntil(
+        () => provider.messageQueue.length == ChatProvider.maxQueuedMessages,
+      );
+      final full = provider.restoreMessageQueueWithResult(fullUndo);
+      expect(full.restoredCount, 0);
+      expect(full.remainingCount, ChatProvider.maxQueuedMessages);
+      expect(provider.messageQueue, hasLength(ChatProvider.maxQueuedMessages));
+      expect(
+        identical(
+            full.remainingUndo!.messages[1].attachments.first, attachment),
+        isTrue,
+      );
+
+      await provider.deleteSession(session.id);
+      final missing =
+          provider.restoreMessageQueueWithResult(full.remainingUndo!);
+      expect(missing.sessionMissing, isTrue);
+      expect(missing.restoredCount, 0);
+      if (!release.isCompleted) release.complete();
+      await active;
+    });
+
+    test('undo remains bound to its session across switching and deletion',
+        () async {
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final source = await provider.createSession();
+      final active = provider.sendMessage('active');
+      await started.future;
+      unawaited(provider.sendMessage('queued for source'));
+      await _waitUntil(() => provider.messageQueue.length == 1);
+      final undo = provider.clearMessageQueue()!;
+
+      final other = await provider.createSession();
+      expect(provider.currentSession!.id, other.id);
+      final restored = provider.restoreMessageQueueWithResult(undo);
+      expect(restored.restoredCount, 1);
+      expect(provider.messageQueue, isEmpty);
+
+      await provider.selectSession(source.id);
+      expect(provider.messageQueue.single.text, 'queued for source');
+      final deletionUndo = provider.clearMessageQueue()!;
+      await provider.deleteSession(source.id);
+      expect(
+        provider.restoreMessageQueueWithResult(deletionUndo).sessionMissing,
+        isTrue,
+      );
+      if (!release.isCompleted) release.complete();
+      await active;
+    });
+  });
+
+  group('workspace import receipt lifecycle', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      NativeBridge.resetImportReadStreamForTesting();
+      await clearPlatformMocks();
+    });
+
+    WorkspaceImportReceipt receipt(String operation) => WorkspaceImportReceipt(
+          operationId: operation * 32,
+          storedPath: '/root/workspace/uploads/report_${operation * 32}.bin',
+          size: 3,
+          sha256: 'f' * 64,
+          displayName: 'report.bin',
+        );
+
+    ChatProvider providerFor(SessionStorage storage) => ChatProvider(
+          storage: storage,
+          llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+            config,
+            onMessages: (_) => StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'done')],
+            )),
+          ),
+        );
+
+    test('durable message reference is saved before native ACK', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final events = <String>[];
+      late ChatProvider provider;
+      NativeBridge.setWorkspaceImportLifecycleBrokerForTesting(
+        (receipt, discard) async {
+          events.add(discard ? 'discard' : 'ack');
+          final persisted = await storage.getSession(
+            provider.currentSession!.id,
+          );
+          expect(persisted!.messages.last.textContent,
+              contains(receipt.storedPath));
+          expect(persisted.pendingWorkspaceImports.single.operationId,
+              receipt.operationId);
+          return true;
+        },
+      );
+      provider = providerFor(storage);
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.createSession();
+      final importReceipt = receipt('a');
+
+      final committed = await provider.sendMessageWithWorkspaceImports(
+        importReceipt.marker,
+        workspaceImports: [importReceipt],
+      );
+
+      expect(committed, isTrue);
+      await _waitUntil(() => events.contains('ack'));
+      await _waitUntilAsync(() async =>
+          (await storage.getSession(provider.currentSession!.id))!
+              .pendingWorkspaceImports
+              .isEmpty);
+      expect(events, ['ack']);
+    });
+
+    test('reference save failure never ACKs and leaves draft ownership',
+        () async {
+      var saves = 0;
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        saves++;
+        if (saves == 2) throw StateError('reference save failed');
+      });
+      await storage.init();
+      var acknowledged = false;
+      NativeBridge.setWorkspaceImportLifecycleBrokerForTesting(
+        (_, __) async {
+          acknowledged = true;
+          return true;
+        },
+      );
+      final provider = providerFor(storage);
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      final importReceipt = receipt('b');
+
+      final committed = await provider.sendMessageWithWorkspaceImports(
+        importReceipt.marker,
+        workspaceImports: [importReceipt],
+      );
+
+      expect(committed, isFalse);
+      expect(acknowledged, isFalse);
+      final persisted = await storage.getSession(session.id);
+      expect(persisted!.messages, isEmpty);
+      expect(persisted.pendingWorkspaceImports, isEmpty);
+    });
+
+    test('restart reconciles crash-before-ACK receipt idempotently', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final importReceipt = receipt('c');
+      final session = ChatSession(
+        id: 'pending_workspace_receipt',
+        messages: [ChatMessage.user(importReceipt.marker)],
+        pendingWorkspaceImports: [importReceipt],
+      );
+      await storage.saveSession(session);
+      var acknowledgements = 0;
+      NativeBridge.setWorkspaceImportLifecycleBrokerForTesting(
+        (_, discard) async {
+          expect(discard, isFalse);
+          acknowledgements++;
+          return true;
+        },
+      );
+      final provider = providerFor(storage);
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+      await provider.selectSession(session.id);
+
+      expect(acknowledgements, 1);
+      expect((await storage.getSession(session.id))!.pendingWorkspaceImports,
+          isEmpty);
+    });
+
+    test('ACK failure retains the durable receipt and does not start model',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      NativeBridge.setWorkspaceImportLifecycleBrokerForTesting(
+        (_, __) async => false,
+      );
+      var modelStarted = false;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            modelStarted = true;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'unsafe')],
+            ));
+          },
+        ),
+      );
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      final importReceipt = receipt('d');
+
+      final committed = await provider.sendMessageWithWorkspaceImports(
+        importReceipt.marker,
+        workspaceImports: [importReceipt],
+      );
+      await _waitUntil(() => provider.agentStatus == AgentStatus.error);
+
+      expect(committed, isTrue);
+      expect(modelStarted, isFalse);
+      final persisted = await storage.getSession(session.id);
+      expect(persisted!.messages.single.textContent,
+          contains(importReceipt.storedPath));
+      expect(persisted.pendingWorkspaceImports.single.operationId,
+          importReceipt.operationId);
+    });
+
+    test('startup discards published receipt with no durable session owner',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final unowned = receipt('e');
+      NativeBridge.setPendingWorkspaceImportListerForTesting(
+        () async => [unowned],
+      );
+      final discarded = <String>[];
+      NativeBridge.setWorkspaceImportLifecycleBrokerForTesting(
+        (receipt, discard) async {
+          expect(discard, isTrue);
+          discarded.add(receipt.operationId);
+          return true;
+        },
+      );
+
+      final provider = providerFor(storage);
+      addTearDown(provider.dispose);
+      await _waitUntil(() => discarded.isNotEmpty);
+
+      expect(discarded, [unowned.operationId]);
+      expect(await storage.getAllSessions(), isEmpty);
+    });
+
+    for (final ackSucceeds in [true, false]) {
+      test(
+          'delete prevents resurrection after stalled ACK ${ackSucceeds ? 'success' : 'failure'}',
+          () async {
+        final storage = SessionStorage();
+        await storage.init();
+        final importReceipt = receipt(ackSucceeds ? 'f' : '1');
+        final session = ChatSession(
+          id: 'delete_stalled_ack_${ackSucceeds ? 'success' : 'failure'}',
+          messages: [ChatMessage.user(importReceipt.marker)],
+          pendingWorkspaceImports: [importReceipt],
+        );
+        await storage.saveSession(session);
+        final ackEntered = Completer<void>();
+        final releaseAck = Completer<void>();
+        var discards = 0;
+        NativeBridge.setWorkspaceImportLifecycleBrokerForTesting(
+          (_, discard) async {
+            if (discard) {
+              discards++;
+              return true;
+            }
+            if (!ackEntered.isCompleted) ackEntered.complete();
+            await releaseAck.future;
+            return ackSucceeds;
+          },
+        );
+        final provider = providerFor(storage);
+        addTearDown(provider.dispose);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+
+        final select = provider.selectSession(session.id);
+        await ackEntered.future.timeout(const Duration(seconds: 2));
+        await provider.deleteSession(session.id);
+        expect(storage.isSessionTombstoned(session.id), isTrue);
+        expect(await storage.getSession(session.id), isNull);
+        expect(discards, 1);
+
+        releaseAck.complete();
+        await select;
+        expect(await storage.getSession(session.id), isNull);
+        final reloadedStorage = SessionStorage();
+        await reloadedStorage.init();
+        expect(await reloadedStorage.getSession(session.id), isNull);
+      });
+    }
   });
 
   group('tool approval hardening', () {
@@ -445,6 +998,331 @@ void main() {
           provider.currentSession!.messages.expand((m) => m.toolResults).single;
       expect(toolResult.output, 'approved');
     });
+
+    test('allow once does not silently become a session policy', () async {
+      var requestCount = 0;
+      final tool = _EchoTool();
+      final provider = ChatProvider(
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount.isOdd) {
+              return [
+                StreamDone(LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'call_$requestCount',
+                      toolName: 'echo',
+                      toolInput: const {'text': 'approved once'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalSessionFirst;
+      await provider.createSession();
+
+      final first = provider.sendMessage('first');
+      await _waitUntil(() => provider.pendingApproval != null);
+      provider.resolveToolApproval(true);
+      await first;
+
+      final second = provider.sendMessage('second');
+      await _waitUntil(() => provider.pendingApproval != null);
+      expect(tool.executionCount, 1);
+      provider.resolveToolApproval(false);
+      await second;
+      expect(tool.executionCount, 1);
+    });
+
+    test('new environment secret is redacted before approval and persistence',
+        () async {
+      const sentinel = 'provider-new-secret-sentinel';
+      var requestCount = 0;
+      final prefs = PreferencesService();
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()
+          ..register(EnvVarTool(prefs), risk: ToolRisk.moderate),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                TextDelta('visible $sentinel'),
+                ReasoningDelta('reasoning $sentinel'),
+                ToolUseStart('set_secret_1', 'set_env_var'),
+                ToolInputDelta(
+                  '{"name":"NEW_PROVIDER_TOKEN","value":"$sentinel"}',
+                ),
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'set_secret_1',
+                      toolName: 'set_env_var',
+                      toolInput: {
+                        'name': 'NEW_PROVIDER_TOKEN',
+                        'value': sentinel,
+                      },
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final transientUiSnapshots = <String>[];
+      provider.addListener(() {
+        transientUiSnapshots.add(
+          '${provider.streamingText}\n${provider.streamingReasoningText}',
+        );
+      });
+      final sendFuture = provider.sendMessage('configure integration');
+      await _waitUntil(() => provider.pendingApproval != null);
+
+      expect(provider.pendingApproval!.arguments, {
+        'name': 'NEW_PROVIDER_TOKEN',
+        'value': ToolUseContent.redactedSecretValue,
+      });
+      expect(provider.streamingText, isNot(contains(sentinel)));
+      expect(provider.streamingReasoningText, isNot(contains(sentinel)));
+      expect(transientUiSnapshots.join('\n'), isNot(contains(sentinel)));
+      expect(provider.currentSession!.toJson().toString(),
+          isNot(contains(sentinel)));
+      final approvalPendingOnDisk = await storage.getSession(session.id);
+      expect(approvalPendingOnDisk!.toJson().toString(),
+          isNot(contains(sentinel)));
+      expect(await storage.searchSessions(sentinel), isEmpty);
+
+      provider.resolveToolApproval(true);
+      await sendFuture;
+      await prefs.init();
+
+      expect(prefs.envVars['NEW_PROVIDER_TOKEN'], sentinel);
+      final persisted = await storage.getSession(session.id);
+      expect(persisted!.toJson().toString(), isNot(contains(sentinel)));
+      expect(await storage.searchSessions(sentinel), isEmpty);
+      expect(
+        persisted.messages
+            .expand((message) => message.toolUses)
+            .single
+            .input['value'],
+        ToolUseContent.redactedSecretValue,
+      );
+      expect(secureStorage.values.join(), contains(sentinel));
+      expect(
+        provider.runtimeDebugEvents.recent(sessionId: session.id).toString(),
+        isNot(contains(sentinel)),
+      );
+    });
+
+    test('secret-setting stream error discards guarded UI and stored bytes',
+        () async {
+      const sentinel = 'provider-stream-error-private-value';
+      final storage = SessionStorage();
+      await storage.init();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
+      final provider = ChatProvider(
+        storage: storage,
+        runtimeDebugEvents: events,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) => [
+            TextDelta('visible $sentinel'),
+            ReasoningDelta('reasoning $sentinel'),
+            ToolUseStart('set_secret_error', 'set_env_var'),
+            ToolInputDelta(
+              '{"name":"ERROR_TOKEN","value":"$sentinel"}',
+            ),
+            StreamError('stream interrupted'),
+          ],
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final transientUiSnapshots = <String>[];
+      provider.addListener(() {
+        transientUiSnapshots.add(
+          '${provider.streamingText}\n${provider.streamingReasoningText}',
+        );
+      });
+
+      await provider.sendMessage('configure integration');
+
+      final stored = await storage.getSession(session.id);
+      final diagnostics = await provider.buildDiagnosticsReport();
+      expect(provider.errorMessage, isNotNull);
+      expect(transientUiSnapshots.join('\n'), isNot(contains(sentinel)));
+      expect(provider.currentSession!.toJson().toString(),
+          isNot(contains(sentinel)));
+      expect(stored!.toJson().toString(), isNot(contains(sentinel)));
+      expect(await storage.searchSessions(sentinel), isEmpty);
+      expect(events.recent(sessionId: session.id).toString(),
+          isNot(contains(sentinel)));
+      expect(diagnostics, isNot(contains(sentinel)));
+    });
+
+    test('cancel discards guarded secret bytes before any durable output',
+        () async {
+      const sentinel = 'provider-cancelled-private-value';
+      final storage = SessionStorage();
+      await storage.init();
+      final buffered = Completer<void>();
+      final release = Completer<void>();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
+      final provider = ChatProvider(
+        storage: storage,
+        runtimeDebugEvents: events,
+        llmServiceFactory: (config, {isInBackground}) =>
+            _GuardedSecretPauseLlmService(
+          config,
+          sentinel: sentinel,
+          buffered: buffered,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final transientUiSnapshots = <String>[];
+      provider.addListener(() {
+        transientUiSnapshots.add(
+          '${provider.streamingText}\n${provider.streamingReasoningText}',
+        );
+      });
+      final sendFuture = provider.sendMessage('configure integration');
+      await buffered.future.timeout(const Duration(seconds: 2));
+
+      final cancelFuture = provider.cancelAgent(
+        sessionId: session.id,
+        savePartial: true,
+      );
+      release.complete();
+      await cancelFuture;
+      await sendFuture;
+
+      final stored = await storage.getSession(session.id);
+      final diagnostics = await provider.buildDiagnosticsReport();
+      expect(transientUiSnapshots.join('\n'), isNot(contains(sentinel)));
+      expect(provider.currentSession!.toJson().toString(),
+          isNot(contains(sentinel)));
+      expect(stored!.toJson().toString(), isNot(contains(sentinel)));
+      expect(await storage.searchSessions(sentinel), isEmpty);
+      expect(events.recent(sessionId: session.id).toString(),
+          isNot(contains(sentinel)));
+      expect(diagnostics, isNot(contains(sentinel)));
+    });
+
+    test('approval fails closed when current session changes', () async {
+      var requestCount = 0;
+      final storage = SessionStorage();
+      await storage.init();
+      final tool = _EchoTool();
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'call_1',
+                      toolName: 'echo',
+                      toolInput: {'text': 'must not execute'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final original = await provider.createSession();
+      final sendFuture = provider.sendMessage('use tool');
+      await _waitUntil(() => provider.pendingApproval != null);
+      await provider.createSession();
+      provider.resolveToolApproval(true);
+      await sendFuture;
+
+      expect(tool.executionCount, 0);
+      final stored = await storage.getSession(original.id);
+      expect(
+          stored!.messages
+              .expand((message) => message.toolResults)
+              .single
+              .isError,
+          isTrue);
+    });
   });
 
   group('agent cancellation', () {
@@ -480,14 +1358,14 @@ void main() {
       final sendFuture = provider.sendMessage('slow prompt');
       await streamStarted.future;
 
-      provider.cancelAgent(sessionId: session.id);
+      await provider.cancelAgent(sessionId: session.id);
 
       await llmDisposed.future.timeout(const Duration(seconds: 1));
       expect(provider.isSessionSending(session.id), isFalse);
       await sendFuture;
     });
 
-    test('agent run marker persists while active and clears on cancel',
+    test('active run marker stays durable but is not exposed as interrupted',
         () async {
       final streamStarted = Completer<void>();
       final releaseStream = Completer<void>();
@@ -516,8 +1394,9 @@ void main() {
         (await storage.getSession(session.id))!.inFlightAgentRun,
         isNotNull,
       );
+      expect(provider.currentInterruptedAgentRun, isNull);
 
-      provider.cancelAgent(sessionId: session.id, savePartial: false);
+      await provider.cancelAgent(sessionId: session.id, savePartial: false);
       await sendFuture.timeout(const Duration(seconds: 2));
       await _waitUntil(() => !provider.isSessionSending(session.id));
       await Future<void>.delayed(const Duration(milliseconds: 50));
@@ -526,6 +1405,427 @@ void main() {
         (await storage.getSession(session.id))!.inFlightAgentRun,
         isNull,
       );
+    });
+
+    test('rapid session switch hides owned run and reloads completion cleanly',
+        () async {
+      final streamStarted = Completer<void>();
+      final releaseStream = Completer<void>();
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: streamStarted,
+          release: releaseStream,
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseStream.isCompleted) releaseStream.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final runningSession = await provider.createSession();
+      final sendFuture = provider.sendMessage('switch while running');
+      await streamStarted.future.timeout(const Duration(seconds: 2));
+      final otherSession = await provider.createSession();
+
+      await provider.selectSession(runningSession.id);
+      expect(provider.isSessionSending(runningSession.id), isTrue);
+      expect(provider.currentInterruptedAgentRun, isNull);
+      await provider.selectSession(otherSession.id);
+
+      releaseStream.complete();
+      await sendFuture.timeout(const Duration(seconds: 2));
+      await provider.selectSession(runningSession.id);
+
+      expect(provider.currentSession!.messages.last.textContent, 'done');
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect(
+        (await storage.getSession(runningSession.id))!.inFlightAgentRun,
+        isNull,
+      );
+    });
+
+    test('cancel during dangerous tool preserves unknown evidence', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final tool = _BlockingDangerousTool();
+      final events = RuntimeDebugEventService();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        runtimeDebugEvents: events,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'slow_call',
+                    toolName: 'slow_dangerous',
+                    toolInput: {'value': 'must not leak'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'unexpected')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!tool.release.isCompleted) tool.release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final sendFuture = provider.sendMessage('start slow tool');
+      await _waitUntil(() => provider.pendingApproval != null);
+      provider.resolveToolApproval(true);
+      await tool.started.future;
+
+      await provider.cancelAgent(sessionId: session.id, savePartial: false);
+
+      expect(provider.isSessionSending(session.id), isFalse);
+      var stored = await storage.getSession(session.id);
+      final cancelledMarker = stored!.inFlightAgentRun!;
+      expect(cancelledMarker.recoveryKind,
+          InterruptedRunRecoveryKind.unknownOutcome);
+      expect(cancelledMarker.toolAttempts.single.lifecycle,
+          ToolAttemptLifecycle.interruptedUnknown);
+      expect(stored.messages.expand((message) => message.toolResults), isEmpty);
+      expect(
+        events
+            .recent(sessionId: session.id)
+            .where((event) => event.type == 'tool.attempt.interruptedUnknown'),
+        hasLength(1),
+      );
+      expect(
+        events
+            .recent(sessionId: session.id)
+            .where((event) => event.type == 'chat.run.cancelled'),
+        hasLength(1),
+      );
+      expect(
+          events
+              .recent(sessionId: session.id)
+              .map((event) => event.data)
+              .toString(),
+          isNot(contains('must not leak')));
+      final trace = events.recentRunTraces(sessionId: session.id).single;
+      expect(trace.status, RunTraceStatus.cancelled);
+      expect(
+        trace.events.where((event) => event.type == 'run.terminal'),
+        hasLength(1),
+      );
+      expect(
+        trace.events.map((event) => event.type),
+        contains('tool.attempt.interruptedUnknown'),
+      );
+      expect(trace.events.toString(), isNot(contains('must not leak')));
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(reloaded.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+      expect(reloaded.currentInterruptedAgentRun!.recoveryKind,
+          InterruptedRunRecoveryKind.unknownOutcome);
+      expect(tool.executionCount, 1);
+
+      tool.release.complete();
+      await sendFuture.timeout(const Duration(seconds: 2));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      stored = await storage.getSession(session.id);
+      expect(stored!.inFlightAgentRun!.toolAttempts.single.lifecycle,
+          ToolAttemptLifecycle.interruptedUnknown);
+      expect(stored.messages.expand((message) => message.toolResults), isEmpty);
+      expect(tool.executionCount, 1);
+    });
+
+    test('delete during non-cancellable tool cannot resurrect session',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final tool = _BlockingDangerousTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'delete_slow_call',
+                    toolName: 'slow_dangerous',
+                    toolInput: {'value': 'delete'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'late completion')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!tool.release.isCompleted) tool.release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final send = provider.sendMessage('delete running session');
+      await _waitUntil(() => provider.pendingApproval != null);
+      provider.resolveToolApproval(true);
+      await tool.started.future.timeout(const Duration(seconds: 2));
+
+      await provider.deleteSession(session.id);
+
+      expect(storage.isSessionTombstoned(session.id), isTrue);
+      expect(await storage.getSession(session.id), isNull);
+      tool.release.complete();
+      await send.timeout(const Duration(seconds: 2));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(await storage.getSession(session.id), isNull);
+      final reloadedStorage = SessionStorage();
+      await reloadedStorage.init();
+      expect(await reloadedStorage.getSession(session.id), isNull);
+    });
+
+    test('confirmed cancellable tool abort records known failure', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final tool = _CancellableDangerousTool();
+      final events = RuntimeDebugEventService();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        runtimeDebugEvents: events,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'cancel_call',
+                    toolName: 'cancellable_http',
+                    toolInput: {'value': 'private'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'unexpected')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!tool.confirmAbort.isCompleted) tool.confirmAbort.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      final sendFuture = provider.sendMessage('start cancellable tool');
+      await _waitUntil(() => provider.pendingApproval != null);
+      provider.resolveToolApproval(true);
+      await tool.started.future;
+
+      await provider.cancelAgent(sessionId: session.id, savePartial: false);
+      expect(
+        (await storage.getSession(session.id))!
+            .inFlightAgentRun!
+            .toolAttempts
+            .single
+            .lifecycle,
+        ToolAttemptLifecycle.interruptedUnknown,
+      );
+
+      tool.confirmAbort.complete();
+      await tool.abortReported.future;
+      await _waitUntil(() {
+        final marker = provider.currentInterruptedAgentRun;
+        return marker?.toolAttempts.single.lifecycle ==
+            ToolAttemptLifecycle.failed;
+      });
+      await sendFuture.timeout(const Duration(seconds: 2));
+      await _waitUntilAsync(() async {
+        final marker = (await storage.getSession(session.id))?.inFlightAgentRun;
+        return marker?.toolAttempts.single.lifecycle ==
+            ToolAttemptLifecycle.failed;
+      });
+
+      final stored = await storage.getSession(session.id);
+      final attempt = stored!.inFlightAgentRun!.toolAttempts.single;
+      expect(attempt.lifecycle, ToolAttemptLifecycle.failed);
+      expect(attempt.executionOutcomeKnown, isTrue);
+      expect(stored.messages.expand((message) => message.toolResults), isEmpty);
+      expect(
+        events.recent(sessionId: session.id).where(
+              (event) => event.type == 'tool.attempt.interruptedUnknown',
+            ),
+        hasLength(1),
+      );
+      expect(
+        events.recent(sessionId: session.id).where(
+              (event) => event.type == 'tool.attempt.failed',
+            ),
+        hasLength(1),
+      );
+      final cancelledEvents = events.recent(sessionId: session.id).where(
+            (event) => event.type == 'chat.run.cancelled',
+          );
+      expect(cancelledEvents, hasLength(1));
+      expect(cancelledEvents.single.data['lifecycle'], 'interruptedUnknown');
+      final trace = events.recentRunTraces(sessionId: session.id).single;
+      expect(trace.status, RunTraceStatus.cancelled);
+      expect(
+        trace.events.where((event) => event.type == 'run.terminal'),
+        hasLength(1),
+      );
+    });
+
+    test('late run A finalization cannot mutate recovery run C', () async {
+      var armedCommits = 0;
+      var armFinalSave = false;
+      final finalSaveEntered = Completer<void>();
+      final releaseFinalSave = Completer<void>();
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        if (!armFinalSave) return;
+        armedCommits++;
+        if (armedCommits == 3) {
+          finalSaveEntered.complete();
+          await releaseFinalSave.future;
+        }
+      });
+      await storage.init();
+      final events = RuntimeDebugEventService();
+      final tool = _EchoTool();
+      var factoryCount = 0;
+      var recoveryRequestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        runtimeDebugEvents: events,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) {
+          factoryCount++;
+          if (factoryCount == 1) {
+            return _ScriptedLlmService(
+              config,
+              onMessages: (_) => StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'A complete')],
+              )),
+            );
+          }
+          return _ScriptedLlmService(
+            config,
+            onMessages: (_) {
+              recoveryRequestCount++;
+              if (recoveryRequestCount == 1) {
+                return StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'run_c_tool',
+                      toolName: 'echo',
+                      toolInput: {'text': 'run C'},
+                    ),
+                  ],
+                ));
+              }
+              return StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'C complete')],
+              ));
+            },
+          );
+        },
+      );
+      addTearDown(() async {
+        if (!releaseFinalSave.isCompleted) releaseFinalSave.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAlways;
+      final session = await provider.createSession();
+      armFinalSave = true;
+      final runA = provider.sendMessage('run A');
+      await finalSaveEntered.future.timeout(const Duration(seconds: 2));
+      final runATrace = events.recentRunTraces(sessionId: session.id).single;
+      final runAId = runATrace.events.first.data['runAttemptId'];
+
+      await provider.cancelAgent(sessionId: session.id, savePartial: false);
+      await runA;
+
+      final runC = provider.sendMessage('run C');
+      await _waitUntil(() => provider.isSessionSending(session.id));
+      unawaited(provider.sendMessage('queued after C'));
+      await _waitUntil(() => provider.messageQueue.length == 1);
+      releaseFinalSave.complete();
+      await _waitUntil(() => provider.pendingApproval != null);
+
+      expect(provider.isSessionSending(session.id), isTrue);
+      expect(provider.messageQueue.single.text, 'queued after C');
+      expect(provider.pendingApproval!.runAttemptId, isNot(runAId));
+      final traces = events.recentRunTraces(sessionId: session.id);
+      expect(traces, hasLength(2));
+      expect(traces.first.status, RunTraceStatus.cancelled);
+      expect(traces.last.status, RunTraceStatus.inFlight);
+      expect(
+        traces.first.events.where((event) => event.type == 'run.terminal'),
+        hasLength(1),
+      );
+
+      provider.clearMessageQueue();
+      provider.resolveToolApproval(true);
+      await runC.timeout(const Duration(seconds: 2));
+
+      expect(tool.executionCount, 1);
+      expect(provider.isSessionSending(session.id), isFalse);
+      expect(provider.pendingApproval, isNull);
+      final completedTraces = events.recentRunTraces(sessionId: session.id);
+      expect(completedTraces.last.status, RunTraceStatus.completed);
+      for (final trace in completedTraces) {
+        expect(
+          trace.events.where((event) => event.type == 'run.terminal'),
+          hasLength(1),
+        );
+      }
     });
   });
 
@@ -537,6 +1837,329 @@ void main() {
 
     tearDown(() async {
       await clearPlatformMocks();
+    });
+
+    test('normal successful response stays clear after storage reload',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'completed normally')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      await provider.sendMessage('normal request');
+
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(reloaded.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+      expect(reloaded.currentSession!.messages.last.textContent,
+          'completed normally');
+      expect(reloaded.currentInterruptedAgentRun, isNull);
+    });
+
+    test('reload retains marker when text has no positive terminal proof',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final startedAt = DateTime.utc(2026, 7, 11, 8);
+      final session = ChatSession(
+        id: 'stale-text-terminal',
+        messages: [
+          ChatMessage.user('normal request'),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('durable completed response')],
+            timestamp: startedAt.add(const Duration(seconds: 1)),
+          ),
+        ],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'stale-text-run',
+          startedAt: startedAt,
+          updatedAt: startedAt,
+        ),
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(storage: storage);
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+
+      expect(provider.currentInterruptedAgentRun, isNotNull);
+      expect(
+        (await storage.getSession(session.id))!.inFlightAgentRun!.runAttemptId,
+        'stale-text-run',
+      );
+    });
+
+    test('reload keeps marker across partial text and assistant error',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final startedAt = DateTime.utc(2026, 7, 10, 8);
+      final session = ChatSession(
+        id: 'partial-error-keeps-marker',
+        messages: [
+          ChatMessage.user('normal request'),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('partial response')],
+            timestamp: startedAt.add(const Duration(seconds: 1)),
+          ),
+          ChatMessage.assistantError(
+            error: const AssistantErrorMetadata(
+              message: 'provider unavailable',
+              code: 'provider_unavailable',
+              canRetry: true,
+              retryAction: AssistantRetryAction.continueRecovery,
+              recoveryRunAttemptId: 'partial-error-run',
+            ),
+            timestamp: startedAt.add(const Duration(seconds: 2)),
+          ),
+        ],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'partial-error-run',
+          startedAt: startedAt,
+          updatedAt: startedAt,
+        ),
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(storage: storage);
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+
+      expect(provider.currentInterruptedAgentRun, isNotNull);
+      expect(provider.errorMessage, 'provider unavailable');
+      expect(
+        (await storage.getSession(session.id))!.inFlightAgentRun!.runAttemptId,
+        'partial-error-run',
+      );
+    });
+
+    test('failed terminal clear stays recoverable after reload', () async {
+      var commitCount = 0;
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        commitCount++;
+        if (commitCount == 4) {
+          throw StateError('injected terminal clear failure');
+        }
+      });
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'durable terminal')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      await provider.sendMessage('normal request');
+
+      final stale = await storage.getSession(session.id);
+      expect(stale!.messages.last.textContent, 'durable terminal');
+      expect(stale.inFlightAgentRun, isNotNull);
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(reloaded.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+
+      expect(reloaded.currentInterruptedAgentRun, isNotNull);
+      expect(
+        (await storage.getSession(session.id))!.inFlightAgentRun!.runAttemptId,
+        stale.inFlightAgentRun!.runAttemptId,
+      );
+    });
+
+    test('reload keeps result evidence without inferring terminal from text',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final startedAt = DateTime.utc(2026, 7, 11, 9);
+      final session = ChatSession(
+        id: 'stale-tool-terminal',
+        messages: [
+          ChatMessage.user('tool request'),
+          ChatMessage(
+            role: 'assistant',
+            content: [
+              ToolUseContent(
+                id: 'tool-call',
+                name: 'echo',
+                input: const {'text': 'safe'},
+              ),
+            ],
+            timestamp: startedAt.add(const Duration(seconds: 1)),
+          ),
+          ChatMessage(
+            role: 'user',
+            content: [
+              ToolResultContent(
+                toolUseId: 'tool-call',
+                output: 'safe',
+                metadata: const {'operationId': 'tool-operation'},
+              ),
+            ],
+            timestamp: startedAt.add(const Duration(seconds: 2)),
+          ),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('tool completed normally')],
+            timestamp: startedAt.add(const Duration(seconds: 3)),
+          ),
+        ],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'stale-tool-run',
+          startedAt: startedAt,
+          updatedAt: startedAt.add(const Duration(seconds: 1)),
+          phase: AgentRunRecoveryPhase.toolInFlight,
+          toolAttempts: [
+            ToolAttemptRecoveryMetadata(
+              operationId: 'tool-operation',
+              toolName: 'echo',
+              risk: RecoveryToolRisk.safe,
+              lifecycle: ToolAttemptLifecycle.completed,
+              proposedAt: startedAt,
+              updatedAt: startedAt.add(const Duration(seconds: 1)),
+              executionStartedAt: startedAt,
+              executionOutcomeKnown: true,
+            ),
+          ],
+        ),
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(storage: storage);
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+
+      expect(provider.currentInterruptedAgentRun, isNotNull);
+      expect(
+        provider.currentInterruptedAgentRun!.toolAttempts.single.lifecycle,
+        ToolAttemptLifecycle.resultPersisted,
+      );
+      expect(
+        (await storage.getSession(session.id))!
+            .inFlightAgentRun!
+            .toolAttempts
+            .single
+            .lifecycle,
+        ToolAttemptLifecycle.resultPersisted,
+      );
+    });
+
+    test('backgrounded normal run completes without recovery on reload',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'background complete')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      provider.setAppInBackground(true);
+      await provider.sendMessage('finish in background');
+      provider.setAppInBackground(false);
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(reloaded.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+      expect(reloaded.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+    });
+
+    test('successful tool run stays clear after storage reload', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.safe),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'echo-call',
+                    toolName: 'echo',
+                    toolInput: {'text': 'safe'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'tool done')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final session = await provider.createSession();
+      await provider.sendMessage('use safe tool');
+
+      expect(tool.executionCount, 1);
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(reloaded.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+      expect(reloaded.currentInterruptedAgentRun, isNull);
     });
 
     test('reload restores sanitized provider failure retry state', () async {
@@ -575,6 +2198,8 @@ void main() {
       expect(firstProvider.currentSession!.toApiMessages(), [
         {'role': 'user', 'content': 'hello'},
       ]);
+      expect(firstProvider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
 
       final secondProvider = ChatProvider(
         storage: storage,
@@ -602,6 +2227,7 @@ void main() {
       );
       expect(secondProvider.currentSession!.messages.last.hasAssistantError,
           isTrue);
+      expect(secondProvider.currentInterruptedAgentRun, isNull);
     });
 
     test('dismiss interrupted run marker clears persisted state', () async {
@@ -611,7 +2237,9 @@ void main() {
         id: 'interrupted-dismiss',
         messages: [ChatMessage.user('original task')],
         inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'dismiss-run',
           startedAt: DateTime.utc(2026, 7, 7),
+          updatedAt: DateTime.utc(2026, 7, 7),
         ),
       );
       await storage.saveSession(session);
@@ -639,7 +2267,9 @@ void main() {
         id: 'interrupted-continue',
         messages: [ChatMessage.user('original task')],
         inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'continue-run',
           startedAt: DateTime.utc(2026, 7, 7),
+          updatedAt: DateTime.utc(2026, 7, 7),
         ),
       );
       await storage.saveSession(session);
@@ -675,6 +2305,1019 @@ void main() {
         contains('上次任务被中断'),
       );
       expect(provider.currentSession!.messages.last.textContent, 'continued');
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'user')
+            .map((message) => message.textContent),
+        ['original task'],
+      );
+    });
+
+    test(
+        'unknown outcome recovery success keeps evidence immediately and after reload',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final originalMarker = _unknownRecoveryMarker('unknown-success-origin');
+      final session = ChatSession(
+        id: 'unknown-success-retained',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: originalMarker,
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'model recovered')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.selectSession(session.id);
+
+      await provider.continueInterruptedAgentRun();
+
+      final retained = provider.currentInterruptedAgentRun!;
+      expect(retained.runAttemptId, isNot(originalMarker.runAttemptId));
+      expect(retained.recoveryKind, InterruptedRunRecoveryKind.unknownOutcome);
+      expect(retained.canClearAfterPositiveTerminal, isFalse);
+      expect(provider.currentSession!.messages.last.textContent,
+          'model recovered');
+      expect(
+        (await storage.getSession(session.id))!.inFlightAgentRun!.recoveryKind,
+        InterruptedRunRecoveryKind.unknownOutcome,
+      );
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(reloaded.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+
+      expect(reloaded.currentInterruptedAgentRun, isNotNull);
+      expect(reloaded.currentInterruptedAgentRun!.recoveryKind,
+          InterruptedRunRecoveryKind.unknownOutcome);
+      expect(reloaded.currentSession!.messages.last.textContent,
+          'model recovered');
+    });
+
+    test('mixed recovery attempts retain unresolved unknown evidence',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final timestamp = DateTime.utc(2026, 7, 10);
+      final session = ChatSession(
+        id: 'mixed-recovery-success-retained',
+        messages: [
+          ChatMessage.user('original task'),
+          ChatMessage(
+            role: 'user',
+            content: [
+              ToolResultContent(
+                toolUseId: 'known-call',
+                output: 'known result',
+                metadata: const {'operationId': 'known-operation'},
+              ),
+            ],
+          ),
+        ],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'mixed-origin',
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          phase: AgentRunRecoveryPhase.toolInFlight,
+          toolAttempts: [
+            ToolAttemptRecoveryMetadata(
+              operationId: 'known-operation',
+              toolName: 'web_fetch',
+              risk: RecoveryToolRisk.safe,
+              lifecycle: ToolAttemptLifecycle.resultPersisted,
+              proposedAt: timestamp,
+              updatedAt: timestamp,
+              executionStartedAt: timestamp,
+              executionOutcomeKnown: true,
+            ),
+            ToolAttemptRecoveryMetadata(
+              operationId: 'unknown-operation',
+              toolName: 'write_file',
+              risk: RecoveryToolRisk.dangerous,
+              lifecycle: ToolAttemptLifecycle.interruptedUnknown,
+              proposedAt: timestamp,
+              updatedAt: timestamp,
+              executionStartedAt: timestamp,
+            ),
+          ],
+        ),
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'mixed recovered')],
+          )),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.selectSession(session.id);
+
+      await provider.continueInterruptedAgentRun();
+
+      final retained = provider.currentInterruptedAgentRun!;
+      expect(retained.recoveryKind, InterruptedRunRecoveryKind.unknownOutcome);
+      expect(retained.toolAttempts, hasLength(2));
+      expect(
+        retained.toolAttempts
+            .firstWhere((attempt) => attempt.operationId == 'known-operation')
+            .lifecycle,
+        ToolAttemptLifecycle.resultPersisted,
+      );
+      expect(
+        retained.toolAttempts
+            .firstWhere((attempt) => attempt.operationId == 'unknown-operation')
+            .lifecycle,
+        ToolAttemptLifecycle.interruptedUnknown,
+      );
+      expect(
+          (await storage.getSession(session.id))!.inFlightAgentRun, isNotNull);
+    });
+
+    test('Continue preflight blockers retain the old recovery marker',
+        () async {
+      Future<void> verifyBlocked({
+        required String id,
+        required Future<void> Function(
+          ChatProvider provider,
+          SessionStorage storage,
+        ) act,
+        AttachmentBudget? attachmentBudget,
+      }) async {
+        final storage = SessionStorage();
+        await storage.init();
+        final marker = _unknownRecoveryMarker('old-$id');
+        final session = ChatSession(
+          id: id,
+          messages: [ChatMessage.user('original task')],
+          inFlightAgentRun: marker,
+        );
+        await storage.saveSession(session);
+        var modelCalls = 0;
+        final provider = ChatProvider(
+          storage: storage,
+          attachmentBudget: attachmentBudget,
+          llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+            config,
+            onMessages: (_) {
+              modelCalls++;
+              return StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'unexpected')],
+              ));
+            },
+          ),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        await provider.selectSession(id);
+
+        await act(provider, storage);
+
+        expect(provider.currentInterruptedAgentRun?.runAttemptId,
+            marker.runAttemptId);
+        expect(
+          provider.currentSession!.messages
+              .where((message) => message.role == 'user')
+              .map((message) => message.textContent),
+          ['original task'],
+        );
+        expect(modelCalls, 0);
+        provider.dispose();
+      }
+
+      await verifyBlocked(
+        id: 'recovery-missing-credential',
+        act: (provider, _) async {
+          PreferencesService().apiKey = null;
+          await provider.continueInterruptedAgentRun();
+        },
+      );
+      await verifyBlocked(
+        id: 'recovery-attachment-rejected',
+        attachmentBudget: const _RejectingAttachmentBudget(),
+        act: (provider, _) => provider.continueInterruptedAgentRun(
+          attachments: [TextContent('attachment')],
+        ),
+      );
+      await verifyBlocked(
+        id: 'recovery-missing-target',
+        act: (provider, storage) async {
+          await storage.deleteSession('recovery-missing-target');
+          await provider.continueInterruptedAgentRun();
+        },
+      );
+    });
+
+    test('Continue concurrent limit retains old evidence', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final marker = _unknownRecoveryMarker('old-concurrent');
+      await storage.saveSession(ChatSession(
+        id: 'recovery-concurrent-limit',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: marker,
+      ));
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().maxConcurrentAgents = 1;
+      final other = await provider.createSession();
+      final otherRun = provider.sendMessage('occupy slot');
+      await started.future;
+      await provider.selectSession('recovery-concurrent-limit');
+
+      await provider.continueInterruptedAgentRun();
+
+      expect(provider.currentInterruptedAgentRun?.runAttemptId,
+          marker.runAttemptId);
+      expect(provider.currentSession!.messages.single.textContent,
+          'original task');
+      await provider.cancelAgent(sessionId: other.id, savePartial: false);
+      await otherRun;
+    });
+
+    test('replacement save failure and pre-commit boundary retain old evidence',
+        () async {
+      var failReplacement = false;
+      var blockReplacement = false;
+      final replacementEntered = Completer<void>();
+      final releaseReplacement = Completer<void>();
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        if (failReplacement) throw StateError('injected replacement failure');
+        if (blockReplacement) {
+          if (!replacementEntered.isCompleted) replacementEntered.complete();
+          await releaseReplacement.future;
+        }
+      });
+      await storage.init();
+      final firstMarker = _unknownRecoveryMarker('old-save-failure');
+      await storage.saveSession(ChatSession(
+        id: 'recovery-save-failure',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: firstMarker,
+      ));
+      var modelCalls = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            modelCalls++;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'continued')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseReplacement.isCompleted) releaseReplacement.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.selectSession('recovery-save-failure');
+
+      failReplacement = true;
+      await provider.continueInterruptedAgentRun();
+      failReplacement = false;
+      expect(
+        (await storage.getSession('recovery-save-failure'))!
+            .inFlightAgentRun!
+            .runAttemptId,
+        firstMarker.runAttemptId,
+      );
+      expect(provider.currentInterruptedAgentRun!.runAttemptId,
+          firstMarker.runAttemptId);
+      expect(modelCalls, 0);
+
+      blockReplacement = true;
+      final continueFuture = provider.continueInterruptedAgentRun();
+      await replacementEntered.future;
+      final beforeCommit = await storage.getSession('recovery-save-failure');
+      expect(beforeCommit!.inFlightAgentRun!.runAttemptId,
+          firstMarker.runAttemptId);
+      expect(beforeCommit.messages.single.textContent, 'original task');
+      expect(modelCalls, 0);
+      blockReplacement = false;
+      releaseReplacement.complete();
+      await continueFuture;
+      expect(modelCalls, 1);
+    });
+
+    test('three interrupted Continue attempts do not accumulate messages',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      await storage.saveSession(ChatSession(
+        id: 'recovery-repeat-continue',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: _unknownRecoveryMarker('repeat-old-run'),
+      ));
+      final starts = <Completer<void>>[];
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) {
+          final started = Completer<void>();
+          starts.add(started);
+          return _BlockingLlmService(
+            config,
+            started: started,
+            release: Completer<void>(),
+          );
+        },
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.selectSession('recovery-repeat-continue');
+
+      for (var index = 0; index < 3; index++) {
+        final attempt = provider.continueInterruptedAgentRun();
+        await _waitUntil(() => starts.length > index);
+        await starts[index].future;
+        await provider.cancelAgent(savePartial: false);
+        await attempt;
+      }
+
+      final stored = await storage.getSession('recovery-repeat-continue');
+      expect(stored!.inFlightAgentRun!.recoveryKind,
+          InterruptedRunRecoveryKind.unknownOutcome);
+      expect(stored.messages, hasLength(1));
+      expect(stored.messages.single.textContent, 'original task');
+      expect(stored.toApiMessages(), [
+        {'role': 'user', 'content': 'original task'},
+      ]);
+    });
+
+    test('legacy Continue renews approval for every risky tool under auto',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final startedAt = DateTime.utc(2026, 7, 7);
+      final session = ChatSession(
+        id: 'legacy-recovery-risky-tools',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: AgentRunRecoveryMarker.fromJson({
+          'startedAt': startedAt.toIso8601String(),
+        }),
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'legacy_call_1',
+                    toolName: 'echo',
+                    toolInput: {'text': 'first'},
+                  ),
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'legacy_call_2',
+                    toolName: 'echo',
+                    toolInput: {'text': 'second'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'done')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.selectSession(session.id);
+
+      final recoveryFuture = provider.continueInterruptedAgentRun();
+      final approvalOperationIds = <String>[];
+      await _waitUntil(() => provider.pendingApproval != null);
+      approvalOperationIds.add(provider.pendingApproval!.operationId!);
+      provider.resolveToolApproval(true);
+      await _waitUntil(() => provider.pendingApproval != null);
+      approvalOperationIds.add(provider.pendingApproval!.operationId!);
+      expect(tool.executionCount, 1);
+      provider.resolveToolApproval(true);
+      await recoveryFuture;
+
+      expect(tool.executionCount, 2);
+      expect(approvalOperationIds.toSet(), hasLength(2));
+      expect(provider.pendingApproval, isNull);
+    });
+
+    test('safe tool waits for explicit Continue but needs no approval',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final startedAt = DateTime.utc(2026, 7, 7);
+      final session = ChatSession(
+        id: 'safe-recovery-continue',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'safe-recovery-run',
+          startedAt: startedAt,
+          updatedAt: startedAt,
+        ),
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.safe),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'safe_call',
+                    toolName: 'echo',
+                    toolInput: {'text': 'safe'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'done')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.selectSession(session.id);
+
+      expect(tool.executionCount, 0);
+      await provider.continueInterruptedAgentRun();
+
+      expect(tool.executionCount, 1);
+      expect(provider.pendingApproval, isNull);
+    });
+
+    test('reload marks started tool unknown and never executes it', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final timestamp = DateTime.utc(2026, 7, 7);
+      final session = ChatSession(
+        id: 'interrupted-tool-started',
+        messages: [
+          ChatMessage.user('original task'),
+          ChatMessage(
+            role: 'assistant',
+            content: [
+              ToolUseContent(
+                id: 'call_1',
+                name: 'echo',
+                input: const {'text': 'must not replay'},
+              ),
+            ],
+          ),
+        ],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'run-started',
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          phase: AgentRunRecoveryPhase.toolInFlight,
+          toolAttempts: [
+            ToolAttemptRecoveryMetadata(
+              operationId: 'operation-started',
+              toolName: 'echo',
+              risk: RecoveryToolRisk.dangerous,
+              lifecycle: ToolAttemptLifecycle.started,
+              proposedAt: timestamp,
+              updatedAt: timestamp,
+              executionStartedAt: timestamp,
+            ),
+          ],
+        ),
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(tool.executionCount, 0);
+      expect(provider.isSessionSending(session.id), isFalse);
+      final marker = provider.currentInterruptedAgentRun!;
+      expect(marker.recoveryKind, InterruptedRunRecoveryKind.unknownOutcome);
+      expect(marker.toolAttempts.single.lifecycle,
+          ToolAttemptLifecycle.interruptedUnknown);
+      expect(
+        (await storage.getSession(session.id))!
+            .inFlightAgentRun!
+            .toolAttempts
+            .single
+            .lifecycle,
+        ToolAttemptLifecycle.interruptedUnknown,
+      );
+    });
+
+    test('persisted tool result is reconciled and never executed twice',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final timestamp = DateTime.utc(2026, 7, 7);
+      final session = ChatSession(
+        id: 'interrupted-tool-persisted',
+        messages: [
+          ChatMessage.user('original task'),
+          ChatMessage(
+            role: 'assistant',
+            content: [
+              ToolUseContent(
+                id: 'call_1',
+                name: 'echo',
+                input: const {'text': 'already ran'},
+              ),
+            ],
+          ),
+          ChatMessage(
+            role: 'user',
+            content: [
+              ToolResultContent(
+                toolUseId: 'call_1',
+                output: 'saved result',
+                metadata: const {'operationId': 'operation-completed'},
+              ),
+            ],
+          ),
+        ],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'run-completed',
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          phase: AgentRunRecoveryPhase.toolInFlight,
+          toolAttempts: [
+            ToolAttemptRecoveryMetadata(
+              operationId: 'operation-completed',
+              toolName: 'echo',
+              risk: RecoveryToolRisk.dangerous,
+              lifecycle: ToolAttemptLifecycle.completed,
+              proposedAt: timestamp,
+              updatedAt: timestamp,
+              executionStartedAt: timestamp,
+              executionOutcomeKnown: true,
+            ),
+          ],
+        ),
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      List<Map<String, dynamic>>? capturedMessages;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            capturedMessages = messages;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'continued safely')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.selectSession(session.id);
+      expect(provider.currentInterruptedAgentRun!.toolAttempts.single.lifecycle,
+          ToolAttemptLifecycle.resultPersisted);
+
+      await provider.continueInterruptedAgentRun();
+
+      expect(tool.executionCount, 0);
+      expect(
+        capturedMessages!
+            .where((message) => message['role'] == 'assistant')
+            .expand((message) => message['content'] as List)
+            .whereType<Map>()
+            .where((block) => block['type'] == 'tool_use'),
+        hasLength(1),
+      );
+      expect(
+        provider.currentSession!.messages
+            .expand((message) => message.toolResults),
+        hasLength(1),
+      );
+      expect(provider.currentSession!.messages.last.textContent,
+          'continued safely');
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(reloaded.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+      expect(reloaded.currentInterruptedAgentRun, isNull);
+    });
+
+    test(
+        'recovery error retry preserves evidence and renews every approval under auto',
+        () async {
+      configureModelFallbackProfiles();
+      final storage = SessionStorage();
+      await storage.init();
+      final timestamp = DateTime.utc(2026, 7, 10, 10);
+      final session = _resultPersistedRecoverySession(
+        id: 'recovery-error-immediate-retry',
+        timestamp: timestamp,
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      var retryPhase = false;
+      var retryModelCalls = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            if (!retryPhase) {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              );
+            }
+            retryModelCalls++;
+            if (retryModelCalls == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'retry_dangerous_1',
+                    toolName: 'echo',
+                    toolInput: {'text': 'first'},
+                  ),
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'retry_dangerous_2',
+                    toolName: 'echo',
+                    toolInput: {'text': 'second'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'recovered')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.selectSession(session.id);
+
+      await provider.continueInterruptedAgentRun();
+
+      final failed = provider.currentSession!.messages.last;
+      final failedMarker = provider.currentInterruptedAgentRun!;
+      expect(failed.assistantError!.isRecoveryRetry, isTrue);
+      expect(failed.assistantError!.recoveryRunAttemptId,
+          failedMarker.runAttemptId);
+      expect(failedMarker.toolAttempts.single.lifecycle,
+          ToolAttemptLifecycle.resultPersisted);
+      expect(
+        provider.currentSession!.messages
+            .expand((message) => message.toolResults)
+            .where((result) => result.toolUseId == 'old_completed_call'),
+        hasLength(1),
+      );
+
+      retryPhase = true;
+      final retry = provider.retryAssistantMessage(
+        provider.currentSession!.messages.length - 1,
+      );
+      AssistantRetryStatus? earlyRetryStatus;
+      unawaited(retry.then((status) => earlyRetryStatus = status));
+      final approvalIds = <String>[];
+      await _waitUntil(
+        () => provider.pendingApproval != null || earlyRetryStatus != null,
+      );
+      expect(provider.pendingApproval, isNotNull,
+          reason: 'retry completed early with $earlyRetryStatus');
+      approvalIds.add(provider.pendingApproval!.operationId!);
+      provider.resolveToolApproval(true);
+      await _waitUntil(() => provider.pendingApproval != null);
+      approvalIds.add(provider.pendingApproval!.operationId!);
+      provider.resolveToolApproval(true);
+      expect(await retry, AssistantRetryStatus.started);
+
+      expect(approvalIds.toSet(), hasLength(2));
+      expect(tool.executionCount, 2);
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+      expect(
+        provider.currentSession!.messages
+            .expand((message) => message.toolResults)
+            .where((result) => result.toolUseId == 'old_completed_call'),
+        hasLength(1),
+      );
+      expect(
+        provider.currentSession!.messages.any(
+          (message) => message.hasAssistantError,
+        ),
+        isFalse,
+      );
+    });
+
+    test('reloaded recovery error retry keeps provenance and approvals',
+        () async {
+      configureModelFallbackProfiles();
+      final storage = SessionStorage();
+      await storage.init();
+      final timestamp = DateTime.utc(2026, 7, 10, 11);
+      final session = _resultPersistedRecoverySession(
+        id: 'recovery-error-reload-retry',
+        timestamp: timestamp,
+      );
+      await storage.saveSession(session);
+      final first = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamError(
+            'OpenAI API error (503): temporarily unavailable',
+            cause: Exception('OpenAI API error (503)'),
+          ),
+        ),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await first.selectSession(session.id);
+      await first.continueInterruptedAgentRun();
+      final persistedFailure = await storage.getSession(session.id);
+      expect(persistedFailure!.inFlightAgentRun, isNotNull);
+      expect(persistedFailure.messages.last.assistantError!.isRecoveryRetry,
+          isTrue);
+      first.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final reloaded = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'reload_retry_1',
+                    toolName: 'echo',
+                    toolInput: {'text': 'first'},
+                  ),
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'reload_retry_2',
+                    toolName: 'echo',
+                    toolInput: {'text': 'second'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'reload recovered')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        reloaded.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await reloaded.selectSession(session.id);
+      final errorIndex = reloaded.currentSession!.messages.length - 1;
+
+      final retry = reloaded.retryAssistantMessage(errorIndex);
+      AssistantRetryStatus? earlyRetryStatus;
+      unawaited(retry.then((status) => earlyRetryStatus = status));
+      await _waitUntil(
+        () => reloaded.pendingApproval != null || earlyRetryStatus != null,
+      );
+      expect(reloaded.pendingApproval, isNotNull,
+          reason: 'retry completed early with $earlyRetryStatus');
+      reloaded.resolveToolApproval(true);
+      await _waitUntil(() => reloaded.pendingApproval != null);
+      reloaded.resolveToolApproval(true);
+      expect(await retry, AssistantRetryStatus.started);
+
+      expect(tool.executionCount, 2);
+      expect(reloaded.currentInterruptedAgentRun, isNull);
+      expect(
+        reloaded.currentSession!.messages
+            .expand((message) => message.toolResults)
+            .where((result) => result.toolUseId == 'old_completed_call'),
+        hasLength(1),
+      );
+    });
+
+    test('expired pre-start approval is renewed even under auto policy',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final timestamp = DateTime.utc(2026, 7, 7);
+      final session = ChatSession(
+        id: 'interrupted-tool-approved',
+        messages: [
+          ChatMessage.user('original task'),
+          ChatMessage(
+            role: 'assistant',
+            content: [
+              ToolUseContent(
+                id: 'old_call',
+                name: 'echo',
+                input: const {'text': 'old action'},
+              ),
+            ],
+          ),
+        ],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'run-approved',
+          startedAt: timestamp,
+          updatedAt: timestamp,
+          phase: AgentRunRecoveryPhase.toolInFlight,
+          toolAttempts: [
+            ToolAttemptRecoveryMetadata(
+              operationId: 'operation-approved',
+              toolName: 'echo',
+              risk: RecoveryToolRisk.moderate,
+              lifecycle: ToolAttemptLifecycle.approvedNotStarted,
+              proposedAt: timestamp,
+              updatedAt: timestamp,
+            ),
+          ],
+        ),
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.moderate),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'new_call',
+                    toolName: 'echo',
+                    toolInput: {'text': 'new action'},
+                  ),
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'new_call_2',
+                    toolName: 'echo',
+                    toolInput: {'text': 'second new action'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'done')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.selectSession(session.id);
+
+      final recoveryFuture = provider.continueInterruptedAgentRun();
+      await _waitUntil(() => provider.pendingApproval != null);
+
+      expect(tool.executionCount, 0);
+      expect(provider.pendingApproval!.operationId, isNotEmpty);
+      expect(provider.pendingApproval!.runAttemptId, isNotEmpty);
+      final pendingMarker =
+          (await storage.getSession(session.id))!.inFlightAgentRun!;
+      expect(
+          pendingMarker.runAttemptId, provider.pendingApproval!.runAttemptId);
+      final pendingAttempt = pendingMarker.toolAttempts.singleWhere(
+        (attempt) =>
+            attempt.operationId == provider.pendingApproval!.operationId,
+      );
+      expect(pendingAttempt.lifecycle, ToolAttemptLifecycle.approvalPending);
+      expect(pendingMarker.toJson().toString(), isNot(contains('new action')));
+      expect(pendingMarker.toJson().toString(), isNot(contains('old action')));
+      final firstOperationId = provider.pendingApproval!.operationId;
+      provider.resolveToolApproval(true);
+      await _waitUntil(() => provider.pendingApproval != null);
+
+      expect(tool.executionCount, 1);
+      expect(provider.pendingApproval!.operationId, isNot(firstOperationId));
+      provider.resolveToolApproval(true);
+      await recoveryFuture;
+
+      expect(tool.executionCount, 2);
+      expect(
+        provider.currentSession!.messages
+            .expand((message) => message.toolUses)
+            .map((toolUse) => toolUse.id),
+        isNot(contains('old_call')),
+      );
     });
 
     test('retry removes stale failure marker and does not duplicate history',
@@ -795,7 +3438,7 @@ void main() {
       final sendFuture = provider.sendMessage('slow prompt');
       await started.future.timeout(const Duration(seconds: 2));
 
-      provider.cancelAgent(sessionId: session.id, savePartial: false);
+      await provider.cancelAgent(sessionId: session.id, savePartial: false);
       await sendFuture.timeout(const Duration(seconds: 2));
 
       expect(
@@ -1124,6 +3767,334 @@ void main() {
     });
   });
 
+  group('session-owned regenerate and retry', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(clearPlatformMocks);
+
+    test('regenerate remains owned by its initiating session after switch',
+        () async {
+      final saveEntered = Completer<void>();
+      final releaseSave = Completer<void>();
+      var blockedSessionId = '';
+      var blockNext = false;
+      final storage = SessionStorage(beforeCommitForTesting: (id) async {
+        if (!blockNext || id != blockedSessionId) return;
+        blockNext = false;
+        saveEntered.complete();
+        await releaseSave.future;
+      });
+      await storage.init();
+      final captured = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            captured.add(messages);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'replacement')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSave.isCompleted) releaseSave.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final owner = await provider.createSession();
+      owner.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.user('owner prompt'),
+          ChatMessage.assistant([
+            {'type': 'text', 'text': 'old response'},
+          ]),
+        ]);
+      await storage.saveSession(owner);
+      final other = await provider.createSession();
+      other.messages.add(ChatMessage.user('other history'));
+      await storage.saveSession(other);
+      final otherBefore =
+          jsonEncode((await storage.getSession(other.id))!.toJson());
+      await provider.selectSession(owner.id);
+
+      blockedSessionId = owner.id;
+      blockNext = true;
+      final regenerate = provider.regenerateLastResponse();
+      await saveEntered.future;
+      await provider.selectSession(other.id);
+      releaseSave.complete();
+      await regenerate;
+
+      expect(provider.currentSession!.id, other.id);
+      expect(jsonEncode((await storage.getSession(other.id))!.toJson()),
+          otherBefore);
+      expect(captured, hasLength(1));
+      expect(jsonEncode(captured.single), contains('owner prompt'));
+      expect(jsonEncode(captured.single), isNot(contains('other history')));
+      final persistedOwner = await storage.getSession(owner.id);
+      expect(persistedOwner!.messages.last.textContent, 'replacement');
+    });
+
+    test('assistant retry keeps owner attachments after session switch',
+        () async {
+      final saveEntered = Completer<void>();
+      final releaseSave = Completer<void>();
+      var blockedSessionId = '';
+      var blockNext = false;
+      final storage = SessionStorage(beforeCommitForTesting: (id) async {
+        if (!blockNext || id != blockedSessionId) return;
+        blockNext = false;
+        saveEntered.complete();
+        await releaseSave.future;
+      });
+      await storage.init();
+      List<Map<String, dynamic>>? request;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            request = messages;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'retried')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSave.isCompleted) releaseSave.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final owner = await provider.createSession();
+      owner.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.userContent([
+            TextContent('retry owner'),
+            ImageContent(data: 'aGk=', mediaType: 'image/png'),
+          ]),
+          ChatMessage(
+            role: 'assistant',
+            content: [TextContent('failed')],
+            assistantError: const AssistantErrorMetadata(
+              message: 'temporary',
+              code: 'provider_error',
+              canRetry: true,
+            ),
+          ),
+        ]);
+      await storage.saveSession(owner);
+      final other = await provider.createSession();
+      other.messages.add(ChatMessage.user('other'));
+      await storage.saveSession(other);
+      final otherBefore =
+          jsonEncode((await storage.getSession(other.id))!.toJson());
+      await provider.selectSession(owner.id);
+
+      blockedSessionId = owner.id;
+      blockNext = true;
+      final retry = provider.retryAssistantMessage(1);
+      await saveEntered.future;
+      await provider.selectSession(other.id);
+      releaseSave.complete();
+
+      expect(await retry, AssistantRetryStatus.started);
+      expect(provider.currentSession!.id, other.id);
+      expect(jsonEncode((await storage.getSession(other.id))!.toJson()),
+          otherBefore);
+      expect(jsonEncode(request), contains('"type":"image"'));
+      expect(jsonEncode(request), isNot(contains('other')));
+      expect((await storage.getSession(owner.id))!.messages.last.textContent,
+          'retried');
+    });
+
+    test('deleting owner during replay save prevents request and resurrection',
+        () async {
+      final saveEntered = Completer<void>();
+      final releaseSave = Completer<void>();
+      var blockedSessionId = '';
+      var blockNext = false;
+      final storage = SessionStorage(beforeCommitForTesting: (id) async {
+        if (!blockNext || id != blockedSessionId) return;
+        blockNext = false;
+        saveEntered.complete();
+        await releaseSave.future;
+      });
+      await storage.init();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'unexpected')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSave.isCompleted) releaseSave.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final owner = await provider.createSession();
+      owner.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.user('owner'),
+          ChatMessage.assistant([
+            {'type': 'text', 'text': 'old'},
+          ]),
+        ]);
+      await storage.saveSession(owner);
+      blockedSessionId = owner.id;
+      blockNext = true;
+      final regenerate = provider.regenerateLastResponse();
+      await saveEntered.future;
+      final deletion = provider.deleteSession(owner.id);
+      releaseSave.complete();
+      await Future.wait([regenerate, deletion]);
+
+      expect(requestCount, 0);
+      expect(await storage.getSession(owner.id), isNull);
+    });
+
+    test('newer replay supersedes stale blocked replay without tail corruption',
+        () async {
+      final saveEntered = Completer<void>();
+      final releaseSave = Completer<void>();
+      var blockedSessionId = '';
+      var blockNext = false;
+      final storage = SessionStorage(beforeCommitForTesting: (id) async {
+        if (!blockNext || id != blockedSessionId) return;
+        blockNext = false;
+        saveEntered.complete();
+        await releaseSave.future;
+      });
+      await storage.init();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'new')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSave.isCompleted) releaseSave.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final owner = await provider.createSession();
+      owner.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.user('owner'),
+          ChatMessage.assistant([
+            {'type': 'text', 'text': 'old'},
+          ]),
+        ]);
+      await storage.saveSession(owner);
+      blockedSessionId = owner.id;
+      blockNext = true;
+      final stale = provider.regenerateLastResponse();
+      await saveEntered.future;
+      final current = provider.regenerateLastResponse();
+      releaseSave.complete();
+      await Future.wait([stale, current]);
+
+      expect(requestCount, 1);
+      final persisted = await storage.getSession(owner.id);
+      expect(persisted!.messages.where((message) => message.role == 'user'),
+          hasLength(1));
+      expect(persisted.messages.last.textContent, 'new');
+    });
+
+    test('failed replay boundary save leaves in-memory tail unchanged',
+        () async {
+      var failSessionId = '';
+      var failNext = false;
+      final storage = SessionStorage(beforeCommitForTesting: (id) async {
+        if (failNext && id == failSessionId) {
+          failNext = false;
+          throw StateError('injected replay save failure');
+        }
+      });
+      await storage.init();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            requestCount++;
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'unexpected')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final owner = await provider.createSession();
+      owner.messages
+        ..clear()
+        ..addAll([
+          ChatMessage.user('owner'),
+          ChatMessage.assistant([
+            {'type': 'text', 'text': 'keep tail'},
+          ]),
+        ]);
+      await storage.saveSession(owner);
+      final before = jsonEncode(owner.messages.map((m) => m.toJson()).toList());
+      failSessionId = owner.id;
+      failNext = true;
+
+      await provider.regenerateLastResponse();
+
+      expect(requestCount, 0);
+      expect(
+        jsonEncode(provider.currentSession!.messages
+            .map((message) => message.toJson())
+            .toList()),
+        before,
+      );
+      expect((await storage.getSession(owner.id))!.messages.last.textContent,
+          'keep tail');
+    });
+  });
+
   group('safe mode and diagnostics', () {
     setUp(() async {
       await installPlatformMocks();
@@ -1208,11 +4179,16 @@ void main() {
 
     test('diagnostics report excludes raw prompt, base64, and secrets',
         () async {
-      final events = RuntimeDebugEventService();
+      final events = RuntimeDebugEventService(tracingEnabled: true);
       events.record(RuntimeDebugEvent(
-        type: 'provider.debug',
+        type: 'stream.terminal',
         sessionId: 's1',
         data: {
+          'attempt': 1,
+          'status': 'failed',
+          'completeness': 'none',
+          'durationMs': 1,
+          'errorCode': 'provider_unavailable',
           'prompt': 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456',
           'imageData': 'data:image/png;base64,${'a' * 200}',
           'api_key': 'sk-secretsecretsecret',
@@ -1232,6 +4208,203 @@ void main() {
       expect(report, isNot(contains('abcdefghijklmnopqrstuvwxyz')));
       expect(report, isNot(contains('data:image/png;base64')));
       expect(report, isNot(contains('aaaaaaaaaaaaaaaaaaaa')));
+    });
+
+    test('persisted Developer Mode on is applied once on every restart',
+        () async {
+      configureAnthropicProfile(
+        baseUrl: 'http://127.0.0.1',
+        developerMode: true,
+      );
+
+      final firstEvents = _CountingRuntimeDebugEventService();
+      final firstProvider = ChatProvider(runtimeDebugEvents: firstEvents);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(firstProvider.developerMode, isTrue);
+      expect(firstEvents.setTracingEnabledCalls, 1);
+      await firstProvider.createSession();
+      await firstProvider.buildDiagnosticsReport();
+      expect(firstEvents.setTracingEnabledCalls, 1);
+      firstEvents.record(RuntimeDebugEvent(
+        type: 'stream.started',
+        sessionId: 's1',
+        data: const {'attempt': 1, 'latencyMs': 1},
+      ));
+      expect(firstEvents.recent().single.type, 'stream.started');
+      firstProvider.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      final secondEvents = _CountingRuntimeDebugEventService();
+      final secondProvider = ChatProvider(runtimeDebugEvents: secondEvents);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        secondProvider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(secondProvider.developerMode, isTrue);
+      expect(secondEvents.setTracingEnabledCalls, 1);
+      secondEvents.record(RuntimeDebugEvent(
+        type: 'stream.started',
+        sessionId: 's2',
+        data: const {'attempt': 1, 'latencyMs': 2},
+      ));
+      expect(secondEvents.recent().single.type, 'stream.started');
+    });
+
+    test('persisted Developer Mode off clears stale capture on every restart',
+        () async {
+      configureAnthropicProfile(
+        baseUrl: 'http://127.0.0.1',
+        developerMode: false,
+      );
+
+      Future<ChatProvider> startWithStaleCapture(
+        _CountingRuntimeDebugEventService events,
+      ) async {
+        events.setTracingEnabled(true);
+        events.record(RuntimeDebugEvent(type: 'stale', sessionId: 's1'));
+        events.startRunTrace('s1');
+        final provider = ChatProvider(runtimeDebugEvents: events);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        return provider;
+      }
+
+      final firstEvents = _CountingRuntimeDebugEventService();
+      final firstProvider = await startWithStaleCapture(firstEvents);
+      expect(firstProvider.developerMode, isFalse);
+      expect(firstEvents.setTracingEnabledCalls, 2);
+      expect(firstEvents.recent(), isEmpty);
+      expect(firstEvents.recentRunTraces(), isEmpty);
+      firstEvents.record(RuntimeDebugEvent(type: 'after.off', sessionId: 's1'));
+      expect(firstEvents.recent(), isEmpty);
+      firstProvider.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      final secondEvents = _CountingRuntimeDebugEventService();
+      final secondProvider = await startWithStaleCapture(secondEvents);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        secondProvider.dispose();
+      });
+      expect(secondProvider.developerMode, isFalse);
+      expect(secondEvents.setTracingEnabledCalls, 2);
+      expect(secondEvents.recent(), isEmpty);
+      expect(secondEvents.recentRunTraces(), isEmpty);
+      final report = await secondProvider.buildDiagnosticsReport();
+      expect(secondEvents.setTracingEnabledCalls, 2);
+      expect(report, contains('Recent events\n- none'));
+    });
+
+    test('toggle off clears active concurrent capture and re-enable is fresh',
+        () async {
+      configureAnthropicProfile(
+        baseUrl: 'http://127.0.0.1',
+        developerMode: true,
+      );
+      final events = RuntimeDebugEventService();
+      final provider = ChatProvider(runtimeDebugEvents: events);
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      events.startRunTrace('s1');
+      events.startRunTrace('s2');
+      events.record(RuntimeDebugEvent(
+        type: 'tool.attempt.started',
+        sessionId: 's1',
+        data: const {
+          'runAttemptId': 'run-1',
+          'operationId': 'op-1',
+          'toolName': 'bash',
+        },
+      ));
+      expect(events.recentRunTraces(), hasLength(2));
+      expect(events.recent(), isNotEmpty);
+
+      provider.setDeveloperMode(false);
+      events.record(RuntimeDebugEvent(
+        type: 'tool.attempt.completed',
+        sessionId: 's1',
+        data: const {'runAttemptId': 'run-1', 'operationId': 'op-1'},
+      ));
+      expect(provider.developerMode, isFalse);
+      expect(events.recent(), isEmpty);
+      expect(events.recentRunTraces(), isEmpty);
+
+      provider.setDeveloperMode(true);
+      expect(events.recent(), isEmpty);
+      expect(events.recentRunTraces(), isEmpty);
+      final s1Trace = events.startRunTrace('s1')!;
+      final s2Trace = events.startRunTrace('s2')!;
+      events.record(RuntimeDebugEvent(
+        type: 'stream.started',
+        sessionId: 's1',
+        data: const {'attempt': 1, 'latencyMs': 1},
+      ));
+      events.record(RuntimeDebugEvent(
+        type: 'model.attempt.started',
+        sessionId: 's2',
+        data: const {'attempt': 1, 'modelLabel': 'openai/gpt-test'},
+      ));
+      expect(
+        events.runTrace(s1Trace)!.events.map((event) => event.type),
+        contains('stream.started'),
+      );
+      expect(
+        events.runTrace(s1Trace)!.events.map((event) => event.type),
+        isNot(contains('model.attempt.started')),
+      );
+      expect(
+          events.runTrace(s2Trace)!.events.last.type, 'model.attempt.started');
+    });
+
+    test('disabling during a live provider run stops all later capture',
+        () async {
+      configureAnthropicProfile(
+        baseUrl: 'http://127.0.0.1',
+        developerMode: true,
+      );
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final events = RuntimeDebugEventService();
+      final provider = ChatProvider(
+        runtimeDebugEvents: events,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      final sendFuture = provider.sendMessage('safe test message');
+      await started.future.timeout(const Duration(seconds: 2));
+      expect(events.recentRunTraces().single.status, RunTraceStatus.inFlight);
+      expect(events.recent(), isNotEmpty);
+
+      provider.setDeveloperMode(false);
+      release.complete();
+      await sendFuture.timeout(const Duration(seconds: 2));
+      events.record(RuntimeDebugEvent(
+        type: 'tool.attempt.completed',
+        sessionId: provider.currentSession!.id,
+        data: const {
+          'runAttemptId': 'ignored-run',
+          'operationId': 'ignored-operation',
+        },
+      ));
+
+      expect(provider.developerMode, isFalse);
+      expect(events.recent(), isEmpty);
+      expect(events.recentRunTraces(), isEmpty);
     });
 
     test('sendMessage rejects oversized image attachment before persistence',
@@ -1278,8 +4451,14 @@ void main() {
 
     test('retryable primary network failure uses configured fallback once',
         () async {
+      configureModelFallbackProfiles(developerMode: true);
       final attemptedModels = <String>[];
+      final traces = RuntimeDebugEventService(tracingEnabled: true);
+      final storage = SessionStorage();
+      await storage.init();
       final provider = ChatProvider(
+        storage: storage,
+        runtimeDebugEvents: traces,
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
           onMessages: (_) {
@@ -1305,7 +4484,7 @@ void main() {
       });
       await Future<void>.delayed(const Duration(milliseconds: 50));
 
-      await provider.createSession();
+      final session = await provider.createSession();
       await provider.sendMessage('hello');
 
       expect(provider.errorMessage, isNull);
@@ -1329,6 +4508,334 @@ void main() {
             .recent()
             .where((event) => event.type == 'model.fallback.success'),
         hasLength(1),
+      );
+      final trace = traces.recentRunTraces().single;
+      expect(trace.status, RunTraceStatus.completed);
+      expect(
+        trace.events.where((event) => event.type == 'model.attempt.started'),
+        hasLength(2),
+      );
+      expect(
+        trace.events.map((event) => event.type),
+        containsAll(['model.fallback.attempt', 'model.fallback.success']),
+      );
+      expect(trace.events.toString(), isNot(contains('hello')));
+      expect(provider.currentInterruptedAgentRun, isNull);
+      expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+
+      final reloaded = ChatProvider(storage: storage);
+      addTearDown(reloaded.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await reloaded.selectSession(session.id);
+      expect(reloaded.currentInterruptedAgentRun, isNull);
+    });
+
+    test('recovery fallback success cannot clear unknown tool evidence',
+        () async {
+      final attemptedModels = <String>[];
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'recovery-fallback-unknown-retained',
+        messages: [ChatMessage.user('original task')],
+        inFlightAgentRun: _unknownRecoveryMarker('fallback-unknown-origin'),
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            if (config.model == 'claude-primary-200k') {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'fallback recovered')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.selectSession(session.id);
+
+      await provider.continueInterruptedAgentRun();
+
+      expect(attemptedModels, ['claude-primary-200k', 'claude-fallback-200k']);
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant')
+            .last
+            .textContent,
+        'fallback recovered',
+      );
+      expect(provider.currentInterruptedAgentRun, isNotNull);
+      expect(provider.currentInterruptedAgentRun!.recoveryKind,
+          InterruptedRunRecoveryKind.unknownOutcome);
+      expect(
+          (await storage.getSession(session.id))!.inFlightAgentRun, isNotNull);
+    });
+
+    test('recovery fallback keeps skill binding and denies undeclared tool',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final verified = _providerVerifiedSkill();
+      final session = _skillBoundRecoverySession(
+        id: 'recovery-fallback-undeclared',
+        activation: verified,
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      final restoredSkillIds = <String>[];
+      final fallbackCalls = <String, int>{};
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        skillCapabilityPolicyFactory: (domains) => SkillCapabilityPolicy(
+          fixedToolDomains: domains,
+          loader: (id) async {
+            restoredSkillIds.add(id);
+            return verified;
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            if (config.model == 'claude-primary-200k') {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              );
+            }
+            final call = (fallbackCalls[config.model] ?? 0) + 1;
+            fallbackCalls[config.model] = call;
+            if (call == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'fallback_undeclared',
+                    toolName: 'echo',
+                    toolInput: {'text': 'blocked'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'denial handled')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.selectSession(session.id);
+
+      await provider.continueInterruptedAgentRun();
+
+      expect(restoredSkillIds, [verified.id, verified.id]);
+      expect(tool.executionCount, 0);
+      expect(provider.pendingApproval, isNull);
+      expect(
+        provider.currentSession!.messages
+            .expand((message) => message.toolResults)
+            .singleWhere(
+              (result) => result.toolUseId == 'fallback_undeclared',
+            )
+            .output,
+        contains('did not declare tool'),
+      );
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant')
+            .last
+            .textContent,
+        'denial handled',
+      );
+    });
+
+    test('declared recovery fallback tool still requires renewed approval',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final verified = _providerVerifiedSkill(tools: const ['echo']);
+      final session = _skillBoundRecoverySession(
+        id: 'recovery-fallback-declared',
+        activation: verified,
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      final fallbackCalls = <String, int>{};
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        skillCapabilityPolicyFactory: (domains) => SkillCapabilityPolicy(
+          fixedToolDomains: domains,
+          loader: (_) async => verified,
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            if (config.model == 'claude-primary-200k') {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              );
+            }
+            final call = (fallbackCalls[config.model] ?? 0) + 1;
+            fallbackCalls[config.model] = call;
+            if (call == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'fallback_declared',
+                    toolName: 'echo',
+                    toolInput: {'text': 'approved'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'approved done')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.selectSession(session.id);
+
+      final recovery = provider.continueInterruptedAgentRun();
+      await _waitUntil(() => provider.pendingApproval != null);
+
+      expect(tool.executionCount, 0);
+      final replacement = (await storage.getSession(session.id))!
+          .inFlightAgentRun!
+          .skillActivation!;
+      expect(replacement.sourceRunAttemptId, 'skill-origin-run');
+      expect(replacement.skillId, verified.id);
+      expect(replacement.trustDigest, verified.trustDigest);
+      provider.resolveToolApproval(true);
+      await recovery;
+
+      expect(tool.executionCount, 1);
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant')
+            .last
+            .textContent,
+        'approved done',
+      );
+    });
+
+    test('stale recovery skill grant stays fail closed across fallback',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final verified = _providerVerifiedSkill(tools: const ['echo']);
+      final session = _skillBoundRecoverySession(
+        id: 'recovery-fallback-stale',
+        activation: verified,
+      );
+      session.messages
+          .expand((message) => message.toolResults)
+          .single
+          .metadata['skillRunAttemptId'] = 'unrelated-history-run';
+      session.inFlightAgentRun = session.inFlightAgentRun!.copyWith(
+        skillActivation: RecoverySkillActivationMetadata(
+          sourceRunAttemptId: 'skill-origin-run',
+          skillId: verified.id,
+          trustDigest: verified.trustDigest,
+        ),
+      );
+      await storage.saveSession(session);
+      final tool = _EchoTool();
+      var restoreAttempts = 0;
+      var fallbackRequestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        skillCapabilityPolicyFactory: (domains) => SkillCapabilityPolicy(
+          fixedToolDomains: domains,
+          loader: (_) async {
+            restoreAttempts++;
+            throw StateError('grant changed');
+          },
+        ),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            if (config.model == 'claude-primary-200k') {
+              return StreamError(
+                'OpenAI API error (503): temporarily unavailable',
+                cause: Exception('OpenAI API error (503)'),
+              );
+            }
+            fallbackRequestCount++;
+            if (fallbackRequestCount == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'fallback_stale',
+                    toolName: 'echo',
+                    toolInput: {'text': 'must not run'},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'stale handled')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.selectSession(session.id);
+
+      await provider.continueInterruptedAgentRun();
+
+      expect(restoreAttempts, 2);
+      expect(tool.executionCount, 0);
+      expect(provider.pendingApproval, isNull);
+      expect(
+        provider.currentSession!.messages
+            .expand((message) => message.toolResults)
+            .singleWhere((result) => result.toolUseId == 'fallback_stale')
+            .output,
+        contains('stale'),
       );
     });
 
@@ -1373,6 +4880,7 @@ void main() {
         'active_provider_profile_id': 'active',
         'model_groups': jsonEncode([group.toJson()]),
         'context_token_budget': 65536,
+        'developer_mode': true,
       });
 
       final attemptedModels = <String>[];
@@ -1506,13 +5014,19 @@ void main() {
       );
     });
 
-    test('stream failure rolls back primary patch and blocks fallback',
+    test(
+        'guarded stream failure rolls back primary patch and falls back cleanly',
         () async {
-      configureModelFallbackProfiles(contextTokenBudget: 4096);
+      configureModelFallbackProfiles(
+        contextTokenBudget: 4096,
+        developerMode: true,
+      );
+      final traces = RuntimeDebugEventService(tracingEnabled: true);
       final summaryModels = <String>[];
       final attemptedModels = <String>[];
       var fallbackCreated = false;
       final provider = ChatProvider(
+        runtimeDebugEvents: traces,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) {
             summaryModels.add(request.llmConfig.model);
@@ -1534,6 +5048,7 @@ void main() {
               if (config.model == 'claude-primary-200k') {
                 return [
                   TextDelta('partial streamed text'),
+                  ReasoningDelta('partial guarded reasoning'),
                   StreamError(
                     'OpenAI API error (503): temporarily unavailable',
                     cause: Exception('OpenAI API error (503)'),
@@ -1564,41 +5079,73 @@ void main() {
 
       await provider.sendMessage('final question');
 
-      expect(provider.errorMessage, isNotNull);
-      expect(attemptedModels, ['claude-primary-200k']);
-      expect(summaryModels, ['claude-primary-200k']);
-      expect(fallbackCreated, isFalse);
-      expect(provider.currentContextSummary, isNull);
+      expect(provider.errorMessage, isNull);
+      expect(
+        attemptedModels,
+        ['claude-primary-200k', 'claude-fallback-200k'],
+      );
+      expect(
+        summaryModels,
+        ['claude-primary-200k', 'claude-fallback-200k'],
+      );
+      expect(fallbackCreated, isTrue);
+      expect(provider.currentContextSummary!.model, 'claude-fallback-200k');
       expect(
         provider.currentSession!.messages.where((message) =>
             message.isSystemNotice && message.textContent.contains('已压缩为摘要')),
-        isEmpty,
+        hasLength(1),
       );
       expect(
         provider.currentSession!.messages
             .where((message) => message.role == 'assistant'),
-        hasLength(assistantCountBefore + 2),
+        hasLength(assistantCountBefore + 1),
       );
-      final errorMarker = provider.currentSession!.messages.last;
-      expect(errorMarker.hasAssistantError, isTrue);
-      expect(errorMarker.assistantError!.fallbackReasonCode,
-          'unsafe_after_partial_run');
-      expect(errorMarker.assistantError!.canRetry, isTrue);
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.role == 'assistant')
+            .last
+            .textContent,
+        'fallback',
+      );
       expect(
         provider.currentSession!.messages
             .map((message) => message.textContent)
             .join('\n'),
-        contains('partial streamed text\n\n[回复中断，内容可能不完整。]'),
+        isNot(contains('partial streamed text')),
       );
       expect(
-        provider.runtimeDebugEvents.recent().any((event) =>
-            event.type == 'model.fallback.skipped' &&
-            event.data['reason'] == 'unsafe_after_partial_run'),
+        provider.currentSession!.messages
+            .map((message) => message.textContent)
+            .join('\n'),
+        isNot(contains('partial guarded reasoning')),
+      );
+      expect(
+        provider.runtimeDebugEvents.recent().any(
+              (event) => event.type == 'model.fallback.success',
+            ),
         isTrue,
+      );
+      final trace = traces.recentRunTraces().single;
+      expect(trace.status, RunTraceStatus.completed);
+      final terminals = trace.events
+          .where((event) => event.type == 'stream.terminal')
+          .toList();
+      expect(terminals, hasLength(2));
+      expect(terminals.first.data['status'], 'failed');
+      expect(terminals.first.data['completeness'], 'partial');
+      expect(terminals.last.data['status'], 'completed');
+      expect(
+        trace.events.where((event) => event.type == 'run.terminal'),
+        hasLength(1),
+      );
+      expect(trace.events.toString(), isNot(contains('partial streamed text')));
+      expect(
+        trace.events.toString(),
+        isNot(contains('partial guarded reasoning')),
       );
     });
 
-    test('stream reset discards dirty partial before error persistence',
+    test('stream reset discards guarded attempts before clean fallback',
         () async {
       final provider = ChatProvider(
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
@@ -1607,15 +5154,24 @@ void main() {
             stopReason: 'end_turn',
             content: [ContentBlock(type: 'text', text: 'unused')],
           )),
-          onMessageEvents: (_) => [
-            TextDelta('dirty first attempt'),
-            const StreamReset(),
-            TextDelta('clean retry partial'),
-            StreamError(
-              'OpenAI API error (503): temporarily unavailable',
-              cause: Exception('OpenAI API error (503)'),
-            ),
-          ],
+          onMessageEvents: (_) => config.model == 'claude-primary-200k'
+              ? [
+                  TextDelta('dirty first attempt'),
+                  const StreamReset(),
+                  TextDelta('clean retry partial'),
+                  StreamError(
+                    'OpenAI API error (503): temporarily unavailable',
+                    cause: Exception('OpenAI API error (503)'),
+                  ),
+                ]
+              : [
+                  StreamDone(const LlmResponse(
+                    stopReason: 'end_turn',
+                    content: [
+                      ContentBlock(type: 'text', text: 'fallback after reset'),
+                    ],
+                  )),
+                ],
         ),
       );
       addTearDown(() async {
@@ -1631,11 +5187,70 @@ void main() {
           .map((message) => message.textContent)
           .join('\n');
       expect(transcript, isNot(contains('dirty first attempt')));
+      expect(transcript, isNot(contains('clean retry partial')));
+      expect(transcript, contains('fallback after reset'));
       expect(
-        transcript,
-        contains('clean retry partial\n\n[回复中断，内容可能不完整。]'),
+        provider.currentSession!.messages.any(
+          (message) => message.hasAssistantError,
+        ),
+        isFalse,
       );
-      expect(provider.currentSession!.messages.last.hasAssistantError, isTrue);
+    });
+
+    test('user cancellation after guarded output never starts fallback',
+        () async {
+      const sentinel = 'cancelled-guarded-fallback-sentinel';
+      final buffered = Completer<void>();
+      final release = Completer<void>();
+      final createdModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) {
+          createdModels.add(config.model);
+          if (config.model == 'claude-primary-200k') {
+            return _GuardedSecretPauseLlmService(
+              config,
+              sentinel: sentinel,
+              buffered: buffered,
+              release: release,
+            );
+          }
+          return _ScriptedLlmService(
+            config,
+            onMessages: (_) => StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'must not appear')],
+            )),
+          );
+        },
+      );
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession();
+      final send = provider.sendMessage('cancel guarded response');
+      await buffered.future.timeout(const Duration(seconds: 2));
+      final cancel = provider.cancelAgent(savePartial: true);
+      release.complete();
+      await cancel;
+      await send;
+
+      expect(createdModels, ['claude-primary-200k']);
+      expect(
+        provider.currentSession!.messages
+            .map((message) => message.textContent)
+            .join('\n'),
+        isNot(contains(sentinel)),
+      );
+      expect(
+        provider.runtimeDebugEvents.recent().any(
+              (event) => event.type == 'model.fallback.attempt',
+            ),
+        isFalse,
+      );
     });
 
     test('stream reset shows reconnecting notice until retry text arrives',
@@ -1671,8 +5286,9 @@ void main() {
 
       continueAfterReset.complete();
       await cleanTokenEmitted.future.timeout(const Duration(seconds: 2));
-      await _waitUntil(() => provider.streamingText == 'clean retry text');
-      expect(provider.agentStatus, AgentStatus.streaming);
+      expect(provider.streamingText, contains('连接中断'));
+      expect(provider.streamingText, isNot(contains('clean retry text')));
+      expect(provider.agentStatus, AgentStatus.thinking);
 
       finishStream.complete();
       await sendFuture.timeout(const Duration(seconds: 2));
@@ -1753,12 +5369,17 @@ void main() {
     });
 
     test('cancel before persisted messages rolls back primary patch', () async {
-      configureModelFallbackProfiles(contextTokenBudget: 4096);
+      configureModelFallbackProfiles(
+        contextTokenBudget: 4096,
+        developerMode: true,
+      );
+      final traces = RuntimeDebugEventService(tracingEnabled: true);
       final started = Completer<void>();
       final release = Completer<void>();
       final summaryModels = <String>[];
       var fallbackCreated = false;
       final provider = ChatProvider(
+        runtimeDebugEvents: traces,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) {
             summaryModels.add(request.llmConfig.model);
@@ -1800,7 +5421,7 @@ void main() {
       await started.future.timeout(const Duration(seconds: 2));
       expect(provider.currentContextSummary?.model, 'claude-primary-200k');
 
-      provider.cancelAgent();
+      await provider.cancelAgent();
       await sendFuture.timeout(const Duration(seconds: 2));
 
       expect(summaryModels, ['claude-primary-200k']);
@@ -1817,13 +5438,19 @@ void main() {
         hasLength(assistantCountBefore),
       );
       expect(provider.isSessionSending(provider.currentSession!.id), isFalse);
+      expect(traces.recentRunTraces().single.status, RunTraceStatus.cancelled);
     });
 
     test('successful primary keeps context patch', () async {
-      configureModelFallbackProfiles(contextTokenBudget: 4096);
+      configureModelFallbackProfiles(
+        contextTokenBudget: 4096,
+        developerMode: true,
+      );
+      final traces = RuntimeDebugEventService(tracingEnabled: true);
       final summaryModels = <String>[];
       final attemptedModels = <String>[];
       final provider = ChatProvider(
+        runtimeDebugEvents: traces,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) {
             summaryModels.add(request.llmConfig.model);
@@ -1856,6 +5483,18 @@ void main() {
       expect(attemptedModels, ['claude-primary-200k']);
       expect(summaryModels, ['claude-primary-200k']);
       expect(provider.currentContextSummary?.model, 'claude-primary-200k');
+      final trace = traces.recentRunTraces().single;
+      expect(trace.status, RunTraceStatus.completed);
+      expect(
+        trace.events.map((event) => event.type),
+        containsAll([
+          'context.assembly.started',
+          'context.assembly.completed',
+          'stream.started',
+          'stream.terminal',
+          'run.terminal',
+        ]),
+      );
       expect(
         provider.currentSession!.messages.where((message) =>
             message.isSystemNotice && message.textContent.contains('已压缩为摘要')),
@@ -2274,7 +5913,7 @@ void main() {
       final sendFuture = provider.sendMessage('hello');
       await fallbackStarted.future.timeout(const Duration(seconds: 2));
 
-      provider.cancelAgent();
+      await provider.cancelAgent();
       await primaryDisposed.future.timeout(const Duration(seconds: 2));
       await fallbackDisposed.future.timeout(const Duration(seconds: 2));
       await sendFuture.timeout(const Duration(seconds: 2));
@@ -2728,6 +6367,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
@@ -2950,6 +6590,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
@@ -3011,6 +6652,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final provider = ChatProvider(
@@ -3224,10 +6866,7 @@ void main() {
           .where((event) => event.type == 'provider.transform.warning')
           .single;
       expect(transformEvent.data['warningCount'], greaterThan(0));
-      expect(
-        transformEvent.data['firstWarning'],
-        contains('image content replaced'),
-      );
+      expect(transformEvent.data['warningCode'], 'image_unsupported');
       expect(transformEvent.data.toString(), isNot(contains('abc123')));
     });
 
@@ -3291,7 +6930,7 @@ void main() {
           .singleWhere((event) => event.type == 'llm.sensitive_data_redacted');
       expect(event.data['stage'], 'provider_payload');
       expect(event.data['totalCount'], 1);
-      expect(event.data.toString(), contains('bearer_token'));
+      expect(event.data.keys.toSet(), {'stage', 'totalCount'});
       expect(
         event.data.toString(),
         isNot(contains('abcdefghijklmnopqrstuvwxyz')),
@@ -3302,6 +6941,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedSystems = <String>[];
       var summaryCalls = 0;
@@ -3358,6 +6998,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 65536,
+        'developer_mode': true,
       });
       ContextSummaryRequest? observedRequest;
       final provider = ChatProvider(
@@ -3402,6 +7043,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedSystems = <String>[];
       final observedMessages = <List<Map<String, dynamic>>>[];
@@ -3488,6 +7130,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedSystems = <String>[];
       var summaryCalls = 0;
@@ -3570,6 +7213,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       ContextSummaryRequest? observedRequest;
       final events = RuntimeDebugEventService();
@@ -3643,6 +7287,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       ContextSummaryRequest? observedRequest;
       final events = RuntimeDebugEventService();
@@ -3711,6 +7356,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final events = RuntimeDebugEventService();
       final provider = ChatProvider(
@@ -3766,6 +7412,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedSystems = <String>[];
       final observedMessages = <List<Map<String, dynamic>>>[];
@@ -3833,9 +7480,13 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
+      final storage = SessionStorage();
+      await storage.init();
       final provider = ChatProvider(
+        storage: storage,
         contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
           onGenerate: (request) => _summaryForRequest(request),
         ),
@@ -3885,6 +7536,277 @@ void main() {
         expect(serialized, isNot(contains('old-compare')));
         expect(serialized, contains('compare prompt'));
       }
+      expect(await provider.useCompareResult(1), isTrue);
+      final selected = provider.currentSession!.messages.last;
+      expect(selected.textContent, 'ok 2');
+      expect(selected.alternatives, ['ok 1']);
+      expect(selected.currentProvenance?.model, 'model-b');
+      expect(selected.alternativeProvenance?.single?.model, 'model-a');
+      final reloaded = await storage.getSession(session.id);
+      expect(reloaded!.messages.last.textContent, 'ok 2');
+      expect(reloaded.messages.last.currentProvenance?.model, 'model-b');
+    });
+
+    test('compare cancellation aborts only one result and keeps successes',
+        () async {
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final disposed = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) {
+          if (config.model == 'model-a') {
+            return _BlockingCompareLlmService(
+              config,
+              started: started,
+              release: release,
+              disposed: disposed,
+            );
+          }
+          return _ScriptedLlmService(
+            config,
+            onMessages: (_) => StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'kept')],
+            )),
+          );
+        },
+      );
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.createSession();
+
+      final send =
+          provider.sendCompare('compare prompt', ['model-a', 'model-b']);
+      await started.future.timeout(const Duration(seconds: 2));
+      provider.cancelCompareResult(
+        'model-a',
+        ownerSessionId: provider.compareOwnerSessionId!,
+        compareGeneration: provider.compareOperationGeneration!,
+      );
+      await disposed.future.timeout(const Duration(seconds: 2));
+      await send.timeout(const Duration(seconds: 2));
+
+      expect(provider.compareResults, hasLength(2));
+      expect(provider.compareResults![0].state, CompareResultState.cancelled);
+      expect(provider.compareResults![1].state, CompareResultState.complete);
+      expect(provider.compareResults![1].text, 'kept');
+    });
+
+    test('run center derives active and queued work from agent state',
+        () async {
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: started,
+          release: release,
+        ),
+      );
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+      final send = provider.sendMessage('first');
+      await started.future.timeout(const Duration(seconds: 2));
+      await provider.sendMessage('second');
+
+      final item = provider.agentRunCenterItems.singleWhere(
+        (candidate) => candidate.sessionId == session.id,
+      );
+      expect(item.isActive, isTrue);
+      expect(item.queuedCount, 1);
+
+      await provider.cancelAgent(sessionId: session.id);
+      await send.timeout(const Duration(seconds: 2));
+    });
+
+    test('run center reads bounded recovery metadata for unloaded sessions',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final session = ChatSession(
+        id: 'run-center-recovery',
+        title: 'Recoverable session',
+        remoteAgentConnectorId: 'historical_remote',
+        inFlightAgentRun: _unknownRecoveryMarker('run-center-attempt'),
+      );
+      await storage.saveSession(session);
+      final provider = ChatProvider(storage: storage);
+      addTearDown(provider.dispose);
+      await _waitUntil(
+        () => provider.sessions.any((summary) => summary.id == session.id),
+      );
+
+      final items = await provider.loadRecoverableAgentRunCenterItems();
+
+      final item = items.singleWhere(
+        (candidate) => candidate.sessionId == session.id,
+      );
+      expect(item.phase, AgentRunCenterPhase.unknownOutcome);
+      expect(item.recoveryKind, InterruptedRunRecoveryKind.unknownOutcome);
+      expect(item.context, AgentRunCenterContext.external);
+      expect(item.safeExecutionDisplayName, isNull);
+    });
+
+    test(
+        'compare owner survives session switch, retry, and selected persistence',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final observed = <String, List<List<Map<String, dynamic>>>>{};
+      var modelACalls = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'unused')],
+          )),
+          onChat: (messages) {
+            observed.putIfAbsent(config.model, () => []).add(
+                  messages
+                      .map((message) => Map<String, dynamic>.from(message))
+                      .toList(),
+                );
+            if (config.model == 'model-a' && modelACalls++ == 0) {
+              throw StateError('injected');
+            }
+            return LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: '${config.model}-ok')],
+            );
+          },
+        ),
+      );
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final sessionA = await provider.createSession();
+      sessionA.messages.add(ChatMessage.user('history-a'));
+      await storage.saveSession(sessionA);
+      final sessionB = await provider.createSession();
+      sessionB.messages.add(ChatMessage.user('history-b'));
+      await storage.saveSession(sessionB);
+      await provider.selectSession(sessionA.id);
+
+      final compare = provider.sendCompare(
+        'owner prompt',
+        ['model-a', 'model-b'],
+      );
+      await provider.selectSession(sessionB.id);
+      await compare;
+
+      expect(provider.compareOwnerSessionId, sessionA.id);
+      expect(provider.compareBelongsToCurrentSession, isFalse);
+      expect(
+        provider.clearCompareResults(
+          ownerSessionId: sessionB.id,
+          compareGeneration: provider.compareOperationGeneration!,
+        ),
+        isFalse,
+      );
+      expect(provider.compareOwnerSessionId, sessionA.id);
+      for (final requests in observed.values) {
+        for (final messages in requests) {
+          final serialized = messages.toString();
+          expect(serialized, contains('history-a'));
+          expect(serialized, isNot(contains('history-b')));
+        }
+      }
+
+      await provider.retryCompareResult('model-a');
+      expect(observed['model-a'], hasLength(2));
+      expect(observed['model-a']!.last.toString(), contains('history-a'));
+      expect(
+          observed['model-a']!.last.toString(), isNot(contains('history-b')));
+
+      expect(await provider.useCompareResult(1), isTrue);
+      final persistedA = await storage.getSession(sessionA.id);
+      final persistedB = await storage.getSession(sessionB.id);
+      expect(persistedA!.messages.last.textContent, 'model-b-ok');
+      expect(persistedA.messages[persistedA.messages.length - 2].textContent,
+          'owner prompt');
+      expect(persistedB!.messages.map((message) => message.textContent),
+          ['history-b']);
+    });
+
+    test('deleted compare owner blocks terminal result and second compare',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final started = Completer<void>();
+      final release = Completer<void>();
+      final observed = <List<Map<String, dynamic>>>[];
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) =>
+            _BlockingCompareWithMessages(
+          config,
+          started: started,
+          release: release,
+          observed: observed,
+        ),
+      );
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final sessionA = await provider.createSession();
+      sessionA.messages.add(ChatMessage.user('history-a'));
+      await storage.saveSession(sessionA);
+      final sessionB = await provider.createSession();
+      sessionB.messages.add(ChatMessage.user('history-b'));
+      await storage.saveSession(sessionB);
+      await provider.selectSession(sessionA.id);
+
+      final first =
+          provider.sendCompare('owner prompt', ['model-a', 'model-b']);
+      await started.future.timeout(const Duration(seconds: 2));
+      await provider.selectSession(sessionB.id);
+      await provider.sendCompare('second prompt', ['model-c', 'model-d']);
+      expect(provider.compareOwnerSessionId, sessionA.id);
+      await provider.deleteSession(sessionA.id);
+      release.complete();
+      await first.timeout(const Duration(seconds: 2));
+
+      expect(await provider.useCompareResult(0), isFalse);
+      expect(await storage.getSession(sessionA.id), isNull);
+      expect(observed.single.toString(), contains('history-a'));
+      expect(observed.single.toString(), isNot(contains('history-b')));
+    });
+
+    test(
+        'owner tombstone immediately after capture prevents any compare request',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      var requests = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'unused')],
+          )),
+          onChat: (_) {
+            requests++;
+            return const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'should-not-run')],
+            );
+          },
+        ),
+      );
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final owner = await provider.createSession();
+
+      final compare =
+          provider.sendCompare('owner prompt', ['model-a', 'model-b']);
+      storage.tombstoneSession(owner.id);
+      await compare;
+
+      expect(requests, 0);
+      expect(await provider.useCompareResult(0), isFalse);
     });
 
     test('sendCompare compresses old large tool results', () async {
@@ -3992,6 +7914,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedSystems = <String>[];
       final provider = ChatProvider(
@@ -4069,6 +7992,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedSystems = <String>[];
       final provider = ChatProvider(
@@ -4132,6 +8056,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedSystems = <String>[];
       var summaryCalls = 0;
@@ -4174,6 +8099,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final observedSystems = <String>[];
@@ -4260,7 +8186,7 @@ void main() {
           .recent(sessionId: session.id)
           .where((event) => event.type == 'token.calibration.updated')
           .single;
-      expect(calibrationEvent.data['keyHash'], isA<String>());
+      expect(calibrationEvent.data.containsKey('keyHash'), isFalse);
       expect(calibrationEvent.data['newMultiplier'], greaterThan(1.0));
       expect(calibrationEvent.data.toString(), isNot(contains('127.0.0.1')));
     });
@@ -4390,6 +8316,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       var requestCount = 0;
       final observedMessages = <List<Map<String, dynamic>>>[];
@@ -4595,7 +8522,7 @@ void main() {
           .where((event) => event.type == 'tool.preflight.repaired')
           .single;
       expect(event.data['repairCount'], 1);
-      expect(event.data['repairTypes'], {'json_closure': 1});
+      expect(event.data['jsonClosureRepairCount'], 1);
       expect(event.data.containsKey('toolName'), isFalse);
       expect(event.data.toString(), isNot(contains('hi')));
       expect(event.data.toString(), isNot(contains('text')));
@@ -4729,6 +8656,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final observedMessages = <List<Map<String, dynamic>>>[];
       final observedTools = <int>[];
@@ -4781,6 +8709,7 @@ void main() {
       SharedPreferences.setMockInitialValues({
         'active_provider_profile_id': 'profile',
         'context_token_budget': 32768,
+        'developer_mode': true,
       });
       final tools = ToolRegistry()
         ..register(_LargeSchemaTool(), risk: ToolRisk.safe);
@@ -5231,6 +9160,36 @@ class _ResetPauseLlmService extends LlmService {
   }
 }
 
+class _GuardedSecretPauseLlmService extends LlmService {
+  final String sentinel;
+  final Completer<void> buffered;
+  final Completer<void> release;
+
+  _GuardedSecretPauseLlmService(
+    super.config, {
+    required this.sentinel,
+    required this.buffered,
+    required this.release,
+  });
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    yield TextDelta('visible $sentinel');
+    yield ReasoningDelta('reasoning $sentinel');
+    yield ToolUseStart('set_secret_cancel', 'set_env_var');
+    yield ToolInputDelta(
+      '{"name":"CANCELLED_TOKEN","value":"$sentinel"}',
+    );
+    if (!buffered.isCompleted) buffered.complete();
+    await release.future;
+    yield StreamError('cancelled test stream');
+  }
+}
+
 class _BlockingLlmService extends LlmService {
   final Completer<void> started;
   final Completer<void> release;
@@ -5268,6 +9227,153 @@ class _BlockingLlmService extends LlmService {
     if (!release.isCompleted) release.complete();
     super.dispose();
   }
+}
+
+class _ManualTimerScheduler {
+  final List<_ManualTimer> _timers = [];
+
+  int get createdCount => _timers.length;
+  int get activeCount => _timers.where((timer) => timer.isActive).length;
+
+  Timer schedule(Duration duration, void Function() callback) {
+    final timer = _ManualTimer(callback);
+    _timers.add(timer);
+    return timer;
+  }
+
+  void fireAll() {
+    for (final timer in List<_ManualTimer>.from(_timers)) {
+      timer.fire();
+    }
+  }
+}
+
+class _ManualTimer implements Timer {
+  _ManualTimer(this._callback);
+
+  final void Function() _callback;
+  bool _active = true;
+  int _tick = 0;
+
+  void fire() {
+    if (!_active) return;
+    _active = false;
+    _tick = 1;
+    _callback();
+  }
+
+  @override
+  void cancel() => _active = false;
+
+  @override
+  bool get isActive => _active;
+
+  @override
+  int get tick => _tick;
+}
+
+class _BlockingCompareLlmService extends LlmService {
+  _BlockingCompareLlmService(
+    super.config, {
+    required this.started,
+    required this.release,
+    required this.disposed,
+  });
+
+  final Completer<void> started;
+  final Completer<void> release;
+  final Completer<void> disposed;
+
+  @override
+  Future<LlmResponse> chat({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    List<ToolDefinition>? tools,
+  }) async {
+    if (!started.isCompleted) started.complete();
+    await release.future;
+    return const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'ignored')],
+    );
+  }
+
+  @override
+  void dispose() {
+    if (!disposed.isCompleted) disposed.complete();
+    if (!release.isCompleted) release.complete();
+    super.dispose();
+  }
+}
+
+class _BlockingCompareWithMessages extends LlmService {
+  _BlockingCompareWithMessages(
+    super.config, {
+    required this.started,
+    required this.release,
+    required this.observed,
+  });
+
+  final Completer<void> started;
+  final Completer<void> release;
+  final List<List<Map<String, dynamic>>> observed;
+
+  @override
+  Future<LlmResponse> chat({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    List<ToolDefinition>? tools,
+  }) async {
+    observed.add(
+      messages.map((message) => Map<String, dynamic>.from(message)).toList(),
+    );
+    if (!started.isCompleted) started.complete();
+    await release.future;
+    return const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'late')],
+    );
+  }
+}
+
+class _CountingRuntimeDebugEventService extends RuntimeDebugEventService {
+  int setTracingEnabledCalls = 0;
+
+  @override
+  void setTracingEnabled(bool enabled) {
+    setTracingEnabledCalls++;
+    super.setTracingEnabled(enabled);
+  }
+}
+
+class _RejectingAttachmentBudget extends AttachmentBudget {
+  const _RejectingAttachmentBudget();
+
+  @override
+  void checkMessageAttachments(List<MessageContent> attachments) {
+    throw const AttachmentBudgetException('injected attachment rejection');
+  }
+}
+
+AgentRunRecoveryMarker _unknownRecoveryMarker(String runAttemptId) {
+  final timestamp = DateTime.utc(2026, 7, 10);
+  return AgentRunRecoveryMarker(
+    runAttemptId: runAttemptId,
+    startedAt: timestamp,
+    updatedAt: timestamp,
+    phase: AgentRunRecoveryPhase.toolInFlight,
+    toolAttempts: [
+      ToolAttemptRecoveryMetadata(
+        operationId: 'unknown-operation-$runAttemptId',
+        toolName: 'web_fetch',
+        risk: RecoveryToolRisk.moderate,
+        lifecycle: ToolAttemptLifecycle.interruptedUnknown,
+        proposedAt: timestamp,
+        updatedAt: timestamp,
+        executionStartedAt: timestamp,
+      ),
+    ],
+  );
 }
 
 class _ThrowingInitSessionStorage extends SessionStorage {
@@ -5360,7 +9466,127 @@ caps.ResolvedModelProfile _resolvedProfileWithCapabilities(
   );
 }
 
+VerifiedSkillUse _providerVerifiedSkill({List<String> tools = const []}) {
+  return VerifiedSkillUse(
+    id: 'com.example.recovery',
+    name: 'Recovery skill',
+    path: '/root/workspace/skills/com.example.recovery/SKILL.md',
+    skillContent: 'verified recovery skill',
+    capabilities: ExtensionCapabilitySnapshot(
+      tools: tools,
+      commands: const [],
+      networkDomains: const [],
+      filesystemRead: const [],
+      filesystemWrite: const [],
+      androidIntents: const [],
+      androidPermissions: const [],
+      secretNames: const [],
+      runtimes: const [],
+      subprocessRequired: false,
+      riskTier: 'low',
+      updatePolicy: 'manual',
+    ),
+    manifestDigest: List.filled(64, 'a').join(),
+    contentDigest: List.filled(64, 'b').join(),
+    trustDigest: List.filled(64, 'c').join(),
+    legacy: false,
+  );
+}
+
+ChatSession _skillBoundRecoverySession({
+  required String id,
+  required VerifiedSkillUse activation,
+}) {
+  final timestamp = DateTime.utc(2026, 7, 7);
+  return ChatSession(
+    id: id,
+    messages: [
+      ChatMessage.user('original skill task'),
+      ChatMessage(
+        role: 'assistant',
+        content: [
+          ToolUseContent(
+            id: 'skill_activation_call',
+            name: 'load_skill',
+            input: {'id': activation.id},
+          ),
+        ],
+      ),
+      ChatMessage(
+        role: 'user',
+        content: [
+          ToolResultContent(
+            toolUseId: 'skill_activation_call',
+            output: 'skill activated',
+            metadata: {
+              'skillId': activation.id,
+              'skillTrustDigest': activation.trustDigest,
+              'skillRunAttemptId': 'skill-origin-run',
+            },
+          ),
+        ],
+      ),
+    ],
+    inFlightAgentRun: AgentRunRecoveryMarker(
+      runAttemptId: 'skill-origin-run',
+      startedAt: timestamp,
+      updatedAt: timestamp,
+    ),
+  );
+}
+
+ChatSession _resultPersistedRecoverySession({
+  required String id,
+  required DateTime timestamp,
+}) {
+  return ChatSession(
+    id: id,
+    messages: [
+      ChatMessage.user('original task'),
+      ChatMessage(
+        role: 'assistant',
+        content: [
+          ToolUseContent(
+            id: 'old_completed_call',
+            name: 'echo',
+            input: const {'text': 'already completed'},
+          ),
+        ],
+      ),
+      ChatMessage(
+        role: 'user',
+        content: [
+          ToolResultContent(
+            toolUseId: 'old_completed_call',
+            output: 'saved result',
+            metadata: const {'operationId': 'old_completed_operation'},
+          ),
+        ],
+      ),
+    ],
+    inFlightAgentRun: AgentRunRecoveryMarker(
+      runAttemptId: 'result-persisted-origin',
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      toolAttempts: [
+        ToolAttemptRecoveryMetadata(
+          operationId: 'old_completed_operation',
+          toolName: 'echo',
+          risk: RecoveryToolRisk.dangerous,
+          lifecycle: ToolAttemptLifecycle.resultPersisted,
+          proposedAt: timestamp,
+          updatedAt: timestamp,
+          executionStartedAt: timestamp,
+          executionOutcomeKnown: true,
+        ),
+      ],
+    ),
+  );
+}
+
 class _EchoTool extends Tool {
+  int executionCount = 0;
+
   @override
   String get name => 'echo';
 
@@ -5377,7 +9603,85 @@ class _EchoTool extends Tool {
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
+    executionCount++;
     return input['text']?.toString() ?? '';
+  }
+}
+
+class _BlockingDangerousTool extends Tool {
+  final Completer<void> started = Completer<void>();
+  final Completer<void> release = Completer<void>();
+  int executionCount = 0;
+
+  @override
+  String get name => 'slow_dangerous';
+
+  @override
+  String get description => 'Slow non-cancellable tool';
+
+  @override
+  Map<String, dynamic> get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'value': {'type': 'string'},
+        },
+      };
+
+  @override
+  Future<String> execute(Map<String, dynamic> input) async {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<ToolResultPayload> executeResultWithOperationAndCancellation(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    required String operationId,
+    required ToolCancellationSignal cancellationSignal,
+  }) async {
+    executionCount++;
+    if (!started.isCompleted) started.complete();
+    await release.future;
+    return const ToolResultPayload(forUser: 'late result');
+  }
+}
+
+class _CancellableDangerousTool extends Tool {
+  final Completer<void> started = Completer<void>();
+  final Completer<void> confirmAbort = Completer<void>();
+  final Completer<void> abortReported = Completer<void>();
+
+  @override
+  String get name => 'cancellable_http';
+
+  @override
+  String get description => 'Cancellable HTTP-like tool';
+
+  @override
+  Map<String, dynamic> get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'value': {'type': 'string'},
+        },
+      };
+
+  @override
+  Future<String> execute(Map<String, dynamic> input) async {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<ToolResultPayload> executeResultWithOperationAndCancellation(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    required String operationId,
+    required ToolCancellationSignal cancellationSignal,
+  }) async {
+    if (!started.isCompleted) started.complete();
+    await cancellationSignal.whenCancelled;
+    await confirmAbort.future;
+    if (!abortReported.isCompleted) abortReported.complete();
+    throw const ToolExecutionCancelledException(sideEffectsPrevented: true);
   }
 }
 

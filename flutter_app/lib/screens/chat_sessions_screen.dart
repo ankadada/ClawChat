@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:provider/provider.dart';
 
 import '../app.dart';
@@ -12,12 +14,21 @@ import '../providers/chat_provider.dart';
 import '../services/native_bridge.dart';
 import '../services/session_storage.dart';
 import '../l10n/app_strings.dart';
+import '../widgets/foldable_dialog_region.dart';
 
 const _defaultNewChatModelGroupSelection = '__default_provider_profile__';
 
+enum _SessionExportDestination { save, share, copy }
+
 class ChatSessionsScreen extends StatefulWidget {
   final bool embedded;
-  const ChatSessionsScreen({super.key, this.embedded = false});
+  final Future<List<SessionSearchResult>> Function(String query)?
+      sessionSearcher;
+  const ChatSessionsScreen({
+    super.key,
+    this.embedded = false,
+    this.sessionSearcher,
+  });
 
   @override
   State<ChatSessionsScreen> createState() => _ChatSessionsScreenState();
@@ -29,6 +40,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
   Timer? _searchDebounce;
   int _searchGeneration = 0;
   bool _searching = false;
+  String? _searchError;
   List<SessionSearchResult> _searchResults = [];
   String? _selectedFolder; // null = show all
 
@@ -124,19 +136,80 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     }
 
     final text = buffer.toString();
-    try {
-      await NativeBridge.shareText(text: text, subject: fullSession.title);
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text(AppStrings.shareSheetOpened)),
-      );
-    } catch (e) {
-      await Clipboard.setData(ClipboardData(text: text));
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${AppStrings.shareFailed}: $e')),
-      );
+    if (utf8.encode(text).length > SessionStorage.maxTransferBytes) {
+      _showSafeFailure(AppStrings.exportTooLarge);
+      return;
     }
+    if (!mounted) return;
+    final destination = await showDialog<_SessionExportDestination>(
+      context: context,
+      builder: (context) => FoldableDialogRegion(
+          child: AlertDialog(
+        title: const Text(AppStrings.exportChat),
+        content: const Text(AppStrings.chooseExportDestination),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(
+              context,
+              _SessionExportDestination.copy,
+            ),
+            child: const Text(AppStrings.copy),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(
+              context,
+              _SessionExportDestination.share,
+            ),
+            child: const Text(AppStrings.androidShare),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(
+              context,
+              _SessionExportDestination.save,
+            ),
+            child: const Text(AppStrings.saveFile),
+          ),
+        ],
+      )),
+    );
+    if (destination == null) return;
+    try {
+      switch (destination) {
+        case _SessionExportDestination.copy:
+          await Clipboard.setData(ClipboardData(text: text));
+        case _SessionExportDestination.share:
+          final opened = await NativeBridge.shareText(
+            text: text,
+            subject: fullSession.title,
+          );
+          if (!opened) throw StateError('share unavailable');
+        case _SessionExportDestination.save:
+          final path = await FilePicker.platform.saveFile(
+            dialogTitle: AppStrings.saveConversationExport,
+            fileName: 'clawchat-session.md',
+            allowedExtensions: const ['md'],
+            type: FileType.custom,
+          );
+          if (path == null) return;
+          final destination = File(path);
+          final temp = File('$path.tmp');
+          await temp.writeAsString(text, flush: true);
+          await temp.rename(destination.path);
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.exportDestinationComplete)),
+      );
+    } catch (_) {
+      _showSafeFailure(AppStrings.exportDestinationFailed);
+    }
+  }
+
+  void _showSafeFailure(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 
   String _messageContentToMarkdown(ChatMessage message) {
@@ -155,7 +228,9 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
         case ToolUseContent(:final name, :final input):
           buffer.writeln('**Tool call**: `$name`');
           buffer.writeln('```json');
-          buffer.writeln(const JsonEncoder.withIndent('  ').convert(input));
+          buffer.writeln(const JsonEncoder.withIndent('  ').convert(
+            ToolUseContent.sanitizedInput(name, input),
+          ));
           buffer.writeln('```');
         case ToolResultContent(:final output):
           buffer.writeln('**Tool result**:');
@@ -181,6 +256,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
       setState(() {
         _searchQuery = '';
         _searching = false;
+        _searchError = null;
         _searchResults = [];
       });
       return;
@@ -190,19 +266,38 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     setState(() {
       _searchQuery = query;
       _searching = true;
+      _searchError = null;
     });
 
     _searchDebounce = Timer(const Duration(milliseconds: 220), () async {
-      final storage = SessionStorage();
-      await storage.init();
-      final results = await storage.searchSessions(query);
-      if (!mounted || generation != _searchGeneration) return;
-      setState(() {
-        _searchResults = results;
-        _searching = false;
-      });
+      try {
+        final searcher = widget.sessionSearcher ??
+            (String value) async {
+              final storage = SessionStorage();
+              await storage.init();
+              return storage.searchSessions(value);
+            };
+        final results = await searcher(query);
+        if (!mounted || generation != _searchGeneration) return;
+        setState(() {
+          _searchResults = results;
+          _searchError = null;
+        });
+      } catch (_) {
+        if (!mounted || generation != _searchGeneration) return;
+        setState(() {
+          _searchResults = [];
+          _searchError = AppStrings.sessionSearchFailed;
+        });
+      } finally {
+        if (mounted && generation == _searchGeneration) {
+          setState(() => _searching = false);
+        }
+      }
     });
   }
+
+  void _retrySearch() => _setSearchQuery(_searchController.text);
 
   @override
   Widget build(BuildContext context) {
@@ -376,12 +471,36 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                   ],
                 ),
               ),
+            if (_searchError != null)
+              Semantics(
+                liveRegion: true,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          _searchError!,
+                          style: TextStyle(color: theme.colorScheme.error),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: _retrySearch,
+                        child: const Text(AppStrings.retry),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             Expanded(
               child: _searching && filteredSessions.isEmpty
                   ? const Center(child: CircularProgressIndicator())
                   : filteredSessions.isEmpty
                       ? Center(
-                          child: Text(AppStrings.noChats,
+                          child: Text(
+                              _searchQuery.isEmpty
+                                  ? AppStrings.noChats
+                                  : AppStrings.noSearchResults,
                               style: theme.textTheme.bodyLarge?.copyWith(
                                   color: theme.colorScheme.onSurfaceVariant)),
                         )
@@ -522,7 +641,8 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
       confirmDismiss: (_) async {
         return await showDialog<bool>(
           context: context,
-          builder: (ctx) => AlertDialog(
+          builder: (ctx) => FoldableDialogRegion(
+              child: AlertDialog(
             title: const Text(AppStrings.deleteChat),
             content: Text(AppStrings.deleteChatConfirm(session.title)),
             actions: [
@@ -535,12 +655,12 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
                 child: const Text(AppStrings.delete),
               ),
             ],
-          ),
+          )),
         );
       },
-      onDismissed: (_) {
+      onDismissed: (_) async {
         HapticFeedback.lightImpact();
-        provider.deleteSession(session.id);
+        await _deleteWithUndo(session, provider);
       },
       background: Container(
         alignment: Alignment.centerRight,
@@ -752,7 +872,8 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
   ) async {
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => FoldableDialogRegion(
+          child: AlertDialog(
         title: const Text(AppStrings.deleteChat),
         content: Text(AppStrings.deleteChatConfirm(session.title)),
         actions: [
@@ -768,11 +889,29 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
             child: const Text(AppStrings.delete),
           ),
         ],
-      ),
+      )),
     );
     if (confirmed != true) return;
     HapticFeedback.lightImpact();
+    await _deleteWithUndo(session, provider);
+  }
+
+  Future<void> _deleteWithUndo(
+    SessionSummary session,
+    ChatProvider provider,
+  ) async {
     await provider.deleteSession(session.id);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text(AppStrings.movedSessionToTrash),
+        action: SnackBarAction(
+          label: AppStrings.undo,
+          onPressed: () =>
+              unawaited(provider.restoreDeletedSession(session.id)),
+        ),
+      ),
+    );
   }
 
   Future<void> _showMoveToFolderDialog(BuildContext context,
@@ -788,7 +927,8 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
 
     final result = await showDialog<String?>(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => FoldableDialogRegion(
+          child: AlertDialog(
         title: const Text(AppStrings.moveToFolder),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -820,7 +960,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
             child: const Text(AppStrings.cancel),
           ),
         ],
-      ),
+      )),
     );
 
     if (result == null) return;
@@ -890,13 +1030,15 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
 
   Future<void> _confirmClearAll(BuildContext context) async {
     final provider = context.read<ChatProvider>();
+    final messenger = ScaffoldMessenger.of(context);
     if (provider.sessions.isEmpty) return;
 
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text(AppStrings.clearAllSessions),
-        content: const Text(AppStrings.clearAllConfirm),
+        content:
+            Text(AppStrings.clearAllConfirmCount(provider.sessions.length)),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -911,7 +1053,20 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
       ),
     );
     if (confirmed == true) {
+      final ids = provider.sessions.map((session) => session.id).toList();
       await provider.clearAllSessions();
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(AppStrings.movedSessionsToTrash(ids.length)),
+          action: SnackBarAction(
+            label: AppStrings.undo,
+            onPressed: () => unawaited(Future.wait(
+              ids.map(provider.restoreDeletedSession),
+            )),
+          ),
+        ),
+      );
     }
   }
 
@@ -958,20 +1113,22 @@ class _DateHeaderDelegate extends SliverPersistentHeaderDelegate {
     double shrinkOffset,
     bool overlapsContent,
   ) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: theme.scaffoldBackgroundColor,
-        border: Border(
-          bottom: BorderSide(color: theme.colorScheme.outline.withAlpha(35)),
+    return SizedBox.expand(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: theme.scaffoldBackgroundColor,
+          border: Border(
+            bottom: BorderSide(color: theme.colorScheme.outline.withAlpha(35)),
+          ),
         ),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(18, 8, 18, 6),
-        child: Text(
-          label,
-          style: theme.textTheme.labelMedium?.copyWith(
-            color: theme.colorScheme.primary,
-            fontWeight: FontWeight.w800,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(18, 8, 18, 6),
+          child: Text(
+            label,
+            style: theme.textTheme.labelMedium?.copyWith(
+              color: theme.colorScheme.primary,
+              fontWeight: FontWeight.w800,
+            ),
           ),
         ),
       ),

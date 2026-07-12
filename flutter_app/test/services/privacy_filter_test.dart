@@ -5,18 +5,24 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('PrivacyFilter.maskEnvVarValues', () {
-    test('fully masks short and long environment values', () {
+    test('does not corrupt ordinary text for short or common values', () {
       final output = PrivacyFilter.maskEnvVarValues(
-        'a=x b=ab token=supersecret12345',
+        'x marks text; password guidance stays readable',
         const {
           'ONE': 'x',
-          'TWO': 'ab',
-          'SECRET': 'supersecret12345',
+          'COMMON': 'password',
         },
       );
 
-      expect(output, isNot(contains('x')));
-      expect(output, isNot(contains('ab')));
+      expect(output, 'x marks text; password guidance stays readable');
+    });
+
+    test('fully masks distinctive long environment values', () {
+      final output = PrivacyFilter.maskEnvVarValues(
+        'token=supersecret12345',
+        const {'SECRET': 'supersecret12345'},
+      );
+
       expect(output, isNot(contains('supersecret12345')));
       expect(output, contains('********'));
       expect(output, isNot(contains('sup')));
@@ -36,7 +42,7 @@ void main() {
     });
 
     test('masks URL-safe base64 variants', () {
-      const secret = '?????abc';
+      const secret = 'url-safe-secret-?????abc';
       final encoded = base64Url.encode(utf8.encode(secret));
       expect(encoded, contains('_'));
       final output = PrivacyFilter.maskEnvVarValues(

@@ -5,6 +5,7 @@ import '../app.dart';
 import '../models/chat_models.dart';
 import '../providers/chat_provider.dart';
 import '../l10n/app_strings.dart';
+import '../screens/agent_run_center_screen.dart';
 
 class AgentStatusBar extends StatelessWidget {
   const AgentStatusBar({super.key});
@@ -16,13 +17,22 @@ class AgentStatusBar extends StatelessWidget {
     return Consumer<ChatProvider>(
       builder: (_, provider, __) {
         if (provider.agentStatus == AgentStatus.idle) {
-          return _animatedStatusBar(const SizedBox.shrink(key: ValueKey('idle')));
+          return _animatedStatusBar(
+              const SizedBox.shrink(key: ValueKey('idle')));
         }
 
         final activeToolName = _activeToolName(provider);
         final (icon, label, color) = switch (provider.agentStatus) {
-          AgentStatus.thinking => (Icons.psychology, AppStrings.statusThinking, theme.colorScheme.primary),
-          AgentStatus.streaming => (Icons.edit, AppStrings.statusStreaming, theme.colorScheme.primary),
+          AgentStatus.thinking => (
+              Icons.psychology,
+              AppStrings.statusThinking,
+              theme.colorScheme.primary
+            ),
+          AgentStatus.streaming => (
+              Icons.edit,
+              AppStrings.statusStreaming,
+              theme.colorScheme.primary
+            ),
           AgentStatus.tooling => (
               Icons.build,
               activeToolName == null
@@ -30,8 +40,16 @@ class AgentStatusBar extends StatelessWidget {
                   : AppStrings.toolExecuting(activeToolName),
               AppColors.statusAmber,
             ),
-          AgentStatus.error => (Icons.error_outline, provider.errorMessage ?? AppStrings.statusError, theme.colorScheme.error),
-          _ => (Icons.hourglass_empty, AppStrings.statusProcessing, theme.colorScheme.primary),
+          AgentStatus.error => (
+              Icons.error_outline,
+              provider.errorMessage ?? AppStrings.statusError,
+              theme.colorScheme.error
+            ),
+          _ => (
+              Icons.hourglass_empty,
+              AppStrings.statusProcessing,
+              theme.colorScheme.primary
+            ),
         };
 
         final isError = provider.agentStatus == AgentStatus.error;
@@ -47,7 +65,8 @@ class AgentStatusBar extends StatelessWidget {
           width: double.infinity,
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           decoration: BoxDecoration(
-            color: Color.alphaBlend(color.withAlpha(18), theme.colorScheme.surface),
+            color: Color.alphaBlend(
+                color.withAlpha(18), theme.colorScheme.surface),
             border: Border(
               bottom: BorderSide(color: color.withAlpha(65)),
             ),
@@ -60,13 +79,24 @@ class AgentStatusBar extends StatelessWidget {
             ],
           ),
           child: Row(
-            crossAxisAlignment: isError ? CrossAxisAlignment.start : CrossAxisAlignment.center,
+            crossAxisAlignment:
+                isError ? CrossAxisAlignment.start : CrossAxisAlignment.center,
             children: [
+              IconButton(
+                tooltip: AppStrings.openAgentRunCenter,
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => const AgentRunCenterScreen(),
+                  ),
+                ),
+                icon: Icon(Icons.view_list_outlined, size: 18, color: color),
+              ),
               if (!isError)
                 provider.agentStatus == AgentStatus.thinking
                     ? RepaintBoundary(child: _PulsingStatusDot(color: color))
                     : SizedBox(
-                        width: 14, height: 14,
+                        width: 14,
+                        height: 14,
                         child: RepaintBoundary(
                           child: CircularProgressIndicator(
                             strokeWidth: 2,
@@ -87,13 +117,15 @@ class AgentStatusBar extends StatelessWidget {
                         borderRadius: BorderRadius.circular(AppRadii.s),
                         child: Text(
                           label,
-                          style: theme.textTheme.bodySmall?.copyWith(color: color),
+                          style:
+                              theme.textTheme.bodySmall?.copyWith(color: color),
                           maxLines: 10,
                         ),
                       )
                     : Text(
                         label,
-                        style: theme.textTheme.bodySmall?.copyWith(color: color),
+                        style:
+                            theme.textTheme.bodySmall?.copyWith(color: color),
                         overflow: TextOverflow.ellipsis,
                       ),
               ),
@@ -102,7 +134,8 @@ class AgentStatusBar extends StatelessWidget {
                   tooltip: AppStrings.copy,
                   icon: Icon(Icons.copy, size: 16, color: color),
                   padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
+                  constraints:
+                      const BoxConstraints(minWidth: 44, minHeight: 44),
                   onPressed: copyError,
                 )
               else
@@ -112,7 +145,8 @@ class AgentStatusBar extends StatelessWidget {
                     padding: const EdgeInsets.symmetric(horizontal: 12),
                     minimumSize: const Size(48, 48),
                   ),
-                  child: Text(AppStrings.cancel, style: TextStyle(color: color, fontSize: 12)),
+                  child: Text(AppStrings.cancel,
+                      style: TextStyle(color: color, fontSize: 12)),
                 ),
             ],
           ),
@@ -178,7 +212,19 @@ class _PulsingStatusDotState extends State<_PulsingStatusDot>
   late final AnimationController _controller = AnimationController(
     vsync: this,
     duration: const Duration(milliseconds: 1200),
-  )..repeat(reverse: true);
+  );
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _controller
+        ..stop()
+        ..value = 1;
+    } else if (!_controller.isAnimating) {
+      _controller.repeat(reverse: true);
+    }
+  }
 
   @override
   void dispose() {
@@ -200,7 +246,8 @@ class _PulsingStatusDotState extends State<_PulsingStatusDot>
               width: size,
               height: size,
               decoration: BoxDecoration(
-                color: widget.color.withAlpha(150 + (_controller.value * 50).round()),
+                color: widget.color
+                    .withAlpha(150 + (_controller.value * 50).round()),
                 shape: BoxShape.circle,
               ),
             ),

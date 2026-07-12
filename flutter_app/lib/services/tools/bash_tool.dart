@@ -1,5 +1,4 @@
 import '../native_bridge.dart';
-import '../preferences_service.dart';
 import 'tool_registry.dart';
 
 class BashTool extends Tool {
@@ -103,6 +102,10 @@ class BashTool extends Tool {
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
+    return _execute(input);
+  }
+
+  Future<String> _execute(Map<String, dynamic> input) async {
     final command = input['command'] as String;
     final timeout = (input['timeout'] as num?)?.toInt() ?? 120;
 
@@ -116,19 +119,15 @@ class BashTool extends Tool {
           'Potentially dangerous commands (rm -rf /, mkfs, dd, fork bombs, etc.) are not allowed.';
     }
 
-    // Inject user-configured environment variables
-    final envVars = PreferencesService().envVars;
-    final envPrefix = envVars.entries
-        .map((e) => 'export ${_shellSafeKey(e.key)}=${_shellQuote(e.value)}')
-        .join('; ');
-
     // Prepend workspace cd for commands that don't explicitly set their own directory
     const workingDir = '/root/workspace';
     final cdPrefix = command.trimLeft().startsWith('cd ')
         ? ''
         : 'cd $workingDir 2>/dev/null; ';
-    final effectiveCommand =
-        '${envPrefix.isNotEmpty ? "$envPrefix; " : ""}$cdPrefix$command';
+    // Raw user-configured secrets are never injected into a general-purpose
+    // shell. A future secret consumer must use a purpose-specific broker that
+    // cannot echo, transform, persist, or export the value.
+    final effectiveCommand = '$cdPrefix$command';
 
     try {
       final output = await NativeBridge.runInProot(
@@ -144,13 +143,5 @@ class BashTool extends Tool {
     } catch (e) {
       return 'Error: $e';
     }
-  }
-
-  static String _shellSafeKey(String key) {
-    return key.replaceAll(RegExp(r'[^a-zA-Z0-9_]'), '_');
-  }
-
-  static String _shellQuote(String value) {
-    return "'${value.replaceAll("'", "'\\''")}'";
   }
 }

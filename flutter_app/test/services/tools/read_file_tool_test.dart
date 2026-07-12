@@ -9,6 +9,7 @@ void main() {
   const channel = MethodChannel(AppConstants.channelName);
   final tool = ReadFileTool();
   String? lastReadPath;
+  List<String>? lastAllowedRoots;
 
   setUpAll(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -16,6 +17,14 @@ void main() {
       if (call.method == 'readRootfsFile') {
         final args = Map<String, dynamic>.from(call.arguments as Map);
         lastReadPath = args['path'] as String;
+        lastAllowedRoots = (args['allowedRoots'] as List?)?.cast<String>();
+        if (lastReadPath!.contains('linked-outside') ||
+            lastReadPath!.contains('scope-link')) {
+          throw PlatformException(
+            code: 'ROOTFS_READ_ERROR',
+            message: 'Symlink traversal is not allowed',
+          );
+        }
         return 'fake content';
       }
       return null;
@@ -125,6 +134,32 @@ void main() {
 
     test('difference from WriteFileTool: workspace root allowed', () async {
       expect(await resolvePath('/root/workspace'), '/root/workspace');
+    });
+  });
+
+  group('ReadFileTool native scope enforcement', () {
+    test('passes the declared scope to the native open boundary', () async {
+      await tool.executeWithAllowedScopes(
+        {'path': '/root/workspace/scoped/file.txt'},
+        const {'/root/workspace/scoped'},
+      );
+      expect(lastAllowedRoots, ['/root/workspace/scoped']);
+    });
+
+    test('fails closed for a pre-existing symlink escape', () async {
+      final result = await tool.executeWithAllowedScopes(
+        {'path': '/root/workspace/scoped/linked-outside/private.txt'},
+        const {'/root/workspace/scoped'},
+      );
+      expect(result, startsWith('Error reading file:'));
+    });
+
+    test('fails closed when the declared scope root is a symlink', () async {
+      final result = await tool.executeWithAllowedScopes(
+        {'path': '/root/workspace/scope-link/private.txt'},
+        const {'/root/workspace/scope-link'},
+      );
+      expect(result, startsWith('Error reading file:'));
     });
   });
 }

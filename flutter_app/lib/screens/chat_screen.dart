@@ -13,6 +13,7 @@ import '../app.dart';
 import '../constants.dart';
 import '../models/chat_models.dart';
 import '../models/provider_profile.dart';
+import '../models/workspace_import_receipt.dart';
 import '../providers/chat_provider.dart';
 import '../services/preferences_service.dart';
 import '../services/current_session_search.dart';
@@ -33,6 +34,8 @@ import '../widgets/compare_view.dart';
 import '../services/tts_service.dart';
 import '../services/whisper_service.dart';
 import 'artifact_preview_screen.dart';
+import 'agent_run_center_screen.dart';
+import 'full_response_screen.dart';
 import 'dashboard_screen.dart';
 import 'model_api_settings_screen.dart';
 import 'settings_screen.dart';
@@ -71,6 +74,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final TtsService _tts = TtsService();
   final WhisperService _whisper = WhisperService();
   final VoiceInputStateMachine _voiceInput = VoiceInputStateMachine();
+  Timer? _voiceElapsedTicker;
+  DateTime? _voiceStartedAt;
   final SharedContentPreparer _sharedContentPreparer =
       const SharedContentPreparer();
   final UsageSummaryService _usageSummaryService = const UsageSummaryService();
@@ -80,6 +85,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   ToolApprovalRequest? _shownApprovalRequest;
   final List<MessageContent> _pendingAttachments = [];
   final List<_PendingAttachmentPreview> _pendingAttachmentPreviews = [];
+  final Set<String> _workspaceImportsBeingCommitted = {};
   final Set<String> _seenMessageAnimationIds = {};
   String? _seenAnimationSessionId;
   bool _queueExpanded = false;
@@ -230,9 +236,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final provider = context.read<ChatProvider>();
     final riskColor = _riskColor(request.risk);
     final arguments = _formatToolArguments(request);
-    final alwaysAsk =
-        provider.toolApprovalPolicy == PreferencesService.toolApprovalAlways;
-
     return showModalBottomSheet<void>(
       context: context,
       isDismissible: false,
@@ -321,23 +324,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ),
                     OutlinedButton(
                       onPressed: () {
-                        PreferencesService().toolApprovalPolicy =
-                            PreferencesService.toolApprovalAuto;
                         Navigator.pop(ctx);
-                        provider.resolveToolApproval(true);
+                        provider.resolveToolApproval(
+                          true,
+                          rememberForSession: true,
+                        );
                       },
-                      child: const Text(AppStrings.toolApprovalAllowAuto),
+                      child: const Text(AppStrings.toolApprovalAllowSession),
                     ),
                     FilledButton(
                       onPressed: () {
                         Navigator.pop(ctx);
                         provider.resolveToolApproval(true);
                       },
-                      child: Text(
-                        alwaysAsk
-                            ? AppStrings.toolApprovalAllowOnce
-                            : AppStrings.toolApprovalAllowSession,
-                      ),
+                      child: const Text(AppStrings.toolApprovalAllowOnce),
                     ),
                   ],
                 ),
@@ -350,6 +350,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   String _formatToolArguments(ToolApprovalRequest request) {
+    if (request.toolName == 'set_env_var') {
+      final safe = ToolUseContent.sanitizedInput(
+        request.toolName,
+        request.arguments,
+      );
+      try {
+        return const JsonEncoder.withIndent('  ').convert(safe);
+      } catch (_) {
+        return '{"name":"invalid","value":"${ToolUseContent.redactedSecretValue}"}';
+      }
+    }
     if (request.toolName == 'bash') {
       final command = request.arguments['command'];
       if (command is String && command.isNotEmpty) return command;
@@ -406,16 +417,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final available = await _speech.initialize(
         onStatus: (status) {
           if (status == 'done' || status == 'notListening') {
-            if (mounted &&
-                _voiceInput.phase == VoiceInputPhase.pluginRecognition) {
+            if (mounted && _voiceInput.route == VoiceInputRoute.plugin) {
               setState(() => _voiceInput.cancel());
             }
           }
         },
         onError: (error) {
           debugPrint('Speech error: ${error.errorMsg}');
-          if (mounted &&
-              _voiceInput.phase == VoiceInputPhase.pluginRecognition) {
+          if (mounted && _voiceInput.route == VoiceInputRoute.plugin) {
             setState(() => _voiceInput.cancel());
           }
         },
@@ -431,8 +440,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _tts.removeListener(_onTtsStateChanged);
     NativeBridge.setShareIntentHandler(null);
+    final previousSessionId = _lastSessionId;
+    if (previousSessionId != null) {
+      try {
+        context.read<ChatProvider>().saveDraft(
+              previousSessionId,
+              _draftWithoutWorkspaceImports(),
+            );
+      } catch (_) {
+        // Provider may already be detached during application teardown.
+      }
+    }
     unawaited(NativeBridge.cancelSpeechRecognition());
     unawaited(_whisper.cancelRecording());
+    unawaited(_discardPendingWorkspaceImports());
+    _voiceElapsedTicker?.cancel();
     _speech.cancel();
     _scrollController.removeListener(_handleScroll);
     _inputController.dispose();
@@ -445,6 +467,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _startListening() async {
     final token = _voiceInput.beginStart();
     if (token == null) return;
+    _voiceStartedAt = DateTime.now();
+    _voiceElapsedTicker?.cancel();
+    _voiceElapsedTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_voiceInput.isBusy) {
+        _voiceElapsedTicker?.cancel();
+        return;
+      }
+      setState(() {});
+    });
     if (mounted) setState(() {});
     await _startListeningImpl(token);
   }
@@ -478,7 +509,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         final granted = await NativeBridge.hasAudioPermission();
         if (!granted) {
           if (mounted && _voiceInput.isCurrent(token)) {
-            setState(() => _voiceInput.complete(token));
+            setState(() => _voiceInput.fail(token, 'audio_permission_denied'));
           }
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -562,7 +593,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     } on TimeoutException catch (e) {
       debugPrint('Native speech recognition timed out: $e');
       if (mounted && _voiceInput.isCurrent(token)) {
-        setState(() => _voiceInput.complete(token));
+        setState(() => _voiceInput.fail(token, 'native_timeout'));
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text(AppStrings.voiceUnavailable)),
         );
@@ -592,7 +623,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final model = prefs.whisperModel;
     if (model == null || model.isEmpty) {
       if (mounted && _voiceInput.isCurrent(token)) {
-        setState(() => _voiceInput.complete(token));
+        setState(() => _voiceInput.fail(token, 'whisper_not_configured'));
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -610,7 +641,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (mounted) setState(() => _voiceInput.enterWhisperRecording(token));
     } else {
       if (mounted) {
-        setState(() => _voiceInput.complete(token));
+        setState(() => _voiceInput.fail(token, 'recording_unavailable'));
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text(AppStrings.voiceUnavailable)),
         );
@@ -621,6 +652,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _stopWhisperRecording() async {
     if (!_isWhisperRecording) return;
     final token = _voiceInput.activeToken;
+    setState(() => _voiceInput.enterStopping(token));
+    await Future<void>.delayed(Duration.zero);
+    if (!mounted || !_voiceInput.isCurrent(token)) return;
     setState(() => _voiceInput.enterTranscribing(token));
 
     if (mounted) {
@@ -642,24 +676,41 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
-    if (_voiceInput.isCurrent(token)) {
-      setState(() => _voiceInput.complete(token));
-    }
-
     if (text != null && text.isNotEmpty) {
+      if (_voiceInput.isCurrent(token)) {
+        setState(() => _voiceInput.complete(token));
+      }
       _inputController.text += text;
       _inputController.selection = TextSelection.collapsed(
         offset: _inputController.text.length,
       );
     } else {
+      if (_voiceInput.isCurrent(token)) {
+        setState(() => _voiceInput.fail(token, 'transcription_failed'));
+      }
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text(AppStrings.transcribeFailed)),
       );
     }
   }
 
-  void _stopListening() {
-    unawaited(_speech.stop());
+  Future<void> _stopListening() async {
+    if (!_voiceInput.isListening) return;
+    final token = _voiceInput.activeToken;
+    setState(() => _voiceInput.enterStopping(token));
+    await Future.wait<void>([
+      _speech.stop(),
+      NativeBridge.cancelSpeechRecognition(),
+      _whisper.cancelRecording(),
+    ]);
+    if (mounted && _voiceInput.isCurrent(token)) {
+      setState(() => _voiceInput.cancel());
+    }
+  }
+
+  void _cancelVoiceInput() {
+    if (!_voiceInput.isBusy) return;
+    unawaited(_speech.cancel());
     unawaited(NativeBridge.cancelSpeechRecognition());
     unawaited(_whisper.cancelRecording());
     setState(() => _voiceInput.cancel());
@@ -702,8 +753,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final currentId = provider.currentSession?.id;
     if (currentId != null && currentId != _lastSessionId) {
       if (_lastSessionId != null) {
-        provider.saveDraft(_lastSessionId!, _inputController.text);
+        provider.saveDraft(_lastSessionId!, _draftWithoutWorkspaceImports());
       }
+      unawaited(_discardPendingWorkspaceImports());
       _pendingAttachments.clear();
       _pendingAttachmentPreviews.clear();
       _lastSessionId = currentId;
@@ -721,21 +773,46 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _sendMessage() {
+  Future<void> _sendMessage() async {
     final text = _inputController.text.trim();
     final attachments = List<MessageContent>.from(_pendingAttachments);
+    final receipts = _pendingAttachmentPreviews
+        .map((preview) => preview.workspaceImportReceipt)
+        .whereType<WorkspaceImportReceipt>()
+        .toList(growable: false);
     if (text.isEmpty && attachments.isEmpty) return;
     HapticFeedback.lightImpact();
+    final provider = context.read<ChatProvider>();
+    _workspaceImportsBeingCommitted.addAll(
+      receipts.map((receipt) => receipt.operationId),
+    );
+    final committed = await provider.sendMessageWithWorkspaceImports(
+      text,
+      attachments: attachments,
+      workspaceImports: receipts,
+    );
+    _workspaceImportsBeingCommitted.removeAll(
+      receipts.map((receipt) => receipt.operationId),
+    );
+    if (!committed) {
+      if (!mounted) {
+        for (final receipt in receipts) {
+          unawaited(
+            NativeBridge.discardWorkspaceImport(receipt).catchError((_) {}),
+          );
+        }
+      }
+      return;
+    }
+    if (!mounted) return;
     setState(() {
       _inputController.clear();
       _pendingAttachments.clear();
       _pendingAttachmentPreviews.clear();
     });
-    final provider = context.read<ChatProvider>();
     if (provider.currentSession != null) {
       provider.saveDraft(provider.currentSession!.id, '');
     }
-    provider.sendMessage(text, attachments: attachments);
   }
 
   Future<void> _createNewChat() async {
@@ -803,7 +880,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _handleSharedContent(SharedContent content) async {
     if (!mounted || !content.hasPayload) return;
     final prepared = await _sharedContentPreparer.prepare(content);
-    if (!mounted) return;
+    if (!mounted) {
+      for (final attachment in prepared.attachments) {
+        final receipt = attachment.workspaceImportReceipt;
+        if (receipt != null) {
+          unawaited(
+            NativeBridge.discardWorkspaceImport(receipt).catchError((_) {}),
+          );
+        }
+      }
+      return;
+    }
 
     final plan = SharedContentImportPlan.fromPrepared(prepared);
     if (!plan.createDraft) {
@@ -813,9 +900,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
 
+    await _discardPendingWorkspaceImports();
+    if (!mounted) {
+      for (final attachment in prepared.attachments) {
+        final receipt = attachment.workspaceImportReceipt;
+        if (receipt != null) {
+          unawaited(
+            NativeBridge.discardWorkspaceImport(receipt).catchError((_) {}),
+          );
+        }
+      }
+      return;
+    }
     final provider = context.read<ChatProvider>();
     final session = await provider.createSession();
-    if (!mounted) return;
+    if (!mounted) {
+      for (final attachment in prepared.attachments) {
+        final receipt = attachment.workspaceImportReceipt;
+        if (receipt != null) {
+          unawaited(
+            NativeBridge.discardWorkspaceImport(receipt).catchError((_) {}),
+          );
+        }
+      }
+      return;
+    }
 
     setState(() {
       _lastSessionId = session.id;
@@ -839,6 +948,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         inputText: attachment.inputText,
         insertedText: insertedText,
         includeAsContentBlock: attachment.includeAsContentBlock,
+        workspaceImportReceipt: attachment.workspaceImportReceipt,
       ));
     }
 
@@ -1050,6 +1160,45 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       subtitle: session?.title ?? AppStrings.appName,
       summary: summary,
     );
+  }
+
+  Future<void> _showRemoteAgentSessionDialog() async {
+    final provider = context.read<ChatProvider>();
+    final currentlyEnabled = provider.currentSessionUsesRemoteAgent;
+    if (!currentlyEnabled && !provider.remoteAgentAvailable) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先在设置中配置并授权远程 Agent。')),
+      );
+      return;
+    }
+    final enable = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text(AppStrings.sessionRemoteAgent),
+        content: Text(
+          currentlyEnabled
+              ? '关闭后，本对话将恢复使用本地配置的模型流程。'
+              : '开启后，本对话文本会发送到你已授权的外部服务。其他对话和本地模型/工具流程不受影响。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, !currentlyEnabled),
+            child: Text(currentlyEnabled ? '关闭' : '为本对话开启'),
+          ),
+        ],
+      ),
+    );
+    if (enable == null || !mounted) return;
+    final changed = await provider.setCurrentSessionRemoteAgentEnabled(enable);
+    if (!changed && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('当前无法更改远程 Agent 选择。')),
+      );
+    }
   }
 
   Future<void> _showUsageSummaryDialog({
@@ -1409,6 +1558,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   _showPromptProfilesDialog();
                 case 'switch_model':
                   _showSwitchModelDialog();
+                case 'remote_agent':
+                  _showRemoteAgentSessionDialog();
                 case 'regenerate':
                   context.read<ChatProvider>().regenerateLastResponse();
                 case 'compare':
@@ -1465,6 +1616,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       title: Text(AppStrings.switchModel),
                       dense: true,
                     )),
+                if (provider.currentSession != null)
+                  const PopupMenuItem(
+                    value: 'remote_agent',
+                    child: ListTile(
+                      leading: Icon(Icons.cloud_outlined),
+                      title: Text(AppStrings.sessionRemoteAgent),
+                      dense: true,
+                    ),
+                  ),
                 const PopupMenuItem(
                     value: 'terminal',
                     child: ListTile(
@@ -1520,263 +1680,315 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ],
       ),
-      body: Column(
-        children: [
-          const AgentStatusBar(),
-          Consumer<ChatProvider>(
-            builder: (_, provider, __) {
-              if (!provider.safeMode) return const SizedBox.shrink();
-              return Material(
-                color: theme.colorScheme.errorContainer,
-                child: SafeArea(
-                  bottom: false,
-                  child: ListTile(
-                    leading: Icon(
-                      Icons.health_and_safety_outlined,
-                      color: theme.colorScheme.onErrorContainer,
-                    ),
-                    title: Text(
-                      '安全模式已启用',
-                      style: theme.textTheme.titleSmall?.copyWith(
-                        color: theme.colorScheme.onErrorContainer,
-                        fontWeight: FontWeight.w700,
+      body: LayoutBuilder(
+        builder: (context, chatConstraints) {
+          final hasCompare = context.select<ChatProvider, bool>(
+            (provider) =>
+                provider.compareResults != null &&
+                provider.compareBelongsToCurrentSession,
+          );
+          final compareWorkspaceMode =
+              hasCompare && chatConstraints.maxHeight < 760;
+          return Column(
+            children: [
+              const AgentStatusBar(),
+              Consumer<ChatProvider>(
+                builder: (_, provider, __) {
+                  if (!provider.safeMode) return const SizedBox.shrink();
+                  return Material(
+                    color: theme.colorScheme.errorContainer,
+                    child: SafeArea(
+                      bottom: false,
+                      child: ListTile(
+                        leading: Icon(
+                          Icons.health_and_safety_outlined,
+                          color: theme.colorScheme.onErrorContainer,
+                        ),
+                        title: Text(
+                          '安全模式已启用',
+                          style: theme.textTheme.titleSmall?.copyWith(
+                            color: theme.colorScheme.onErrorContainer,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        subtitle: Text(
+                          '已跳过自动恢复会话，避免重复打开异常长会话。',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onErrorContainer,
+                          ),
+                        ),
+                        trailing: TextButton(
+                          onPressed: provider.exitSafeMode,
+                          child: const Text('退出'),
+                        ),
                       ),
                     ),
-                    subtitle: Text(
-                      '已跳过自动恢复会话，避免重复打开异常长会话。',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onErrorContainer,
-                      ),
-                    ),
-                    trailing: TextButton(
-                      onPressed: provider.exitSafeMode,
-                      child: const Text('退出'),
-                    ),
-                  ),
-                ),
-              );
-            },
-          ),
-          Selector<ChatProvider, AgentRunRecoveryMarker?>(
-            selector: (_, provider) => provider.currentInterruptedAgentRun,
-            builder: (context, marker, __) {
-              if (marker == null) return const SizedBox.shrink();
-              return _buildInterruptedRunBanner(theme);
-            },
-          ),
-          Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final maxContentWidth =
-                    math.min(640.0, constraints.maxWidth * 0.86);
-                return Selector<
-                    ChatProvider,
-                    ({
-                      List<ChatMessage> messages,
-                      bool hasStreaming,
-                      AgentStatus status,
-                      String? sessionId,
-                      int messageVersion,
-                      String modelLabel,
-                    })>(
-                  selector: (_, p) => (
-                    messages: p.currentSession?.messages ?? [],
-                    hasStreaming: p.agentStatus == AgentStatus.streaming ||
-                        p.streamingText.isNotEmpty ||
-                        p.streamingReasoningTotalLength > 0,
-                    status: p.agentStatus,
-                    sessionId: p.currentSession?.id,
-                    messageVersion: p.messageVersion,
-                    modelLabel: p.currentSession?.modelOverride != null
-                        ? '${p.configuredProfileName} · '
-                            '${p.currentSession!.modelOverride}'
-                        : p.configuredModelLabel,
-                  ),
-                  builder: (context, data, __) {
-                    final messages = data.messages;
-                    final hasStreaming = data.hasStreaming;
-                    final showTyping =
-                        data.status == AgentStatus.thinking && !hasStreaming;
-                    final agentActive = hasStreaming ||
-                        showTyping ||
-                        data.status == AgentStatus.thinking ||
-                        data.status == AgentStatus.streaming ||
-                        data.status == AgentStatus.tooling;
-                    _trackAgentCompletion(
-                      sessionId: data.sessionId,
-                      isActive: agentActive,
-                      completed:
-                          !agentActive && data.status == AgentStatus.idle,
-                    );
+                  );
+                },
+              ),
+              Selector<ChatProvider, AgentRunRecoveryMarker?>(
+                selector: (_, provider) => provider.currentInterruptedAgentRun,
+                builder: (context, marker, __) {
+                  if (marker == null) return const SizedBox.shrink();
+                  return _buildInterruptedRunBanner(theme, marker);
+                },
+              ),
+              if (!compareWorkspaceMode)
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final maxContentWidth =
+                          math.min(640.0, constraints.maxWidth * 0.86);
+                      return Selector<
+                          ChatProvider,
+                          ({
+                            List<ChatMessage> messages,
+                            bool hasStreaming,
+                            AgentStatus status,
+                            String? sessionId,
+                            int messageVersion,
+                            String modelLabel,
+                          })>(
+                        selector: (_, p) => (
+                          messages: p.currentSession?.messages ?? [],
+                          hasStreaming:
+                              p.agentStatus == AgentStatus.streaming ||
+                                  p.streamingText.isNotEmpty ||
+                                  p.streamingReasoningTotalLength > 0,
+                          status: p.agentStatus,
+                          sessionId: p.currentSession?.id,
+                          messageVersion: p.messageVersion,
+                          modelLabel: p.currentSession?.modelOverride != null
+                              ? '${p.configuredProfileName} · '
+                                  '${p.currentSession!.modelOverride}'
+                              : p.configuredModelLabel,
+                        ),
+                        builder: (context, data, __) {
+                          final messages = data.messages;
+                          final hasStreaming = data.hasStreaming;
+                          final showTyping =
+                              data.status == AgentStatus.thinking &&
+                                  !hasStreaming;
+                          final agentActive = hasStreaming ||
+                              showTyping ||
+                              data.status == AgentStatus.thinking ||
+                              data.status == AgentStatus.streaming ||
+                              data.status == AgentStatus.tooling;
+                          _trackAgentCompletion(
+                            sessionId: data.sessionId,
+                            isActive: agentActive,
+                            completed:
+                                !agentActive && data.status == AgentStatus.idle,
+                          );
 
-                    // Sync draft when session changes via Selector rebuild
-                    final currentId = data.sessionId;
-                    if (currentId != null && currentId != _lastSessionId) {
-                      _syncDraftForSession();
-                    }
-                    _primeMessageAnimations(currentId, messages);
-                    if (currentId != _renderWindowSessionId) {
-                      _renderWindowSessionId = currentId;
-                      _renderWindowState =
-                          _renderWindowState.reset(_initialRenderMessageWindow);
-                    }
+                          // Sync draft when session changes via Selector rebuild
+                          final currentId = data.sessionId;
+                          if (currentId != null &&
+                              currentId != _lastSessionId) {
+                            _syncDraftForSession();
+                          }
+                          _primeMessageAnimations(currentId, messages);
+                          if (currentId != _renderWindowSessionId) {
+                            _renderWindowSessionId = currentId;
+                            _renderWindowState = _renderWindowState
+                                .reset(_initialRenderMessageWindow);
+                          }
 
-                    if (messages.isEmpty && !hasStreaming && !showTyping) {
-                      return _buildEmptyState(
-                          theme, data.modelLabel, maxContentWidth);
-                    }
+                          if (messages.isEmpty &&
+                              !hasStreaming &&
+                              !showTyping) {
+                            return _buildEmptyState(
+                                theme, data.modelLabel, maxContentWidth);
+                          }
 
-                    final window = _messageWindowFor(messages);
-                    final visibleMessages = window.messages;
-                    _retainMessageKeysForWindow(
-                      window.startIndex,
-                      window.startIndex + visibleMessages.length,
-                    );
-                    final hasLoadOlder = window.hiddenBeforeCount > 0;
-                    final virtualMessageStart = hasLoadOlder ? 1 : 0;
-                    final extraItemCount =
-                        (hasStreaming ? 1 : 0) + (showTyping ? 1 : 0);
-                    final itemCount = visibleMessages.length +
-                        virtualMessageStart +
-                        extraItemCount;
-                    final streamingOrTypingIndex =
-                        virtualMessageStart + visibleMessages.length;
-                    if (_userHasScrolledUp && hasStreaming) {
-                      _scheduleScrollExtentCompensation();
-                    }
-                    return Stack(
-                      children: [
-                        SelectionArea(
-                          child: NotificationListener<ScrollNotification>(
-                            onNotification: _handleScrollNotification,
-                            child: ListView.builder(
-                              key: const ValueKey('chat-message-list'),
-                              controller: _scrollController,
-                              reverse: true,
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 16, vertical: 12),
-                              itemCount: itemCount,
-                              itemBuilder: (context, index) {
-                                final virtualIndex = itemCount - 1 - index;
-                                if (virtualIndex == streamingOrTypingIndex &&
-                                    hasStreaming) {
-                                  return Consumer<ChatProvider>(
-                                    builder: (_, provider, __) {
-                                      return RepaintBoundary(
-                                        child: _buildStreamingBubble(
-                                          provider.streamingText,
+                          final window = _messageWindowFor(messages);
+                          final visibleMessages = window.messages;
+                          _retainMessageKeysForWindow(
+                            window.startIndex,
+                            window.startIndex + visibleMessages.length,
+                          );
+                          final hasLoadOlder = window.hiddenBeforeCount > 0;
+                          final virtualMessageStart = hasLoadOlder ? 1 : 0;
+                          final extraItemCount =
+                              (hasStreaming ? 1 : 0) + (showTyping ? 1 : 0);
+                          final itemCount = visibleMessages.length +
+                              virtualMessageStart +
+                              extraItemCount;
+                          final streamingOrTypingIndex =
+                              virtualMessageStart + visibleMessages.length;
+                          if (_userHasScrolledUp && hasStreaming) {
+                            _scheduleScrollExtentCompensation();
+                          }
+                          return Stack(
+                            children: [
+                              SelectionArea(
+                                child: NotificationListener<ScrollNotification>(
+                                  onNotification: _handleScrollNotification,
+                                  child: ListView.builder(
+                                    key: const ValueKey('chat-message-list'),
+                                    controller: _scrollController,
+                                    reverse: true,
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 16, vertical: 12),
+                                    itemCount: itemCount,
+                                    itemBuilder: (context, index) {
+                                      final virtualIndex =
+                                          itemCount - 1 - index;
+                                      if (virtualIndex ==
+                                              streamingOrTypingIndex &&
+                                          hasStreaming) {
+                                        return Consumer<ChatProvider>(
+                                          builder: (_, provider, __) {
+                                            return RepaintBoundary(
+                                              child: _buildStreamingBubble(
+                                                provider.streamingText,
+                                                theme,
+                                                maxContentWidth,
+                                                reasoningText: provider
+                                                    .streamingReasoningText,
+                                                reasoningTotalLength: provider
+                                                    .streamingReasoningTotalLength,
+                                                previousRole: messages.isEmpty
+                                                    ? null
+                                                    : messages.last.role,
+                                              ),
+                                            );
+                                          },
+                                        );
+                                      }
+                                      if (virtualIndex ==
+                                              streamingOrTypingIndex &&
+                                          showTyping) {
+                                        return RepaintBoundary(
+                                          child: _buildTypingIndicatorBubble(
+                                            theme,
+                                            maxContentWidth,
+                                            previousRole: messages.isEmpty
+                                                ? null
+                                                : messages.last.role,
+                                          ),
+                                        );
+                                      }
+                                      if (hasLoadOlder && virtualIndex == 0) {
+                                        return _buildLoadOlderMessagesAffordance(
                                           theme,
-                                          maxContentWidth,
-                                          reasoningText:
-                                              provider.streamingReasoningText,
-                                          reasoningTotalLength: provider
-                                              .streamingReasoningTotalLength,
-                                          previousRole: messages.isEmpty
-                                              ? null
-                                              : messages.last.role,
+                                          hiddenCount: window.hiddenBeforeCount,
+                                          totalMessageCount: messages.length,
+                                        );
+                                      }
+                                      final visibleIndex =
+                                          virtualIndex - virtualMessageStart;
+                                      final message =
+                                          visibleMessages[visibleIndex];
+                                      final originalIndex =
+                                          originalMessageIndexForVisibleIndex(
+                                        windowStartIndex: window.startIndex,
+                                        visibleIndex: visibleIndex,
+                                      );
+                                      final previousRole = visibleIndex > 0
+                                          ? visibleMessages[visibleIndex - 1]
+                                              .role
+                                          : null;
+                                      final nextRole = visibleIndex <
+                                              visibleMessages.length - 1
+                                          ? visibleMessages[visibleIndex + 1]
+                                              .role
+                                          : null;
+                                      final animationId =
+                                          _messageAnimationId(message);
+                                      final animate = _seenMessageAnimationIds
+                                          .add(animationId);
+                                      return _AnimatedMessageEntry(
+                                        key: ValueKey(animationId),
+                                        animate: animate,
+                                        child: KeyedSubtree(
+                                          key: _keyForMessageIndex(
+                                              originalIndex),
+                                          child: RepaintBoundary(
+                                            child: _buildMessageBubble(
+                                              message,
+                                              originalIndex,
+                                              theme,
+                                              maxContentWidth,
+                                              messages: messages,
+                                              previousRole: previousRole,
+                                              nextRole: nextRole,
+                                              highlighted: originalIndex ==
+                                                  _highlightedSearchMessageIndex,
+                                            ),
+                                          ),
                                         ),
                                       );
                                     },
-                                  );
-                                }
-                                if (virtualIndex == streamingOrTypingIndex &&
-                                    showTyping) {
-                                  return RepaintBoundary(
-                                    child: _buildTypingIndicatorBubble(
-                                      theme,
-                                      maxContentWidth,
-                                      previousRole: messages.isEmpty
-                                          ? null
-                                          : messages.last.role,
-                                    ),
-                                  );
-                                }
-                                if (hasLoadOlder && virtualIndex == 0) {
-                                  return _buildLoadOlderMessagesAffordance(
-                                    theme,
-                                    hiddenCount: window.hiddenBeforeCount,
-                                    totalMessageCount: messages.length,
-                                  );
-                                }
-                                final visibleIndex =
-                                    virtualIndex - virtualMessageStart;
-                                final message = visibleMessages[visibleIndex];
-                                final originalIndex =
-                                    originalMessageIndexForVisibleIndex(
-                                  windowStartIndex: window.startIndex,
-                                  visibleIndex: visibleIndex,
-                                );
-                                final previousRole = visibleIndex > 0
-                                    ? visibleMessages[visibleIndex - 1].role
-                                    : null;
-                                final nextRole =
-                                    visibleIndex < visibleMessages.length - 1
-                                        ? visibleMessages[visibleIndex + 1].role
-                                        : null;
-                                final animationId =
-                                    _messageAnimationId(message);
-                                final animate =
-                                    _seenMessageAnimationIds.add(animationId);
-                                return _AnimatedMessageEntry(
-                                  key: ValueKey(animationId),
-                                  animate: animate,
-                                  child: KeyedSubtree(
-                                    key: _keyForMessageIndex(originalIndex),
-                                    child: RepaintBoundary(
-                                      child: _buildMessageBubble(
-                                        message,
-                                        originalIndex,
-                                        theme,
-                                        maxContentWidth,
-                                        messages: messages,
-                                        previousRole: previousRole,
-                                        nextRole: nextRole,
-                                        highlighted: originalIndex ==
-                                            _highlightedSearchMessageIndex,
-                                      ),
-                                    ),
                                   ),
-                                );
-                              },
-                            ),
-                          ),
-                        ),
-                        Positioned(
-                          right: 16,
-                          bottom: 16,
-                          child: _buildScrollToBottomButton(theme),
-                        ),
-                      ],
-                    );
+                                ),
+                              ),
+                              Positioned(
+                                right: 16,
+                                bottom: 16,
+                                child: _buildScrollToBottomButton(theme),
+                              ),
+                            ],
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ),
+              // Compare view
+              Consumer<ChatProvider>(
+                builder: (_, provider, __) {
+                  if (provider.compareResults == null ||
+                      !provider.compareBelongsToCurrentSession) {
+                    return const SizedBox.shrink();
+                  }
+                  final ownerSessionId = provider.compareOwnerSessionId!;
+                  final compareGeneration =
+                      provider.compareOperationGeneration!;
+                  return Expanded(
+                    child: CompareView(
+                      results: provider.compareResults!,
+                      isComparing: provider.isComparing,
+                      maxPanelHeight: chatConstraints.maxHeight,
+                      onDismiss: () => provider.clearCompareResults(
+                        ownerSessionId: ownerSessionId,
+                        compareGeneration: compareGeneration,
+                      ),
+                      onUse: (index) =>
+                          unawaited(provider.useCompareResult(index)),
+                      onCancel: (model) => provider.cancelCompareResult(
+                        model,
+                        ownerSessionId: ownerSessionId,
+                        compareGeneration: compareGeneration,
+                      ),
+                      onRetry: (model) =>
+                          unawaited(provider.retryCompareResult(model)),
+                    ),
+                  );
+                },
+              ),
+              if (!compareWorkspaceMode)
+                Consumer<ChatProvider>(
+                  builder: (_, provider, __) {
+                    final messages = provider.currentSession?.messages;
+                    if (messages == null || messages.isEmpty) {
+                      return const SizedBox.shrink();
+                    }
+                    return _buildQuickPrompts(theme);
                   },
-                );
-              },
-            ),
-          ),
-          // Compare view
-          Consumer<ChatProvider>(
-            builder: (_, provider, __) {
-              if (provider.compareResults == null) {
-                return const SizedBox.shrink();
-              }
-              return CompareView(
-                results: provider.compareResults!,
-                isComparing: provider.isComparing,
-                onDismiss: () => provider.clearCompareResults(),
-              );
-            },
-          ),
-          Consumer<ChatProvider>(
-            builder: (_, provider, __) {
-              final messages = provider.currentSession?.messages;
-              if (messages == null || messages.isEmpty) {
-                return const SizedBox.shrink();
-              }
-              return _buildQuickPrompts(theme);
-            },
-          ),
-          _buildInputArea(theme),
-        ],
+                ),
+              if (compareWorkspaceMode)
+                Flexible(
+                  child: SingleChildScrollView(
+                    reverse: true,
+                    child: _buildInputArea(theme),
+                  ),
+                )
+              else
+                _buildInputArea(theme),
+            ],
+          );
+        },
       ),
     );
   }
@@ -1879,74 +2091,77 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         constraints: BoxConstraints(maxWidth: math.min(480.0, maxContentWidth)),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                width: 72,
-                height: 72,
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.primary.withAlpha(18),
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                      color: theme.colorScheme.primary.withAlpha(45)),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 72,
+                  height: 72,
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.primary.withAlpha(18),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                        color: theme.colorScheme.primary.withAlpha(45)),
+                  ),
+                  child: Icon(Icons.auto_awesome,
+                      size: 34, color: theme.colorScheme.primary),
                 ),
-                child: Icon(Icons.auto_awesome,
-                    size: 34, color: theme.colorScheme.primary),
-              ),
-              const SizedBox(height: 18),
-              Text(AppStrings.sendMessageToStart,
-                  textAlign: TextAlign.center,
-                  style: theme.textTheme.titleMedium?.copyWith(
-                      color: theme.colorScheme.onSurface,
-                      fontWeight: FontWeight.w700)),
-              const SizedBox(height: 8),
-              Text(AppStrings.aiAssistantCapabilities,
-                  textAlign: TextAlign.center,
-                  style: theme.textTheme.bodySmall
-                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
-              const SizedBox(height: 12),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.surfaceContainerHighest,
-                  borderRadius: BorderRadius.circular(AppRadii.xl),
-                  border: Border.all(
-                      color: theme.colorScheme.outline.withAlpha(45)),
-                ),
-                child: Text(AppStrings.currentModelLabel(modelName),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.labelSmall
+                const SizedBox(height: 18),
+                Text(AppStrings.sendMessageToStart,
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                        color: theme.colorScheme.onSurface,
+                        fontWeight: FontWeight.w700)),
+                const SizedBox(height: 8),
+                Text(AppStrings.aiAssistantCapabilities,
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodySmall
                         ?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
-              ),
-              const SizedBox(height: 18),
-              Wrap(
-                alignment: WrapAlignment.center,
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  for (final prompt in prompts)
-                    ActionChip(
-                      label: Text(prompt),
-                      onPressed: () {
-                        _inputController.text = prompt;
-                        _inputController.selection = TextSelection.collapsed(
-                          offset: _inputController.text.length,
-                        );
-                        _focusNode.requestFocus();
-                      },
-                      side: BorderSide(
-                          color: theme.colorScheme.outline.withAlpha(70)),
-                      backgroundColor: theme.colorScheme.surface,
-                      labelStyle: theme.textTheme.labelMedium,
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 6),
-                    ),
-                ],
-              ),
-            ],
+                const SizedBox(height: 12),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(AppRadii.xl),
+                    border: Border.all(
+                        color: theme.colorScheme.outline.withAlpha(45)),
+                  ),
+                  child: Text(AppStrings.currentModelLabel(modelName),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant)),
+                ),
+                const SizedBox(height: 18),
+                Wrap(
+                  alignment: WrapAlignment.center,
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final prompt in prompts)
+                      ActionChip(
+                        label: Text(prompt),
+                        onPressed: () {
+                          _inputController.text = prompt;
+                          _inputController.selection = TextSelection.collapsed(
+                            offset: _inputController.text.length,
+                          );
+                          _focusNode.requestFocus();
+                        },
+                        side: BorderSide(
+                            color: theme.colorScheme.outline.withAlpha(70)),
+                        backgroundColor: theme.colorScheme.surface,
+                        labelStyle: theme.textTheme.labelMedium,
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 6),
+                      ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -2053,8 +2268,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildInterruptedRunBanner(ThemeData theme) {
+  Widget _buildInterruptedRunBanner(
+    ThemeData theme,
+    AgentRunRecoveryMarker marker,
+  ) {
     final colors = theme.colorScheme;
+    final (subtitle, continueLabel) = switch (marker.recoveryKind) {
+      InterruptedRunRecoveryKind.retryModelTurn => (
+          marker.hasPersistedToolResults
+              ? '工具结果已保存。继续只会恢复模型上下文，不会再次执行工具。'
+              : '生成过程没有正常结束。确认后可重试模型回合，不会自动执行工具。',
+          '继续',
+        ),
+      InterruptedRunRecoveryKind.reauthorizeAction => (
+          '工具尚未开始，旧授权已失效。继续时必须重新授权。',
+          '重新授权',
+        ),
+      InterruptedRunRecoveryKind.unknownOutcome => (
+          '工具可能已经执行，但结果未知。不会重放；只能明确发起一次新操作。',
+          '重新发起',
+        ),
+      InterruptedRunRecoveryKind.inspectOnly => (
+          '恢复记录已损坏，已安全停止。请查看详情或忽略后手动处理。',
+          null,
+        ),
+    };
     return Material(
       color: colors.tertiaryContainer,
       child: SafeArea(
@@ -2072,7 +2310,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
           ),
           subtitle: Text(
-            '生成过程没有正常结束，未保存的流式内容已丢失。',
+            subtitle,
             style: theme.textTheme.bodySmall?.copyWith(
               color: colors.onTertiaryContainer,
             ),
@@ -2081,19 +2319,77 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             spacing: 8,
             children: [
               TextButton(
+                onPressed: () => _showInterruptedRunInspection(marker),
+                child: const Text('查看'),
+              ),
+              TextButton(
                 onPressed: () =>
                     context.read<ChatProvider>().dismissInterruptedAgentRun(),
                 child: const Text('忽略'),
               ),
-              FilledButton.tonal(
-                onPressed: () =>
-                    context.read<ChatProvider>().continueInterruptedAgentRun(),
-                child: const Text('继续'),
-              ),
+              if (continueLabel != null)
+                FilledButton.tonal(
+                  onPressed: () => context
+                      .read<ChatProvider>()
+                      .continueInterruptedAgentRun(),
+                  child: Text(continueLabel),
+                ),
             ],
           ),
         ),
       ),
+    );
+  }
+
+  Future<void> _showInterruptedRunInspection(
+    AgentRunRecoveryMarker marker,
+  ) {
+    return showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('中断恢复详情', style: theme.textTheme.titleMedium),
+                const SizedBox(height: 12),
+                SelectableText(
+                  'Run attempt: ${marker.runAttemptId}\n'
+                  'Started: ${marker.startedAt.toIso8601String()}',
+                  style: theme.textTheme.bodySmall,
+                ),
+                if (marker.toolAttempts.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  ...marker.toolAttempts.map(
+                    (attempt) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        '${attempt.toolName} · ${attempt.risk.name} · '
+                        '${attempt.lifecycle.name}\n'
+                        'Operation: ${attempt.operationId}',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text('关闭'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -2105,6 +2401,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   ) {
     final error = message.assistantError!;
     final color = theme.colorScheme.error;
+    final remoteAuthorizationError = error.source == 'remote_agent' &&
+        const {
+          'remote_agent_consentRequired',
+          'remote_agent_invalidConfiguration',
+          'remote_agent_credentialUnavailable',
+        }.contains(error.code);
     return ConstrainedBox(
       constraints: BoxConstraints(maxWidth: maxContentWidth),
       child: Container(
@@ -2132,7 +2434,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        AppStrings.assistantErrorTitle,
+                        error.isRecoveryRetry
+                            ? AppStrings.assistantRecoveryErrorTitle
+                            : AppStrings.assistantErrorTitle,
                         style: theme.textTheme.labelLarge?.copyWith(
                           color: color,
                           fontWeight: FontWeight.w700,
@@ -2151,13 +2455,40 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ],
             ),
             const SizedBox(height: 8),
-            if (error.canRetry)
+            if (remoteAuthorizationError)
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton(
+                    onPressed: () async {
+                      await context
+                          .read<ChatProvider>()
+                          .setCurrentSessionRemoteAgentEnabled(false);
+                    },
+                    child: const Text(AppStrings.useLocal),
+                  ),
+                  OutlinedButton(
+                    onPressed: () => Navigator.of(context).push(
+                      CupertinoPageRoute(
+                        builder: (_) => const SettingsScreen(),
+                      ),
+                    ),
+                    child: const Text(AppStrings.reauthorizeExternal),
+                  ),
+                ],
+              )
+            else if (error.canRetry)
               Align(
                 alignment: Alignment.centerLeft,
                 child: FilledButton.icon(
                   onPressed: () => _retryAssistantMessage(messageIndex),
                   icon: const Icon(Icons.refresh, size: 16),
-                  label: const Text(AppStrings.retry),
+                  label: Text(
+                    error.isRecoveryRetry
+                        ? AppStrings.assistantRecoveryContinue
+                        : AppStrings.retry,
+                  ),
                   style: FilledButton.styleFrom(
                     visualDensity: VisualDensity.compact,
                     minimumSize: const Size(0, 38),
@@ -2179,12 +2510,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Future<void> _retryAssistantMessage(int messageIndex) async {
     final messenger = ScaffoldMessenger.of(context);
+    final session = context.read<ChatProvider>().currentSession;
+    final recoveryRetry = session != null &&
+        messageIndex >= 0 &&
+        messageIndex < session.messages.length &&
+        session.messages[messageIndex].assistantError?.isRecoveryRetry == true;
     final status =
         await context.read<ChatProvider>().retryAssistantMessage(messageIndex);
     if (!mounted) return;
     messenger.showSnackBar(
       SnackBar(
-        content: Text(_assistantRetryStatusText(status)),
+        content: Text(
+          recoveryRetry && status == AssistantRetryStatus.started
+              ? AppStrings.assistantRecoveryStarted
+              : _assistantRetryStatusText(status),
+        ),
         duration: const Duration(seconds: 2),
       ),
     );
@@ -2788,7 +3128,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ReasoningTextPanel(text: reasoningContent!),
                     if (text.isNotEmpty) const SizedBox(height: 12),
                   ],
-                  if (text.isNotEmpty) StreamingText(text: text),
+                  if (text.isNotEmpty)
+                    StreamingText(
+                      text: text,
+                      onOpenFullResponse: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => FullResponseScreen(text: text),
+                        ),
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -3724,7 +4072,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           if (confirmed != true) continue;
         }
         final prepared = await FileAttachmentService.prepareForMessage(file);
-        if (!mounted) return;
+        if (!mounted) {
+          final receipt = prepared.workspaceImportReceipt;
+          if (receipt != null) {
+            unawaited(
+              NativeBridge.discardWorkspaceImport(receipt).catchError((_) {}),
+            );
+          }
+          return;
+        }
         final insertedText = _appendAttachmentText(prepared.inputText);
         setState(() {
           if (prepared.includeAsContentBlock) {
@@ -3735,6 +4091,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             inputText: prepared.inputText,
             insertedText: insertedText,
             includeAsContentBlock: prepared.includeAsContentBlock,
+            workspaceImportReceipt: prepared.workspaceImportReceipt,
           ));
         });
       } catch (e) {
@@ -3845,6 +4202,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _removePendingAttachment(_PendingAttachmentPreview preview) {
+    final receipt = preview.workspaceImportReceipt;
+    if (receipt != null &&
+        _workspaceImportsBeingCommitted.contains(receipt.operationId)) {
+      return;
+    }
     setState(() {
       _pendingAttachmentPreviews.remove(preview);
       if (preview.includeAsContentBlock) {
@@ -3864,6 +4226,47 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         offset: _inputController.text.length,
       );
     });
+    final sessionId = context.read<ChatProvider>().currentSession?.id;
+    if (sessionId != null) {
+      context.read<ChatProvider>().saveDraft(sessionId, _inputController.text);
+    }
+    if (receipt != null) {
+      unawaited(NativeBridge.discardWorkspaceImport(receipt).catchError((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('附件清理将在下次启动时重试。')),
+        );
+      }));
+    }
+  }
+
+  Future<void> _discardPendingWorkspaceImports() async {
+    final receipts = _pendingAttachmentPreviews
+        .map((preview) => preview.workspaceImportReceipt)
+        .whereType<WorkspaceImportReceipt>()
+        .where(
+          (receipt) =>
+              !_workspaceImportsBeingCommitted.contains(receipt.operationId),
+        )
+        .toList(growable: false);
+    for (final receipt in receipts) {
+      try {
+        await NativeBridge.discardWorkspaceImport(receipt);
+      } catch (_) {
+        // Native CLEANUP_REQUIRED evidence is retained for startup retry.
+      }
+    }
+  }
+
+  String _draftWithoutWorkspaceImports() {
+    var draft = _inputController.text;
+    for (final preview in _pendingAttachmentPreviews) {
+      if (preview.workspaceImportReceipt == null) continue;
+      draft = draft.replaceFirst(preview.insertedText, '');
+      draft = draft.replaceFirst('${preview.inputText}\n', '');
+      draft = draft.replaceFirst(preview.inputText, '');
+    }
+    return draft;
   }
 
   Widget _buildAttachmentPreviews(ThemeData theme) {
@@ -4229,46 +4632,49 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          InkWell(
-            onTap: () => setState(() => _queueExpanded = !_queueExpanded),
-            borderRadius: BorderRadius.circular(AppRadii.s),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              child: Row(
-                children: [
-                  Icon(Icons.queue, size: 16, color: theme.colorScheme.primary),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      AppStrings.messagesQueued(queue.length),
-                      style: theme.textTheme.bodySmall,
-                      overflow: TextOverflow.ellipsis,
+          Semantics(
+            label: AppStrings.messagesQueued(queue.length),
+            liveRegion: true,
+            button: true,
+            child: InkWell(
+              onTap: () => setState(() => _queueExpanded = !_queueExpanded),
+              borderRadius: BorderRadius.circular(AppRadii.s),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: Row(
+                  children: [
+                    Icon(Icons.queue,
+                        size: 16, color: theme.colorScheme.primary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        AppStrings.messagesQueued(queue.length),
+                        style: theme.textTheme.bodySmall,
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
-                  ),
-                  Icon(
-                    _queueExpanded ? Icons.expand_less : Icons.expand_more,
-                    size: 20,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                  if (!isRunning)
-                    TextButton(
-                      onPressed: provider.sendNextQueued,
-                      child: const Text(AppStrings.sendQueued),
+                    Icon(
+                      _queueExpanded ? Icons.expand_less : Icons.expand_more,
+                      size: 20,
+                      color: theme.colorScheme.onSurfaceVariant,
                     ),
-                  IconButton(
-                    tooltip: AppStrings.clearMessageQueue,
-                    icon: const Icon(Icons.clear_all, size: 18),
-                    onPressed: () {
-                      provider.clearMessageQueue();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text(AppStrings.messageQueueCleared),
-                          duration: Duration(seconds: 1),
-                        ),
-                      );
-                    },
-                  ),
-                ],
+                    if (!isRunning)
+                      TextButton(
+                        onPressed: provider.sendNextQueued,
+                        child: const Text(AppStrings.sendQueued),
+                      ),
+                    IconButton(
+                      tooltip: AppStrings.clearMessageQueue,
+                      icon: const Icon(Icons.clear_all, size: 18),
+                      constraints: const BoxConstraints(
+                        minWidth: 48,
+                        minHeight: 48,
+                      ),
+                      onPressed: () => _clearQueueWithUndo(provider, queue),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -4308,10 +4714,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       ),
                       padding: EdgeInsets.zero,
                       constraints: const BoxConstraints(
-                        minWidth: 32,
-                        minHeight: 32,
+                        minWidth: 48,
+                        minHeight: 48,
                       ),
-                      onPressed: () => provider.removeQueuedMessage(message.id),
+                      tooltip: AppStrings.removeQueuedMessage,
+                      onPressed: () {
+                        final undo = provider.removeQueuedMessage(message.id);
+                        if (undo != null) _showQueueUndo(provider, undo);
+                      },
                     ),
                   ],
                 ),
@@ -4320,6 +4730,90 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  Future<void> _clearQueueWithUndo(
+    ChatProvider provider,
+    List<QueuedMessage> queue,
+  ) async {
+    if (queue.any((message) => message.attachments.isNotEmpty)) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text(AppStrings.clearMessageQueue),
+          content: const Text(AppStrings.clearQueueAttachmentsWarning),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text(AppStrings.cancel),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text(AppStrings.confirm),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
+    final undo = provider.clearMessageQueue();
+    if (undo != null) _showQueueUndo(provider, undo);
+  }
+
+  void _showQueueUndo(
+    ChatProvider provider,
+    MessageQueueUndo undo, {
+    String message = AppStrings.messageQueueCleared,
+  }) {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    final controller = messenger.showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 6),
+        action: SnackBarAction(
+          label: AppStrings.undo,
+          onPressed: () {
+            final result = provider.restoreMessageQueueWithResult(undo);
+            if (!mounted) return;
+            if (result.sessionMissing) {
+              messenger.showSnackBar(
+                const SnackBar(
+                  content: Text(AppStrings.messageQueueRestoreUnavailable),
+                ),
+              );
+              return;
+            }
+            final remaining = result.remainingUndo;
+            if (remaining != null) {
+              _showQueueUndo(
+                provider,
+                remaining,
+                message: result.restoredCount == 0
+                    ? AppStrings.messageQueueRestoreCapacityFull
+                    : AppStrings.messageQueuePartiallyRestored(
+                        result.restoredCount,
+                        result.remainingCount,
+                      ),
+              );
+              return;
+            }
+            messenger.showSnackBar(
+              SnackBar(
+                content: Text(
+                  AppStrings.messageQueueRestored(result.restoredCount),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+    controller.closed.then((reason) {
+      if (reason != SnackBarClosedReason.action) {
+        provider.expireMessageQueueUndo(undo);
+      }
+    });
   }
 
   String _queuedMessagePreview(QueuedMessage message) {
@@ -4368,6 +4862,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       style: theme.textTheme.bodySmall,
                       overflow: TextOverflow.ellipsis,
                     ),
+                  ),
+                  IconButton(
+                    tooltip: AppStrings.openAgentRunCenter,
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const AgentRunCenterScreen(),
+                      ),
+                    ),
+                    icon: const Icon(Icons.view_list_outlined),
                   ),
                   Icon(
                     _backgroundTasksExpanded
@@ -4490,8 +4993,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     _buildAttachmentPreviews(theme),
+                    _buildExecutionContextChip(theme, provider),
                     _buildBackgroundTasksBar(theme, provider),
                     _buildMessageQueueBar(theme, provider, isRunning),
+                    _buildVoiceState(theme),
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.end,
                       children: [
@@ -4566,36 +5071,48 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         ),
                         if (!isRunning) const SizedBox(width: 6),
                         if (!isRunning)
-                          GestureDetector(
-                            onTap: () {
-                              if (_isWhisperRecording) {
-                                _stopWhisperRecording();
-                              } else if (_isListening) {
-                                _stopListening();
-                              } else {
-                                HapticFeedback.lightImpact();
-                                _startListening();
-                              }
-                            },
-                            child: Container(
-                              width: 48,
-                              height: 48,
-                              decoration: BoxDecoration(
-                                color: isRecording
-                                    ? AppColors.statusRed.withAlpha(28)
-                                    : theme.colorScheme.surfaceContainerHighest,
-                                borderRadius: BorderRadius.circular(AppRadii.s),
-                                border: Border.all(
+                          Semantics(
+                            button: true,
+                            liveRegion: _voiceInput.isBusy,
+                            label: _isWhisperRecording
+                                ? AppStrings.voiceStopAndTranscribe
+                                : _isListening
+                                    ? AppStrings.voiceStop
+                                    : AppStrings.voiceStart,
+                            child: GestureDetector(
+                              onTap: () {
+                                if (_isWhisperRecording) {
+                                  _stopWhisperRecording();
+                                } else if (_isListening) {
+                                  _stopListening();
+                                } else {
+                                  HapticFeedback.lightImpact();
+                                  _startListening();
+                                }
+                              },
+                              child: Container(
+                                width: 48,
+                                height: 48,
+                                decoration: BoxDecoration(
                                   color: isRecording
-                                      ? AppColors.statusRed.withAlpha(120)
-                                      : theme.colorScheme.outline.withAlpha(55),
+                                      ? AppColors.statusRed.withAlpha(28)
+                                      : theme
+                                          .colorScheme.surfaceContainerHighest,
+                                  borderRadius:
+                                      BorderRadius.circular(AppRadii.s),
+                                  border: Border.all(
+                                    color: isRecording
+                                        ? AppColors.statusRed.withAlpha(120)
+                                        : theme.colorScheme.outline
+                                            .withAlpha(55),
+                                  ),
                                 ),
-                              ),
-                              child: Icon(
-                                isRecording ? Icons.mic : Icons.mic_none,
-                                color: isRecording
-                                    ? AppColors.statusRed
-                                    : theme.colorScheme.onSurfaceVariant,
+                                child: Icon(
+                                  isRecording ? Icons.mic : Icons.mic_none,
+                                  color: isRecording
+                                      ? AppColors.statusRed
+                                      : theme.colorScheme.onSurfaceVariant,
+                                ),
                               ),
                             ),
                           ),
@@ -4609,6 +5126,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                 height: 48,
                                 child: IconButton.filled(
                                   onPressed: provider.cancelAgent,
+                                  tooltip: AppStrings.stopResponse,
                                   icon: const Icon(Icons.stop),
                                   iconSize: 20,
                                   style: IconButton.styleFrom(
@@ -4627,6 +5145,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                 height: 48,
                                 child: IconButton.filled(
                                   onPressed: queueFull ? null : _sendMessage,
+                                  tooltip: AppStrings.send,
                                   icon: const Icon(Icons.send),
                                   iconSize: 20,
                                   style: IconButton.styleFrom(
@@ -4652,6 +5171,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             height: 48,
                             child: IconButton.filled(
                               onPressed: _sendMessage,
+                              tooltip: AppStrings.send,
                               icon: const Icon(Icons.send),
                               iconSize: 20,
                               style: IconButton.styleFrom(
@@ -4675,6 +5195,168 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       },
     );
   }
+
+  Widget _buildExecutionContextChip(
+    ThemeData theme,
+    ChatProvider provider,
+  ) {
+    final external = provider.currentSessionUsesRemoteAgent;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Semantics(
+        button: true,
+        label: provider.currentExecutionContextLabel,
+        child: ActionChip(
+          avatar: Icon(
+            external ? Icons.public : Icons.smartphone,
+            size: 18,
+          ),
+          label: Text(
+            provider.currentExecutionContextLabel,
+            overflow: TextOverflow.ellipsis,
+          ),
+          onPressed: () => _showExecutionContextDetails(provider),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showExecutionContextDetails(ChatProvider provider) async {
+    final external = provider.currentSessionUsesRemoteAgent;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                provider.currentExecutionContextLabel,
+                style: Theme.of(ctx).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 8),
+              Text(external
+                  ? AppStrings.externalContextDisclosure
+                  : AppStrings.localContextDisclosure),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  if (external)
+                    FilledButton.icon(
+                      onPressed: () async {
+                        await provider
+                            .setCurrentSessionRemoteAgentEnabled(false);
+                        if (ctx.mounted) Navigator.pop(ctx);
+                      },
+                      icon: const Icon(Icons.smartphone),
+                      label: const Text(AppStrings.useLocal),
+                    ),
+                  OutlinedButton(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      Navigator.of(context).push(
+                        CupertinoPageRoute(
+                          builder: (_) => const SettingsScreen(),
+                        ),
+                      );
+                    },
+                    child: Text(external
+                        ? AppStrings.reauthorizeExternal
+                        : AppStrings.settings),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildVoiceState(ThemeData theme) {
+    final phase = _voiceInput.phase;
+    if (phase == VoiceInputPhase.idle) return const SizedBox.shrink();
+    final label = switch (phase) {
+      VoiceInputPhase.listening => AppStrings.voiceListening,
+      VoiceInputPhase.stopping => AppStrings.voiceStopping,
+      VoiceInputPhase.transcribing => AppStrings.transcribing,
+      VoiceInputPhase.cancelled => AppStrings.voiceCancelled,
+      VoiceInputPhase.error => switch (_voiceInput.errorCode) {
+          'audio_permission_denied' => AppStrings.voicePermissionError,
+          'native_timeout' => AppStrings.voiceTimeoutError,
+          'whisper_not_configured' => AppStrings.voiceSetupError,
+          'transcription_failed' => AppStrings.voiceTranscriptionError,
+          _ => AppStrings.voiceError,
+        },
+      VoiceInputPhase.idle => '',
+    };
+    return Semantics(
+      container: true,
+      liveRegion: true,
+      label: label,
+      child: Container(
+        constraints: const BoxConstraints(minHeight: 48),
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        decoration: BoxDecoration(
+          color: phase == VoiceInputPhase.error
+              ? theme.colorScheme.errorContainer
+              : theme.colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(AppRadii.s),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              phase == VoiceInputPhase.error
+                  ? Icons.error_outline
+                  : phase == VoiceInputPhase.cancelled
+                      ? Icons.mic_off_outlined
+                      : Icons.mic_none,
+              size: 20,
+            ),
+            const SizedBox(width: 8),
+            Expanded(child: Text(label)),
+            if (_voiceInput.isBusy && _voiceStartedAt != null)
+              ExcludeSemantics(
+                child: Text(
+                  _formatVoiceElapsed(DateTime.now().difference(
+                    _voiceStartedAt!,
+                  )),
+                  style: theme.textTheme.labelSmall,
+                ),
+              ),
+            if (_voiceInput.isBusy)
+              TextButton(
+                onPressed: () => _isWhisperRecording
+                    ? _stopWhisperRecording()
+                    : _cancelVoiceInput(),
+                child: Text(_isWhisperRecording
+                    ? AppStrings.voiceStopAndTranscribe
+                    : AppStrings.voiceCancel),
+              ),
+            if (phase == VoiceInputPhase.error)
+              TextButton(
+                onPressed: () => Navigator.of(context).push(
+                  CupertinoPageRoute(builder: (_) => const SettingsScreen()),
+                ),
+                child: const Text(AppStrings.settings),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatVoiceElapsed(Duration elapsed) {
+    final minutes = elapsed.inMinutes.toString().padLeft(2, '0');
+    final seconds = (elapsed.inSeconds % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
 }
 
 class _PendingAttachmentPreview {
@@ -4682,12 +5364,14 @@ class _PendingAttachmentPreview {
   final String inputText;
   final String insertedText;
   final bool includeAsContentBlock;
+  final WorkspaceImportReceipt? workspaceImportReceipt;
 
   const _PendingAttachmentPreview({
     required this.content,
     required this.inputText,
     required this.insertedText,
     required this.includeAsContentBlock,
+    this.workspaceImportReceipt,
   });
 }
 
@@ -4747,6 +5431,16 @@ class _AnimatedMessageEntryState extends State<_AnimatedMessageEntry>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _controller.value = 1;
+    } else if (widget.animate && _controller.value == 0) {
+      _controller.forward();
+    }
+  }
+
+  @override
   void dispose() {
     _slideAnimation.dispose();
     _fadeAnimation.dispose();
@@ -4782,7 +5476,19 @@ class _TypingDotsState extends State<_TypingDots>
   late final AnimationController _controller = AnimationController(
     vsync: this,
     duration: const Duration(milliseconds: 1200),
-  )..repeat();
+  );
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _controller
+        ..stop()
+        ..value = 1;
+    } else if (!_controller.isAnimating) {
+      _controller.repeat();
+    }
+  }
 
   @override
   void dispose() {

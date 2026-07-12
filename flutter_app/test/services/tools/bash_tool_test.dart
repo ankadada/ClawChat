@@ -387,4 +387,38 @@ void main() {
       expect(await isBlocked('cat README.md'), isFalse);
     });
   });
+
+  test('bash never injects configured secrets for echo or inspection',
+      () async {
+    final prefs = PreferencesService();
+    prefs.envVars = {
+      'DECLARED_TOKEN': 'sentinel_value_for_test',
+    };
+    final executedCommands = <String>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') {
+        executedCommands
+            .add((call.arguments as Map)['command']?.toString() ?? '');
+        return 'not-present';
+      }
+      return null;
+    });
+
+    for (final command in const [
+      r'echo $DECLARED_TOKEN',
+      'printenv DECLARED_TOKEN',
+      r'echo ${DECLARED_TOKEN}',
+      r'''printf '%s' "$DECLARED_TOKEN" | base64''',
+      'env',
+    ]) {
+      final output = await tool.execute({'command': command});
+      expect(output, isNot(contains('sentinel_value_for_test')));
+    }
+    expect(
+      executedCommands.join('\n'),
+      isNot(contains('sentinel_value_for_test')),
+    );
+    prefs.envVars = {};
+  });
 }

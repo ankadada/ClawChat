@@ -9,6 +9,7 @@ void main() {
   const channel = MethodChannel(AppConstants.channelName);
   final tool = WriteFileTool();
   String? lastWritePath;
+  List<String>? lastAllowedRoots;
 
   setUpAll(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -19,6 +20,14 @@ void main() {
           return '';
         case 'writeRootfsFile':
           lastWritePath = args['path'] as String;
+          lastAllowedRoots = (args['allowedRoots'] as List?)?.cast<String>();
+          if (lastWritePath!.contains('linked-outside') ||
+              lastWritePath!.contains('scope-link')) {
+            throw PlatformException(
+              code: 'ROOTFS_WRITE_ERROR',
+              message: 'Symlink traversal is not allowed',
+            );
+          }
           return true;
       }
       return null;
@@ -195,6 +204,41 @@ void main() {
 
     test('allows dotfiles', () async {
       expect(await shellMetacharactersMatch('.gitignore'), isFalse);
+    });
+  });
+
+  group('WriteFileTool native scope enforcement', () {
+    test('passes the declared scope to the native write boundary', () async {
+      await tool.executeWithAllowedScopes(
+        {
+          'path': '/root/workspace/scoped/file.txt',
+          'content': 'data',
+        },
+        const {'/root/workspace/scoped'},
+      );
+      expect(lastAllowedRoots, ['/root/workspace/scoped']);
+    });
+
+    test('fails closed for a pre-existing parent symlink escape', () async {
+      final result = await tool.executeWithAllowedScopes(
+        {
+          'path': '/root/workspace/scoped/linked-outside/file.txt',
+          'content': 'data',
+        },
+        const {'/root/workspace/scoped'},
+      );
+      expect(result, startsWith('Error writing file:'));
+    });
+
+    test('fails closed when the declared write root is a symlink', () async {
+      final result = await tool.executeWithAllowedScopes(
+        {
+          'path': '/root/workspace/scope-link/file.txt',
+          'content': 'data',
+        },
+        const {'/root/workspace/scope-link'},
+      );
+      expect(result, startsWith('Error writing file:'));
     });
   });
 }

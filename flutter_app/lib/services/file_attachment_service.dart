@@ -2,9 +2,12 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 
 import '../models/chat_models.dart';
+import '../models/workspace_import_receipt.dart';
 import 'attachment_budget.dart';
+import 'bounded_file_reader.dart';
 import 'native_bridge.dart';
 
 class PreparedAttachment {
@@ -13,6 +16,7 @@ class PreparedAttachment {
   final bool includeAsContentBlock;
   final bool containsSensitiveText;
   final String? sensitiveWarning;
+  final WorkspaceImportReceipt? workspaceImportReceipt;
 
   const PreparedAttachment({
     required this.content,
@@ -20,6 +24,7 @@ class PreparedAttachment {
     required this.includeAsContentBlock,
     this.containsSensitiveText = false,
     this.sensitiveWarning,
+    this.workspaceImportReceipt,
   });
 }
 
@@ -27,6 +32,7 @@ class PreparedAttachment {
 /// into the proot workspace for use by the AI agent.
 class FileAttachmentService {
   static const _attachmentBudget = AttachmentBudget();
+  static BoundedFileStreamFactory? _inlineReadStreamForTesting;
 
   static const Set<String> _imageExtensions = {
     'jpg',
@@ -129,13 +135,14 @@ class FileAttachmentService {
     final extension = _extensionFor(safeName);
 
     if (_imageExtensions.contains(extension)) {
-      final sourceFile = File(sourcePath);
-      final byteLength = await sourceFile.length();
-      _attachmentBudget.checkInlineImageBytes(
-        byteLength,
-        fileName: safeName,
+      final bytes = await BoundedFileReader.readBytes(
+        sourcePath,
+        validateBytes: (byteLength) => _attachmentBudget.checkInlineImageBytes(
+          byteLength,
+          fileName: safeName,
+        ),
+        streamFactory: _inlineReadStreamForTesting,
       );
-      final bytes = await sourceFile.readAsBytes();
       final base64Content = base64Encode(bytes);
       return PreparedAttachment(
         content: ImageContent(
@@ -149,14 +156,20 @@ class FileAttachmentService {
     }
 
     if (_textExtensions.contains(extension)) {
-      final sourceFile = File(sourcePath);
-      final byteLength = await sourceFile.length();
-      _attachmentBudget.checkInlineTextBytes(
-        byteLength,
-        fileName: safeName,
+      final bytes = await BoundedFileReader.readBytes(
+        sourcePath,
+        validateBytes: (byteLength) => _attachmentBudget.checkInlineTextBytes(
+          byteLength,
+          fileName: safeName,
+        ),
+        streamFactory: _inlineReadStreamForTesting,
       );
-      final bytes = await sourceFile.readAsBytes();
-      final text = utf8.decode(bytes, allowMalformed: true);
+      late final String text;
+      try {
+        text = utf8.decode(bytes);
+      } on FormatException {
+        throw const FormatException('Text attachment is not valid UTF-8.');
+      }
       final fence = text.contains('```') ? '````' : '```';
       return PreparedAttachment(
         content: TextContent('File: $safeName\n$fence\n$text\n$fence'),
@@ -167,13 +180,13 @@ class FileAttachmentService {
       );
     }
 
-    final path = await importToWorkspace(file);
-    final size = formatFileSize(file.size);
-    final marker = '[Attached: $path ($size)]';
+    final receipt = await importToWorkspace(file);
+    final marker = receipt.marker;
     return PreparedAttachment(
       content: TextContent(marker),
       inputText: marker,
       includeAsContentBlock: false,
+      workspaceImportReceipt: receipt,
     );
   }
 
@@ -193,7 +206,9 @@ class FileAttachmentService {
   /// Copy a picked file into the proot workspace.
   /// Returns the path inside proot where the file was placed
   /// (e.g. /root/workspace/uploads/photo.jpg).
-  static Future<String> importToWorkspace(PlatformFile file) async {
+  static Future<WorkspaceImportReceipt> importToWorkspace(
+    PlatformFile file,
+  ) async {
     final sourcePath = file.path;
     if (sourcePath == null) {
       throw Exception(
@@ -201,33 +216,13 @@ class FileAttachmentService {
     }
 
     final safeName = sanitizeFileName(file.name);
-    final extension = _extensionFor(safeName);
     final sourceFile = File(sourcePath);
     final byteLength = await sourceFile.length();
     _attachmentBudget.checkWorkspaceImportBytes(
       byteLength,
       fileName: safeName,
     );
-
-    const destDir = 'root/workspace/uploads';
-    final destPath = '$destDir/$safeName';
-
-    if (_textExtensions.contains(extension)) {
-      // Text file: read as string and write directly via rootfs
-      final content = await sourceFile.readAsString();
-      await NativeBridge.writeRootfsFile(destPath, content);
-    } else {
-      // Binary file: base64 encode, write to temp file, decode inside proot
-      final bytes = await sourceFile.readAsBytes();
-      final base64Content = base64Encode(bytes);
-      await NativeBridge.writeRootfsFile('$destDir/.tmp_b64', base64Content);
-      await NativeBridge.runInProot(
-        'base64 -d /root/workspace/uploads/.tmp_b64 > "/root/workspace/uploads/$safeName" '
-        '&& rm /root/workspace/uploads/.tmp_b64',
-      );
-    }
-
-    return '/root/workspace/uploads/$safeName';
+    return NativeBridge.importFileToWorkspace(sourcePath, safeName);
   }
 
   /// Get a human-readable file size string.
@@ -254,5 +249,17 @@ class FileAttachmentService {
     if (extension == 'gif') return 'image/gif';
     if (extension == 'webp') return 'image/webp';
     return 'image/png';
+  }
+
+  @visibleForTesting
+  static void setInlineReadStreamForTesting(
+    BoundedFileStreamFactory streamFactory,
+  ) {
+    _inlineReadStreamForTesting = streamFactory;
+  }
+
+  @visibleForTesting
+  static void resetInlineReadStreamForTesting() {
+    _inlineReadStreamForTesting = null;
   }
 }

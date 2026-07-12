@@ -97,7 +97,6 @@ class DiagnosticsExportService {
       'providerKind': resolved?.provider.kind.name,
       'providerKey': resolved?.providerKey,
       'model': resolved?.modelId ?? profile?.effectiveModel,
-      'baseUrlHost': _hostOnly(profile?.baseUrl),
       if (capabilities != null) ..._capabilitySummary(capabilities),
     };
     return const JsonEncoder.withIndent('  ').convert(_sanitizeMap(values));
@@ -125,9 +124,7 @@ class DiagnosticsExportService {
   }
 
   Map<String, Object?> _sanitizeMap(Map<dynamic, dynamic> value) {
-    final recursivelyRedacted =
-        _sanitizeExportValue(value) as Map<String, Object?>;
-    return RuntimeDebugEventService.sanitizeData(recursivelyRedacted);
+    return _sanitizeExportValue(value) as Map<String, Object?>;
   }
 
   Object? _sanitizeExportValue(Object? value) {
@@ -157,13 +154,6 @@ class DiagnosticsExportService {
     return const LlmContentSanitizer()
         .sanitizeText(value.toString().replaceAll(RegExp(r'\s+'), ' ').trim())
         .text;
-  }
-
-  String _hostOnly(String? baseUrl) {
-    if (baseUrl == null || baseUrl.trim().isEmpty) return 'none';
-    final uri = Uri.tryParse(baseUrl.trim());
-    final host = uri?.host;
-    return host == null || host.isEmpty ? 'custom' : host.toLowerCase();
   }
 
   String _finalSanitize(String report) {

@@ -1,20 +1,26 @@
 enum VoiceInputPhase {
   idle,
-  starting,
-  nativeRecognition,
-  pluginRecognition,
-  whisperRecording,
+  listening,
+  stopping,
   transcribing,
+  cancelled,
+  error,
 }
+
+enum VoiceInputRoute { native, plugin, whisper }
 
 class VoiceInputStateMachine {
   VoiceInputPhase phase = VoiceInputPhase.idle;
+  VoiceInputRoute? route;
+  String? errorCode;
   int _token = 0;
 
   int? beginStart() {
-    if (phase != VoiceInputPhase.idle) return null;
+    if (isBusy) return null;
     _token += 1;
-    phase = VoiceInputPhase.starting;
+    errorCode = null;
+    route = null;
+    phase = VoiceInputPhase.listening;
     return _token;
   }
 
@@ -22,23 +28,27 @@ class VoiceInputStateMachine {
 
   bool isCurrent(int token) => token == _token;
 
-  bool get isListening =>
-      phase == VoiceInputPhase.starting ||
-      phase == VoiceInputPhase.nativeRecognition ||
-      phase == VoiceInputPhase.pluginRecognition;
+  bool get isListening => phase == VoiceInputPhase.listening;
 
-  bool get isWhisperRecording => phase == VoiceInputPhase.whisperRecording;
+  bool get isWhisperRecording =>
+      phase == VoiceInputPhase.listening && route == VoiceInputRoute.whisper;
 
-  bool get isBusy => phase != VoiceInputPhase.idle;
+  bool get isBusy => !isTerminal;
+  bool get isTerminal =>
+      phase == VoiceInputPhase.idle ||
+      phase == VoiceInputPhase.cancelled ||
+      phase == VoiceInputPhase.error;
+
+  bool enterStopping(int token) => _enter(token, VoiceInputPhase.stopping);
 
   bool enterNativeRecognition(int token) =>
-      _enter(token, VoiceInputPhase.nativeRecognition);
+      _enterListening(token, VoiceInputRoute.native);
 
   bool enterPluginRecognition(int token) =>
-      _enter(token, VoiceInputPhase.pluginRecognition);
+      _enterListening(token, VoiceInputRoute.plugin);
 
   bool enterWhisperRecording(int token) =>
-      _enter(token, VoiceInputPhase.whisperRecording);
+      _enterListening(token, VoiceInputRoute.whisper);
 
   bool enterTranscribing(int token) =>
       _enter(token, VoiceInputPhase.transcribing);
@@ -46,17 +56,36 @@ class VoiceInputStateMachine {
   bool complete(int token) {
     if (!isCurrent(token)) return false;
     phase = VoiceInputPhase.idle;
+    route = null;
+    errorCode = null;
+    route = null;
     return true;
   }
 
   void cancel() {
     _token += 1;
-    phase = VoiceInputPhase.idle;
+    errorCode = null;
+    phase = VoiceInputPhase.cancelled;
+  }
+
+  bool fail(int token, String code) {
+    if (!isCurrent(token)) return false;
+    errorCode = code;
+    route = null;
+    phase = VoiceInputPhase.error;
+    return true;
   }
 
   bool _enter(int token, VoiceInputPhase nextPhase) {
     if (!isCurrent(token)) return false;
     phase = nextPhase;
+    return true;
+  }
+
+  bool _enterListening(int token, VoiceInputRoute nextRoute) {
+    if (!isCurrent(token)) return false;
+    route = nextRoute;
+    phase = VoiceInputPhase.listening;
     return true;
   }
 }

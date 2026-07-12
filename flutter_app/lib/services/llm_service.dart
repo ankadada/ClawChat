@@ -1,14 +1,136 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
-import 'package:http/io_client.dart';
 import '../models/model_capabilities.dart';
+import 'app_http.dart';
 import 'api_validator.dart';
 import 'llm_content_sanitizer.dart';
 import 'model_capability_registry.dart';
 import 'provider_message_transform.dart';
 export '../models/model_capabilities.dart' show ApiFormat;
+
+/// Test seam for driving request timeout time and lifecycle transitions.
+///
+/// Production uses [_SystemLlmTimeoutScheduler], whose clock is monotonic and
+/// whose global binding observer publishes precise lifecycle transitions.
+/// Tests can publish transitions at an exact fake-clock instant so foreground
+/// budget accounting has no wall-clock sleeps or polling races.
+@visibleForTesting
+abstract interface class LlmTimeoutScheduler {
+  DateTime now();
+
+  Timer schedule(Duration duration, void Function() callback);
+
+  Future<void> delay(Duration duration);
+
+  void Function()? registerLifecycleListener(
+    void Function(LlmLifecycleTransition transition) listener,
+  );
+}
+
+@immutable
+@visibleForTesting
+final class LlmLifecycleTransition {
+  const LlmLifecycleTransition({
+    required this.isInBackground,
+    required this.timestamp,
+  });
+
+  final bool isInBackground;
+  final DateTime timestamp;
+}
+
+final class _LlmDeadline {
+  const _LlmDeadline({
+    required this.startedAt,
+    required this.expiresAt,
+    required this.maxDuration,
+  });
+
+  final DateTime startedAt;
+  final DateTime expiresAt;
+  final Duration maxDuration;
+
+  Duration remaining(DateTime now) => expiresAt.difference(now);
+}
+
+/// Process-wide precise app lifecycle events in the timeout clock domain.
+final class _LlmLifecycleBroadcaster with WidgetsBindingObserver {
+  _LlmLifecycleBroadcaster()
+      : _origin = DateTime.now(),
+        _clock = Stopwatch()..start();
+
+  static final instance = _LlmLifecycleBroadcaster();
+
+  final DateTime _origin;
+  final Stopwatch _clock;
+  final Set<void Function(LlmLifecycleTransition)> _listeners = {};
+  bool _observing = false;
+  bool? _isInBackground;
+
+  DateTime now() => _origin.add(_clock.elapsed);
+
+  void Function()? addListener(
+    void Function(LlmLifecycleTransition transition) listener,
+  ) {
+    if (!_observing) {
+      late final WidgetsBinding binding;
+      try {
+        binding = WidgetsBinding.instance;
+      } on FlutterError {
+        // Pure Dart/VM tests may exercise LLM services without a Flutter
+        // binding. They use the bounded sampled-lifecycle fallback instead.
+        return null;
+      }
+      binding.addObserver(this);
+      _observing = true;
+    }
+    _listeners.add(listener);
+    return () => _listeners.remove(listener);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final isInBackground = state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached;
+    if (_isInBackground == isInBackground) return;
+    _isInBackground = isInBackground;
+    final transition = LlmLifecycleTransition(
+      isInBackground: isInBackground,
+      timestamp: now(),
+    );
+    for (final listener in _listeners.toList(growable: false)) {
+      listener(transition);
+    }
+  }
+}
+
+final class _SystemLlmTimeoutScheduler implements LlmTimeoutScheduler {
+  _SystemLlmTimeoutScheduler();
+
+  final _lifecycle = _LlmLifecycleBroadcaster.instance;
+
+  @override
+  DateTime now() => _lifecycle.now();
+
+  @override
+  Timer schedule(Duration duration, void Function() callback) {
+    return Timer(duration, callback);
+  }
+
+  @override
+  Future<void> delay(Duration duration) => Future<void>.delayed(duration);
+
+  @override
+  void Function()? registerLifecycleListener(
+    void Function(LlmLifecycleTransition transition) listener,
+  ) {
+    return _lifecycle.addListener(listener);
+  }
+}
 
 class EncryptedContentError implements Exception {
   final String message;
@@ -325,10 +447,12 @@ class _ResilientSseRetry extends _ResilientSseEvent {
 
 class LlmService {
   final LlmConfig config;
-  final http.Client _client;
+  final AppHttpClient _client;
+  final Completer<void> _abortTrigger = Completer<void>();
   final bool Function()? _isInBackground;
   final Duration _requestTimeoutDuration;
   final Duration _requestMaxWallClockDuration;
+  final LlmTimeoutScheduler _timeoutScheduler;
   final CapabilityRegistry _capabilityRegistry;
   bool _disposed = false;
 
@@ -357,23 +481,15 @@ class LlmService {
     CapabilityRegistry capabilityRegistry = CapabilityRegistry.instance,
     Duration? requestTimeout,
     Duration? requestMaxWallClock,
+    AppHttpClient? httpClient,
+    @visibleForTesting LlmTimeoutScheduler? timeoutScheduler,
   })  : _capabilityRegistry = capabilityRegistry,
         _isInBackground = isInBackground,
         _requestTimeoutDuration = requestTimeout ?? _requestTimeout,
         _requestMaxWallClockDuration =
             requestMaxWallClock ?? _requestMaxWallClockTimeout,
-        _client = _createPinnedClient();
-
-  /// Creates an HTTP client that rejects bad TLS certificates (self-signed,
-  /// expired, wrong-host) to mitigate MITM attacks on API traffic.
-  static http.Client _createPinnedClient() {
-    final httpClient = HttpClient()
-      ..idleTimeout = const Duration(seconds: 120)
-      ..badCertificateCallback = (X509Certificate cert, String host, int port) {
-        return false;
-      };
-    return IOClient(httpClient);
-  }
+        _timeoutScheduler = timeoutScheduler ?? _SystemLlmTimeoutScheduler(),
+        _client = httpClient ?? AppHttpClientRegistry.instance.client;
 
   /// Validates that [url] uses HTTPS and targets a known AI provider host.
   void _validateApiHost(String url) {
@@ -394,23 +510,27 @@ class LlmService {
     required String apiFormat,
     required String apiKey,
     String? baseUrl,
+    AppHttpClient? httpClient,
   }) async {
+    final client = httpClient ?? AppHttpClientRegistry.instance.client;
     if (apiFormat == 'anthropic') {
       final effectiveBaseUrl = (baseUrl != null && baseUrl.isNotEmpty)
           ? baseUrl
           : 'https://api.anthropic.com';
       final url = _joinEndpointUrl(effectiveBaseUrl, '/v1/models');
-      final client = _createPinnedClient();
       try {
         final uri =
             ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
-        final response = await client.get(
-          uri,
+        final response = await _sendResponseWithTimeout(
+          client,
+          method: 'GET',
+          uri: uri,
           headers: {
             'x-api-key': apiKey,
             'anthropic-version': '2023-06-01',
           },
-        ).timeout(const Duration(seconds: 10));
+          timeout: const Duration(seconds: 10),
+        );
         if (response.statusCode == 200) {
           final data = jsonDecode(response.body) as Map<String, dynamic>;
           final models = (data['data'] as List? ?? const [])
@@ -424,8 +544,6 @@ class LlmService {
         return _anthropicPresetModels();
       } catch (_) {
         return _anthropicPresetModels();
-      } finally {
-        client.close();
       }
     }
 
@@ -433,14 +551,16 @@ class LlmService {
         ? baseUrl
         : 'https://api.openai.com';
     final url = _joinEndpointUrl(effectiveBaseUrl, '/v1/models');
-    final client = _createPinnedClient();
     try {
       final uri =
           ApiValidator.validateBearerUrl(url, context: 'Models API endpoint');
-      final response = await client.get(
-        uri,
+      final response = await _sendResponseWithTimeout(
+        client,
+        method: 'GET',
+        uri: uri,
         headers: {'Authorization': 'Bearer $apiKey'},
-      ).timeout(const Duration(seconds: 10));
+        timeout: const Duration(seconds: 10),
+      );
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
@@ -463,8 +583,6 @@ class LlmService {
       );
     } catch (e) {
       throw Exception('Failed to fetch models: $e');
-    } finally {
-      client.close();
     }
   }
 
@@ -526,12 +644,88 @@ class LlmService {
     return _joinBaseUrl(trimmedBase, endpoint);
   }
 
-  /// Closes the underlying HTTP client. Must be called when the service
-  /// is no longer needed to avoid connection pool leaks.
+  static Future<http.Response> _sendResponse(
+    AppHttpClient client,
+    http.BaseRequest request,
+  ) async {
+    return http.Response.fromStream(await client.send(request));
+  }
+
+  static Future<http.Response> _sendResponseWithTimeout(
+    AppHttpClient client, {
+    required String method,
+    required Uri uri,
+    required Map<String, String> headers,
+    required Duration timeout,
+  }) async {
+    final abort = Completer<void>();
+    final timer = Timer(timeout, () {
+      if (!abort.isCompleted) abort.complete();
+    });
+    final request = http.AbortableRequest(
+      method,
+      uri,
+      abortTrigger: abort.future,
+    )..headers.addAll(headers);
+    try {
+      return await _sendResponse(client, request);
+    } on http.RequestAbortedException {
+      throw TimeoutException('Request timed out', timeout);
+    } finally {
+      timer.cancel();
+    }
+  }
+
+  http.AbortableRequest _abortableRequest(
+    String method,
+    Uri uri, {
+    required Map<String, String> headers,
+    required Future<void> attemptAbortTrigger,
+    required _LlmDeadline deadline,
+    String? body,
+  }) {
+    _ensureDeadlineRemaining(deadline);
+    final request = http.AbortableRequest(
+      method,
+      uri,
+      abortTrigger: Future.any<void>([
+        _abortTrigger.future,
+        attemptAbortTrigger,
+      ]),
+    );
+    request.headers.addAll(headers);
+    if (body != null) request.body = body;
+    return request;
+  }
+
+  Future<http.Response> _postJson(
+    Uri uri, {
+    required Map<String, String> headers,
+    required String body,
+    required Future<void> attemptAbortTrigger,
+    required _LlmDeadline deadline,
+  }) {
+    return _sendResponse(
+      _client,
+      _abortableRequest(
+        'POST',
+        uri,
+        headers: headers,
+        body: body,
+        attemptAbortTrigger: attemptAbortTrigger,
+        deadline: deadline,
+      ),
+    );
+  }
+
+  /// Retires this service without closing the app-owned shared transport.
+  /// Active stream subscriptions remain independently cancellable by callers.
   void dispose() {
     if (_disposed) return;
     _disposed = true;
-    _client.close();
+    if (!_abortTrigger.isCompleted) {
+      _abortTrigger.complete();
+    }
   }
 
   ResolvedModelProfile get resolvedModelProfile => _capabilityRegistry.resolve(
@@ -596,6 +790,8 @@ class LlmService {
   static const Duration _streamChunkTimeout = Duration(seconds: 60);
   static const Duration _streamReconnectBaseDelay = Duration(seconds: 2);
   static const Duration _foregroundTimeoutPollInterval = Duration(seconds: 1);
+  static const Duration _sampledLifecyclePollInterval =
+      Duration(milliseconds: 100);
   static const String _requestMaxWallClockTimeoutMessage =
       'Request exceeded maximum wall-clock timeout';
   static const int _maxRetries = 3;
@@ -606,29 +802,74 @@ class LlmService {
   };
 
   /// Runs [fn] with exponential backoff retry on 429 and 5xx errors.
-  Future<T> _retryWithBackoff<T>(Future<T> Function() fn) async {
-    final requestStartedAt = DateTime.now();
+  Future<T> _retryWithBackoff<T>(
+    Future<T> Function(
+      Future<void> attemptAbortTrigger,
+      _LlmDeadline deadline,
+    ) fn, {
+    _LlmDeadline? deadline,
+  }) async {
+    final logicalDeadline = deadline ?? _newDeadline();
     for (int attempt = 0; attempt <= _maxRetries; attempt++) {
+      final attemptAbort = Completer<void>();
+      late final Future<T> attemptWork;
+      _ensureDeadlineRemaining(logicalDeadline);
       try {
-        return await _withForegroundTimeout(fn(), startedAt: requestStartedAt);
+        attemptWork =
+            Future<T>.sync(() => fn(attemptAbort.future, logicalDeadline));
+        return await _withForegroundTimeout(
+          attemptWork,
+          deadline: logicalDeadline,
+          abortOnTimeout: () {
+            if (!attemptAbort.isCompleted) attemptAbort.complete();
+          },
+        );
       } on TimeoutException catch (e) {
         if (_isRequestMaxWallClockTimeout(e)) rethrow;
         if (attempt == _maxRetries) rethrow;
       } catch (e) {
+        if (e is http.RequestAbortedException) rethrow;
         final isRetryable = e is http.ClientException ||
             (e is Exception && _isRetryableHttpError(e.toString()));
         if (!isRetryable || attempt == _maxRetries) rethrow;
       }
+      await _retireAttemptBeforeRetry(attemptAbort, attemptWork);
       final delay = Duration(seconds: (1 << attempt) * 2);
-      final wallRemaining = _remainingRequestWallClock(requestStartedAt);
+      final wallRemaining = _remainingRequestWallClock(logicalDeadline);
       if (wallRemaining <= Duration.zero) {
         throw _requestMaxWallClockTimeoutException(
-          _requestMaxWallClockDuration,
+          logicalDeadline.maxDuration,
         );
       }
-      await Future.delayed(delay <= wallRemaining ? delay : wallRemaining);
+      if (_disposed) throw http.RequestAbortedException();
+      await _timeoutScheduler.delay(
+        delay <= wallRemaining ? delay : wallRemaining,
+      );
+      if (_disposed) throw http.RequestAbortedException();
     }
     throw StateError('unreachable');
+  }
+
+  Future<void> _retireAttemptBeforeRetry<T>(
+    Completer<void> attemptAbort,
+    Future<T> attemptWork,
+  ) async {
+    if (!attemptAbort.isCompleted) attemptAbort.complete();
+    await attemptAbort.future;
+    try {
+      await attemptWork;
+    } catch (_) {
+      // The retry classifier already handled this attempt's terminal error.
+    }
+  }
+
+  @visibleForTesting
+  Future<T> retryWithBackoffForTesting<T>(
+    Future<T> Function(Future<void> attemptAbortTrigger) operation,
+  ) {
+    return _retryWithBackoff(
+      (attemptAbortTrigger, _) => operation(attemptAbortTrigger),
+    );
   }
 
   static bool _isRequestMaxWallClockTimeout(TimeoutException error) {
@@ -644,38 +885,38 @@ class LlmService {
     );
   }
 
-  Duration _remainingRequestWallClock(DateTime startedAt) {
-    return _requestMaxWallClockDuration - DateTime.now().difference(startedAt);
+  _LlmDeadline _newDeadline() {
+    final startedAt = _timeoutScheduler.now();
+    return _LlmDeadline(
+      startedAt: startedAt,
+      expiresAt: startedAt.add(_requestMaxWallClockDuration),
+      maxDuration: _requestMaxWallClockDuration,
+    );
+  }
+
+  Duration _remainingRequestWallClock(_LlmDeadline deadline) {
+    return deadline.remaining(_timeoutScheduler.now());
+  }
+
+  void _ensureDeadlineRemaining(_LlmDeadline deadline) {
+    if (_remainingRequestWallClock(deadline) <= Duration.zero) {
+      throw _requestMaxWallClockTimeoutException(deadline.maxDuration);
+    }
   }
 
   Future<T> _withForegroundTimeout<T>(
     Future<T> future, {
-    required DateTime startedAt,
+    required _LlmDeadline deadline,
+    required void Function() abortOnTimeout,
   }) {
-    final isInBackground = _isInBackground;
-    if (isInBackground == null) {
-      final wallRemaining = _remainingRequestWallClock(startedAt);
-      if (wallRemaining <= Duration.zero) {
-        return Future<T>.error(
-          _requestMaxWallClockTimeoutException(_requestMaxWallClockDuration),
-          StackTrace.current,
-        );
-      }
-      if (wallRemaining < _requestTimeoutDuration) {
-        return future.timeout(
-          wallRemaining,
-          onTimeout: () => throw _requestMaxWallClockTimeoutException(
-            _requestMaxWallClockDuration,
-          ),
-        );
-      }
-      return future.timeout(_requestTimeoutDuration);
-    }
+    final isInBackground = _isInBackground ?? () => false;
 
     final completer = Completer<T>();
     Timer? timer;
+    void Function()? unregisterLifecycleListener;
     var settled = false;
-    var lastCheck = DateTime.now();
+    TimeoutException? pendingTimeout;
+    var lastCheck = _timeoutScheduler.now();
     var foregroundElapsed = Duration.zero;
     var wasInBackground = isInBackground();
 
@@ -684,41 +925,56 @@ class LlmService {
       timer = null;
     }
 
+    void cancelLifecycleListener() {
+      unregisterLifecycleListener?.call();
+      unregisterLifecycleListener = null;
+    }
+
     void completeValue(T value) {
       if (settled) return;
       settled = true;
       cancelTimer();
-      completer.complete(value);
+      cancelLifecycleListener();
+      final timeout = pendingTimeout;
+      if (timeout != null) {
+        completer.completeError(timeout, StackTrace.current);
+      } else {
+        completer.complete(value);
+      }
     }
 
     void completeError(Object error, StackTrace stackTrace) {
       if (settled) return;
       settled = true;
       cancelTimer();
-      completer.completeError(error, stackTrace);
+      cancelLifecycleListener();
+      final timeout = pendingTimeout;
+      if (timeout != null) {
+        completer.completeError(timeout, StackTrace.current);
+      } else {
+        completer.completeError(error, stackTrace);
+      }
     }
 
     Duration minDuration(Duration a, Duration b) => a <= b ? a : b;
     final timeoutMicros = _requestTimeoutDuration.inMicroseconds;
-    final pollInterval = minDuration(
+    var pollInterval = minDuration(
       _foregroundTimeoutPollInterval,
       Duration(
         microseconds: timeoutMicros <= 4 ? 1 : (timeoutMicros + 3) ~/ 4,
       ),
     );
 
-    void failWithTimeout(String message, Duration duration) {
-      completeError(
-        TimeoutException(
-          message,
-          duration,
-        ),
-        StackTrace.current,
-      );
+    void beginTimeout(String message, Duration duration) {
+      if (settled || pendingTimeout != null) return;
+      pendingTimeout = TimeoutException(message, duration);
+      cancelTimer();
+      cancelLifecycleListener();
+      abortOnTimeout();
     }
 
     Duration remainingWallClock(DateTime now) {
-      return _requestMaxWallClockDuration - now.difference(startedAt);
+      return deadline.remaining(now);
     }
 
     Duration nextDelay(Duration preferred, DateTime now) {
@@ -727,61 +983,105 @@ class LlmService {
       return minDuration(preferred, wallRemaining);
     }
 
+    late void Function({
+      DateTime? transitionTimestamp,
+      bool? transitionBackgroundState,
+    }) checkTimeout;
+
     void scheduleTimeout([Duration? delay]) {
       cancelTimer();
-      if (settled) return;
-      timer = Timer(delay ?? _requestTimeoutDuration, () {
-        if (settled) return;
-        final now = DateTime.now();
-        final wallRemaining = remainingWallClock(now);
-        if (wallRemaining <= Duration.zero) {
-          failWithTimeout(
-            '$_requestMaxWallClockTimeoutMessage: '
-            '$_requestMaxWallClockDuration',
-            _requestMaxWallClockDuration,
-          );
-          return;
-        }
-        if (isInBackground()) {
-          wasInBackground = true;
-          foregroundElapsed = Duration.zero;
-          lastCheck = now;
-          scheduleTimeout(nextDelay(pollInterval, now));
-          return;
-        }
-        if (wasInBackground) {
-          wasInBackground = false;
-          foregroundElapsed = Duration.zero;
-          lastCheck = now;
-          scheduleTimeout(
-            nextDelay(minDuration(_requestTimeoutDuration, pollInterval), now),
-          );
-          return;
-        }
-        foregroundElapsed += now.difference(lastCheck);
-        lastCheck = now;
-        final remaining = _requestTimeoutDuration - foregroundElapsed;
-        if (remaining <= Duration.zero) {
-          failWithTimeout(
-            'No response received within $_requestTimeoutDuration',
-            _requestTimeoutDuration,
-          );
-          return;
-        }
-        scheduleTimeout(
-          nextDelay(minDuration(remaining, pollInterval), now),
-        );
+      if (settled || pendingTimeout != null) return;
+      timer = _timeoutScheduler.schedule(delay ?? _requestTimeoutDuration, () {
+        checkTimeout();
       });
     }
 
-    scheduleTimeout(
-      nextDelay(
-        minDuration(_requestTimeoutDuration, pollInterval),
-        DateTime.now(),
-      ),
-    );
+    void scheduleNextCheck(DateTime now) {
+      final foregroundRemaining = _requestTimeoutDuration - foregroundElapsed;
+      final preferred = wasInBackground
+          ? pollInterval
+          : minDuration(foregroundRemaining, pollInterval);
+      scheduleTimeout(nextDelay(preferred, now));
+    }
+
+    checkTimeout = ({
+      DateTime? transitionTimestamp,
+      bool? transitionBackgroundState,
+    }) {
+      if (settled || pendingTimeout != null) return;
+      final sampledNow = _timeoutScheduler.now();
+      final now =
+          transitionTimestamp == null || transitionTimestamp.isAfter(sampledNow)
+              ? sampledNow
+              : transitionTimestamp;
+      final wallRemaining = remainingWallClock(now);
+      if (wallRemaining <= Duration.zero) {
+        beginTimeout(
+          '$_requestMaxWallClockTimeoutMessage: '
+          '${deadline.maxDuration}',
+          deadline.maxDuration,
+        );
+        return;
+      }
+      final currentlyInBackground =
+          transitionBackgroundState ?? isInBackground();
+      final elapsedSinceLastCheck =
+          now.isBefore(lastCheck) ? Duration.zero : now.difference(lastCheck);
+
+      // Charge elapsed time according to the previously observed state. With
+      // precise lifecycle events the timestamp is exact. With sampled fallback
+      // a foreground -> background interval is conservatively charged in full,
+      // bounding error without allowing repeated toggles to refresh budget.
+      if (!wasInBackground) {
+        foregroundElapsed += elapsedSinceLastCheck;
+      }
+
+      lastCheck = now;
+      wasInBackground = currentlyInBackground;
+      final remaining = _requestTimeoutDuration - foregroundElapsed;
+      if (remaining <= Duration.zero) {
+        beginTimeout(
+          'No response received within $_requestTimeoutDuration',
+          _requestTimeoutDuration,
+        );
+        return;
+      }
+      scheduleNextCheck(now);
+    };
+
+    if (_isInBackground != null) {
+      unregisterLifecycleListener =
+          _timeoutScheduler.registerLifecycleListener((transition) {
+        checkTimeout(
+          transitionTimestamp: transition.timestamp,
+          transitionBackgroundState: transition.isInBackground,
+        );
+      });
+      if (unregisterLifecycleListener == null) {
+        pollInterval = minDuration(
+          pollInterval,
+          _sampledLifecyclePollInterval,
+        );
+      }
+    }
+    scheduleNextCheck(_timeoutScheduler.now());
     future.then(completeValue, onError: completeError);
     return completer.future;
+  }
+
+  @visibleForTesting
+  Future<T> withForegroundTimeoutForTesting<T>(
+    Future<T> Function(Future<void> abortTrigger) operation,
+  ) {
+    final abort = Completer<void>();
+    final deadline = _newDeadline();
+    return _withForegroundTimeout(
+      Future<T>.sync(() => operation(abort.future)),
+      deadline: deadline,
+      abortOnTimeout: () {
+        if (!abort.isCompleted) abort.complete();
+      },
+    );
   }
 
   static bool _isRetryableHttpError(String msg) {
@@ -791,6 +1091,10 @@ class LlmService {
   }
 
   bool _isRetryableStreamError(Object error) {
+    if (error is http.RequestAbortedException) return false;
+    if (error is TimeoutException && _isRequestMaxWallClockTimeout(error)) {
+      return false;
+    }
     return error is http.ClientException ||
         error is TimeoutException ||
         error is SocketException ||
@@ -799,67 +1103,178 @@ class LlmService {
         (error is Exception && _isRetryableHttpError(error.toString()));
   }
 
-  Future<void> _delayBeforeStreamReconnect(int completedAttempts) async {
+  Future<void> _delayBeforeStreamReconnect(
+    int completedAttempts,
+    _LlmDeadline deadline,
+  ) async {
     final multiplier = 1 << completedAttempts;
-    await Future.delayed(_streamReconnectBaseDelay * multiplier);
+    final delay = _streamReconnectBaseDelay * multiplier;
+    final wallRemaining = _remainingRequestWallClock(deadline);
+    if (wallRemaining <= Duration.zero) {
+      throw _requestMaxWallClockTimeoutException(deadline.maxDuration);
+    }
+    await _timeoutScheduler.delay(
+      delay <= wallRemaining ? delay : wallRemaining,
+    );
+    if (_remainingRequestWallClock(deadline) <= Duration.zero) {
+      throw _requestMaxWallClockTimeoutException(deadline.maxDuration);
+    }
   }
 
   Stream<String> _linesWithForegroundTimeout(
     Stream<List<int>> byteStream, {
+    required _LlmDeadline deadline,
     bool Function()? isInBackground,
   }) {
     late final StreamController<String> controller;
     StreamSubscription<String>? subscription;
     Timer? timeoutTimer;
+    void Function()? unregisterLifecycleListener;
     var pendingLine = '';
-    var lastChunkTime = DateTime.now();
+    var lastCheck = _timeoutScheduler.now();
+    var idleForegroundElapsed = Duration.zero;
+    var wasInBackground = isInBackground?.call() ?? false;
     var closed = false;
+    var controllerCancelled = false;
+    var consumerPaused = false;
 
     void cancelTimeout() {
       timeoutTimer?.cancel();
       timeoutTimer = null;
     }
 
-    void failWithTimeout() {
-      closed = true;
-      unawaited(subscription?.cancel());
-      controller.addError(
-        TimeoutException(
-          'No stream data received within $_streamChunkTimeout',
-          _streamChunkTimeout,
-        ),
-      );
-      unawaited(controller.close());
+    void cancelLifecycleListener() {
+      unregisterLifecycleListener?.call();
+      unregisterLifecycleListener = null;
     }
 
-    void scheduleTimeout([Duration delay = _streamChunkTimeout]) {
+    void cleanupTimeoutState() {
+      cancelTimeout();
+      cancelLifecycleListener();
+    }
+
+    void failWithError(Object error, StackTrace stackTrace) {
+      if (closed) return;
+      closed = true;
+      cleanupTimeoutState();
+      unawaited(() async {
+        try {
+          await subscription?.cancel();
+        } finally {
+          if (!controllerCancelled) {
+            controller.addError(error, stackTrace);
+            await controller.close();
+          }
+        }
+      }());
+    }
+
+    Duration minDuration(Duration a, Duration b) => a <= b ? a : b;
+
+    Duration wallRemaining(DateTime now) {
+      return deadline.remaining(now);
+    }
+
+    late void Function({
+      DateTime? transitionTimestamp,
+      bool? transitionBackgroundState,
+    }) checkTimeout;
+
+    void scheduleTimeout(Duration delay) {
       cancelTimeout();
       if (closed) return;
-      timeoutTimer = Timer(delay, () {
-        if (closed) return;
-        if (isInBackground?.call() == true) {
-          lastChunkTime = DateTime.now();
-          scheduleTimeout();
-          return;
-        }
-
-        final idleDuration = DateTime.now().difference(lastChunkTime);
-        if (idleDuration < _streamChunkTimeout) {
-          scheduleTimeout(_streamChunkTimeout - idleDuration);
-          return;
-        }
-
-        failWithTimeout();
+      timeoutTimer = _timeoutScheduler.schedule(delay, () {
+        checkTimeout();
       });
+    }
+
+    void scheduleNextCheck(DateTime now) {
+      final remainingWall = wallRemaining(now);
+      if (remainingWall <= Duration.zero) {
+        scheduleTimeout(Duration.zero);
+        return;
+      }
+      if (consumerPaused) {
+        scheduleTimeout(remainingWall);
+        return;
+      }
+      final lifecyclePollInterval =
+          isInBackground != null && unregisterLifecycleListener == null
+              ? _sampledLifecyclePollInterval
+              : _foregroundTimeoutPollInterval;
+      final preferred = wasInBackground
+          ? lifecyclePollInterval
+          : minDuration(
+              _streamChunkTimeout - idleForegroundElapsed,
+              lifecyclePollInterval,
+            );
+      scheduleTimeout(minDuration(preferred, remainingWall));
+    }
+
+    checkTimeout = ({
+      DateTime? transitionTimestamp,
+      bool? transitionBackgroundState,
+    }) {
+      if (closed) return;
+      final sampledNow = _timeoutScheduler.now();
+      if (wallRemaining(sampledNow) <= Duration.zero) {
+        failWithError(
+          _requestMaxWallClockTimeoutException(
+            deadline.maxDuration,
+          ),
+          StackTrace.current,
+        );
+        return;
+      }
+      final now =
+          transitionTimestamp == null || transitionTimestamp.isAfter(sampledNow)
+              ? sampledNow
+              : transitionTimestamp;
+      final currentlyInBackground =
+          transitionBackgroundState ?? isInBackground?.call() ?? false;
+      final elapsedSinceLastCheck =
+          now.isBefore(lastCheck) ? Duration.zero : now.difference(lastCheck);
+      if (!consumerPaused && !wasInBackground) {
+        idleForegroundElapsed += elapsedSinceLastCheck;
+      }
+      lastCheck = now;
+      wasInBackground = currentlyInBackground;
+      if (!consumerPaused && idleForegroundElapsed >= _streamChunkTimeout) {
+        failWithError(
+          TimeoutException(
+            'No stream data received within $_streamChunkTimeout',
+            _streamChunkTimeout,
+          ),
+          StackTrace.current,
+        );
+        return;
+      }
+      scheduleNextCheck(sampledNow);
+    };
+
+    void resetIdleBudget() {
+      idleForegroundElapsed = Duration.zero;
+      lastCheck = _timeoutScheduler.now();
+      wasInBackground = isInBackground?.call() ?? false;
+      scheduleNextCheck(lastCheck);
     }
 
     controller = StreamController<String>(
       onListen: () {
-        scheduleTimeout();
+        if (isInBackground != null) {
+          unregisterLifecycleListener =
+              _timeoutScheduler.registerLifecycleListener((transition) {
+            checkTimeout(
+              transitionTimestamp: transition.timestamp,
+              transitionBackgroundState: transition.isInBackground,
+            );
+          });
+        }
+        scheduleNextCheck(_timeoutScheduler.now());
         subscription = byteStream.transform(utf8.decoder).listen(
           (chunk) {
-            lastChunkTime = DateTime.now();
-            scheduleTimeout();
+            if (closed) return;
+            resetIdleBudget();
             pendingLine += chunk;
             while (true) {
               final newlineIndex = pendingLine.indexOf('\n');
@@ -873,11 +1288,7 @@ class LlmService {
             }
           },
           onError: (Object error, StackTrace stackTrace) {
-            if (closed) return;
-            closed = true;
-            cancelTimeout();
-            controller.addError(error, stackTrace);
-            unawaited(controller.close());
+            failWithError(error, stackTrace);
           },
           onDone: () {
             if (closed) return;
@@ -890,23 +1301,28 @@ class LlmService {
               pendingLine = '';
             }
             closed = true;
-            cancelTimeout();
+            cleanupTimeoutState();
             unawaited(controller.close());
           },
         );
       },
       onPause: () {
-        cancelTimeout();
+        if (closed) return;
+        consumerPaused = true;
+        lastCheck = _timeoutScheduler.now();
+        scheduleNextCheck(lastCheck);
         subscription?.pause();
       },
       onResume: () {
-        lastChunkTime = DateTime.now();
-        scheduleTimeout();
+        if (closed) return;
+        consumerPaused = false;
+        resetIdleBudget();
         subscription?.resume();
       },
       onCancel: () async {
+        controllerCancelled = true;
         closed = true;
-        cancelTimeout();
+        cleanupTimeoutState();
         await subscription?.cancel();
       },
     );
@@ -914,17 +1330,31 @@ class LlmService {
     return controller.stream;
   }
 
+  @visibleForTesting
+  Stream<String> linesWithForegroundTimeoutForTesting(
+    Stream<List<int>> byteStream,
+  ) {
+    return _linesWithForegroundTimeout(
+      byteStream,
+      deadline: _newDeadline(),
+      isInBackground: _isInBackground,
+    );
+  }
+
   Stream<_ResilientSseEvent> _resilientSseDataStream({
     required Future<http.StreamedResponse> Function() openStream,
     required bool Function(String data) isDoneData,
+    required _LlmDeadline deadline,
     bool Function()? isInBackground,
   }) async* {
     for (int attempt = 0; attempt <= _maxStreamReconnects; attempt++) {
       final sseDataLines = <String>[];
       try {
+        _ensureDeadlineRemaining(deadline);
         final response = await openStream();
         await for (final line in _linesWithForegroundTimeout(
           response.stream,
+          deadline: deadline,
           isInBackground: isInBackground,
         )) {
           if (line.startsWith('data:')) {
@@ -959,7 +1389,31 @@ class LlmService {
           rethrow;
         }
         yield const _ResilientSseRetry();
-        await _delayBeforeStreamReconnect(attempt);
+        await _delayBeforeStreamReconnect(attempt, deadline);
+      }
+    }
+  }
+
+  @visibleForTesting
+  Stream<String> resilientSseDataForTesting(
+    Future<http.StreamedResponse> Function(
+      Future<void> attemptAbortTrigger,
+    ) openStream,
+  ) async* {
+    final deadline = _newDeadline();
+    await for (final event in _resilientSseDataStream(
+      openStream: () => _retryWithBackoff(
+        (attemptAbortTrigger, _) => openStream(attemptAbortTrigger),
+        deadline: deadline,
+      ),
+      isDoneData: (_) => false,
+      deadline: deadline,
+      isInBackground: _isInBackground,
+    )) {
+      if (event is _ResilientSseData) {
+        yield event.data;
+      } else if (event is _ResilientSseRetry) {
+        yield '__retry__';
       }
     }
   }
@@ -969,6 +1423,7 @@ class LlmService {
     required List<Map<String, dynamic>> messages,
     required List<ToolDefinition> tools,
   }) async {
+    _ensureNotDisposed();
     switch (config.format) {
       case ApiFormat.anthropic:
         return _anthropicChat(system, messages, tools);
@@ -982,6 +1437,7 @@ class LlmService {
     required List<Map<String, dynamic>> messages,
     required List<ToolDefinition> tools,
   }) {
+    _ensureNotDisposed();
     switch (config.format) {
       case ApiFormat.anthropic:
         return _anthropicStream(system, messages, tools);
@@ -999,12 +1455,14 @@ class LlmService {
   ) async {
     final url = _joinEndpointUrl(config.baseUrl, '/v1/messages');
     _validateApiHost(url);
-    return _retryWithBackoff(() async {
+    return _retryWithBackoff((attemptAbortTrigger, deadline) async {
       final body = _buildAnthropicBody(system, messages, tools, stream: false);
-      final response = await _client.post(
+      final response = await _postJson(
         Uri.parse(url),
         headers: _anthropicHeaders(),
         body: jsonEncode(body),
+        attemptAbortTrigger: attemptAbortTrigger,
+        deadline: deadline,
       );
       if (response.statusCode != 200) {
         throw _anthropicApiException(response.statusCode, response.body);
@@ -1020,20 +1478,26 @@ class LlmService {
   ) async* {
     final url = _joinEndpointUrl(config.baseUrl, '/v1/messages');
     _validateApiHost(url);
+    final deadline = _newDeadline();
     final body = _buildAnthropicBody(system, messages, tools, stream: true);
 
     Future<http.StreamedResponse> openStream() {
-      return _retryWithBackoff(() async {
-        final request = http.Request('POST', Uri.parse(url));
-        request.headers.addAll(_anthropicHeaders());
-        request.body = jsonEncode(body);
+      return _retryWithBackoff((attemptAbortTrigger, attemptDeadline) async {
+        final request = _abortableRequest(
+          'POST',
+          Uri.parse(url),
+          headers: _anthropicHeaders(),
+          body: jsonEncode(body),
+          attemptAbortTrigger: attemptAbortTrigger,
+          deadline: attemptDeadline,
+        );
         final response = await _client.send(request);
         if (response.statusCode != 200) {
           final errorBody = await response.stream.bytesToString();
           throw _anthropicApiException(response.statusCode, errorBody);
         }
         return response;
-      });
+      }, deadline: deadline);
     }
 
     final List<ContentBlock> collectedBlocks = [];
@@ -1283,6 +1747,7 @@ class LlmService {
       await for (final data in _resilientSseDataStream(
         openStream: openStream,
         isDoneData: (data) => data == '[DONE]',
+        deadline: deadline,
         isInBackground: _isInBackground,
       )) {
         if (data is _ResilientSseRetry) {
@@ -1441,22 +1906,26 @@ class LlmService {
   ) async {
     final url = _joinEndpointUrl(config.baseUrl, '/v1/chat/completions');
     _validateApiHost(url);
-    return _retryWithBackoff(() async {
+    return _retryWithBackoff((attemptAbortTrigger, deadline) async {
       final body = _buildOpenAIBody(system, messages, tools, stream: false);
-      final response = await _client.post(
+      final response = await _postJson(
         Uri.parse(url),
         headers: _openaiHeaders(),
         body: jsonEncode(body),
+        attemptAbortTrigger: attemptAbortTrigger,
+        deadline: deadline,
       );
       if (response.statusCode == 400 &&
           (_tryTokenKeyFallback(response.body) ||
               _tryReasoningContentFallback(response.body))) {
         final retryBody =
             _buildOpenAIBody(system, messages, tools, stream: false);
-        final retryResponse = await _client.post(
+        final retryResponse = await _postJson(
           Uri.parse(url),
           headers: _openaiHeaders(),
           body: jsonEncode(retryBody),
+          attemptAbortTrigger: attemptAbortTrigger,
+          deadline: deadline,
         );
         if (retryResponse.statusCode != 200) {
           throw Exception(
@@ -1479,6 +1948,7 @@ class LlmService {
   ) async* {
     final url = _joinEndpointUrl(config.baseUrl, '/v1/chat/completions');
     _validateApiHost(url);
+    final deadline = _newDeadline();
     var includeUsage = await _capabilityRegistry
         .supportsOpenAIStreamUsage(resolvedModelProfile);
     var body = _buildOpenAIBody(
@@ -1490,10 +1960,15 @@ class LlmService {
     );
 
     Future<http.StreamedResponse> openStream() {
-      return _retryWithBackoff(() async {
-        final request = http.Request('POST', Uri.parse(url));
-        request.headers.addAll(_openaiHeaders());
-        request.body = jsonEncode(body);
+      return _retryWithBackoff((attemptAbortTrigger, attemptDeadline) async {
+        final request = _abortableRequest(
+          'POST',
+          Uri.parse(url),
+          headers: _openaiHeaders(),
+          body: jsonEncode(body),
+          attemptAbortTrigger: attemptAbortTrigger,
+          deadline: attemptDeadline,
+        );
         final response = await _client.send(request);
         if (response.statusCode == 400) {
           final errorBody = await response.stream.bytesToString();
@@ -1508,9 +1983,14 @@ class LlmService {
               stream: true,
               includeStreamUsage: false,
             );
-            final retryReq = http.Request('POST', Uri.parse(url));
-            retryReq.headers.addAll(_openaiHeaders());
-            retryReq.body = jsonEncode(body);
+            final retryReq = _abortableRequest(
+              'POST',
+              Uri.parse(url),
+              headers: _openaiHeaders(),
+              body: jsonEncode(body),
+              attemptAbortTrigger: attemptAbortTrigger,
+              deadline: attemptDeadline,
+            );
             final retryResp = await _client.send(retryReq);
             if (retryResp.statusCode != 200) {
               final retryErr = await retryResp.stream.bytesToString();
@@ -1528,9 +2008,14 @@ class LlmService {
               stream: true,
               includeStreamUsage: includeUsage,
             );
-            final retryReq = http.Request('POST', Uri.parse(url));
-            retryReq.headers.addAll(_openaiHeaders());
-            retryReq.body = jsonEncode(body);
+            final retryReq = _abortableRequest(
+              'POST',
+              Uri.parse(url),
+              headers: _openaiHeaders(),
+              body: jsonEncode(body),
+              attemptAbortTrigger: attemptAbortTrigger,
+              deadline: attemptDeadline,
+            );
             final retryResp = await _client.send(retryReq);
             if (retryResp.statusCode != 200) {
               final retryErr = await retryResp.stream.bytesToString();
@@ -1548,7 +2033,7 @@ class LlmService {
               'OpenAI API error (${response.statusCode}): ${_sanitizeErrorBody(errorBody)}');
         }
         return response;
-      });
+      }, deadline: deadline);
     }
 
     String currentText = '';
@@ -1685,6 +2170,7 @@ class LlmService {
       await for (final data in _resilientSseDataStream(
         openStream: openStream,
         isDoneData: (data) => data == '[DONE]',
+        deadline: deadline,
         isInBackground: _isInBackground,
       )) {
         if (data is _ResilientSseRetry) {
@@ -1921,6 +2407,12 @@ class LlmService {
         'Accept-Encoding': 'identity',
         ..._keepAliveHeaders,
       };
+
+  void _ensureNotDisposed() {
+    if (_disposed) {
+      throw StateError('LlmService has been disposed');
+    }
+  }
 
   LlmResponse _parseOpenAIResponse(Map<String, dynamic> json) {
     final choice = (json['choices'] as List)[0] as Map<String, dynamic>;

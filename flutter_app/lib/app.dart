@@ -1,11 +1,17 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'layout/foldable_layout.dart';
 import 'providers/chat_provider.dart';
 import 'screens/splash_screen.dart';
 import 'screens/chat_screen.dart';
 import 'screens/chat_sessions_screen.dart';
+import 'screens/remote_agent_configuration_recovery_screen.dart';
+import 'services/app_http.dart';
 import 'services/preferences_service.dart';
+import 'services/remote_agent_boot.dart';
+import 'services/remote_agent_configuration_service.dart';
+import 'services/remote_agent_connector.dart';
 
 /// Global notifier so any widget (e.g. SettingsScreen) can change the theme
 /// and have the MaterialApp rebuild immediately.
@@ -54,14 +60,112 @@ class AppRadii {
   static const double xl = 24.0;
 }
 
-class ClawChatApp extends StatelessWidget {
-  const ClawChatApp({super.key});
+class ClawChatApp extends StatefulWidget {
+  const ClawChatApp({
+    super.key,
+    required this.runtimeInfo,
+    required this.httpRegistry,
+    this.remoteAgentConfigurationLoader,
+    this.remoteAgentEvidenceResetter,
+    this.bootControllerForTesting,
+    this.operationalHomeBuilderForTesting,
+    this.chatProviderFactoryForTesting,
+  });
+
+  final AppRuntimeInfo runtimeInfo;
+  final AppHttpClientRegistry httpRegistry;
+  final RemoteAgentConfigurationLoader? remoteAgentConfigurationLoader;
+  final RemoteAgentEvidenceResetter? remoteAgentEvidenceResetter;
+  final RemoteAgentBootController? bootControllerForTesting;
+  final Widget Function(BuildContext context, bool localOnly)?
+      operationalHomeBuilderForTesting;
+  final ChatProvider Function(RemoteAgentRuntimeBinding binding)?
+      chatProviderFactoryForTesting;
+
+  @override
+  State<ClawChatApp> createState() => _ClawChatAppState();
+}
+
+class _ClawChatAppState extends State<ClawChatApp> {
+  late final RemoteAgentBootController _remoteAgentBoot;
+  late final RemoteAgentRuntimeBinding _remoteAgentRuntime;
+  late final ChatProvider _chatProvider;
+  RemoteAgentConfigurationService? _attachedRemoteConfiguration;
+  late final bool _ownsRemoteAgentBoot;
+
+  @override
+  void initState() {
+    super.initState();
+    final injected = widget.bootControllerForTesting;
+    _ownsRemoteAgentBoot = injected == null;
+    _remoteAgentRuntime = RemoteAgentRuntimeBinding();
+    _chatProvider =
+        widget.chatProviderFactoryForTesting?.call(_remoteAgentRuntime) ??
+            ChatProvider(remoteAgentRuntimeBinding: _remoteAgentRuntime);
+    _remoteAgentBoot = injected ??
+        RemoteAgentBootController(
+          loader: widget.remoteAgentConfigurationLoader ??
+              RemoteAgentConfigurationService.createForApp,
+          resetter: widget.remoteAgentEvidenceResetter ??
+              RemoteAgentConfigurationService.resetCorruptEvidenceForApp,
+        );
+    _remoteAgentBoot.bindRuntimeTransition(_syncRemoteRuntime);
+    _remoteAgentBoot.start();
+  }
+
+  Future<void> _syncRemoteRuntime(
+    RemoteAgentBootStatus status,
+    RemoteAgentConfigurationService? configuration,
+  ) async {
+    if (status == RemoteAgentBootStatus.ready && configuration != null) {
+      if (identical(_attachedRemoteConfiguration, configuration) &&
+          _remoteAgentRuntime.isAttached) {
+        return;
+      }
+      _attachedRemoteConfiguration = configuration;
+      await _remoteAgentRuntime.attach(
+        configuration,
+        CozeOpenApiRemoteAgentConnector(
+          client: widget.httpRegistry.webFetchClient,
+          credentialResolver: configuration,
+        ),
+      );
+      return;
+    }
+    _attachedRemoteConfiguration = null;
+    await _remoteAgentRuntime.detach(
+      reason: status == RemoteAgentBootStatus.localOnly
+          ? '本地安全模式已启用；远程配置证据尚未恢复。'
+          : '远程配置正在恢复，当前不可用。',
+    );
+  }
+
+  @override
+  void dispose() {
+    _chatProvider.dispose();
+    _remoteAgentRuntime.dispose();
+    if (_ownsRemoteAgentBoot) _remoteAgentBoot.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return MultiProvider(
       providers: [
-        ChangeNotifierProvider(create: (_) => ChatProvider()),
+        Provider<AppRuntimeInfo>.value(value: widget.runtimeInfo),
+        Provider<AppHttpClientRegistry>(
+          create: (_) => widget.httpRegistry,
+          dispose: (_, registry) => registry.dispose(),
+          lazy: false,
+        ),
+        Provider<AppHttpClient>.value(value: widget.httpRegistry.client),
+        ChangeNotifierProvider<RemoteAgentBootController>.value(
+          value: _remoteAgentBoot,
+        ),
+        Provider<RemoteAgentRuntimeBinding>.value(
+          value: _remoteAgentRuntime,
+        ),
+        ChangeNotifierProvider<ChatProvider>.value(value: _chatProvider),
       ],
       child: ValueListenableBuilder<ThemeMode>(
         valueListenable: themeNotifier,
@@ -79,21 +183,44 @@ class ClawChatApp extends StatelessWidget {
             builder: (context, child) {
               return MediaQuery(
                 data: MediaQuery.of(context).copyWith(
-                  textScaler: TextScaler.linear(scale),
+                  textScaler: composeAppTextScaler(
+                    MediaQuery.textScalerOf(context),
+                    scale,
+                  ),
                 ),
                 child: child!,
               );
             },
-            home: const SplashScreen(),
+            home: AnimatedBuilder(
+              animation: _remoteAgentBoot,
+              builder: (context, _) => _bootHome(context),
+            ),
           ),
         ),
       ),
     );
   }
 
+  Widget _bootHome(BuildContext context) {
+    switch (_remoteAgentBoot.status) {
+      case RemoteAgentBootStatus.initializing:
+        return const RemoteAgentBootProgressScreen();
+      case RemoteAgentBootStatus.recovery:
+        return RemoteAgentConfigurationRecoveryScreen(
+          controller: _remoteAgentBoot,
+        );
+      case RemoteAgentBootStatus.ready:
+      case RemoteAgentBootStatus.localOnly:
+        final localOnly = _remoteAgentBoot.isLocalOnly;
+        final testingBuilder = widget.operationalHomeBuilderForTesting;
+        if (testingBuilder != null) return testingBuilder(context, localOnly);
+        return const _OperationalAppRoot();
+    }
+  }
+
   ThemeData _buildDarkTheme() {
     final base = ThemeData.dark(useMaterial3: true);
-    final textTheme = GoogleFonts.interTextTheme(base.textTheme);
+    final textTheme = base.textTheme;
 
     return base.copyWith(
       visualDensity: VisualDensity.adaptivePlatformDensity,
@@ -119,12 +246,12 @@ class ClawChatApp extends StatelessWidget {
         bodyColor: Colors.white,
         displayColor: Colors.white,
       ),
-      appBarTheme: AppBarTheme(
+      appBarTheme: const AppBarTheme(
         elevation: 0,
         scrolledUnderElevation: 0,
         backgroundColor: AppColors.darkBg,
         foregroundColor: Colors.white,
-        titleTextStyle: GoogleFonts.inter(
+        titleTextStyle: TextStyle(
           fontSize: 20,
           fontWeight: FontWeight.w700,
           color: Colors.white,
@@ -205,7 +332,7 @@ class ClawChatApp extends StatelessWidget {
       ),
       snackBarTheme: SnackBarThemeData(
         backgroundColor: AppColors.darkSurfaceAlt,
-        contentTextStyle: GoogleFonts.inter(color: Colors.white),
+        contentTextStyle: const TextStyle(color: Colors.white),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(AppRadii.s),
           side: const BorderSide(color: AppColors.darkBorder),
@@ -224,7 +351,7 @@ class ClawChatApp extends StatelessWidget {
 
   ThemeData _buildLightTheme() {
     final base = ThemeData.light(useMaterial3: true);
-    final textTheme = GoogleFonts.interTextTheme(base.textTheme);
+    final textTheme = base.textTheme;
 
     return base.copyWith(
       visualDensity: VisualDensity.adaptivePlatformDensity,
@@ -245,15 +372,15 @@ class ClawChatApp extends StatelessWidget {
         bodyColor: const Color(0xFF0A0A0A),
         displayColor: const Color(0xFF0A0A0A),
       ),
-      appBarTheme: AppBarTheme(
+      appBarTheme: const AppBarTheme(
         elevation: 0,
         scrolledUnderElevation: 0,
         backgroundColor: AppColors.lightBg,
-        foregroundColor: const Color(0xFF0A0A0A),
-        titleTextStyle: GoogleFonts.inter(
+        foregroundColor: Color(0xFF0A0A0A),
+        titleTextStyle: TextStyle(
           fontSize: 20,
           fontWeight: FontWeight.w700,
-          color: const Color(0xFF0A0A0A),
+          color: Color(0xFF0A0A0A),
         ),
       ),
       cardTheme: CardTheme(
@@ -329,7 +456,7 @@ class ClawChatApp extends StatelessWidget {
       ),
       snackBarTheme: SnackBarThemeData(
         backgroundColor: const Color(0xFF0A0A0A),
-        contentTextStyle: GoogleFonts.inter(color: Colors.white),
+        contentTextStyle: const TextStyle(color: Colors.white),
         shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(AppRadii.s)),
         behavior: SnackBarBehavior.floating,
@@ -343,6 +470,13 @@ class ClawChatApp extends StatelessWidget {
       ),
     );
   }
+}
+
+class _OperationalAppRoot extends StatelessWidget {
+  const _OperationalAppRoot();
+
+  @override
+  Widget build(BuildContext context) => const SplashScreen();
 }
 
 class ResponsiveShell extends StatefulWidget {
@@ -360,6 +494,18 @@ class _ResponsiveShellState extends State<ResponsiveShell> {
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
+        final media = MediaQuery.of(context);
+        final foldable = FoldableLayout.resolve(
+          constraints.biggest,
+          media.displayFeatures,
+          bottomInset: media.viewInsets.bottom,
+        );
+        if (foldable.hasSeparatedRegions) {
+          return _SeparatedFoldableLayout(
+            layout: foldable,
+            chatScreenKey: _chatScreenKey,
+          );
+        }
         final shouldBeDual = _isDualPane
             ? constraints.maxWidth >= 680 // stay dual until drops below 680
             : constraints.maxWidth >= 700; // switch to dual at 700
@@ -421,7 +567,8 @@ class _DualPaneLayoutState extends State<DualPaneLayout> {
                 width: sidebarWidth,
                 child: const ChatSessionsScreen(embedded: true),
               ),
-              _SidebarResizeDivider(
+              SidebarResizeDivider(
+                semanticValue: '${sidebarWidth.round()} dp',
                 onDragUpdate: (delta) {
                   final next = (sidebarWidth + delta)
                       .clamp(_minSidebarWidth, maxSidebarWidth)
@@ -430,6 +577,13 @@ class _DualPaneLayoutState extends State<DualPaneLayout> {
                   if (_prefsReady) {
                     _prefs.dualPaneSidebarWidth = next;
                   }
+                },
+                onReset: () {
+                  final next = PreferencesService.defaultDualPaneSidebarWidth
+                      .clamp(_minSidebarWidth, maxSidebarWidth)
+                      .toDouble();
+                  setState(() => _sidebarWidth = next);
+                  if (_prefsReady) _prefs.dualPaneSidebarWidth = next;
                 },
               ),
               Expanded(child: ChatScreen(key: widget.chatScreenKey)),
@@ -441,46 +595,181 @@ class _DualPaneLayoutState extends State<DualPaneLayout> {
   }
 }
 
-class _SidebarResizeDivider extends StatelessWidget {
+class SidebarResizeDivider extends StatelessWidget {
+  final String semanticValue;
   final ValueChanged<double> onDragUpdate;
+  final VoidCallback onReset;
 
-  const _SidebarResizeDivider({required this.onDragUpdate});
+  const SidebarResizeDivider({
+    super.key,
+    required this.semanticValue,
+    required this.onDragUpdate,
+    required this.onReset,
+  });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return MouseRegion(
-      cursor: SystemMouseCursors.resizeLeftRight,
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onHorizontalDragUpdate: (details) => onDragUpdate(details.delta.dx),
-        child: SizedBox(
-          width: 16,
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              Container(
-                width: 1,
-                color: theme.colorScheme.outline.withAlpha(80),
-              ),
-              DecoratedBox(
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.surface,
-                  borderRadius: BorderRadius.circular(AppRadii.s),
-                  border: Border.all(
-                    color: theme.colorScheme.outline.withAlpha(70),
+    return Semantics(
+      container: true,
+      label: '调整会话列表宽度',
+      value: '$semanticValue；可用方向键调整，Home 恢复默认',
+      increasedValue: '更宽',
+      decreasedValue: '更窄',
+      onIncrease: () => onDragUpdate(24),
+      onDecrease: () => onDragUpdate(-24),
+      child: Focus(
+        onKeyEvent: (_, event) {
+          if (event is! KeyDownEvent) return KeyEventResult.ignored;
+          if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
+            onDragUpdate(-24);
+            return KeyEventResult.handled;
+          }
+          if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+            onDragUpdate(24);
+            return KeyEventResult.handled;
+          }
+          if (event.logicalKey == LogicalKeyboardKey.home) {
+            onReset();
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
+        child: MouseRegion(
+          cursor: SystemMouseCursors.resizeLeftRight,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onHorizontalDragUpdate: (details) => onDragUpdate(details.delta.dx),
+            onDoubleTap: onReset,
+            child: SizedBox(
+              key: const ValueKey('sidebar-resize-target'),
+              width: 48,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    key: const ValueKey('sidebar-resize-visual-line'),
+                    width: 1,
+                    color: theme.colorScheme.outline.withAlpha(80),
                   ),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 8),
-                  child: Icon(
-                    Icons.drag_indicator,
-                    size: 16,
-                    color: theme.colorScheme.onSurfaceVariant,
+                  DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.surface,
+                      borderRadius: BorderRadius.circular(AppRadii.s),
+                      border: Border.all(
+                        color: theme.colorScheme.outline.withAlpha(70),
+                      ),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      child: Icon(
+                        Icons.drag_indicator,
+                        size: 16,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
                   ),
-                ),
+                ],
               ),
-            ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+final class _PreferenceTextScaler extends TextScaler {
+  const _PreferenceTextScaler(this.platform, this.preference);
+
+  final TextScaler platform;
+  final double preference;
+
+  @override
+  double scale(double fontSize) => platform.scale(fontSize) * preference;
+
+  @override
+  double get textScaleFactor => scale(1);
+
+  @override
+  bool operator ==(Object other) =>
+      other is _PreferenceTextScaler &&
+      other.platform == platform &&
+      other.preference == preference;
+
+  @override
+  int get hashCode => Object.hash(platform, preference);
+}
+
+@visibleForTesting
+TextScaler composeAppTextScaler(TextScaler platform, double preference) =>
+    _PreferenceTextScaler(platform, preference);
+
+class _SeparatedFoldableLayout extends StatelessWidget {
+  const _SeparatedFoldableLayout({
+    required this.layout,
+    required this.chatScreenKey,
+  });
+
+  final FoldableLayout layout;
+  final GlobalKey chatScreenKey;
+
+  @override
+  Widget build(BuildContext context) {
+    final auxiliary = layout.auxiliary!;
+    return Scaffold(
+      body: Stack(
+        children: [
+          Positioned.fromRect(
+            rect: auxiliary,
+            child: ClipRect(
+              child: layout.posture == FoldablePosture.tabletop
+                  ? const _TabletopAuxiliary()
+                  : const ChatSessionsScreen(embedded: true),
+            ),
+          ),
+          Positioned.fromRect(
+            rect: layout.primary,
+            child: ClipRect(child: ChatScreen(key: chatScreenKey)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TabletopAuxiliary extends StatelessWidget {
+  const _TabletopAuxiliary();
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Theme.of(context).colorScheme.surfaceContainerLow,
+      child: InkWell(
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => const ChatSessionsScreen()),
+        ),
+        child: Center(
+          child: Semantics(
+            button: true,
+            label: '打开会话列表',
+            child: const Padding(
+              padding: EdgeInsets.all(8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.forum_outlined),
+                  SizedBox(width: 8),
+                  Flexible(
+                    child: Text(
+                      '会话列表',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
       ),

@@ -7,17 +7,21 @@ enum SetupStep {
   error,
 }
 
+enum SetupFailureCategory { network, storage, integrity, environment, status }
+
 class SetupState {
   final SetupStep step;
   final double progress;
   final String message;
   final String? error;
+  final SetupFailureCategory? failureCategory;
 
   const SetupState({
     this.step = SetupStep.checkingStatus,
     this.progress = 0.0,
     this.message = '',
     this.error,
+    this.failureCategory,
   });
 
   SetupState copyWith({
@@ -25,12 +29,14 @@ class SetupState {
     double? progress,
     String? message,
     String? error,
+    SetupFailureCategory? failureCategory,
   }) {
     return SetupState(
       step: step ?? this.step,
       progress: progress ?? this.progress,
       message: message ?? this.message,
       error: error,
+      failureCategory: failureCategory ?? this.failureCategory,
     );
   }
 
@@ -56,12 +62,18 @@ class SetupState {
 
   int get stepNumber {
     switch (step) {
-      case SetupStep.checkingStatus: return 0;
-      case SetupStep.downloadingRootfs: return 1;
-      case SetupStep.extractingRootfs: return 2;
-      case SetupStep.installingPackages: return 3;
-      case SetupStep.complete: return 4;
-      case SetupStep.error: return -1;
+      case SetupStep.checkingStatus:
+        return 0;
+      case SetupStep.downloadingRootfs:
+        return 1;
+      case SetupStep.extractingRootfs:
+        return 2;
+      case SetupStep.installingPackages:
+        return 3;
+      case SetupStep.complete:
+        return 4;
+      case SetupStep.error:
+        return -1;
     }
   }
 

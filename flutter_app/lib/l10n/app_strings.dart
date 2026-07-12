@@ -9,7 +9,6 @@ class AppStrings {
 
   // ── General ──────────────────────────────────────────────────────
   static const appName = 'ClawChat';
-  static const cancel = '取消';
   static const confirm = '确定';
   static const delete = '删除';
   static const copy = '复制';
@@ -73,6 +72,15 @@ class AppStrings {
   static const sendQueued = '发送';
   static const clearMessageQueue = '清空队列';
   static const messageQueueCleared = '队列已清空';
+  static String messageQueueRestored(int count) => '已恢复 $count 条排队消息';
+  static String messageQueuePartiallyRestored(int restored, int remaining) =>
+      '已恢复 $restored 条；队列容量不足，仍保留 $remaining 条可撤销内容';
+  static const messageQueueRestoreCapacityFull = '队列已满；未恢复的文字和附件仍保留在撤销记录中';
+  static const messageQueueRestoreUnavailable = '会话已不存在，无法恢复队列';
+  static const removeQueuedMessage = '移除排队消息';
+  static const clearQueueAttachmentsWarning =
+      '队列中包含附件。清空会暂时移除文字、顺序和附件；你可以在提示消失前撤销。';
+  static const undo = '撤销';
   static const clearQueueBeforeRegenerate = '请先清空消息队列再重新生成';
   static String contextCompactedNotice(
     int droppedMessageCount,
@@ -107,6 +115,25 @@ class AppStrings {
   static String loadOlderMessages(int count) => '加载更早 $count 条消息';
   static String hiddenOlderMessages(int count) => '还有 $count 条更早消息';
   static const inputHint = '输入消息...';
+  static const send = '发送消息';
+  static const stopResponse = '停止回复';
+  static const voiceStart = '开始语音输入';
+  static const voiceStarting = '正在启动语音输入';
+  static const voiceListening = '正在聆听，轻点可停止';
+  static const voiceStop = '停止语音输入';
+  static const voiceCancel = '取消语音输入';
+  static const voiceStopAndTranscribe = '停止并转写';
+  static const voiceStopping = '正在停止录音';
+  static const voiceCancelled = '语音输入已取消';
+  static const voiceError = '语音输入失败，请检查语音设置';
+  static const voicePermissionError = '麦克风权限未开启，请在设置中授权';
+  static const voiceTimeoutError = '系统语音识别超时，可检查语音设置后重试';
+  static const voiceSetupError = '尚未配置备用语音识别，请前往设置';
+  static const voiceTranscriptionError = '录音转写失败，请检查语音设置';
+  static const localContextDisclosure = '此对话使用本机配置的模型和工具流程。';
+  static const externalContextDisclosure = '此对话会把文本发送到已授权的外部连接器；这里只显示连接器名称。';
+  static const useLocal = '使用本地';
+  static const reauthorizeExternal = '重新授权';
   static const toolApprovalTitle = '工具执行确认';
   static const toolApprovalArguments = '参数';
   static const toolApprovalDeny = '拒绝';
@@ -120,6 +147,8 @@ class AppStrings {
   static const modelFetchPresetNotice =
       'Failed to fetch models, showing presets';
   static String modelFetchFailed(String e) => 'Failed to fetch models: $e';
+  static const modelFetchFailedSafe = '无法获取模型列表。请检查连接配置后重试或手动输入。';
+  static const modelSettingsLoadFailed = '无法读取模型设置。现有配置未被清除，请重试或返回。';
 
   // ── Chat sessions screen ─────────────────────────────────────────
   static const chatHistory = '对话记录';
@@ -140,7 +169,7 @@ class AppStrings {
   static String daysAgo(int n) => '$n 天前';
 
   // ── Dashboard screen ─────────────────────────────────────────────
-  static const dashboard = '首页';
+  static const dashboard = '系统健康';
   static const chat = '聊天';
   static const chatSubtitle = '与 AI 助手对话';
   static const terminal = '终端';
@@ -199,6 +228,7 @@ class AppStrings {
   static String deleteActiveProfileConfirm(String name) =>
       '删除 "$name" 后将自动切换到其他配置。';
   static String providerProfileSaveFailed(String e) => '配置保存失败: $e';
+  static const providerProfileSaveFailedSafe = '配置未保存。请重试，输入内容已保留。';
   static const modelFallback = '模型回退';
   static const modelFallbackEnabled = '自动回退';
   static const modelFallbackDisabled = '未启用回退目标';
@@ -244,6 +274,9 @@ class AppStrings {
   static const settingsAppearance = '外观';
   static const settingsVoice = '语音';
   static const settingsModelApi = '模型/API';
+  static const remoteAgentConnector = '远程 Agent 连接器';
+  static const remoteAgentConnectorSubtitle = '外部处理需明确授权，并按对话单独启用';
+  static const sessionRemoteAgent = '本对话使用远程 Agent';
   static const settingsAgentSkills = 'Agent/技能';
   static const settingsData = '数据';
   static const toolApprovalPolicy = '工具审批策略';
@@ -268,11 +301,48 @@ class AppStrings {
   static const installPackages = '安装软件包';
   static const initComplete = '初始化完成!';
   static const currentOperation = '当前操作';
+  static const setupPreludeTitle = '先在本机准备你的 AI 工作空间';
+  static const setupPreludeSubtitle = '一次简短初始化，然后连接你选择的 AI 服务。';
+  static const setupPromiseLocal = '对话和本地会话数据以这台设备为准。';
+  static const setupPromiseByok = '由你提供模型服务和 API 端点；密钥安全保存在设备上。';
+  static const setupPromiseTools = '命令和文件工具运行在应用内嵌的本地 Alpine 环境。';
+  static const setupPromiseConnector = '外部 Agent 连接器是可选项，并且按对话单独启用。';
+  static const bootstrapPreflightTitle = '初始化下载';
+  static const bootstrapDownloadDetails =
+      '将下载约 3 MB 的 Alpine 基础环境，并在线安装工具包。请预留至少 256 MB 存储空间。';
+  static const bootstrapCheckingDevice = '正在检查设备状态…';
+  static const bootstrapPreflightUnavailable = '无法读取设备状态，请重试。';
+  static const bootstrapStorageUnknown = '暂时无法读取可用空间；初始化时仍会安全失败。';
+  static String bootstrapStorageAvailable(int bytes) =>
+      '可用空间约 ${(bytes / 1024 / 1024).floor()} MB';
+  static const bootstrapNetworkUnavailable = '当前没有可用网络。';
+  static const bootstrapNetworkReady = '网络已连接。';
+  static const bootstrapNetworkRequired = '初始化需要网络；连接状态尚未由系统验证。';
+  static const bootstrapCacheFound = '发现本地下载；开始时会先校验，损坏或不完整内容会重新下载。';
+  static const bootstrapPartialEnvironmentFound = '发现未完成的本地环境；初始化会安全地修复或重建它。';
+  static const bootstrapNetworkFailure = '下载未完成。请检查网络后重试。';
+  static const bootstrapIntegrityFailure = '下载内容未通过完整性校验，已停止初始化。请重试。';
+  static const bootstrapStorageFailure = '可用存储空间不足，请释放空间后重试。';
+  static const bootstrapSetupFailed = '初始化未完成。设备数据未被上传，请重试。';
+
+  // ── Provider onboarding ─────────────────────────────────────────
+  static const providerAuthFailure = '凭据未被服务接受。请编辑 API Key 后重试。';
+  static const providerNetworkFailure = '无法连接模型服务。请检查网络后重试。';
+  static const providerEndpointFailure = 'API 端点格式无效或不可访问，请编辑地址。';
+  static const providerResponseFailure = '模型服务暂时无法返回模型列表。';
+  static const providerPresetFallback = '未能在线验证模型列表；以下为内置候选，请确认后继续。';
+  static const providerModelsReady = '模型列表已验证。';
+  static const providerFetchCancelled = '已停止等待；输入内容已保留。';
+  static const editConnection = '编辑连接';
+  static const cancel = '取消';
+  static const invalidBaseUrl = '请输入有效的 HTTP 或 HTTPS API 地址。';
+  static const pleaseSelectModel = '请选择或输入模型名称。';
 
   // ── Splash screen ────────────────────────────────────────────────
   static const tagline = 'AI Agent for Android';
   static const splashLoading = 'Loading...';
   static const checkingSetupStatus = 'Checking setup status...';
+  static const setupStatusUnavailable = '无法检查本地初始化状态，请重试。';
 
   // ── Terminal screen ──────────────────────────────────────────────
   static const terminalTitle = 'Terminal';
@@ -355,7 +425,7 @@ class AppStrings {
   static const importSkill = '导入技能';
   static const importLocalSkill = '导入本地技能';
   static const localFilePath = '文件路径';
-  static const skillUrl = '技能仓库地址';
+  static const skillUrl = '技能归档地址';
   static const importButton = '导入';
   static const importFailed = '导入失败';
   static const installPresets = '安装预设技能';
@@ -363,6 +433,12 @@ class AppStrings {
   static const directory = 'Directory';
   static const selectSkillArchive =
       'Select a .zip, .tar.gz, or .tgz skill archive';
+  static const remoteSkillArchiveHint =
+      'https://example.com/skill.zip (git repositories are unavailable)';
+  static const directorySkillImportUnavailable =
+      'Directory import is unavailable on this runtime. Create a .zip, .tar.gz, or .tgz archive first.';
+  static const preparingSkillArchive = '正在安全下载并验证技能归档…';
+  static const cancelSkillImport = '取消导入';
 
   // ── Environment Variables ─────────────────────────────────────────
   static const envVars = '环境变量';
@@ -443,6 +519,9 @@ class AppStrings {
   // ── Regenerate ─────────────────────────────────────────────────────
   static const regenerate = '重新生成';
   static const assistantErrorTitle = '回复失败';
+  static const assistantRecoveryErrorTitle = '恢复未完成，安全状态已保留';
+  static const assistantRecoveryContinue = '继续安全恢复';
+  static const assistantRecoveryStarted = '已开始安全恢复';
   static const assistantErrorRetryUnavailable = '这次失败不适合直接重试';
   static const assistantRetryStarted = '已重新发送';
   static const assistantRetryUnavailable = '当前失败状态无法重试';
@@ -523,6 +602,74 @@ class AppStrings {
   static const sessionTitle = '会话标题';
   static const clearAllSessions = '清空所有会话';
   static const clearAllConfirm = '确定要删除所有会话吗？此操作不可恢复。';
+  static String clearAllConfirmCount(int count) =>
+      '将 $count 个会话移入本地回收站。回收站有数量、容量和保留期限制。';
+  static const sessionSearchFailed = '搜索未完成，请重试。';
+  static const movedSessionToTrash = '会话已移入本地回收站。';
+  static String movedSessionsToTrash(int count) => '$count 个会话已移入本地回收站。';
+  static const chooseExportDestination = '选择保存文件、Android 分享或明确复制。失败时不会自动复制。';
+  static const androidShare = 'Android 分享';
+  static const saveFile = '保存文件';
+  static const saveConversationExport = '保存本地会话导出';
+  static const exportDestinationComplete = '导出操作已完成。';
+  static const exportDestinationFailed = '导出未完成。没有内容被自动复制，请重试或选择其他目标。';
+  static const exportTooLarge = '导出超过本地安全大小限制。';
+
+  // ── Local data and recovery ─────────────────────────────────────
+  static const localDataRecovery = '本地数据与恢复';
+  static const localDataAuthority = '会话数据以这台设备上的本地副本为准。';
+  static const localDataLoadFailed = '无法读取本地数据状态，请重试。';
+  static const exportConversations = '导出会话';
+  static String exportScopeSummary(
+    int count,
+    DateTime? earliest,
+    DateTime? latest,
+    int bytes,
+  ) {
+    final range = earliest == null || latest == null
+        ? '无日期范围'
+        : '${earliest.toLocal().toString().split(' ').first} 至 ${latest.toLocal().toString().split(' ').first}';
+    return '$count 个会话 · $range · 约 ${(bytes / 1024).ceil()} KB';
+  }
+
+  static const exportInclusions = '包含：会话文本、工具结果、附件内容块、文件夹、恢复标记和本地收据状态。';
+  static const exportExclusions = '排除：API 密钥、Provider 配置、API 端点和远程连接器选择。';
+  static const localDataExportSubject = 'ClawChat 本地会话导出';
+  static const importDryRunNotice = '先完整解析和验证，再选择冲突策略；取消或验证失败不会修改会话。';
+  static const chooseImportFile = '选择并预览文件';
+  static const importPreview = '导入预览';
+  static String importPreviewSummaryValues({
+    required int schema,
+    required int valid,
+    required int invalid,
+    required int duplicates,
+    required int conflicts,
+    required int fresh,
+    required int requiredBytes,
+  }) =>
+      'Schema v$schema · 有效 $valid · 无效 $invalid · 重复 $duplicates · 冲突 $conflicts · 新增 $fresh · 需要约 ${(requiredBytes / 1024).ceil()} KB';
+  static const importSensitiveExclusions =
+      '导入文件不得携带凭据、Provider 配置、API 端点或远程连接器选择。';
+  static const importKeepExisting = '保留现有会话，跳过冲突';
+  static const importAsCopy = '作为副本导入并分配新 ID';
+  static const importReplace = '创建本地备份后替换';
+  static const importFailedSafe = '导入未完成；现有会话未被静默合并。';
+  static String importResult(int imported, int skipped, int replaced) =>
+      '导入完成：$imported 个，跳过 $skipped 个，替换 $replaced 个。';
+  static String preImportBackupAvailable(String name) => '替换前备份：$name';
+  static const rollbackImport = '回滚最近替换';
+  static String rollbackImportComplete(int count) => '已从本地备份恢复 $count 个会话。';
+  static const rollbackImportFailed = '无法验证或恢复本地导入备份。';
+  static const sessionTrash = '会话回收站';
+  static const trashRetentionNotice = '最多保留 20 个、合计 25 MB、最长 7 天；到期后自动永久删除。';
+  static const trashEmpty = '回收站为空';
+  static String trashExpires(DateTime value) =>
+      '保留至 ${value.toLocal().toString().split('.').first}';
+  static const restore = '恢复';
+  static const deletePermanently = '永久删除';
+  static const deletePermanentlyConfirm = '此操作将删除本地恢复副本，无法撤销。';
+  static const sessionRestored = '会话已恢复；已失效的运行和待处理收据不会复活。';
+  static const restoreFailed = '无法安全恢复该会话。';
 
   // ── About ─────────────────────────────────────────────────────────
   static const aboutDescription =
@@ -650,4 +797,18 @@ class AppStrings {
   static const comparing = '正在对比...';
   static const compareStart = '开始对比';
   static const noModelsSelected = '请至少选择两个模型';
+
+  // ── Agent run center / response workspace ────────────────────────
+  static const agentRunCenter = 'Agent 任务中心';
+  static const openAgentRunCenter = '打开 Agent 任务中心';
+  static const openConversation = '打开会话';
+  static const cancelOnlyThisRun = '仅取消此任务';
+  static const reviewApproval = '返回会话审查审批';
+  static const continueSafeRecovery = '继续安全恢复';
+  static const useInConversation = '用于对话';
+  static const cancelOnlyThisResult = '仅取消此结果';
+  static const retryOnlyThisResult = '仅重试此结果';
+  static const fullResponse = '完整回复';
+  static const openFullResponse = '打开完整回复';
+  static const searchInResponse = '在回复中搜索';
 }

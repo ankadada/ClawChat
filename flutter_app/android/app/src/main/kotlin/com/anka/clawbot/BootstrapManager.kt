@@ -4,12 +4,20 @@ import android.content.Context
 import android.util.Log
 import android.net.ConnectivityManager
 import android.net.LinkProperties
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.system.Os
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.OpenOption
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.nio.file.StandardOpenOption
 import java.util.zip.GZIPInputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
@@ -19,6 +27,11 @@ class BootstrapManager(
     private val filesDir: String,
     private val nativeLibDir: String
 ) {
+    data class StagedReadLocation(
+        val rootPath: String,
+        val relativePath: String
+    )
+
     private val rootfsDir = "$filesDir/rootfs/alpine"
     private val tmpDir = "$filesDir/tmp"
     private val homeDir = "$filesDir/home"
@@ -76,6 +89,10 @@ class BootstrapManager(
             || java.nio.file.Files.isSymbolicLink(java.nio.file.Paths.get("$rootfsDir/usr/bin/python3"))
         val curlExists = File("$rootfsDir/usr/bin/curl").exists()
             || java.nio.file.Files.isSymbolicLink(java.nio.file.Paths.get("$rootfsDir/usr/bin/curl"))
+        val archive = File("$tmpDir/alpine-rootfs.tar.gz")
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val activeNetwork = connectivity.activeNetwork
+        val capabilities = activeNetwork?.let { connectivity.getNetworkCapabilities(it) }
         return mapOf(
             "rootfsExists" to rootfsExists,
             "binShExists" to binShExists,
@@ -83,6 +100,10 @@ class BootstrapManager(
             "pythonInstalled" to pythonExists,
             "curlInstalled" to curlExists,
             "rootfsPath" to rootfsDir,
+            "availableBytes" to File(filesDir).usableSpace,
+            "cachedArchiveBytes" to if (archive.isFile) archive.length() else 0L,
+            "networkConnected" to (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true),
+            "networkValidated" to (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true),
             "complete" to (rootfsExists && (binShExists || binBashExists) && apkDbExists)
         )
     }
@@ -531,28 +552,200 @@ class BootstrapManager(
         }
     }
 
-    private fun validateRootfsPath(path: String): File {
-        val file = File(rootfsDir, path)
-        val normalizedBase = File(rootfsDir).canonicalPath.let {
-            if (it.endsWith(File.separator)) it else it + File.separator
+    private fun normalizeVirtualPath(path: String): String {
+        if (path.indexOf('\u0000') >= 0 || path.contains('\\')) {
+            throw SecurityException("Invalid rootfs path")
         }
-        if (!file.canonicalPath.startsWith(normalizedBase)) {
-            throw SecurityException("Path traversal detected: $path")
+        val segments = mutableListOf<String>()
+        for (segment in path.split('/')) {
+            if (segment.isEmpty() || segment == ".") continue
+            if (segment == "..") throw SecurityException("Path traversal detected")
+            segments.add(segment)
         }
-        return file
+        return if (segments.isEmpty()) "/" else "/" + segments.joinToString("/")
     }
 
-    /** Read a file from inside the rootfs (e.g. /root/.openclaw/openclaw.json). */
-    fun readRootfsFile(path: String): String? {
-        val file = validateRootfsPath(path)
-        return if (file.exists()) file.readText() else null
+    private fun isInsideScope(path: String, scope: String): Boolean {
+        return scope == "/" || path == scope || path.startsWith("$scope/")
     }
 
-    /** Write content to a file inside the rootfs, creating parent dirs as needed. */
-    fun writeRootfsFile(path: String, content: String) {
-        val file = validateRootfsPath(path)
-        file.parentFile?.mkdirs()
-        file.writeText(content)
+    private fun scopedHostPath(path: String, allowedRoots: List<String>): Path {
+        if (allowedRoots.isEmpty()) throw SecurityException("No filesystem scope granted")
+        val virtualPath = normalizeVirtualPath(path)
+        val scopes = allowedRoots.map { normalizeVirtualPath(it) }
+        if (scopes.none { isInsideScope(virtualPath, it) }) {
+            throw SecurityException("Path is outside the granted filesystem scope")
+        }
+        val root = Paths.get(rootfsDir).toAbsolutePath().normalize()
+        if (Files.isSymbolicLink(root) ||
+            !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+            throw SecurityException("Unsafe rootfs directory")
+        }
+        val target = root.resolve(virtualPath.removePrefix("/")).normalize()
+        if (target != root && !target.startsWith(root)) {
+            throw SecurityException("Path escapes rootfs")
+        }
+        return target
+    }
+
+    private fun rejectSymlinkComponents(target: Path) {
+        val root = Paths.get(rootfsDir).toAbsolutePath().normalize()
+        if (Files.isSymbolicLink(root)) {
+            throw SecurityException("Symlink rootfs is not allowed")
+        }
+        var current = root
+        for (segment in root.relativize(target)) {
+            current = current.resolve(segment)
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS) &&
+                Files.isSymbolicLink(current)) {
+                throw SecurityException("Symlink traversal is not allowed")
+            }
+        }
+    }
+
+    private fun rejectHardLinkedFile(target: Path) {
+        val linkCount = try {
+            (Files.getAttribute(
+                target,
+                "unix:nlink",
+                LinkOption.NOFOLLOW_LINKS
+            ) as? Number)?.toLong()
+                ?: throw SecurityException("Unable to verify file link count")
+        } catch (e: SecurityException) {
+            throw e
+        } catch (e: Exception) {
+            throw SecurityException("Unable to verify file link count", e)
+        }
+        if (linkCount != 1L) {
+            throw SecurityException("Hard-linked files are not allowed")
+        }
+    }
+
+    private fun createParentDirectoriesWithoutSymlinks(target: Path) {
+        val root = Paths.get(rootfsDir).toAbsolutePath().normalize()
+        val parent = target.parent ?: throw SecurityException("File parent is missing")
+        var current = root
+        for (segment in root.relativize(parent)) {
+            current = current.resolve(segment)
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isSymbolicLink(current) ||
+                    !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                    throw SecurityException("Unsafe filesystem scope component")
+                }
+            } else {
+                Files.createDirectory(current)
+                if (Files.isSymbolicLink(current)) {
+                    throw SecurityException("Unsafe filesystem scope component")
+                }
+            }
+        }
+    }
+
+    /** Prepare only the trusted directory. All file operations after this
+     * point are descriptor-relative inside SecureImportNative. */
+    fun prepareWorkspaceUploadsDirectory(): String {
+        val uploads = scopedHostPath(
+            "/root/workspace/uploads",
+            listOf("/root/workspace/uploads")
+        )
+        createParentDirectoriesWithoutSymlinks(uploads.resolve("placeholder"))
+        if (Files.exists(uploads, LinkOption.NOFOLLOW_LINKS)) {
+            if (Files.isSymbolicLink(uploads) ||
+                !Files.isDirectory(uploads, LinkOption.NOFOLLOW_LINKS)) {
+                throw SecurityException("Unsafe workspace uploads directory")
+            }
+        } else {
+            Files.createDirectory(uploads)
+        }
+        rejectSymlinkComponents(uploads)
+        val canonical = uploads.toFile().canonicalFile.toPath()
+        if (canonical != uploads.toAbsolutePath().normalize()) {
+            throw SecurityException("Workspace uploads directory is not canonical")
+        }
+        return uploads.toString()
+    }
+
+    fun resolveStagedImportReadPath(
+        path: String,
+        allowedRoot: String
+    ): StagedReadLocation {
+        if (allowedRoot != "/root/workspace/.skill-import-staging") {
+            throw SecurityException("Invalid staged import read scope")
+        }
+        val target = scopedHostPath(path, listOf(allowedRoot))
+        val root = scopedHostPath(allowedRoot, listOf(allowedRoot))
+        rejectSymlinkComponents(root)
+        rejectSymlinkComponents(target)
+        val relative = root.relativize(target).toString()
+        if (relative.isEmpty() || relative.contains("..") || relative.contains('\\')) {
+            throw SecurityException("Invalid staged import relative path")
+        }
+        return StagedReadLocation(root.toString(), relative)
+    }
+
+    /** Read without following any symlink in the granted root or target path. */
+    fun readRootfsFile(path: String, allowedRoots: List<String> = listOf("/")): String? {
+        val target = scopedHostPath(path, allowedRoots)
+        rejectSymlinkComponents(target)
+        if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) return null
+        if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) return null
+        rejectHardLinkedFile(target)
+        val options = setOf<OpenOption>(
+            StandardOpenOption.READ,
+            LinkOption.NOFOLLOW_LINKS
+        )
+        return Files.newByteChannel(target, options).use { channel ->
+            java.nio.channels.Channels.newInputStream(channel)
+                .bufferedReader(Charsets.UTF_8)
+                .use { it.readText() }
+        }
+    }
+
+    /** Create/write without following any symlink in the granted path. */
+    fun writeRootfsFile(
+        path: String,
+        content: String,
+        allowedRoots: List<String> = listOf("/"),
+        createNew: Boolean = false
+    ) {
+        writeRootfsBytes(path, content.toByteArray(Charsets.UTF_8), allowedRoots, createNew)
+    }
+
+    fun writeRootfsBytes(
+        path: String,
+        bytes: ByteArray,
+        allowedRoots: List<String> = listOf("/"),
+        createNew: Boolean = false
+    ) {
+        val target = scopedHostPath(path, allowedRoots)
+        createParentDirectoriesWithoutSymlinks(target)
+        rejectSymlinkComponents(target)
+        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
+                throw SecurityException("Write target is not a regular file")
+            }
+            rejectHardLinkedFile(target)
+        }
+        val options = if (createNew) {
+            setOf<OpenOption>(
+                StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.WRITE,
+                LinkOption.NOFOLLOW_LINKS
+            )
+        } else {
+            setOf<OpenOption>(
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE,
+                LinkOption.NOFOLLOW_LINKS
+            )
+        }
+        Files.newByteChannel(target, options).use { channel ->
+            val buffer = ByteBuffer.wrap(bytes)
+            while (buffer.hasRemaining()) channel.write(buffer)
+        }
+        rejectSymlinkComponents(target)
+        rejectHardLinkedFile(target)
     }
 
     /**

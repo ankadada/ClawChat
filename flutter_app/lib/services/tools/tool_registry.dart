@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../../services/llm_service.dart';
 import '../../models/chat_models.dart';
 import '../llm_content_sanitizer.dart';
@@ -15,6 +17,38 @@ import 'write_file_tool.dart';
 import 'web_fetch_tool.dart';
 import 'web_search_tool.dart';
 import 'image_gen_tool.dart';
+import 'load_skill_tool.dart';
+
+class ToolCancellationSignal {
+  final Completer<void> _cancelled = Completer<void>();
+
+  bool get isCancellationRequested => _cancelled.isCompleted;
+  Future<void> get whenCancelled => _cancelled.future;
+
+  void cancel() {
+    if (!_cancelled.isCompleted) _cancelled.complete();
+  }
+
+  void throwIfCancellationRequested({
+    bool sideEffectsPrevented = true,
+  }) {
+    if (!isCancellationRequested) return;
+    throw ToolExecutionCancelledException(
+      sideEffectsPrevented: sideEffectsPrevented,
+    );
+  }
+}
+
+class ToolExecutionCancelledException implements Exception {
+  final bool sideEffectsPrevented;
+
+  const ToolExecutionCancelledException({
+    required this.sideEffectsPrevented,
+  });
+
+  @override
+  String toString() => 'Tool execution cancelled';
+}
 
 abstract class Tool {
   String get name;
@@ -42,6 +76,39 @@ abstract class Tool {
     );
   }
 
+  /// Execution hook carrying a stable per-attempt operation ID.
+  ///
+  /// Tools that support upstream idempotency can override this method and
+  /// forward [operationId]. Existing tools remain backward compatible and
+  /// execute through [executeResult] without receiving extra user data.
+  Future<ToolResultPayload> executeResultWithOperation(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    required String operationId,
+  }) {
+    return executeResult(input, sessionId: sessionId);
+  }
+
+  /// Optional cancellation-aware operation hook.
+  ///
+  /// The default implementation only checks cancellation before dispatch.
+  /// Tools that can abort an in-flight request should override this method,
+  /// listen to [cancellationSignal.whenCancelled], and throw
+  /// [ToolExecutionCancelledException] only when abort is confirmed.
+  Future<ToolResultPayload> executeResultWithOperationAndCancellation(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    required String operationId,
+    required ToolCancellationSignal cancellationSignal,
+  }) {
+    cancellationSignal.throwIfCancellationRequested();
+    return executeResultWithOperation(
+      input,
+      sessionId: sessionId,
+      operationId: operationId,
+    );
+  }
+
   ToolDefinition toDefinition() => ToolDefinition(
         name: name,
         description: description,
@@ -62,6 +129,7 @@ class ToolRegistry {
       mcpService: prefs == null ? null : McpService(prefs: prefs),
     );
     registry.register(BashTool(), risk: ToolRisk.dangerous);
+    registry.register(LoadSkillTool(), risk: ToolRisk.safe);
     registry.register(ReadFileTool(), risk: ToolRisk.moderate);
     registry.register(WriteFileTool(), risk: ToolRisk.dangerous);
     registry.register(WebFetchTool(), risk: ToolRisk.moderate);
@@ -143,9 +211,82 @@ class ToolRegistry {
     String name,
     Map<String, dynamic> input, {
     String? sessionId,
+    String? operationId,
+    ToolCancellationSignal? cancellationSignal,
+    Set<String>? allowedNetworkDomains,
+    Set<String>? allowedFilesystemReadScopes,
+    Set<String>? allowedFilesystemWriteScopes,
   }) async {
     final tool = _tools[name];
     if (tool == null) throw Exception('Unknown tool: $name');
+    if (tool is ReadFileTool && allowedFilesystemReadScopes != null) {
+      cancellationSignal?.throwIfCancellationRequested();
+      final output = await tool.executeWithAllowedScopes(
+        input,
+        allowedFilesystemReadScopes,
+      );
+      return ToolResultFormatter.format(
+        toolName: tool.name,
+        input: input,
+        output: output,
+        isError: output.startsWith('Error'),
+      );
+    }
+    if (tool is WriteFileTool && allowedFilesystemWriteScopes != null) {
+      cancellationSignal?.throwIfCancellationRequested();
+      final output = await tool.executeWithAllowedScopes(
+        input,
+        allowedFilesystemWriteScopes,
+      );
+      return ToolResultFormatter.format(
+        toolName: tool.name,
+        input: input,
+        output: output,
+        isError: output.startsWith('Error'),
+      );
+    }
+    if (tool is WebFetchTool && allowedNetworkDomains != null) {
+      cancellationSignal?.throwIfCancellationRequested();
+      final output = await tool.executeWithAllowedDomains(
+        input,
+        allowedDomains: allowedNetworkDomains,
+        cancellationSignal: cancellationSignal,
+      );
+      return ToolResultFormatter.format(
+        toolName: tool.name,
+        input: input,
+        output: output,
+        isError: output.startsWith('Error'),
+      );
+    }
+    if (tool is WebSearchTool && allowedNetworkDomains != null) {
+      cancellationSignal?.throwIfCancellationRequested();
+      final output = await tool.executeForSkill(
+        input,
+        cancellationSignal: cancellationSignal,
+      );
+      return ToolResultFormatter.format(
+        toolName: tool.name,
+        input: input,
+        output: output,
+        isError: output.startsWith('Search failed:'),
+      );
+    }
+    if (operationId != null) {
+      if (cancellationSignal != null) {
+        return tool.executeResultWithOperationAndCancellation(
+          input,
+          sessionId: sessionId,
+          operationId: operationId,
+          cancellationSignal: cancellationSignal,
+        );
+      }
+      return tool.executeResultWithOperation(
+        input,
+        sessionId: sessionId,
+        operationId: operationId,
+      );
+    }
     return tool.executeResult(input, sessionId: sessionId);
   }
 

@@ -5,7 +5,8 @@ import '../l10n/app_strings.dart';
 class ArtifactsView extends StatefulWidget {
   final String htmlContent;
   final double height;
-  const ArtifactsView({super.key, required this.htmlContent, this.height = 400});
+  const ArtifactsView(
+      {super.key, required this.htmlContent, this.height = 400});
 
   @override
   State<ArtifactsView> createState() => _ArtifactsViewState();
@@ -48,7 +49,8 @@ class _ArtifactsViewState extends State<ArtifactsView> {
         'content="default-src \'none\'; style-src \'unsafe-inline\'; '
         'script-src \'unsafe-inline\'; img-src data:;">';
     return html.contains(RegExp(r'<head[\s>]'))
-        ? html.replaceFirstMapped(RegExp(r'<head[^>]*>'), (m) => '${m.group(0)}$csp')
+        ? html.replaceFirstMapped(
+            RegExp(r'<head[^>]*>'), (m) => '${m.group(0)}$csp')
         : '<html><head>$csp</head><body>$html</body></html>';
   }
 

@@ -5,24 +5,32 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import '../l10n/app_strings.dart';
+import 'app_http.dart';
 import 'api_validator.dart';
 import 'preferences_service.dart';
 
 class TtsService extends ChangeNotifier {
   static final TtsService _instance = TtsService._();
-  factory TtsService() => _instance;
+  factory TtsService({AppHttpClient? httpClient}) {
+    if (httpClient != null) _instance._injectedClient = httpClient;
+    return _instance;
+  }
   TtsService._();
 
   static const _channel = MethodChannel('com.anka.clawbot/native');
   final FlutterTts _tts = FlutterTts();
   bool _initialized = false;
+  Future<void>? _initialization;
   bool _systemAvailable = false;
   int _systemFailCount = 0;
   String? _selectedSystemLanguage;
   bool _systemQueueActive = false;
   int _playbackToken = 0;
+  int _requestGeneration = 0;
+  Future<void> _mediaControlTail = Future<void>.value();
   int _systemPlaybackToken = 0;
   bool _systemStopRequested = false;
   bool _systemPaused = false;
@@ -33,6 +41,11 @@ class TtsService extends ChangeNotifier {
   String? _currentMessageId;
   String? _currentRouteLabel;
   String? _lastSpokenText;
+  AppHttpClient? _injectedClient;
+  Completer<void>? _activeApiAbort;
+  final Map<String, _TtsApiAudioOperation> _apiAudioOperations = {};
+  _TtsApiAudioOperation? _activeApiAudio;
+  int _apiAudioSequence = 0;
   String? lastError;
   static const int _maxSystemFailures = 3;
   static const int _defaultSystemChunkLimit = 220;
@@ -46,6 +59,9 @@ class TtsService extends ChangeNotifier {
     'en_US',
     'en',
   ];
+
+  AppHttpClient get _httpClient =>
+      _injectedClient ?? AppHttpClientRegistry.instance.client;
 
   bool isLoadingMessage(String messageId) =>
       isLoading && _currentMessageId == messageId;
@@ -65,16 +81,16 @@ class TtsService extends ChangeNotifier {
     return _systemAvailable || (ttsModel != null && ttsModel.isNotEmpty);
   }
 
-  Future<void> init() async {
-    if (_initialized) return;
+  Future<void> init() {
+    if (_initialized) return Future<void>.value();
+    return _initialization ??= _initialize();
+  }
 
+  Future<void> _initialize() async {
     _channel.setMethodCallHandler((call) async {
       if (call.method == 'onAudioComplete') {
+        await _handleNativeAudioEvent(call.arguments);
         if (_systemQueueActive) return;
-        isSpeaking = false;
-        _currentMessageId = null;
-        _currentRouteLabel = null;
-        notifyListeners();
       }
     });
 
@@ -122,8 +138,8 @@ class TtsService extends ChangeNotifier {
         notifyListeners();
       });
       _tts.setErrorHandler(_handleSystemTtsError);
-    } catch (e) {
-      debugPrint('TTS init failed: $e');
+    } catch (_) {
+      debugPrint('TTS initialization failed');
       _systemAvailable = false;
     }
     _initialized = true;
@@ -150,24 +166,21 @@ class TtsService extends ChangeNotifier {
     for (final lang in _preferredSystemLanguages) {
       try {
         final available = await _tts.isLanguageAvailable(lang);
-        debugPrint('TTS isLanguageAvailable($lang) = $available');
         if (_isTtsSuccess(available)) {
           final result = await _tts.setLanguage(lang);
-          debugPrint('TTS setLanguage($lang) = $result');
           if (_isTtsSuccess(result)) return lang;
         }
-      } catch (e) {
-        debugPrint('TTS language check $lang failed: $e');
+      } catch (_) {
+        debugPrint('TTS language availability check failed');
       }
     }
 
     for (final lang in availableLanguages.where(_isChineseLanguage)) {
       try {
         final result = await _tts.setLanguage(lang);
-        debugPrint('TTS setLanguage($lang) = $result');
         if (_isTtsSuccess(result)) return lang;
-      } catch (e) {
-        debugPrint('TTS fallback language $lang failed: $e');
+      } catch (_) {
+        debugPrint('TTS fallback language selection failed');
       }
     }
 
@@ -177,7 +190,7 @@ class TtsService extends ChangeNotifier {
   Future<String?> _prepareSystemEngine(
       {bool forceLanguageProbe = false}) async {
     final engines = _stringList(await _tts.getEngines);
-    debugPrint('TTS engines: $engines');
+    debugPrint('TTS engine count=${engines.length}');
     if (engines.isEmpty) {
       debugPrint('TTS: no system engines');
       _systemAvailable = false;
@@ -185,13 +198,12 @@ class TtsService extends ChangeNotifier {
     }
 
     final languages = _stringList(await _tts.getLanguages);
-    debugPrint('TTS available languages: $languages');
+    debugPrint('TTS language count=${languages.length}');
     var selectedLanguage = forceLanguageProbe ? null : _selectedSystemLanguage;
     if (selectedLanguage == null) {
       selectedLanguage = await _selectSystemLanguage(languages);
     } else {
       final result = await _tts.setLanguage(selectedLanguage);
-      debugPrint('TTS setLanguage($selectedLanguage) = $result');
       if (!_isTtsSuccess(result)) {
         selectedLanguage = await _selectSystemLanguage(languages);
       }
@@ -207,7 +219,7 @@ class TtsService extends ChangeNotifier {
     _selectedSystemLanguage = selectedLanguage;
     _systemAvailable = true;
     _systemFailCount = 0;
-    debugPrint('TTS: selected system language $selectedLanguage');
+    debugPrint('TTS system language selected');
     await _tts.setSpeechRate(0.5);
     await _tts.setVolume(1.0);
     await _tts.setPitch(1.0);
@@ -260,26 +272,38 @@ class TtsService extends ChangeNotifier {
     return lines.join('\n');
   }
 
-  Future<bool> speak(String text, String messageId) async {
+  Future<bool> speak(String text, String messageId) {
+    final generation = ++_requestGeneration;
+    return _speakForGeneration(text, messageId, generation);
+  }
+
+  Future<bool> _speakForGeneration(
+    String text,
+    String messageId,
+    int generation,
+  ) async {
     await init();
+    if (!_isRequestCurrent(generation)) return false;
 
     if (_currentMessageId == messageId &&
         (_systemQueueActive || _systemPaused)) {
       if (_systemPaused) {
-        return _resumeSystemPlayback();
+        return _resumeSystemPlayback(generation);
       }
       if (isSpeaking) {
-        return _pauseSystemPlayback();
+        return _pauseSystemPlayback(generation);
       }
     }
 
     if ((isSpeaking || isLoading) && _currentMessageId == messageId) {
-      await stop();
-      return true;
+      await _stopForGeneration(generation);
+      return _isRequestCurrent(generation);
     }
 
-    await stop();
-    final playbackToken = ++_playbackToken;
+    await _stopForGeneration(generation);
+    if (!_isRequestCurrent(generation)) return false;
+    final playbackToken = generation;
+    _playbackToken = playbackToken;
     _currentMessageId = messageId;
     _currentRouteLabel = null;
     lastError = null;
@@ -294,6 +318,7 @@ class TtsService extends ChangeNotifier {
 
     final systemReady = _systemAvailable ||
         await _prepareSystemEngine(forceLanguageProbe: true) != null;
+    if (!_isRequestCurrent(generation)) return false;
     if (systemReady) {
       return _speakViaSystem(speakableText, messageId, playbackToken);
     }
@@ -314,6 +339,7 @@ class TtsService extends ChangeNotifier {
 
     final ok =
         await _speakViaApi(speakableText, ttsModel, prefs, playbackToken);
+    if (!_isRequestCurrent(generation)) return false;
     if (!ok) {
       if (_isPlaybackCurrent(playbackToken)) {
         isSpeaking = false;
@@ -332,9 +358,11 @@ class TtsService extends ChangeNotifier {
   ) async {
     try {
       final language = await _prepareSystemEngine(forceLanguageProbe: false);
+      if (!_isRequestCurrent(playbackToken)) return false;
       if (language == null) return false;
 
       final limit = await _systemChunkLimit();
+      if (!_isRequestCurrent(playbackToken)) return false;
       final chunks = _splitTextForSystemSpeech(text, maxLength: limit);
       if (chunks.isEmpty) return false;
 
@@ -359,7 +387,9 @@ class TtsService extends ChangeNotifier {
           index: i,
           total: chunks.length,
           token: token,
+          playbackToken: playbackToken,
         );
+        if (!_isRequestCurrent(playbackToken)) return false;
         if (chunkSucceeded) {
           anyChunkSucceeded = true;
         } else {
@@ -368,8 +398,14 @@ class TtsService extends ChangeNotifier {
       }
 
       if (Platform.isAndroid) {
-        await _tts.setQueueMode(0);
+        await _runMediaControl<void>(
+          playbackToken,
+          () async {
+            await _tts.setQueueMode(0);
+          },
+        );
       }
+      if (!_isRequestCurrent(playbackToken)) return false;
       if (token == _systemPlaybackToken) {
         _systemQueueActive = false;
         _systemPaused = false;
@@ -387,8 +423,9 @@ class TtsService extends ChangeNotifier {
         lastError = '系统语音引擎无法朗读这段文本';
       }
       return true;
-    } catch (e) {
-      debugPrint('TTS system speak failed before playback: $e');
+    } catch (_) {
+      debugPrint('TTS system playback setup failed');
+      if (!_isRequestCurrent(playbackToken)) return false;
       _systemQueueActive = false;
       _systemPaused = false;
       _systemCurrentChunk = null;
@@ -406,16 +443,24 @@ class TtsService extends ChangeNotifier {
 
   bool _isPlaybackCurrent(int token) => token == _playbackToken;
 
-  Future<bool> _pauseSystemPlayback() async {
+  bool _isRequestCurrent(int generation) =>
+      generation == _requestGeneration ||
+      (_systemQueueActive && generation == _playbackToken);
+
+  Future<bool> _pauseSystemPlayback(int generation) async {
     if (!_systemQueueActive || _systemPaused) return false;
     _systemPaused = true;
     isSpeaking = false;
     notifyListeners();
     try {
-      await _tts.pause();
+      await _runMediaControl<void>(generation, () async {
+        await _tts.pause();
+      });
+      if (!_isRequestCurrent(generation)) return false;
       return true;
-    } catch (e) {
-      debugPrint('TTS system pause failed: $e');
+    } catch (_) {
+      debugPrint('TTS system pause failed');
+      if (!_isRequestCurrent(generation)) return false;
       _systemPaused = false;
       isSpeaking = true;
       notifyListeners();
@@ -423,7 +468,7 @@ class TtsService extends ChangeNotifier {
     }
   }
 
-  Future<bool> _resumeSystemPlayback() async {
+  Future<bool> _resumeSystemPlayback(int generation) async {
     if (!_systemQueueActive || !_systemPaused) return false;
     final chunk = _systemCurrentChunk;
     if (chunk == null || chunk.isEmpty) return false;
@@ -431,17 +476,20 @@ class TtsService extends ChangeNotifier {
     isSpeaking = true;
     notifyListeners();
     try {
-      if (Platform.isAndroid) {
-        await _tts.setQueueMode(0);
-      }
-      final result = await _tts.speak(chunk);
-      debugPrint('TTS system resume: $result');
+      final result = await _runMediaControl<dynamic>(generation, () async {
+        if (Platform.isAndroid) {
+          await _tts.setQueueMode(0);
+        }
+        return _tts.speak(chunk);
+      });
+      if (!_isRequestCurrent(generation)) return false;
       if (!_isTtsSuccess(result)) {
         _completeSystemChunk(false);
       }
       return _isTtsSuccess(result);
-    } catch (e) {
-      debugPrint('TTS system resume failed: $e');
+    } catch (_) {
+      debugPrint('TTS system resume failed');
+      if (!_isRequestCurrent(generation)) return false;
       _completeSystemChunk(false);
       return false;
     }
@@ -452,18 +500,22 @@ class TtsService extends ChangeNotifier {
     required int index,
     required int total,
     required int token,
+    required int playbackToken,
   }) async {
     final completer = Completer<bool>();
     _systemChunkCompleter = completer;
     _systemCurrentChunk = chunk;
     try {
-      if (Platform.isAndroid) {
-        await _tts.setQueueMode(0);
+      final result = await _runMediaControl<dynamic>(playbackToken, () async {
+        if (Platform.isAndroid) {
+          await _tts.setQueueMode(0);
+        }
+        return _tts.speak(chunk);
+      });
+      if (!_isRequestCurrent(playbackToken) ||
+          !_isPlaybackCurrent(playbackToken)) {
+        return false;
       }
-      final result = await _tts.speak(chunk);
-      debugPrint(
-        'TTS system chunk ${index + 1}/$total length=${chunk.length}: $result',
-      );
       if (!_isTtsSuccess(result)) {
         _completeSystemChunk(false);
       }
@@ -473,9 +525,11 @@ class TtsService extends ChangeNotifier {
         index: index,
         total: total,
         token: token,
+        playbackToken: playbackToken,
       );
-    } catch (e) {
-      debugPrint('TTS system chunk ${index + 1}/$total failed: $e');
+    } catch (_) {
+      debugPrint('TTS system chunk ${index + 1}/$total failed');
+      if (!_isRequestCurrent(playbackToken)) return false;
       _completeSystemChunk(false);
       return false;
     } finally {
@@ -494,6 +548,7 @@ class TtsService extends ChangeNotifier {
     required int index,
     required int total,
     required int token,
+    required int playbackToken,
   }) async {
     var activeWait = Duration.zero;
     while (!completer.isCompleted) {
@@ -503,6 +558,10 @@ class TtsService extends ChangeNotifier {
         Future<void>.delayed(const Duration(milliseconds: 250)),
       ]);
       if (completer.isCompleted) break;
+      if (!_isRequestCurrent(playbackToken) ||
+          !_isPlaybackCurrent(playbackToken)) {
+        return false;
+      }
       if (_systemStopRequested || token != _systemPlaybackToken) return false;
       if (!_systemPaused) {
         activeWait += DateTime.now().difference(started);
@@ -539,8 +598,8 @@ class TtsService extends ChangeNotifier {
     }
   }
 
-  void _handleSystemTtsError(dynamic msg) {
-    debugPrint('TTS error: $msg');
+  void _handleSystemTtsError(dynamic _) {
+    debugPrint('TTS system engine error');
     if (_systemQueueActive) {
       _completeSystemChunk(false);
       notifyListeners();
@@ -574,8 +633,11 @@ class TtsService extends ChangeNotifier {
       isSpeaking = true;
       _currentRouteLabel = AppStrings.ttsApiEngine(ttsModel);
       notifyListeners();
-      _speakViaApi(text, ttsModel, prefs, _playbackToken).then((ok) {
-        if (!ok) {
+      final playbackToken = _playbackToken;
+      _speakViaApi(text, ttsModel, prefs, playbackToken).then((ok) {
+        if (!ok &&
+            _isPlaybackCurrent(playbackToken) &&
+            _isRequestCurrent(playbackToken)) {
           isSpeaking = false;
           _currentMessageId = null;
           _currentRouteLabel = null;
@@ -589,7 +651,7 @@ class TtsService extends ChangeNotifier {
       _currentRouteLabel = null;
       lastError = ttsModel == null || ttsModel.isEmpty
           ? '系统语音合成失败（可能缺少中文语音包），请在设置 → 语音能力 中填写 TTS 模型名称启用 API 兜底'
-          : '语音合成出错: $msg';
+          : '语音合成出错';
       notifyListeners();
     }
   }
@@ -639,6 +701,60 @@ class TtsService extends ChangeNotifier {
   }) =>
       _splitTextForSystemSpeech(text, maxLength: maxLength);
 
+  @visibleForTesting
+  Future<bool> speakViaApiForTesting(
+    String text,
+    String model,
+    PreferencesService prefs, {
+    Directory? cacheDirectory,
+  }) async {
+    final generation = ++_requestGeneration;
+    await _stopForGeneration(generation);
+    if (!_isRequestCurrent(generation)) return false;
+    _playbackToken = generation;
+    isSpeaking = true;
+    final result = await _speakViaApi(
+      text,
+      model,
+      prefs,
+      generation,
+      cacheDirectory: cacheDirectory,
+    );
+    if (!result && _isRequestCurrent(generation)) isSpeaking = false;
+    return result;
+  }
+
+  @visibleForTesting
+  String? get activeApiAudioOperationIdForTesting => _activeApiAudio?.id;
+
+  @visibleForTesting
+  String? get activeApiAudioPathForTesting => _activeApiAudio?.file.path;
+
+  @visibleForTesting
+  Future<void> handleNativeAudioEventForTesting({
+    required String operationId,
+    required String event,
+  }) {
+    return _handleNativeAudioEvent({
+      'operationId': operationId,
+      'event': event,
+    });
+  }
+
+  @visibleForTesting
+  Future<void> resetApiAudioForTesting() async {
+    final abort = _activeApiAbort;
+    if (abort != null && !abort.isCompleted) abort.complete();
+    _activeApiAbort = null;
+    _requestGeneration += 1;
+    _playbackToken = _requestGeneration;
+    await _cleanupAllApiAudioOperations();
+    _injectedClient = null;
+    lastError = null;
+    isLoading = false;
+    isSpeaking = false;
+  }
+
   List<String> _splitTextForSystemSpeech(
     String text, {
     required int maxLength,
@@ -679,11 +795,16 @@ class TtsService extends ChangeNotifier {
     String text,
     String model,
     PreferencesService prefs,
-    int playbackToken,
-  ) async {
+    int playbackToken, {
+    Directory? cacheDirectory,
+  }) async {
+    if (!_isRequestCurrent(playbackToken) ||
+        !_isPlaybackCurrent(playbackToken)) {
+      return false;
+    }
     final apiKey = prefs.apiKey;
     if (apiKey == null || apiKey.isEmpty) {
-      lastError = '未配置 API Key';
+      if (_isRequestCurrent(playbackToken)) lastError = '未配置 API Key';
       return false;
     }
 
@@ -693,48 +814,54 @@ class TtsService extends ChangeNotifier {
     isLoading = true;
     notifyListeners();
 
-    final client = HttpClient();
-    client.badCertificateCallback = (cert, host, port) => false;
-    client.connectionTimeout = const Duration(seconds: 15);
-    client.idleTimeout = const Duration(seconds: 30);
+    final abort = Completer<void>();
+    _activeApiAbort = abort;
+    _TtsApiAudioOperation? audioOperation;
+    var handedToNative = false;
+    final timeout = Timer(const Duration(seconds: 90), () {
+      if (!abort.isCompleted) abort.complete();
+    });
     try {
       final uri =
           ApiValidator.validateBearerUrl(url, context: 'TTS API endpoint');
-      debugPrint('TTS API: POST $url model=$model');
 
-      final request = await client.postUrl(uri);
-      request.headers.set('Authorization', 'Bearer $apiKey');
-      request.headers.contentType =
-          ContentType('application', 'json', charset: 'utf-8');
-      request.headers.set('Accept', 'audio/mpeg');
-      request.headers.set('User-Agent', 'ClawChat/1.0');
-      final bodyJson = jsonEncode({
-        'model': model,
-        'input': text,
-        'voice': 'alloy',
-        'response_format': 'mp3',
-      });
-      request.add(utf8.encode(bodyJson));
+      final request = http.AbortableRequest(
+        'POST',
+        uri,
+        abortTrigger: abort.future,
+      )
+        ..headers['Authorization'] = 'Bearer $apiKey'
+        ..headers['Content-Type'] = 'application/json; charset=utf-8'
+        ..headers['Accept'] = 'audio/mpeg'
+        ..body = jsonEncode({
+          'model': model,
+          'input': text,
+          'voice': 'alloy',
+          'response_format': 'mp3',
+        });
       // Long text + ElevenLabs can take 30-60s; allow up to 90s
-      final response =
-          await request.close().timeout(const Duration(seconds: 90));
-      if (!_isPlaybackCurrent(playbackToken)) return true;
-      debugPrint(
-          'TTS API: status=${response.statusCode} contentLength=${response.contentLength} contentType=${response.headers.contentType}');
+      final response = await _httpClient.send(request);
+      if (!_isRequestCurrent(playbackToken) ||
+          !_isPlaybackCurrent(playbackToken)) {
+        return false;
+      }
+      debugPrint('TTS API request status=${response.statusCode}');
 
       // Read response body as bytes
       final bytesBuilder = BytesBuilder(copy: false);
-      await for (final chunk in response) {
+      await for (final chunk in response.stream.timeout(
+        const Duration(seconds: 90),
+      )) {
         bytesBuilder.add(chunk);
       }
       final body = bytesBuilder.toBytes();
-      if (!_isPlaybackCurrent(playbackToken)) return true;
-      debugPrint('TTS API: received ${body.length} bytes');
+      if (!_isRequestCurrent(playbackToken) ||
+          !_isPlaybackCurrent(playbackToken)) {
+        return false;
+      }
 
       if (response.statusCode != 200) {
-        final errText = utf8.decode(body, allowMalformed: true);
-        lastError =
-            '语音合成失败 (${response.statusCode}): ${errText.length > 200 ? errText.substring(0, 200) : errText}';
+        lastError = '语音合成失败 (${response.statusCode})';
         return false;
       }
       if (body.isEmpty) {
@@ -742,51 +869,194 @@ class TtsService extends ChangeNotifier {
         return false;
       }
 
-      final dir = await getTemporaryDirectory();
-      final file =
-          File('${dir.path}/tts_${DateTime.now().millisecondsSinceEpoch}.mp3');
+      final dir = cacheDirectory ?? await getTemporaryDirectory();
+      if (!_isRequestCurrent(playbackToken) ||
+          !_isPlaybackCurrent(playbackToken)) {
+        return false;
+      }
+      final operationId = 'api-$playbackToken-${++_apiAudioSequence}';
+      final file = File('${dir.path}/tts_$operationId.mp3');
+      audioOperation = _TtsApiAudioOperation(
+        operationId,
+        file,
+        playbackToken,
+      );
       await file.writeAsBytes(body);
 
-      if (!_isPlaybackCurrent(playbackToken)) {
-        try {
-          await file.delete();
-        } catch (_) {}
-        return true;
+      if (!_isRequestCurrent(playbackToken) ||
+          !_isPlaybackCurrent(playbackToken)) {
+        return false;
       }
-      await _channel.invokeMethod('playAudio', {'path': file.path});
+      final obsoleteOperationIds =
+          _apiAudioOperations.keys.toList(growable: false);
+      for (final obsoleteOperationId in obsoleteOperationIds) {
+        await _cleanupApiAudioOperation(obsoleteOperationId);
+      }
+      if (!_isRequestCurrent(playbackToken) ||
+          !_isPlaybackCurrent(playbackToken)) {
+        return false;
+      }
+      _apiAudioOperations[operationId] = audioOperation;
+      _activeApiAudio = audioOperation;
+      final started = await _runMediaControl<bool?>(
+        playbackToken,
+        () => _channel.invokeMethod<bool>('playAudio', {
+          'path': file.path,
+          'operationId': operationId,
+        }),
+      );
+      if (started != true) {
+        if (!_isRequestCurrent(playbackToken)) return false;
+        throw StateError('Native audio playback was not started');
+      }
+      handedToNative = true;
+      if (!_isRequestCurrent(playbackToken) ||
+          !_isPlaybackCurrent(playbackToken)) {
+        await _cleanupApiAudioOperation(operationId);
+        return false;
+      }
       isLoading = false;
       notifyListeners();
       return true;
-    } catch (e) {
-      debugPrint('TTS API exception: $e');
-      lastError = '语音合成失败: $e';
+    } catch (_) {
+      debugPrint('TTS API request failed');
+      if (_isRequestCurrent(playbackToken) &&
+          _isPlaybackCurrent(playbackToken)) {
+        lastError = '语音合成失败';
+      }
       return false;
     } finally {
-      if (_isPlaybackCurrent(playbackToken)) {
+      timeout.cancel();
+      if (!handedToNative && audioOperation != null) {
+        await _cleanupApiAudioOperation(audioOperation.id);
+        await _deleteApiAudioFile(audioOperation.file);
+      }
+      if (_isRequestCurrent(playbackToken) &&
+          _isPlaybackCurrent(playbackToken)) {
         isLoading = false;
         notifyListeners();
       }
-      client.close(force: true);
+      if (identical(_activeApiAbort, abort)) _activeApiAbort = null;
     }
   }
 
-  Future<void> stop() async {
-    _playbackToken += 1;
+  Future<void> _handleNativeAudioEvent(dynamic arguments) async {
+    if (arguments is! Map) return;
+    final operationId = arguments['operationId']?.toString();
+    if (operationId == null || operationId.isEmpty) return;
+    final event = arguments['event']?.toString();
+    final operation = _apiAudioOperations[operationId];
+    final wasActive = identical(_activeApiAudio, operation);
+    await _cleanupApiAudioOperation(operationId);
+    if (!wasActive ||
+        operation == null ||
+        !_isPlaybackCurrent(operation.generation) ||
+        !_isRequestCurrent(operation.generation)) {
+      return;
+    }
+
+    if (event == 'error') lastError = '语音播放失败';
+    isSpeaking = false;
+    _currentMessageId = null;
+    _currentRouteLabel = null;
+    notifyListeners();
+  }
+
+  Future<void> _cleanupApiAudioOperation(String operationId) async {
+    final operation = _apiAudioOperations.remove(operationId);
+    if (operation == null) return;
+    if (identical(_activeApiAudio, operation)) _activeApiAudio = null;
+    await _deleteApiAudioFile(operation.file);
+  }
+
+  Future<void> _cleanupAllApiAudioOperations() async {
+    final operations = _apiAudioOperations.values.toList(growable: false);
+    _apiAudioOperations.clear();
+    _activeApiAudio = null;
+    for (final operation in operations) {
+      await _deleteApiAudioFile(operation.file);
+    }
+  }
+
+  static Future<void> _deleteApiAudioFile(File file) async {
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Cache cleanup must not mask playback state transitions.
+    }
+  }
+
+  Future<T?> _runMediaControl<T>(
+    int generation,
+    Future<T> Function() action,
+  ) {
+    final completer = Completer<T?>();
+    final previous = _mediaControlTail;
+    final scheduled = () async {
+      try {
+        await previous;
+      } catch (_) {
+        // A failed operation must not poison subsequent media controls.
+      }
+      if (!_isRequestCurrent(generation)) {
+        completer.complete(null);
+        return;
+      }
+      try {
+        completer.complete(await action());
+      } catch (error, stackTrace) {
+        completer.completeError(error, stackTrace);
+      }
+    }();
+    _mediaControlTail = scheduled.catchError((_) {});
+    return completer.future;
+  }
+
+  Future<void> stop() {
+    final generation = ++_requestGeneration;
+    return _stopForGeneration(generation);
+  }
+
+  Future<void> _stopForGeneration(int generation) async {
+    if (!_isRequestCurrent(generation)) return;
+    _playbackToken = generation;
     _systemPlaybackToken += 1;
     _systemStopRequested = true;
     _systemPaused = false;
     _completeSystemChunk(false);
     _systemQueueActive = false;
     _systemCurrentChunk = null;
+    final abort = _activeApiAbort;
+    if (abort != null && !abort.isCompleted) abort.complete();
+    if (identical(_activeApiAbort, abort)) _activeApiAbort = null;
+    final activeOperationId = _activeApiAudio?.id;
+    final operationIds = _apiAudioOperations.keys.toList(growable: false);
     try {
-      await _tts.stop();
-      if (Platform.isAndroid) {
-        await _tts.setQueueMode(0);
+      await _runMediaControl<void>(generation, () async {
+        try {
+          await _tts.stop();
+          if (Platform.isAndroid) {
+            await _tts.setQueueMode(0);
+          }
+        } catch (_) {
+          // Continue to the operation-scoped native stop.
+        }
+        if (activeOperationId != null) {
+          try {
+            await _channel.invokeMethod('stopAudio', {
+              'operationId': activeOperationId,
+            });
+          } catch (_) {
+            // Dart still owns and removes the matching cache file below.
+          }
+        }
+      });
+    } finally {
+      for (final operationId in operationIds) {
+        await _cleanupApiAudioOperation(operationId);
       }
-    } catch (_) {}
-    try {
-      await _channel.invokeMethod('stopAudio');
-    } catch (_) {}
+    }
+    if (!_isRequestCurrent(generation)) return;
     isSpeaking = false;
     _currentMessageId = null;
     _currentRouteLabel = null;
@@ -795,4 +1065,12 @@ class TtsService extends ChangeNotifier {
 
   bool isPlayingMessage(String messageId) =>
       isSpeaking && _currentMessageId == messageId;
+}
+
+final class _TtsApiAudioOperation {
+  const _TtsApiAudioOperation(this.id, this.file, this.generation);
+
+  final String id;
+  final File file;
+  final int generation;
 }

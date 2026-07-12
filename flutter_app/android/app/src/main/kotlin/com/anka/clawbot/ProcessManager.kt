@@ -6,6 +6,7 @@ import android.util.Log
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
@@ -18,6 +19,8 @@ class ProcessManager(
     private val filesDir: String,
     private val nativeLibDir: String
 ) {
+    private val activeOperations = ConcurrentHashMap<String, Process>()
+    private val cancelledOperations = ConcurrentHashMap.newKeySet<String>()
     private val rootfsDir get() = "$filesDir/rootfs/alpine"
     private val tmpDir get() = "$filesDir/tmp"
     private val homeDir get() = "$filesDir/home"
@@ -252,8 +255,12 @@ class ProcessManager(
     fun runInProotSync(
         command: String,
         timeoutSeconds: Long = 900,
-        mountStorage: Boolean = false
+        mountStorage: Boolean = false,
+        operationId: String? = null
     ): String {
+        if (operationId != null && cancelledOperations.contains(operationId)) {
+            throw InterruptedException("operation cancelled")
+        }
         val cmd = buildInstallCommand(command, mountStorage)
         val env = prootEnv()
 
@@ -269,6 +276,12 @@ class ProcessManager(
         pb.redirectErrorStream(true)
 
         val process = pb.start()
+        if (operationId != null) {
+            activeOperations[operationId] = process
+            if (cancelledOperations.contains(operationId)) {
+                process.destroyForcibly()
+            }
+        }
         val output = StringBuilder()
         val errorLines = StringBuilder()
         val outputLock = Any()
@@ -311,6 +324,11 @@ class ProcessManager(
             process.destroyForcibly()
             Thread.currentThread().interrupt()
             throw e
+        } finally {
+            if (operationId != null) {
+                activeOperations.remove(operationId, process)
+                cancelledOperations.remove(operationId)
+            }
         }
         if (!exited) {
             process.destroyForcibly()
@@ -341,6 +359,17 @@ class ProcessManager(
         }
 
         return synchronized(outputLock) { output.toString() }
+    }
+
+    fun cancelOperation(operationId: String) {
+        cancelledOperations.add(operationId)
+        activeOperations[operationId]?.destroyForcibly()
+    }
+
+    fun finishOperation(operationId: String) {
+        if (!activeOperations.containsKey(operationId)) {
+            cancelledOperations.remove(operationId)
+        }
     }
 
     // ================================================================

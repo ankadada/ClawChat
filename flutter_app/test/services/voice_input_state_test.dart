@@ -11,7 +11,8 @@ void main() {
       expect(state.isListening, isTrue);
 
       expect(state.enterNativeRecognition(token!), isTrue);
-      expect(state.phase, VoiceInputPhase.nativeRecognition);
+      expect(state.phase, VoiceInputPhase.listening);
+      expect(state.route, VoiceInputRoute.native);
 
       expect(state.complete(token), isTrue);
       expect(state.phase, VoiceInputPhase.idle);
@@ -26,7 +27,8 @@ void main() {
       state.enterPluginRecognition(token!);
 
       expect(state.beginStart(), isNull);
-      expect(state.phase, VoiceInputPhase.pluginRecognition);
+      expect(state.phase, VoiceInputPhase.listening);
+      expect(state.route, VoiceInputRoute.plugin);
     });
 
     test('cancel invalidates stale async completions', () {
@@ -35,13 +37,32 @@ void main() {
       state.enterNativeRecognition(first!);
 
       state.cancel();
-      expect(state.phase, VoiceInputPhase.idle);
+      expect(state.phase, VoiceInputPhase.cancelled);
       expect(state.complete(first), isFalse);
 
       final second = state.beginStart();
       expect(second, isNot(first));
       expect(state.enterWhisperRecording(second!), isTrue);
-      expect(state.phase, VoiceInputPhase.whisperRecording);
+      expect(state.phase, VoiceInputPhase.listening);
+      expect(state.route, VoiceInputRoute.whisper);
+    });
+
+    test('stopping and errors are explicit and stale callbacks stay blocked',
+        () {
+      final state = VoiceInputStateMachine();
+      final token = state.beginStart()!;
+      state.enterWhisperRecording(token);
+
+      expect(state.enterStopping(token), isTrue);
+      expect(state.phase, VoiceInputPhase.stopping);
+      expect(state.enterTranscribing(token), isTrue);
+      expect(state.fail(token, 'transcription_failed'), isTrue);
+      expect(state.phase, VoiceInputPhase.error);
+      expect(state.errorCode, 'transcription_failed');
+
+      final retry = state.beginStart();
+      expect(retry, isNotNull);
+      expect(state.complete(token), isFalse);
     });
 
     test('transcribing keeps the mic busy until completion', () {

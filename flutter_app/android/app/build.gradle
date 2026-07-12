@@ -4,23 +4,17 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
-def localProperties = new Properties()
-def localPropertiesFile = rootProject.file("local.properties")
-if (localPropertiesFile.exists()) {
-    localPropertiesFile.withReader("UTF-8") { reader ->
-        localProperties.load(reader)
-    }
+// pubspec.yaml is the version authority even for direct Gradle invocation.
+// Do not accept ignored/stale flutter.versionName or flutter.versionCode values
+// from local.properties when someone runs android/gradlew directly.
+def pubspecFile = rootProject.file("../pubspec.yaml")
+def pubspecVersion = (pubspecFile.getText("UTF-8") =~
+    /(?m)^version:\s*([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\+([0-9]+)\s*$/)
+if (!pubspecVersion.find()) {
+    throw new GradleException("pubspec.yaml must declare versionName+versionCode")
 }
-
-def flutterVersionCode = localProperties.getProperty("flutter.versionCode")
-if (flutterVersionCode == null) {
-    flutterVersionCode = "1"
-}
-
-def flutterVersionName = localProperties.getProperty("flutter.versionName")
-if (flutterVersionName == null) {
-    flutterVersionName = "1.5.0"
-}
+def flutterVersionName = pubspecVersion.group(1)
+def flutterVersionCode = pubspecVersion.group(2)
 
 def keystoreProperties = new Properties()
 def keystorePropertiesFile = rootProject.file("key.properties")
@@ -32,7 +26,6 @@ if (keystorePropertiesFile.exists()) {
 
 def hasKeystore = keystoreProperties.containsKey('storeFile') &&
     file(keystoreProperties['storeFile']).exists()
-
 android {
     namespace = "com.anka.clawbot"
     compileSdk = 36
@@ -53,6 +46,12 @@ android {
         targetSdk = 36
         versionCode = flutterVersionCode.toInteger()
         versionName = flutterVersionName
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -Wall -Wextra -Werror"
+            }
+        }
     }
 
     if (hasKeystore) {
@@ -80,6 +79,13 @@ android {
     packagingOptions {
         jniLibs {
             useLegacyPackaging = true
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 }

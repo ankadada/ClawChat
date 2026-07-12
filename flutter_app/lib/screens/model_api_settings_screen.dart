@@ -17,11 +17,13 @@ import '../services/preferences_service.dart';
 class ModelApiSettingsScreen extends StatefulWidget {
   final String? initialProfileId;
   final ModelListFetcher? modelFetcher;
+  final Future<void> Function()? settingsLoadGate;
 
   const ModelApiSettingsScreen({
     super.key,
     this.initialProfileId,
     this.modelFetcher,
+    this.settingsLoadGate,
   });
 
   @override
@@ -40,6 +42,8 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
   String? _editingProfileId;
   String _apiFormat = ProviderProfile.anthropicFormat;
   bool _loading = true;
+  String? _loadError;
+  int _loadGeneration = 0;
   List<String> _availableModels = [];
   bool _fetchingModels = false;
   bool _manualModelInput = false;
@@ -69,32 +73,46 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
   }
 
   Future<void> _loadSettings() async {
-    await _prefs.init();
-    if (!mounted) return;
-    final profiles = _prefs.profiles;
-    final activeProfileId = _prefs.activeProfileId ?? profiles.first.id;
-    final initialProfileId = widget.initialProfileId;
-    final editingProfileId =
-        profiles.any((profile) => profile.id == initialProfileId)
-            ? initialProfileId
-            : activeProfileId;
-    final editingProfile = profiles.firstWhere(
-      (profile) => profile.id == editingProfileId,
-      orElse: () => profiles.first,
-    );
-    setState(() {
-      _profiles = profiles;
-      _activeProfileId = activeProfileId;
-      _editingProfileId = editingProfile.id;
-      _loadProfileIntoForm(editingProfile);
-      final contextTokenBudget = _prefs.contextTokenBudget;
-      _contextTokenBudget =
-          _validContextTokenBudgets.contains(contextTokenBudget)
-              ? contextTokenBudget
-              : AppConstants.defaultContextTokenBudget;
-      _autoCompact = _prefs.autoCompact;
-      _loading = false;
-    });
+    final generation = ++_loadGeneration;
+    if (mounted) setState(() => _loading = true);
+    try {
+      await widget.settingsLoadGate?.call();
+      await _prefs.init();
+      if (!mounted || generation != _loadGeneration) return;
+      final profiles = _prefs.profiles;
+      if (profiles.isEmpty) throw StateError('profiles unavailable');
+      final activeProfileId = _prefs.activeProfileId ?? profiles.first.id;
+      final initialProfileId = widget.initialProfileId;
+      final editingProfileId =
+          profiles.any((profile) => profile.id == initialProfileId)
+              ? initialProfileId
+              : activeProfileId;
+      final editingProfile = profiles.firstWhere(
+        (profile) => profile.id == editingProfileId,
+        orElse: () => profiles.first,
+      );
+      setState(() {
+        _profiles = profiles;
+        _activeProfileId = activeProfileId;
+        _editingProfileId = editingProfile.id;
+        _loadProfileIntoForm(editingProfile);
+        final contextTokenBudget = _prefs.contextTokenBudget;
+        _contextTokenBudget =
+            _validContextTokenBudgets.contains(contextTokenBudget)
+                ? contextTokenBudget
+                : AppConstants.defaultContextTokenBudget;
+        _autoCompact = _prefs.autoCompact;
+        _loadError = null;
+      });
+    } catch (_) {
+      if (mounted && generation == _loadGeneration) {
+        setState(() => _loadError = AppStrings.modelSettingsLoadFailed);
+      }
+    } finally {
+      if (mounted && generation == _loadGeneration) {
+        setState(() => _loading = false);
+      }
+    }
   }
 
   ProviderProfile? get _editingProfile {
@@ -186,12 +204,12 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     return true;
   }
 
-  void _showProfileSaveError(Object error) {
+  void _showProfileSaveError(Object _) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
+      const SnackBar(
         content: Text(
-          AppStrings.providerProfileSaveFailed(_briefError(error)),
+          AppStrings.providerProfileSaveFailedSafe,
         ),
       ),
     );
@@ -502,7 +520,7 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
         _fetchingModels = false;
         _manualModelInput = true;
       });
-      _showModelFetchNotice(AppStrings.modelFetchFailed(_briefError(e)));
+      _showModelFetchNotice(AppStrings.modelFetchFailedSafe);
     }
   }
 
@@ -511,11 +529,6 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
     );
-  }
-
-  String _briefError(Object error) {
-    final text = error.toString().replaceFirst('Exception: ', '');
-    return text.length > 160 ? '${text.substring(0, 160)}...' : text;
   }
 
   Widget _settingsGroup(ThemeData theme, List<Widget> children) {
@@ -1157,17 +1170,46 @@ class _ModelApiSettingsScreenState extends State<ModelApiSettingsScreen> {
           ),
         ],
       ),
-      body: _loading
+      body: _loading && _profiles.isEmpty
           ? const Center(child: CircularProgressIndicator())
-          : ListView(
-              padding: const EdgeInsets.symmetric(vertical: 4),
-              children: [
-                _profileList(theme),
-                _profileForm(theme),
-                _fallbackSettings(theme),
-                _advancedSettings(theme),
-              ],
-            ),
+          : _loadError != null && _profiles.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.error_outline, size: 40),
+                        const SizedBox(height: 12),
+                        Text(_loadError!, textAlign: TextAlign.center),
+                        const SizedBox(height: 12),
+                        FilledButton.icon(
+                          onPressed: _loadSettings,
+                          icon: const Icon(Icons.refresh),
+                          label: const Text(AppStrings.retry),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              : ListView(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  children: [
+                    if (_loadError != null)
+                      ListTile(
+                        leading: const Icon(Icons.error_outline),
+                        title: Text(_loadError!),
+                        trailing: TextButton(
+                          onPressed: _loadSettings,
+                          child: const Text(AppStrings.retry),
+                        ),
+                      ),
+                    _profileList(theme),
+                    _profileForm(theme),
+                    _fallbackSettings(theme),
+                    _advancedSettings(theme),
+                  ],
+                ),
     );
   }
 

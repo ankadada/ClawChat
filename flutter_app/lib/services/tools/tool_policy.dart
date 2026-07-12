@@ -10,15 +10,23 @@ class ToolApprovalRequest {
   final String toolName;
   final Map<String, dynamic> arguments;
   final ToolRisk risk;
+  final String? runAttemptId;
+  final String? operationId;
 
   const ToolApprovalRequest({
     required this.toolName,
     required this.arguments,
     required this.risk,
+    this.runAttemptId,
+    this.operationId,
   });
 }
 
 typedef ToolApprovalCallback = FutureOr<bool> Function(
+  ToolApprovalRequest request,
+);
+
+typedef ToolAdditionalDenyCheck = ToolDenyDecision? Function(
   ToolApprovalRequest request,
 );
 
@@ -39,12 +47,14 @@ class ToolPolicy {
   final ToolApprovalCallback? onApprovalRequired;
   final Set<String> deniedToolNames;
   final List<String> bashCommandDenyPatterns;
+  final ToolAdditionalDenyCheck? additionalDenyCheck;
 
   const ToolPolicy({
     this.approvalRequiredFor = const {ToolRisk.moderate, ToolRisk.dangerous},
     this.onApprovalRequired,
     this.deniedToolNames = const {},
     this.bashCommandDenyPatterns = const [],
+    this.additionalDenyCheck,
   });
 
   bool requiresApproval(ToolRisk risk) => approvalRequiredFor.contains(risk);
@@ -69,7 +79,7 @@ class ToolPolicy {
         }
       }
     }
-    return null;
+    return additionalDenyCheck?.call(request);
   }
 
   Future<bool> approve(ToolApprovalRequest request) async {

@@ -1,8 +1,10 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/services/file_attachment_service.dart';
+import 'package:clawchat/services/native_bridge.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -12,16 +14,32 @@ void main() {
 
   const channel = MethodChannel(AppConstants.channelName);
   late Directory tempDir;
+  late List<Map<String, dynamic>> rootfsWrites;
+  late List<String> prootCommands;
 
   setUp(() async {
     tempDir =
         await Directory.systemTemp.createTemp('clawchat_attachment_test_');
+    rootfsWrites = [];
+    prootCommands = [];
+    FileAttachmentService.resetInlineReadStreamForTesting();
+    NativeBridge.resetImportReadStreamForTesting();
+    NativeBridge.setImportIdentityProbeForTesting((_) async => 'stable-file');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
       switch (call.method) {
         case 'writeRootfsFile':
+        case 'writeRootfsBytes':
+          rootfsWrites.add(
+            {
+              'method': call.method,
+              ...Map<String, dynamic>.from(call.arguments as Map? ?? {}),
+            },
+          );
           return true;
         case 'runInProot':
+          final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+          prootCommands.add(args['command']?.toString() ?? '');
           return '';
       }
       return null;
@@ -31,6 +49,8 @@ void main() {
   tearDown(() async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);
+    FileAttachmentService.resetInlineReadStreamForTesting();
+    NativeBridge.resetImportReadStreamForTesting();
     if (await tempDir.exists()) {
       await tempDir.delete(recursive: true);
     }
@@ -141,6 +161,108 @@ void main() {
       );
     });
 
+    test('image growth after metadata preflight is bounded by actual bytes',
+        () async {
+      final file = await writeFile('growing.png', [1]);
+      final maxChunk = Uint8List(3 * 1024 * 1024);
+      FileAttachmentService.setInlineReadStreamForTesting((_) async* {
+        yield maxChunk;
+        yield [2];
+      });
+
+      await expectLater(
+        FileAttachmentService.prepareForMessage(
+          platformFile(file, 'growing.png'),
+        ),
+        throwsException,
+      );
+
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('text growth after metadata preflight is bounded by actual bytes',
+        () async {
+      final file = await writeFile('growing.txt', [1]);
+      final maxChunk = Uint8List(100 * 1024);
+      FileAttachmentService.setInlineReadStreamForTesting((_) async* {
+        yield maxChunk;
+        yield [2];
+      });
+
+      await expectLater(
+        FileAttachmentService.prepareForMessage(
+          platformFile(file, 'growing.txt'),
+        ),
+        throwsException,
+      );
+
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('source replacement is rejected after metadata preflight', () async {
+      final file = await writeFile('replaced.png', [1]);
+      final replacement = await writeFile('replacement.bin', [1, 2]);
+      FileAttachmentService.setInlineReadStreamForTesting((path) {
+        File(path).deleteSync();
+        replacement.renameSync(path);
+        return File(path).openRead();
+      });
+
+      await expectLater(
+        FileAttachmentService.prepareForMessage(
+          platformFile(file, 'replaced.png'),
+        ),
+        throwsA(isA<FileSystemException>()),
+      );
+    });
+
+    test('inline read error creates no attachment or workspace output',
+        () async {
+      final file = await writeFile('read-error.txt', [1]);
+      FileAttachmentService.setInlineReadStreamForTesting((_) async* {
+        yield [1];
+        throw const FileSystemException('injected read failure');
+      });
+
+      await expectLater(
+        FileAttachmentService.prepareForMessage(
+          platformFile(file, 'read-error.txt'),
+        ),
+        throwsA(isA<FileSystemException>()),
+      );
+
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('image and text reads accept their exact byte boundaries', () async {
+      final image = await writeSparseFile('boundary.png', 3 * 1024 * 1024);
+      final text = await writeStringFile('boundary.txt', 'a' * (100 * 1024));
+
+      final preparedImage = await FileAttachmentService.prepareForMessage(
+        platformFile(image, 'boundary.png'),
+      );
+      final preparedText = await FileAttachmentService.prepareForMessage(
+        platformFile(text, 'boundary.txt'),
+      );
+
+      expect(preparedImage.content, isA<ImageContent>());
+      expect(preparedText.inputText, contains('a' * 1024));
+    });
+
+    test('malformed UTF-8 text is rejected after bounded read', () async {
+      final file = await writeFile('malformed.txt', [0xff]);
+
+      await expectLater(
+        FileAttachmentService.prepareForMessage(
+          platformFile(file, 'malformed.txt'),
+        ),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
     test('oversized binary import throws before workspace write', () async {
       final file = await writeSparseFile('large.bin', 51 * 1024 * 1024);
 
@@ -171,9 +293,409 @@ void main() {
       );
 
       expect(prepared.content, isA<TextContent>());
+      expect(prepared.inputText, contains('archive.bin ->'));
       expect(
-          prepared.inputText, contains('/root/workspace/uploads/archive.bin'));
+        prepared.inputText,
+        matches(
+          RegExp(r'/root/workspace/uploads/archive_[a-f0-9]{32}\.bin'),
+        ),
+      );
       expect(prepared.includeAsContentBlock, isFalse);
+      expect(prepared.workspaceImportReceipt, isNotNull);
+      expect(prepared.workspaceImportReceipt!.storedPath,
+          contains('/root/workspace/uploads/archive_'));
+    });
+
+    test('same-name binary imports use immutable unique destinations',
+        () async {
+      final first = await writeFile('first.bin', [1, 2, 3]);
+      final second = await writeFile('second.bin', [4, 5, 6]);
+
+      final paths = await Future.wait([
+        FileAttachmentService.importToWorkspace(
+          platformFile(first, 'same.bin'),
+        ),
+        FileAttachmentService.importToWorkspace(
+          platformFile(second, 'same.bin'),
+        ),
+      ]);
+
+      final storedPaths = paths.map((receipt) => receipt.storedPath).toList();
+      expect(storedPaths.toSet(), hasLength(2));
+      expect(
+        storedPaths,
+        everyElement(
+          matches(RegExp(
+            r'^/root/workspace/uploads/same_[a-f0-9]{32}\.bin$',
+          )),
+        ),
+      );
+      expect(rootfsWrites, hasLength(2));
+      expect(rootfsWrites.map((write) => write['path']).toSet(), hasLength(2));
+      expect(
+        rootfsWrites
+            .map((write) => base64Encode(write['bytes'] as Uint8List))
+            .toSet(),
+        {
+          base64Encode([1, 2, 3]),
+          base64Encode([4, 5, 6])
+        },
+      );
+      expect(rootfsWrites.every((write) => write['createNew'] == true), isTrue);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('sequential same-name text imports preserve both immutable paths',
+        () async {
+      final first = await writeStringFile('first.txt', 'first');
+      final second = await writeStringFile('second.txt', 'second');
+
+      final firstReceipt = await NativeBridge.importFileToWorkspace(
+        first.path,
+        'same.txt',
+      );
+      final secondReceipt = await NativeBridge.importFileToWorkspace(
+        second.path,
+        'same.txt',
+      );
+
+      final firstPath = firstReceipt.storedPath;
+      final secondPath = secondReceipt.storedPath;
+      expect(firstPath, isNot(secondPath));
+      expect(firstPath, matches(RegExp(r'same_[a-f0-9]{32}\.txt$')));
+      expect(secondPath, matches(RegExp(r'same_[a-f0-9]{32}\.txt$')));
+      expect(
+          rootfsWrites.map((write) => write['content']), ['first', 'second']);
+      expect(rootfsWrites.every((write) => write['createNew'] == true), isTrue);
+    });
+
+    test('create-new destination failure never falls back to overwrite',
+        () async {
+      final file = await writeFile('write-fails.bin', [7, 8, 9]);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+        if (call.method == 'writeRootfsBytes') {
+          expect(args['createNew'], isTrue);
+          throw PlatformException(code: 'WRITE_FAILED');
+        }
+        return null;
+      });
+
+      await expectLater(
+        FileAttachmentService.importToWorkspace(
+          platformFile(file, 'write-fails.bin'),
+        ),
+        throwsA(isA<PlatformException>()),
+      );
+
+      expect(prootCommands, isEmpty);
+    });
+
+    test('native import rejects oversized input before reading or writing',
+        () async {
+      final file = await writeSparseFile('native-large.bin', 51 * 1024 * 1024);
+
+      await expectLater(
+        NativeBridge.importFileToWorkspace(file.path, 'native-large.bin'),
+        throwsException,
+      );
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('source growth after metadata check is bounded before scratch write',
+        () async {
+      final file = await writeFile('growing.bin', [1]);
+      final repeatedChunk = Uint8List(1024 * 1024);
+      NativeBridge.setImportReadStreamForTesting((_) async* {
+        for (var index = 0; index < 51; index++) {
+          yield repeatedChunk;
+        }
+      });
+
+      await expectLater(
+        NativeBridge.importFileToWorkspace(file.path, 'growing.bin'),
+        throwsException,
+      );
+
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('concurrent source read failure creates no scratch or destination',
+        () async {
+      final file = await writeFile('mutating.bin', [1]);
+      NativeBridge.setImportReadStreamForTesting((_) async* {
+        yield [1, 2, 3];
+        throw const FileSystemException('source changed while reading');
+      });
+
+      await expectLater(
+        NativeBridge.importFileToWorkspace(file.path, 'mutating.bin'),
+        throwsA(isA<FileSystemException>()),
+      );
+
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('same-size source replacement is rejected before scratch write',
+        () async {
+      final file = await writeFile('selected.bin', [1, 2, 3]);
+      final replacement = await writeFile('replacement.bin', [4, 5, 6]);
+      NativeBridge.setImportReadStreamForTesting((path) {
+        File(path).deleteSync();
+        File(replacement.path).renameSync(path);
+        return File(path).openRead();
+      });
+
+      await expectLater(
+        NativeBridge.importFileToWorkspace(file.path, 'selected.bin'),
+        throwsA(isA<FileSystemException>()),
+      );
+
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('source symlink substitution is rejected before scratch write',
+        () async {
+      final file = await writeFile('selected.bin', [1, 2, 3]);
+      final replacement = await writeFile('replacement.bin', [4, 5, 6]);
+      NativeBridge.setImportReadStreamForTesting((path) {
+        File(path).deleteSync();
+        Link(path).createSync(replacement.path);
+        return File(path).openRead();
+      });
+
+      await expectLater(
+        NativeBridge.importFileToWorkspace(file.path, 'selected.bin'),
+        throwsA(isA<FileSystemException>()),
+      );
+
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('metadata-stable identity change seam fails before scratch write',
+        () async {
+      final file = await writeFile('selected.bin', [1, 2, 3]);
+      var probes = 0;
+      NativeBridge.setImportIdentityProbeForTesting((_) async {
+        probes++;
+        return probes == 1 ? 'identity-a' : 'identity-b';
+      });
+
+      await expectLater(
+        NativeBridge.importFileToWorkspace(file.path, 'selected.bin'),
+        throwsA(isA<FileSystemException>()),
+      );
+
+      expect(probes, 2);
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('descriptor identity ABA mismatch is rejected before destination',
+        () async {
+      final file = await writeFile('selected.bin', [1, 2, 3]);
+      NativeBridge.resetImportReadStreamForTesting();
+      NativeBridge.setHostFileImportBrokerForTesting(
+        (_, __, ___, ____) async => {
+          'storedPath': '/root/workspace/uploads/restored-original-file.bin',
+          'size': 3,
+          'sha256': 'a' * 64,
+          'sourceIdentity': 'alternate-file',
+        },
+      );
+
+      await expectLater(
+        NativeBridge.importFileToWorkspace(file.path, 'selected.bin'),
+        throwsA(isA<FileSystemException>()),
+      );
+
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('production broker returns metadata without Dart byte roundtrip',
+        () async {
+      final file = await writeFile('native.bin', [1, 2, 3]);
+      NativeBridge.resetImportReadStreamForTesting();
+      String? requestedDestination;
+      NativeBridge.setHostFileImportBrokerForTesting(
+        (_, destination, __, maxBytes) async {
+          requestedDestination = destination;
+          expect(maxBytes, 50 * 1024 * 1024);
+          return {
+            'storedPath': '/$destination',
+            'size': 3,
+            'sha256': 'a' * 64,
+            'sourceIdentity': 'descriptor-snapshot',
+          };
+        },
+      );
+
+      final receipt =
+          await NativeBridge.importFileToWorkspace(file.path, 'native.bin');
+
+      expect(receipt.storedPath, '/$requestedDestination');
+      expect(receipt.size, 3);
+      expect(receipt.sha256, 'a' * 64);
+      expect(rootfsWrites, isEmpty);
+      expect(prootCommands, isEmpty);
+    });
+
+    test('production channel returns unacknowledged receipt', () async {
+      final file = await writeFile('native.bin', [1, 2, 3]);
+      NativeBridge.resetImportReadStreamForTesting();
+      var acknowledged = false;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+        if (call.method == 'importHostFileToWorkspace') {
+          final destination = args['destinationPath'] as String;
+          return {
+            'storedPath': '/$destination',
+            'size': 3,
+            'sha256': 'c' * 64,
+            'sourceIdentity': 'descriptor-snapshot',
+          };
+        }
+        if (call.method == 'acknowledgeHostFileImport') {
+          expect(args['storedPath'], startsWith('/root/workspace/uploads/'));
+          expect(args['operationId'], matches(RegExp(r'^[a-f0-9]{32}$')));
+          acknowledged = true;
+          return true;
+        }
+        return null;
+      });
+
+      final receipt =
+          await NativeBridge.importFileToWorkspace(file.path, 'native.bin');
+
+      expect(receipt.storedPath, startsWith('/root/workspace/uploads/native_'));
+      expect(acknowledged, isFalse);
+      expect(rootfsWrites, isEmpty);
+    });
+
+    test('failed explicit native journal acknowledgement fails closed',
+        () async {
+      final file = await writeFile('native.bin', [1, 2, 3]);
+      NativeBridge.resetImportReadStreamForTesting();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+        if (call.method == 'importHostFileToWorkspace') {
+          final destination = args['destinationPath'] as String;
+          return {
+            'storedPath': '/$destination',
+            'size': 3,
+            'sha256': 'd' * 64,
+            'sourceIdentity': 'descriptor-snapshot',
+          };
+        }
+        if (call.method == 'acknowledgeHostFileImport') return false;
+        return null;
+      });
+
+      final receipt =
+          await NativeBridge.importFileToWorkspace(file.path, 'native.bin');
+      await expectLater(
+        NativeBridge.acknowledgeWorkspaceImport(receipt),
+        throwsA(isA<FileSystemException>()),
+      );
+
+      expect(rootfsWrites, isEmpty);
+    });
+
+    test('explicit discard sends the complete operation receipt', () async {
+      final file = await writeFile('native.bin', [1, 2, 3]);
+      NativeBridge.resetImportReadStreamForTesting();
+      Map<String, dynamic>? discarded;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+        if (call.method == 'importHostFileToWorkspace') {
+          final destination = args['destinationPath'] as String;
+          return {
+            'storedPath': '/$destination',
+            'size': 3,
+            'sha256': 'e' * 64,
+            'sourceIdentity': 'descriptor-snapshot',
+          };
+        }
+        if (call.method == 'discardHostFileImport') {
+          discarded = args;
+          return true;
+        }
+        return null;
+      });
+
+      final receipt =
+          await NativeBridge.importFileToWorkspace(file.path, 'native.bin');
+      await NativeBridge.discardWorkspaceImport(receipt);
+
+      expect(discarded?['operationId'], receipt.operationId);
+      expect(discarded?['storedPath'], receipt.storedPath);
+      expect(discarded?['size'], 3);
+      expect(discarded?['sha256'], 'e' * 64);
+    });
+
+    test('pending native receipt list reconstructs bounded display metadata',
+        () async {
+      NativeBridge.resetImportReadStreamForTesting();
+      const operationId = 'f123456789abcdef0123456789abcde0';
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'listPendingWorkspaceImports') {
+          expect((call.arguments as Map)['limit'], 64);
+          return [
+            {
+              'operationId': operationId,
+              'storedPath': '/root/workspace/uploads/report_$operationId.bin',
+              'size': 7,
+              'sha256': 'a' * 64,
+            },
+          ];
+        }
+        return null;
+      });
+
+      final pending = await NativeBridge.listPendingWorkspaceImports();
+
+      expect(pending, hasLength(1));
+      expect(pending.single.operationId, operationId);
+      expect(pending.single.displayName, 'report.bin');
+      expect(pending.single.size, 7);
+    });
+
+    test('workspace filename component remains bounded after UUID suffix',
+        () async {
+      final file = await writeFile('native.bin', [1]);
+      NativeBridge.resetImportReadStreamForTesting();
+      String? requestedDestination;
+      NativeBridge.setHostFileImportBrokerForTesting(
+        (_, destination, __, ___) async {
+          requestedDestination = destination;
+          return {
+            'storedPath': '/$destination',
+            'size': 1,
+            'sha256': 'b' * 64,
+            'sourceIdentity': 'descriptor-snapshot',
+          };
+        },
+      );
+
+      await NativeBridge.importFileToWorkspace(
+        file.path,
+        '${'x' * 400}.${'y' * 80}',
+      );
+
+      final component = requestedDestination!.split('/').last;
+      expect(utf8.encode(component).length, lessThanOrEqualTo(212));
+      expect(component, contains(RegExp(r'_[a-f0-9]{32}')));
     });
   });
 }

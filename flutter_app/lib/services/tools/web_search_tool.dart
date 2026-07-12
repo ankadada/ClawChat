@@ -1,8 +1,21 @@
-import 'dart:convert';
-import 'dart:io';
+import 'dart:async';
+import 'package:http/http.dart' as http;
+import '../../models/chat_models.dart';
+import '../app_http.dart';
 import 'tool_registry.dart';
+import 'tool_result_formatter.dart';
 
 class WebSearchTool extends Tool {
+  WebSearchTool({Uri? endpoint, AppHttpClient? httpClient})
+      : _endpoint = endpoint ?? Uri.parse('https://html.duckduckgo.com/html/'),
+        _injectedClient = httpClient;
+
+  final Uri _endpoint;
+  final AppHttpClient? _injectedClient;
+
+  AppHttpClient get _client =>
+      _injectedClient ?? AppHttpClientRegistry.instance.client;
+
   @override
   String get name => 'web_search';
 
@@ -13,41 +26,106 @@ class WebSearchTool extends Tool {
 
   @override
   Map<String, dynamic> get inputSchema => {
-    'type': 'object',
-    'properties': {
-      'query': {
-        'type': 'string',
-        'description': 'The search query',
-      },
-      'num_results': {
-        'type': 'integer',
-        'description': 'Number of results to return (default: 5, max: 10)',
-      },
-    },
-    'required': ['query'],
-  };
+        'type': 'object',
+        'properties': {
+          'query': {
+            'type': 'string',
+            'description': 'The search query',
+          },
+          'num_results': {
+            'type': 'integer',
+            'description': 'Number of results to return (default: 5, max: 10)',
+          },
+        },
+        'required': ['query'],
+      };
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
-    final query = input['query'] as String;
-    final numResults = (input['num_results'] as num?)?.toInt().clamp(1, 10) ?? 5;
+    return _execute(input, followRedirects: true, cancellationSignal: null);
+  }
 
-    final client = HttpClient();
+  Future<String> executeForSkill(
+    Map<String, dynamic> input, {
+    ToolCancellationSignal? cancellationSignal,
+  }) {
+    return _execute(
+      input,
+      followRedirects: false,
+      cancellationSignal: cancellationSignal,
+    );
+  }
+
+  @override
+  Future<ToolResultPayload> executeResultWithOperationAndCancellation(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    required String operationId,
+    required ToolCancellationSignal cancellationSignal,
+  }) async {
+    final output = await _execute(
+      input,
+      followRedirects: true,
+      cancellationSignal: cancellationSignal,
+    );
+    return ToolResultFormatter.format(
+      toolName: name,
+      input: input,
+      output: output,
+      isError: output.startsWith('Search failed:'),
+    );
+  }
+
+  Future<String> _execute(
+    Map<String, dynamic> input, {
+    required bool followRedirects,
+    required ToolCancellationSignal? cancellationSignal,
+  }) async {
+    cancellationSignal?.throwIfCancellationRequested();
+    final query = input['query'] as String;
+    final numResults =
+        (input['num_results'] as num?)?.toInt().clamp(1, 10) ?? 5;
+
     try {
-      client.userAgent = 'Mozilla/5.0';
-      final request = await client.getUrl(
-        Uri.parse('https://html.duckduckgo.com/html/?q=${Uri.encodeComponent(query)}'),
-      );
-      final response = await request.close().timeout(const Duration(seconds: 15));
-      final body = await response.transform(utf8.decoder).join();
+      final abort = Completer<void>();
+      final timer = Timer(const Duration(seconds: 15), abort.complete);
+      if (cancellationSignal != null) {
+        unawaited(cancellationSignal.whenCancelled.then((_) {
+          if (!abort.isCompleted) abort.complete();
+        }));
+      }
+      final request = http.AbortableRequest(
+        'GET',
+        _endpoint.replace(queryParameters: {'q': query}),
+        abortTrigger: abort.future,
+      )..followRedirects = followRedirects;
+      late final http.Response response;
+      try {
+        response = await http.Response.fromStream(await _client.send(request));
+        if (cancellationSignal?.isCancellationRequested == true) {
+          throw const ToolExecutionCancelledException(
+            sideEffectsPrevented: true,
+          );
+        }
+      } finally {
+        timer.cancel();
+      }
+      final body = response.body;
 
       final results = _parseResults(body, numResults);
       if (results.isEmpty) return 'No results found for: $query';
-      return results.map((r) => '${r['title']}\n${r['snippet']}\n${r['url']}').join('\n\n---\n\n');
+      return results
+          .map((r) => '${r['title']}\n${r['snippet']}\n${r['url']}')
+          .join('\n\n---\n\n');
+    } on ToolExecutionCancelledException {
+      rethrow;
     } catch (e) {
+      if (cancellationSignal?.isCancellationRequested == true) {
+        throw const ToolExecutionCancelledException(
+          sideEffectsPrevented: true,
+        );
+      }
       return 'Search failed: $e';
-    } finally {
-      client.close();
     }
   }
 
@@ -69,7 +147,9 @@ class WebSearchTool extends Tool {
     final titleMatches = resultBlockPattern.allMatches(html).toList();
     final snippetMatches = snippetPattern.allMatches(html).toList();
 
-    for (int i = 0; i < titleMatches.length && results.length < maxResults; i++) {
+    for (int i = 0;
+        i < titleMatches.length && results.length < maxResults;
+        i++) {
       final titleMatch = titleMatches[i];
       final url = _decodeUrl(titleMatch.group(1) ?? '');
       final title = _stripHtml(titleMatch.group(2) ?? '');

@@ -1,6 +1,6 @@
 class AppConstants {
   static const String appName = 'ClawChat';
-  static const String version = '2.4.0';
+  static const String version = '2.5.0';
   static const String packageName = 'com.anka.clawbot';
 
   static final ansiEscape = RegExp(r'\x1b\[[0-9;]*[a-zA-Z]');

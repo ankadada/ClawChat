@@ -14,19 +14,20 @@ class WriteFileTool extends Tool {
 
   @override
   Map<String, dynamic> get inputSchema => {
-    'type': 'object',
-    'properties': {
-      'path': {
-        'type': 'string',
-        'description': 'Absolute path for the file (inside proot, under /root/workspace)',
-      },
-      'content': {
-        'type': 'string',
-        'description': 'The content to write to the file',
-      },
-    },
-    'required': ['path', 'content'],
-  };
+        'type': 'object',
+        'properties': {
+          'path': {
+            'type': 'string',
+            'description':
+                'Absolute path for the file (inside proot, under /root/workspace)',
+          },
+          'content': {
+            'type': 'string',
+            'description': 'The content to write to the file',
+          },
+        },
+        'required': ['path', 'content'],
+      };
 
   static const _allowedRoot = '/root/workspace';
 
@@ -51,6 +52,13 @@ class WriteFileTool extends Tool {
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
+    return executeWithAllowedScopes(input, const {_allowedRoot});
+  }
+
+  Future<String> executeWithAllowedScopes(
+    Map<String, dynamic> input,
+    Set<String> allowedScopes,
+  ) async {
     final path = input['path'] as String;
     final content = input['content'] as String;
 
@@ -64,9 +72,11 @@ class WriteFileTool extends Tool {
       if (_shellMetacharacters.hasMatch(resolved)) {
         return 'Error: Path contains invalid characters.';
       }
-      final dir = resolved.substring(0, resolved.lastIndexOf('/'));
-      await NativeBridge.runInProot("mkdir -p '$dir'", mountStorage: false);
-      await NativeBridge.writeRootfsFile(rootfsPath, content);
+      await NativeBridge.writeRootfsFile(
+        rootfsPath,
+        content,
+        allowedRoots: allowedScopes,
+      );
       return 'Successfully wrote ${content.length} bytes to $resolved';
     } catch (e) {
       return 'Error writing file: $e';

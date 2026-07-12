@@ -101,7 +101,7 @@ class _ArtifactPreviewScreenState extends State<ArtifactPreviewScreen> {
   }
 
   Future<void> _copyHtml() async {
-    await Clipboard.setData(ClipboardData(text: widget.htmlContent));
+    await Clipboard.setData(ClipboardData(text: _safeDocument));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
@@ -117,7 +117,7 @@ class _ArtifactPreviewScreenState extends State<ArtifactPreviewScreen> {
       final file = File(
         '${directory.path}/clawchat_artifact_${DateTime.now().millisecondsSinceEpoch}.html',
       );
-      await file.writeAsString(widget.htmlContent);
+      await file.writeAsString(_safeDocument);
       final opened = await NativeBridge.openHtmlFile(file.path);
       if (!opened) throw Exception(AppStrings.openInBrowserFailed);
     } catch (e) {
@@ -127,6 +127,8 @@ class _ArtifactPreviewScreenState extends State<ArtifactPreviewScreen> {
       );
     }
   }
+
+  String get _safeDocument => safeArtifactDocument(widget.htmlContent);
 
   @override
   Widget build(BuildContext context) {
@@ -198,6 +200,10 @@ bool isPreviewableHtml(String content, {String? language}) {
       lower.contains('<html') ||
       lower.contains('<body');
 }
+
+@visibleForTesting
+String safeArtifactDocument(String html) =>
+    sandboxArtifactHtml(html, allowJavaScript: false);
 
 @visibleForTesting
 String sandboxArtifactHtml(String html, {required bool allowJavaScript}) {

@@ -31,7 +31,9 @@ class ContextSummaryRequest {
 }
 
 class ContextSummaryService {
-  static const version = 1;
+  // Version 2 invalidates summaries produced before skill history was
+  // projected to a fixed non-instructional marker.
+  static const version = 2;
   static const _maxToolResultChars = 1200;
   static const _maxToolInputChars = 800;
   static const _maxExtractiveChars = 2400;

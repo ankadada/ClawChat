@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -120,6 +121,216 @@ void main() {
       expect(backupSession.messages.single.textContent, 'first version');
     });
 
+    test('serializes lifecycle saves by invocation order per session',
+        () async {
+      final firstCommitEntered = Completer<void>();
+      final releaseFirstCommit = Completer<void>();
+      var commitCount = 0;
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        commitCount++;
+        if (commitCount == 1) {
+          firstCommitEntered.complete();
+          await releaseFirstCommit.future;
+        }
+      });
+      await storage.init();
+      final timestamp = DateTime.utc(2026, 7, 10);
+      final session = ChatSession(
+        id: 'ordered_lifecycle',
+        inFlightAgentRun: _recoveryMarker(
+          timestamp,
+          ToolAttemptLifecycle.completed,
+          executionOutcomeKnown: true,
+        ),
+      );
+
+      final completedSave = storage.saveSession(session);
+      await firstCommitEntered.future;
+      session.inFlightAgentRun = _recoveryMarker(
+        timestamp,
+        ToolAttemptLifecycle.interruptedUnknown,
+      );
+      final interruptedSave = storage.saveSession(session);
+      session.inFlightAgentRun = _recoveryMarker(
+        timestamp,
+        ToolAttemptLifecycle.failed,
+        executionOutcomeKnown: true,
+      );
+      final knownAbortSave = storage.saveSession(session);
+
+      expect(commitCount, 1);
+      releaseFirstCommit.complete();
+      await Future.wait([completedSave, interruptedSave, knownAbortSave]);
+
+      final loaded = await storage.getSession(session.id);
+      expect(loaded, isNotNull);
+      expect(loaded!.inFlightAgentRun!.toolAttempts.single.lifecycle,
+          ToolAttemptLifecycle.failed);
+      expect(loaded.inFlightAgentRun!.toolAttempts.single.executionOutcomeKnown,
+          isTrue);
+      final backup = File(
+        '${tempDir.path}/clawchat_sessions/${session.id}.json.bak',
+      );
+      final backupSession = ChatSession.fromJson(
+        jsonDecode(await backup.readAsString()) as Map<String, dynamic>,
+      );
+      expect(backupSession.inFlightAgentRun!.toolAttempts.single.lifecycle,
+          ToolAttemptLifecycle.interruptedUnknown);
+    });
+
+    test('completion clear save cannot be overtaken by an older marker save',
+        () async {
+      final markerCommitEntered = Completer<void>();
+      final releaseMarkerCommit = Completer<void>();
+      var commitCount = 0;
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        commitCount++;
+        if (commitCount == 1) {
+          markerCommitEntered.complete();
+          await releaseMarkerCommit.future;
+        }
+      });
+      await storage.init();
+      final timestamp = DateTime.utc(2026, 7, 11);
+      final session = ChatSession(
+        id: 'completion_clear_order',
+        messages: [ChatMessage.user('normal request')],
+        inFlightAgentRun: AgentRunRecoveryMarker(
+          runAttemptId: 'ordered-run',
+          startedAt: timestamp,
+          updatedAt: timestamp,
+        ),
+      );
+
+      final markerSave = storage.saveSession(session);
+      await markerCommitEntered.future;
+      session.messages.add(ChatMessage(
+        role: 'assistant',
+        content: [TextContent('completed')],
+        timestamp: timestamp.add(const Duration(seconds: 1)),
+      ));
+      session.inFlightAgentRun = null;
+      final completionSave = storage.saveSession(session);
+
+      expect(commitCount, 1);
+      releaseMarkerCommit.complete();
+      await Future.wait([markerSave, completionSave]);
+
+      final loaded = await storage.getSession(session.id);
+      expect(loaded!.messages.last.textContent, 'completed');
+      expect(loaded.inFlightAgentRun, isNull);
+    });
+
+    test('failed queued save does not poison the next save', () async {
+      var commitCount = 0;
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        commitCount++;
+        if (commitCount == 1) throw StateError('injected commit failure');
+      });
+      await storage.init();
+      final session = ChatSession(id: 'save_failure_recovery', title: 'first');
+
+      final failed = storage.saveSession(session);
+      session.title = 'second';
+      final recovered = storage.saveSession(session);
+
+      await expectLater(failed, throwsStateError);
+      await recovered;
+      expect((await storage.getSession(session.id))?.title, 'second');
+      expect(commitCount, 2);
+    });
+
+    test('delete tombstone invalidates a stalled save and prevents reload',
+        () async {
+      final commitEntered = Completer<void>();
+      final releaseCommit = Completer<void>();
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        if (!commitEntered.isCompleted) commitEntered.complete();
+        await releaseCommit.future;
+      });
+      await storage.init();
+      final session = ChatSession(id: 'delete_stalled_save', title: 'stale');
+
+      final staleSave = storage.saveSession(session);
+      await commitEntered.future;
+      final delete = storage.deleteSession(session.id);
+      expect(storage.isSessionTombstoned(session.id), isTrue);
+      await expectLater(storage.getSession(session.id), completion(isNull));
+
+      releaseCommit.complete();
+      await expectLater(
+        staleSave,
+        throwsA(isA<SessionTombstonedException>()),
+      );
+      await delete;
+      expect(await storage.getSession(session.id), isNull);
+
+      final reloaded = SessionStorage();
+      await reloaded.init();
+      expect(await reloaded.getSession(session.id), isNull);
+    });
+
+    test('late saves stay rejected until explicit recreation generation',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final original = ChatSession(id: 'explicit_recreate', title: 'old');
+      await storage.saveSession(original);
+      final oldGeneration = storage.sessionGeneration(original.id);
+
+      await storage.deleteSession(original.id);
+      await expectLater(
+        storage.saveSession(original),
+        throwsA(isA<SessionTombstonedException>()),
+      );
+
+      final recreated = ChatSession(id: original.id, title: 'new identity');
+      await storage.recreateDeletedSession(recreated);
+
+      expect(
+        storage.isSessionGenerationCurrent(original.id, oldGeneration),
+        isFalse,
+      );
+      expect((await storage.getSession(original.id))!.title, 'new identity');
+      original.title = 'late stale callback';
+      await expectLater(
+        storage.saveSession(original),
+        throwsA(isA<SessionTombstonedException>()),
+      );
+      expect((await storage.getSession(original.id))!.title, 'new identity');
+    });
+
+    test('recreation queues after delete while stale commit is blocked',
+        () async {
+      final commitEntered = Completer<void>();
+      final releaseCommit = Completer<void>();
+      var blockFirst = true;
+      final storage = SessionStorage(beforeCommitForTesting: (_) async {
+        if (!blockFirst) return;
+        blockFirst = false;
+        commitEntered.complete();
+        await releaseCommit.future;
+      });
+      await storage.init();
+      final stale = ChatSession(id: 'queued_recreate', title: 'stale');
+      final staleSave = storage.saveSession(stale);
+      await commitEntered.future;
+
+      final delete = storage.deleteSession(stale.id);
+      final recreate = storage.recreateDeletedSession(
+        ChatSession(id: stale.id, title: 'recreated'),
+      );
+      releaseCommit.complete();
+
+      await expectLater(
+        staleSave,
+        throwsA(isA<SessionTombstonedException>()),
+      );
+      await delete;
+      await recreate;
+      expect((await storage.getSession(stale.id))!.title, 'recreated');
+    });
+
     test('path traversal IDs are regenerated by ChatSession parsing', () {
       final session = ChatSession.fromJson(_sessionJson('../escape'));
 
@@ -135,15 +346,16 @@ void main() {
       expect(await storage.getSession('nested/path'), isNull);
     });
 
-    test('import with invalid IDs writes only safe session files', () async {
+    test('import with invalid IDs is side-effect free', () async {
       final storage = SessionStorage();
       await storage.init();
-      final count = await storage.importFromJson(jsonEncode({
-        'version': 1,
-        'sessions': [_sessionJson('../../outside')],
-      }));
-
-      expect(count, 1);
+      await expectLater(
+        storage.importFromJson(jsonEncode({
+          'version': 1,
+          'sessions': [_sessionJson('../../outside')],
+        })),
+        throwsFormatException,
+      );
       final sessionsDir = Directory('${tempDir.path}/clawchat_sessions');
       final files = await sessionsDir
           .list()
@@ -151,10 +363,21 @@ void main() {
           .cast<File>()
           .toList();
 
-      expect(files, hasLength(1));
-      expect(files.single.parent.path, sessionsDir.path);
-      expect(files.single.uri.pathSegments.last, isNot(contains('..')));
-      expect(files.single.uri.pathSegments.last, isNot(contains('/')));
+      expect(files, isEmpty);
+    });
+
+    test('oversized import is rejected before mutation', () async {
+      final storage = SessionStorage();
+      await storage.init();
+      await storage.saveSession(ChatSession(id: 'keep_local', title: 'Keep'));
+
+      await expectLater(
+        storage.previewImport('x' * (SessionStorage.maxTransferBytes + 1)),
+        throwsFormatException,
+      );
+
+      expect((await storage.getSession('keep_local'))?.title, 'Keep');
+      expect(await storage.getSessionIds(), contains('keep_local'));
     });
 
     test('import preserves existing session on id conflict', () async {
@@ -189,6 +412,222 @@ void main() {
       final imported = all.singleWhere((session) => session.id != 'same_id');
       expect(imported.title, 'Imported (imported copy)');
       expect(imported.messages.single.textContent, 'import me');
+    });
+
+    test('versioned export is bounded and excludes endpoint selections',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      await storage.saveSession(ChatSession(
+        id: 'export_safe',
+        title: 'Local',
+        baseUrlOverride: 'https://private.invalid',
+        remoteAgentConnectorId: 'remote_choice',
+        messages: [ChatMessage.user('local content')],
+      ));
+
+      final artifact = await storage.exportAllAsJson();
+      final decoded = jsonDecode(artifact) as Map<String, dynamic>;
+      final session = (decoded['sessions'] as List).single as Map;
+      expect(decoded['schema'], 'clawchat.sessions');
+      expect(decoded['version'], 2);
+      expect(session.containsKey('baseUrlOverride'), isFalse);
+      expect(session.containsKey('remoteAgentConnectorId'), isFalse);
+      expect(utf8.encode(artifact).length,
+          lessThanOrEqualTo(SessionStorage.maxTransferBytes));
+    });
+
+    test('import preview is dry-run and stale new-ID conflicts fail closed',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final source = jsonEncode({
+        'version': 1,
+        'sessions': [_sessionJson('arrives_later')],
+      });
+      final preview = await storage.previewImport(source);
+      expect(preview.newCount, 1);
+      expect(await storage.getSessionIds(), isEmpty);
+
+      await storage.saveSession(ChatSession(
+        id: 'arrives_later',
+        title: 'Concurrent local session',
+      ));
+      await expectLater(
+        storage.applyImport(
+          preview,
+          SessionImportConflictPolicy.replace,
+        ),
+        throwsStateError,
+      );
+      expect((await storage.getSession('arrives_later'))?.title,
+          'Concurrent local session');
+    });
+
+    test('replace creates verified backup and rollback restores original',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      await storage.saveSession(ChatSession(
+        id: 'replace_me',
+        title: 'Original',
+        messages: [ChatMessage.user('original body')],
+      ));
+      final preview = await storage.previewImport(jsonEncode({
+        'version': 1,
+        'sessions': [
+          _sessionJson(
+            'replace_me',
+            title: 'Imported',
+            messages: [ChatMessage.user('imported body').toJson()],
+          ),
+        ],
+      }));
+      final result = await storage.applyImport(
+        preview,
+        SessionImportConflictPolicy.replace,
+      );
+      expect(result.replaced, 1);
+      expect(result.backupPath, isNotNull);
+      expect(await File(result.backupPath!).exists(), isTrue);
+      expect((await storage.getSession('replace_me'))?.title, 'Imported');
+
+      expect(await storage.rollbackImportBackup(result.backupPath!), 1);
+      final restored = await storage.getSession('replace_me');
+      expect(restored?.title, 'Original');
+      expect(restored?.messages.single.textContent, 'original body');
+    });
+
+    test('changed conflict after preview is rejected without mutation',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final existing = ChatSession(id: 'changed_conflict', title: 'First');
+      await storage.saveSession(existing);
+      final preview = await storage.previewImport(jsonEncode({
+        'version': 1,
+        'sessions': [_sessionJson('changed_conflict', title: 'Imported')],
+      }));
+
+      existing.title = 'Changed locally';
+      await storage.saveSession(existing);
+
+      await expectLater(
+        storage.applyImport(preview, SessionImportConflictPolicy.replace),
+        throwsStateError,
+      );
+      expect((await storage.getSession('changed_conflict'))?.title,
+          'Changed locally');
+    });
+
+    test('failed multi-session apply rolls back from durable journal',
+        () async {
+      var writes = 0;
+      final storage = SessionStorage(
+        importMutationFaultInjector: (step) {
+          if (step == SessionImportMutationStep.afterSessionWrite &&
+              ++writes == 1) {
+            throw StateError('injected import interruption');
+          }
+        },
+      );
+      await storage.init();
+      await storage.saveSession(ChatSession(
+        id: 'journal_original',
+        title: 'Original',
+      ));
+      final preview = await storage.previewImport(jsonEncode({
+        'version': 1,
+        'sessions': [
+          _sessionJson('journal_original', title: 'Replacement'),
+          _sessionJson('journal_new', title: 'New'),
+        ],
+      }));
+
+      await expectLater(
+        storage.applyImport(preview, SessionImportConflictPolicy.replace),
+        throwsStateError,
+      );
+
+      final restarted = SessionStorage();
+      await restarted.init();
+      expect(
+          (await restarted.getSession('journal_original'))?.title, 'Original');
+      expect(await restarted.getSession('journal_new'), isNull);
+      expect(
+        await File('${tempDir.path}/clawchat_sessions/.import-transaction.json')
+            .exists(),
+        isFalse,
+      );
+    });
+
+    test('duplicate replacement is rejected without changing live session',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      await storage.saveSession(ChatSession(id: 'duplicate', title: 'Local'));
+      final preview = await storage.previewImport(jsonEncode({
+        'version': 1,
+        'sessions': [
+          _sessionJson('duplicate', title: 'First'),
+          _sessionJson('duplicate', title: 'Second'),
+        ],
+      }));
+
+      await expectLater(
+        storage.applyImport(preview, SessionImportConflictPolicy.replace),
+        throwsFormatException,
+      );
+      expect((await storage.getSession('duplicate'))?.title, 'Local');
+    });
+
+    test('trash survives restart and undo restores safe exact local state',
+        () async {
+      final first = SessionStorage();
+      await first.init();
+      await first.saveSession(ChatSession(
+        id: 'trash_restart',
+        title: 'Draft title',
+        folder: 'Work',
+        inFlightAgentRun: _recoveryMarker(
+          DateTime.utc(2026, 7, 12),
+          ToolAttemptLifecycle.started,
+        ),
+        messages: [ChatMessage.user('draft body')],
+      ));
+      await first.deleteSession('trash_restart');
+      expect(await first.getSession('trash_restart'), isNull);
+      expect(await first.listTrash(), hasLength(1));
+
+      final restarted = SessionStorage();
+      await restarted.init();
+      expect(await restarted.getSession('trash_restart'), isNull);
+      final restored = await restarted.restoreFromTrash('trash_restart');
+      expect(restored?.title, 'Draft title');
+      expect(restored?.folder, 'Work');
+      expect(restored?.messages.single.textContent, 'draft body');
+      expect(restored?.inFlightAgentRun, isNull);
+      expect(await restarted.listTrash(), isEmpty);
+      expect(
+          (await restarted.getSession('trash_restart'))?.title, 'Draft title');
+    });
+
+    test('trash retention prunes deterministically to the entry bound',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      for (var index = 0;
+          index < SessionStorage.maxTrashEntries + 2;
+          index += 1) {
+        final id = 'trash_$index';
+        await storage.saveSession(ChatSession(id: id, title: 'Item $index'));
+        await storage.deleteSession(id);
+      }
+
+      final trash = await storage.listTrash();
+      expect(trash, hasLength(SessionStorage.maxTrashEntries));
+      expect(trash.map((entry) => entry.title), contains('Item 21'));
+      expect(trash.map((entry) => entry.title), isNot(contains('Item 0')));
     });
   });
 
@@ -379,6 +818,31 @@ void main() {
       expect(apiMessages.any((m) => m['role'] == 'system'), isFalse);
     });
   });
+}
+
+AgentRunRecoveryMarker _recoveryMarker(
+  DateTime timestamp,
+  ToolAttemptLifecycle lifecycle, {
+  bool executionOutcomeKnown = false,
+}) {
+  return AgentRunRecoveryMarker(
+    runAttemptId: 'ordered-run',
+    startedAt: timestamp,
+    updatedAt: timestamp,
+    phase: AgentRunRecoveryPhase.toolInFlight,
+    toolAttempts: [
+      ToolAttemptRecoveryMetadata(
+        operationId: 'ordered-operation',
+        toolName: 'web_fetch',
+        risk: RecoveryToolRisk.moderate,
+        lifecycle: lifecycle,
+        proposedAt: timestamp,
+        updatedAt: timestamp,
+        executionStartedAt: timestamp,
+        executionOutcomeKnown: executionOutcomeKnown,
+      ),
+    ],
+  );
 }
 
 Map<String, dynamic> _sessionJson(

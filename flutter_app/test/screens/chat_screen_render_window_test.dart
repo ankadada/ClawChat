@@ -1,10 +1,15 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:ui';
 
+import 'package:clawchat/app.dart';
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/l10n/app_strings.dart';
 import 'package:clawchat/models/chat_models.dart';
+import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/screens/chat_screen.dart';
+import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/session_storage.dart';
 import 'package:flutter/material.dart';
@@ -126,7 +131,9 @@ void main() {
       title: 'Interrupted Banner Session',
       messages: [ChatMessage.user('hello')],
       inFlightAgentRun: AgentRunRecoveryMarker(
+        runAttemptId: 'banner-run',
         startedAt: DateTime.utc(2026, 1, 1),
+        updatedAt: DateTime.utc(2026, 1, 1),
       ),
     );
     await storage.saveSession(session);
@@ -135,6 +142,7 @@ void main() {
     await _pumpChatScreen(tester, provider);
 
     expect(find.text('上次任务被中断'), findsOneWidget);
+    expect(find.widgetWithText(TextButton, '查看'), findsOneWidget);
     expect(find.widgetWithText(TextButton, '忽略'), findsOneWidget);
     expect(find.widgetWithText(FilledButton, '继续'), findsOneWidget);
 
@@ -147,6 +155,421 @@ void main() {
       (await storage.getSession(session.id))!.inFlightAgentRun,
       isNull,
     );
+  });
+
+  testWidgets('does not label the currently owned run as interrupted',
+      (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1200, 900);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final started = Completer<void>();
+    final release = Completer<void>();
+    provider.dispose();
+    PreferencesService().apiKey = 'sk-test';
+    provider = ChatProvider(
+      storage: storage,
+      llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+        config,
+        started: started,
+        release: release,
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    final session = await provider.createSession();
+    final send = provider.sendMessage('normal active request');
+    for (var attempt = 0; attempt < 200 && !started.isCompleted; attempt++) {
+      await tester.pump(const Duration(milliseconds: 10));
+    }
+    expect(started.isCompleted, isTrue);
+
+    await _pumpChatScreen(tester, provider);
+
+    expect(provider.isSessionSending(session.id), isTrue);
+    expect((await storage.getSession(session.id))!.inFlightAgentRun, isNotNull);
+    expect(provider.currentInterruptedAgentRun, isNull);
+    expect(find.text('上次任务被中断'), findsNothing);
+
+    release.complete();
+    for (var attempt = 0;
+        attempt < 200 && provider.isSessionSending(session.id);
+        attempt++) {
+      await tester.pump(const Duration(milliseconds: 10));
+    }
+    expect(provider.isSessionSending(session.id), isFalse);
+    await send;
+    expect(find.text('上次任务被中断'), findsNothing);
+    expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
+
+    provider.dispose();
+    provider = ChatProvider(storage: storage);
+    await tester.pump(const Duration(milliseconds: 50));
+    await provider.selectSession(session.id);
+    await _pumpChatScreen(tester, provider);
+    expect(provider.currentInterruptedAgentRun, isNull);
+    expect(find.text('上次任务被中断'), findsNothing);
+  });
+
+  testWidgets('shows fail-closed unknown tool recovery details',
+      (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1200, 900);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final timestamp = DateTime.utc(2026, 1, 1);
+    final session = ChatSession(
+      id: 'unknown_tool_recovery_banner',
+      messages: [ChatMessage.user('hello')],
+      inFlightAgentRun: AgentRunRecoveryMarker(
+        runAttemptId: 'run-unknown',
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        phase: AgentRunRecoveryPhase.toolInFlight,
+        toolAttempts: [
+          ToolAttemptRecoveryMetadata(
+            operationId: 'operation-unknown',
+            toolName: 'write_file',
+            risk: RecoveryToolRisk.dangerous,
+            lifecycle: ToolAttemptLifecycle.started,
+            proposedAt: timestamp,
+            updatedAt: timestamp,
+            executionStartedAt: timestamp,
+          ),
+        ],
+      ),
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreen(tester, provider);
+
+    expect(find.textContaining('结果未知'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '重新发起'), findsOneWidget);
+    await tester.tap(find.widgetWithText(TextButton, '查看'));
+    await tester.pumpAndSettle();
+    expect(find.text('中断恢复详情'), findsOneWidget);
+    expect(find.textContaining('run-unknown'), findsOneWidget);
+    expect(find.textContaining('operation-unknown'), findsOneWidget);
+    expect(find.textContaining('write_file · dangerous'), findsOneWidget);
+  });
+
+  testWidgets('unknown recovery success keeps banner after reload',
+      (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1200, 900);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    provider.dispose();
+    PreferencesService().apiKey = 'sk-test';
+    provider = ChatProvider(
+      storage: storage,
+      llmServiceFactory: (config, {isInBackground}) =>
+          _ImmediateLlmService(config),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    final timestamp = DateTime.utc(2026, 1, 1);
+    final session = ChatSession(
+      id: 'unknown_success_banner',
+      messages: [ChatMessage.user('original task')],
+      inFlightAgentRun: AgentRunRecoveryMarker(
+        runAttemptId: 'unknown-success-origin',
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        phase: AgentRunRecoveryPhase.toolInFlight,
+        toolAttempts: [
+          ToolAttemptRecoveryMetadata(
+            operationId: 'unknown-operation',
+            toolName: 'write_file',
+            risk: RecoveryToolRisk.dangerous,
+            lifecycle: ToolAttemptLifecycle.interruptedUnknown,
+            proposedAt: timestamp,
+            updatedAt: timestamp,
+            executionStartedAt: timestamp,
+          ),
+        ],
+      ),
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await provider.continueInterruptedAgentRun();
+    await _pumpChatScreen(tester, provider);
+
+    expect(find.text('model recovered'), findsOneWidget);
+    expect(find.text('上次任务被中断'), findsOneWidget);
+    expect(find.textContaining('结果未知'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '重新发起'), findsOneWidget);
+
+    provider.dispose();
+    provider = ChatProvider(storage: storage);
+    await tester.pump(const Duration(milliseconds: 50));
+    await provider.selectSession(session.id);
+    await _pumpChatScreen(tester, provider);
+
+    expect(provider.currentInterruptedAgentRun, isNotNull);
+    expect(find.text('model recovered'), findsOneWidget);
+    expect(find.text('上次任务被中断'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '重新发起'), findsOneWidget);
+  });
+
+  testWidgets('labels recovery-origin error action as safe Continue',
+      (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1200, 900);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final timestamp = DateTime.utc(2026, 1, 1);
+    final session = ChatSession(
+      id: 'recovery_error_card',
+      messages: [
+        ChatMessage.user('original task'),
+        ChatMessage.assistantError(
+          error: const AssistantErrorMetadata(
+            message: 'provider unavailable',
+            code: 'provider_unavailable',
+            canRetry: true,
+            retryAction: AssistantRetryAction.continueRecovery,
+            recoveryRunAttemptId: 'recovery-error-run',
+          ),
+        ),
+      ],
+      inFlightAgentRun: AgentRunRecoveryMarker(
+        runAttemptId: 'recovery-error-run',
+        startedAt: timestamp,
+        updatedAt: timestamp,
+      ),
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreen(tester, provider);
+
+    expect(find.text(AppStrings.assistantRecoveryErrorTitle), findsOneWidget);
+    expect(find.text(AppStrings.assistantRecoveryContinue), findsOneWidget);
+    expect(find.text(AppStrings.retry), findsNothing);
+  });
+
+  testWidgets('fold and unfold preserve one ChatScreen and its draft state',
+      (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(800, 700);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    await provider.createSession();
+    const shellKey = ValueKey('responsive-shell');
+
+    Future<void> pump(List<DisplayFeature> features) async {
+      await tester.pumpWidget(
+        ChangeNotifierProvider<ChatProvider>.value(
+          value: provider,
+          child: MaterialApp(
+            home: MediaQuery(
+              data: MediaQueryData(
+                size: const Size(800, 700),
+                displayFeatures: features,
+                textScaler: const TextScaler.linear(2),
+              ),
+              child: const ResponsiveShell(key: shellKey),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+
+    await pump(const []);
+    expect(find.bySemanticsLabel('调整会话列表宽度'), findsOneWidget);
+    final resizeTarget = find.byKey(const ValueKey('sidebar-resize-target'));
+    final visualLine = find.byKey(const ValueKey('sidebar-resize-visual-line'));
+    expect(tester.getSize(resizeTarget).width, greaterThanOrEqualTo(48));
+    expect(tester.getSize(visualLine).width, 1);
+    expect(
+      tester.getCenter(resizeTarget).dx,
+      closeTo(tester.getCenter(visualLine).dx, 0.01),
+    );
+    expect(find.bySemanticsLabel(AppStrings.voiceStart), findsOneWidget);
+    expect(find.byTooltip(AppStrings.send), findsOneWidget);
+    final composer = find.byWidgetPredicate(
+      (widget) =>
+          widget is TextField &&
+          widget.decoration?.hintText == AppStrings.inputHint,
+    );
+    expect(composer, findsOneWidget);
+    await tester.enterText(composer, 'draft survives posture');
+
+    await pump(const [
+      DisplayFeature(
+        bounds: Rect.fromLTWH(390, 0, 20, 700),
+        type: DisplayFeatureType.hinge,
+        state: DisplayFeatureState.postureFlat,
+      ),
+    ]);
+    expect(find.byType(ChatScreen), findsOneWidget);
+    expect(resizeTarget, findsNothing);
+    expect(find.text('draft survives posture'), findsOneWidget);
+
+    await pump(const []);
+    expect(find.byType(ChatScreen), findsOneWidget);
+    expect(find.text('draft survives posture'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('tabletop with IME keeps chat in the usable upper region',
+      (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(600, 800);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    await provider.createSession();
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider<ChatProvider>.value(
+        value: provider,
+        child: const MaterialApp(
+          home: MediaQuery(
+            data: MediaQueryData(
+              size: Size(600, 800),
+              viewInsets: EdgeInsets.only(bottom: 360),
+              textScaler: TextScaler.linear(2),
+              displayFeatures: [
+                DisplayFeature(
+                  bounds: Rect.fromLTWH(0, 300, 600, 20),
+                  type: DisplayFeatureType.fold,
+                  state: DisplayFeatureState.postureHalfOpened,
+                ),
+              ],
+            ),
+            child: ResponsiveShell(),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(find.byType(ChatScreen), findsOneWidget);
+    expect(tester.getTopLeft(find.byType(ChatScreen)).dy, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+      'production shell keeps compare decision and composer in 300dp tabletop pane',
+      (tester) async {
+    provider.dispose();
+    final profile = ProviderProfile.defaults().copyWith(
+      id: 'compare-profile',
+      apiKey: 'test-key',
+      model: 'compare-model',
+    );
+    secureStorage['provider_profiles'] = jsonEncode([profile.toJson()]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'compare-profile',
+    });
+    PreferencesService.resetForTesting();
+    var requests = 0;
+    provider = ChatProvider(
+      storage: storage,
+      llmServiceFactory: (config, {isInBackground}) =>
+          _CompareCompositionLlmService(config, onRequest: () => requests++),
+    );
+    await tester.runAsync(() async {
+      await testerPumpInitGap();
+      await provider.createSession();
+      await provider.sendCompare('layout prompt', ['model-a', 'model-b']);
+    });
+    expect(requests, 2);
+
+    Future<void> pump(
+      Size size,
+      List<DisplayFeature> features, {
+      double bottomInset = 0,
+      double textScale = 1,
+    }) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = size;
+      await tester.pumpWidget(
+        ChangeNotifierProvider<ChatProvider>.value(
+          value: provider,
+          child: MaterialApp(
+            theme: ThemeData(useMaterial3: true),
+            builder: (context, child) => MediaQuery(
+              data: MediaQueryData(
+                size: size,
+                displayFeatures: features,
+                viewInsets: EdgeInsets.only(bottom: bottomInset),
+                textScaler: TextScaler.linear(textScale),
+              ),
+              child: child!,
+            ),
+            home: const ResponsiveShell(key: ValueKey('compare-shell')),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 350));
+    }
+
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    const tabletop = DisplayFeature(
+      bounds: Rect.fromLTWH(0, 300, 600, 20),
+      type: DisplayFeatureType.fold,
+      state: DisplayFeatureState.postureHalfOpened,
+    );
+    await pump(const Size(600, 620), const [tabletop], textScale: 2);
+    expect(
+        find.byKey(const ValueKey('compact-compare-decision')), findsOneWidget);
+    expect(find.text(AppStrings.useInConversation), findsOneWidget);
+    expect(find.byTooltip(AppStrings.send), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.enterText(find.byType(TextField).last, 'draft survives');
+    await tester.tap(find.byTooltip('下一个结果'));
+    await tester.pump();
+    expect(find.textContaining('2/2'), findsOneWidget);
+
+    await pump(
+      const Size(600, 620),
+      const [
+        DisplayFeature(
+          bounds: Rect.fromLTWH(0, 300, 600, 0),
+          type: DisplayFeatureType.fold,
+          state: DisplayFeatureState.postureHalfOpened,
+        ),
+      ],
+      bottomInset: 280,
+      textScale: 2,
+    );
+    expect(find.text(AppStrings.useInConversation), findsOneWidget);
+    expect(find.text('draft survives'), findsOneWidget);
+    expect(find.textContaining('2/2'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await pump(
+      const Size(800, 600),
+      const [
+        DisplayFeature(
+          bounds: Rect.fromLTWH(400, 0, 0, 600),
+          type: DisplayFeatureType.fold,
+          state: DisplayFeatureState.postureHalfOpened,
+        ),
+      ],
+    );
+    expect(requests, 2);
+    expect(find.text('draft survives'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }
 
@@ -185,6 +608,25 @@ ChatSession _syntheticSession(int totalMessages) {
 
 String _messageText(int index) => 'synthetic render window message $index';
 
+class _CompareCompositionLlmService extends LlmService {
+  _CompareCompositionLlmService(super.config, {required this.onRequest});
+
+  final VoidCallback onRequest;
+
+  @override
+  Future<LlmResponse> chat({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    List<ToolDefinition>? tools,
+  }) async {
+    onRequest();
+    return LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: '${config.model} result')],
+    );
+  }
+}
+
 class _MemorySessionStorage extends SessionStorage {
   final Map<String, ChatSession> _sessions = {};
 
@@ -210,7 +652,11 @@ class _MemorySessionStorage extends SessionStorage {
   Future<ChatSession?> getSession(String id) async => _sessions[id];
 
   @override
-  Future<void> saveSession(ChatSession session) async {
+  Future<void> saveSession(
+    ChatSession session, {
+    int? expectedGeneration,
+    SessionCommitGuard? commitGuard,
+  }) async {
     _sessions[session.id] = ChatSession.fromJson(
       jsonDecode(jsonEncode(session.toJson())) as Map<String, dynamic>,
     );
@@ -242,5 +688,46 @@ class _MemorySessionStorage extends SessionStorage {
   @override
   Future<void> clearAll() async {
     _sessions.clear();
+  }
+}
+
+class _BlockingLlmService extends LlmService {
+  final Completer<void> started;
+  final Completer<void> release;
+
+  _BlockingLlmService(
+    super.config, {
+    required this.started,
+    required this.release,
+  });
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    if (!started.isCompleted) started.complete();
+    await release.future;
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'completed')],
+    ));
+  }
+}
+
+class _ImmediateLlmService extends LlmService {
+  _ImmediateLlmService(super.config);
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'model recovered')],
+    ));
   }
 }

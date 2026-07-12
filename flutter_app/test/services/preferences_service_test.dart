@@ -662,4 +662,18 @@ void main() {
     expect(service.activeProfileId, 'first');
     expect(service.apiKey, 'sk-first');
   });
+
+  test('Developer Mode is off by default and persists explicit opt-in',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final service = PreferencesService();
+    await service.init();
+
+    expect(service.developerMode, isFalse);
+    service.developerMode = true;
+
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getBool('developer_mode'), isTrue);
+    expect(service.developerMode, isTrue);
+  });
 }

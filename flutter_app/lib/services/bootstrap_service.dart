@@ -1,20 +1,45 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart';
-import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import '../constants.dart';
 import '../models/setup_state.dart';
+import 'app_http.dart';
 import 'native_bridge.dart';
 
 class BootstrapService {
-  final Dio _dio = Dio();
+  BootstrapService({AppHttpClient? httpClient}) : _injectedClient = httpClient;
+
+  final AppHttpClient? _injectedClient;
+
+  AppHttpClient get _client =>
+      _injectedClient ?? AppHttpClientRegistry.instance.client;
 
   // SHA256 hashes for Alpine 3.21.3 minirootfs tarballs
   static const Map<String, String> _rootfsSha256 = {
-    'aarch64': 'ead8a4b37867bd19e7417dd078748e2312c0aea364403d96758d63ea8ff261ea',
+    'aarch64':
+        'ead8a4b37867bd19e7417dd078748e2312c0aea364403d96758d63ea8ff261ea',
     'arm': '28b2a97374cccd96646e32ab2ebcbd52fa507f1e456620e86a7b227bc2ab3bd3',
-    'x86_64': '1a694899e406ce55d32334c47ac0b2efb6c06d7e878102d1840892ad44cd5239',
+    'x86_64':
+        '1a694899e406ce55d32334c47ac0b2efb6c06d7e878102d1840892ad44cd5239',
   };
+  static const int requiredFreeBytes = 256 * 1024 * 1024;
+
+  Future<BootstrapPreflight> preflight() async {
+    final status = await NativeBridge.getBootstrapStatus();
+    final available = status['availableBytes'];
+    final cached = status['cachedArchiveBytes'];
+    return BootstrapPreflight(
+      bootstrapComplete: status['complete'] == true,
+      rootfsPresent: status['rootfsExists'] == true,
+      availableBytes: available is num ? available.toInt() : null,
+      cachedArchiveBytes: cached is num ? cached.toInt() : 0,
+      networkConnected: status['networkConnected'] as bool?,
+      networkValidated: status['networkValidated'] as bool?,
+    );
+  }
 
   void _updateSetupNotification(String text, {int progress = -1}) {
     try {
@@ -47,10 +72,11 @@ class BootstrapService {
         progress: 0.0,
         message: '需要初始化环境',
       );
-    } catch (e) {
-      return SetupState(
+    } catch (_) {
+      return const SetupState(
         step: SetupStep.error,
-        error: '状态检查失败: $e',
+        error: 'status unavailable',
+        failureCategory: SetupFailureCategory.status,
       );
     }
   }
@@ -59,10 +85,28 @@ class BootstrapService {
     required void Function(SetupState) onProgress,
   }) async {
     try {
+      final readiness = await preflight();
+      if (!readiness.hasEnoughStorage) {
+        onProgress(const SetupState(
+          step: SetupStep.error,
+          error: 'insufficient storage',
+          failureCategory: SetupFailureCategory.storage,
+        ));
+        return;
+      }
+      if (readiness.networkConnected == false) {
+        onProgress(const SetupState(
+          step: SetupStep.error,
+          error: 'network unavailable',
+          failureCategory: SetupFailureCategory.network,
+        ));
+        return;
+      }
       try {
         await NativeBridge.startSetupService();
       } catch (e) {
-        stderr.writeln('[BootstrapService] startSetupService failed (non-fatal): $e');
+        stderr.writeln(
+            '[BootstrapService] startSetupService failed (non-fatal): $e');
       }
 
       // Step 0: 初始化目录
@@ -72,10 +116,14 @@ class BootstrapService {
         message: '创建目录...',
       ));
       _updateSetupNotification('创建目录...', progress: 2);
-      try { await NativeBridge.setupDirs(); } catch (e) {
+      try {
+        await NativeBridge.setupDirs();
+      } catch (e) {
         stderr.writeln('[BootstrapService] setupDirs failed: $e');
       }
-      try { await NativeBridge.writeResolv(); } catch (e) {
+      try {
+        await NativeBridge.writeResolv();
+      } catch (e) {
         stderr.writeln('[BootstrapService] writeResolv failed: $e');
       }
 
@@ -84,6 +132,7 @@ class BootstrapService {
       final rootfsUrl = AppConstants.getRootfsUrl(arch);
       final filesDir = await NativeBridge.getFilesDir();
       final tarPath = '$filesDir/tmp/alpine-rootfs.tar.gz';
+      final tarFile = File(tarPath);
 
       _updateSetupNotification('下载 Alpine rootfs...', progress: 5);
       onProgress(const SetupState(
@@ -92,29 +141,38 @@ class BootstrapService {
         message: '下载 Alpine Linux 根文件系统...',
       ));
 
-      try {
-        await _dio.download(
-          rootfsUrl,
-          tarPath,
-          onReceiveProgress: (received, total) {
-            if (total > 0) {
-              final progress = received / total;
-              final mb = (received / 1024 / 1024).toStringAsFixed(1);
-              final totalMb = (total / 1024 / 1024).toStringAsFixed(1);
-              final notifProgress = 5 + (progress * 25).round();
-              _updateSetupNotification(
-                '下载 rootfs: $mb / $totalMb MB', progress: notifProgress);
-              onProgress(SetupState(
-                step: SetupStep.downloadingRootfs,
-                progress: progress,
-                message: '下载中: $mb MB / $totalMb MB',
-              ));
-            }
-          },
-        );
-      } on DioException catch (e) {
-        stderr.writeln('[BootstrapService] rootfs download failed: ${e.message}');
-        rethrow;
+      final cachedArchiveValid = await _hasValidCachedArchive(tarFile, arch);
+      if (!cachedArchiveValid) {
+        try {
+          await _downloadFile(
+            Uri.parse(rootfsUrl),
+            tarFile,
+            onProgress: (received, total) {
+              if (total > 0) {
+                final progress = received / total;
+                final mb = (received / 1024 / 1024).toStringAsFixed(1);
+                final totalMb = (total / 1024 / 1024).toStringAsFixed(1);
+                final notifProgress = 5 + (progress * 25).round();
+                _updateSetupNotification('下载 rootfs: $mb / $totalMb MB',
+                    progress: notifProgress);
+                onProgress(SetupState(
+                  step: SetupStep.downloadingRootfs,
+                  progress: progress,
+                  message: '下载中: $mb MB / $totalMb MB',
+                ));
+              }
+            },
+          );
+        } catch (e) {
+          stderr.writeln('[BootstrapService] rootfs download failed');
+          throw BootstrapDownloadException(e);
+        }
+      } else {
+        onProgress(const SetupState(
+          step: SetupStep.downloadingRootfs,
+          progress: 1.0,
+          message: '使用已校验的本地下载',
+        ));
       }
 
       // Verify SHA256 integrity using streaming hash to avoid loading
@@ -130,9 +188,10 @@ class BootstrapService {
         final actualHash = output.events.single.toString();
         final expectedHash = _rootfsSha256[arch];
         if (expectedHash == null || actualHash != expectedHash) {
-          stderr.writeln('[BootstrapService] SHA256 mismatch: expected=$expectedHash actual=$actualHash');
+          stderr.writeln(
+              '[BootstrapService] SHA256 mismatch: expected=$expectedHash actual=$actualHash');
           await File(tarPath).delete();
-          throw Exception('rootfs 完整性校验失败 (SHA256 不匹配)');
+          throw const BootstrapIntegrityException();
         }
       } on FileSystemException catch (e) {
         stderr.writeln('[BootstrapService] Failed to read downloaded file: $e');
@@ -201,20 +260,160 @@ class BootstrapService {
         progress: 1.0,
         message: '环境初始化完成! 可以开始聊天了。',
       ));
-    } on DioException catch (e) {
+    } on BootstrapDownloadException {
       _stopSetupService();
-      stderr.writeln('[BootstrapService] Setup failed (DioException): ${e.message}');
-      onProgress(SetupState(
+      stderr.writeln('[BootstrapService] Setup download failed');
+      onProgress(const SetupState(
         step: SetupStep.error,
-        error: '下载失败: ${e.message}。请检查网络连接。',
+        error: 'download unavailable',
+        failureCategory: SetupFailureCategory.network,
       ));
-    } catch (e) {
+    } on BootstrapIntegrityException {
       _stopSetupService();
-      stderr.writeln('[BootstrapService] Setup failed: $e');
-      onProgress(SetupState(
+      stderr.writeln('[BootstrapService] Setup integrity verification failed');
+      onProgress(const SetupState(
         step: SetupStep.error,
-        error: '初始化失败: $e',
+        error: 'integrity verification failed',
+        failureCategory: SetupFailureCategory.integrity,
+      ));
+    } catch (_) {
+      _stopSetupService();
+      stderr.writeln('[BootstrapService] Setup failed');
+      onProgress(const SetupState(
+        step: SetupStep.error,
+        error: 'environment setup failed',
+        failureCategory: SetupFailureCategory.environment,
       ));
     }
   }
+
+  @visibleForTesting
+  Future<void> downloadFileForTesting(
+    Uri uri,
+    File destination, {
+    void Function(int received, int total)? onProgress,
+    Duration timeout = const Duration(seconds: 30),
+  }) {
+    return _downloadFile(
+      uri,
+      destination,
+      onProgress: onProgress,
+      timeout: timeout,
+    );
+  }
+
+  Future<void> _downloadFile(
+    Uri uri,
+    File destination, {
+    void Function(int received, int total)? onProgress,
+    Duration timeout = const Duration(minutes: 2),
+  }) async {
+    final abort = Completer<void>();
+    var timedOut = false;
+    final timer = Timer(timeout, () {
+      timedOut = true;
+      if (!abort.isCompleted) abort.complete();
+    });
+    IOSink? sink;
+    try {
+      final request = http.AbortableRequest(
+        'GET',
+        uri,
+        abortTrigger: abort.future,
+      );
+      final response = await _client.send(request);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException(
+          'Download failed with HTTP ${response.statusCode}',
+          uri: uri,
+        );
+      }
+
+      final total = response.contentLength ?? -1;
+      var received = 0;
+      sink = destination.openWrite();
+      await for (final chunk in response.stream) {
+        sink.add(chunk);
+        received += chunk.length;
+        onProgress?.call(received, total);
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+    } on http.RequestAbortedException {
+      if (sink != null) {
+        await sink.close();
+        sink = null;
+      }
+      if (await destination.exists()) await destination.delete();
+      if (timedOut) {
+        throw TimeoutException('Download timed out', timeout);
+      }
+      rethrow;
+    } catch (_) {
+      if (sink != null) {
+        await sink.close();
+        sink = null;
+      }
+      if (await destination.exists()) await destination.delete();
+      rethrow;
+    } finally {
+      timer.cancel();
+      if (sink != null) await sink.close();
+    }
+  }
+
+  Future<bool> _hasValidCachedArchive(File file, String arch) async {
+    if (!await file.exists()) return false;
+    final expected = _rootfsSha256[arch];
+    if (expected == null) return false;
+    try {
+      final output = AccumulatorSink<Digest>();
+      final input = sha256.startChunkedConversion(output);
+      await for (final chunk in file.openRead()) {
+        input.add(chunk);
+      }
+      input.close();
+      if (output.events.single.toString() == expected) return true;
+    } catch (_) {
+      // Invalid or unreadable cache is removed below and downloaded again.
+    }
+    try {
+      await file.delete();
+    } catch (_) {}
+    return false;
+  }
+}
+
+final class BootstrapPreflight {
+  const BootstrapPreflight({
+    required this.bootstrapComplete,
+    required this.rootfsPresent,
+    required this.availableBytes,
+    required this.cachedArchiveBytes,
+    required this.networkConnected,
+    required this.networkValidated,
+  });
+
+  final bool bootstrapComplete;
+  final bool rootfsPresent;
+  final int? availableBytes;
+  final int cachedArchiveBytes;
+  final bool? networkConnected;
+  final bool? networkValidated;
+
+  bool get hasEnoughStorage =>
+      availableBytes == null ||
+      availableBytes! >= BootstrapService.requiredFreeBytes;
+  bool get canStart => hasEnoughStorage && networkConnected != false;
+}
+
+final class BootstrapDownloadException implements Exception {
+  const BootstrapDownloadException(this.cause);
+
+  final Object cause;
+}
+
+final class BootstrapIntegrityException implements Exception {
+  const BootstrapIntegrityException();
 }
