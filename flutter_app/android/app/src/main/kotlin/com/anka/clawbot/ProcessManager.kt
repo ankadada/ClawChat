@@ -6,6 +6,7 @@ import android.util.Log
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -15,9 +16,10 @@ import java.util.concurrent.TimeUnit
  *   - Install mode (buildInstallCommand): matches proot-distro's run_proot_cmd()
  *   - Gateway mode (buildGatewayCommand): matches proot-distro's command_login()
  */
-class ProcessManager(
+internal class ProcessManager(
     private val filesDir: String,
-    private val nativeLibDir: String
+    private val nativeLibDir: String,
+    private val cleanupCoordinator: CommandCleanupCoordinator? = null,
 ) {
     private val activeOperations = ConcurrentHashMap<String, Process>()
     private val cancelledOperations = ConcurrentHashMap.newKeySet<String>()
@@ -252,19 +254,64 @@ class ProcessManager(
     // Execute a command in proot (install mode) and return output.
     // Used during bootstrap for apt, npm, chmod, etc.
     // ================================================================
-    fun runInProotSync(
+    internal fun runInProotSync(
         command: String,
         timeoutSeconds: Long = 900,
         mountStorage: Boolean = false,
-        operationId: String? = null
+        operationId: String? = null,
+        continuationKey: CommandOwnerKey? = null,
     ): String {
+        require(continuationKey == null || continuationKey.operationId == operationId) {
+            "continuation operation identity mismatch"
+        }
         if (operationId != null && cancelledOperations.contains(operationId)) {
             throw InterruptedException("operation cancelled")
         }
         val cmd = buildInstallCommand(command, mountStorage)
         val env = prootEnv()
+        val coordinator = cleanupCoordinator
+            ?: throw IllegalStateException("durable command launch gate unavailable")
+        val internalOperationId = operationId ?: UUID.randomUUID().toString()
+        val gateKey = continuationKey ?: CommandOwnerKey(
+            CommandContinuationOwner.AGENT_BASH,
+            "internal-proot-$internalOperationId",
+            internalOperationId,
+        )
+        val ownsReservation = continuationKey == null
+        if (ownsReservation) {
+            val reserve = NativeCommandContinuationOwner.registry.reserve(
+                gateKey,
+                TimeUnit.SECONDS.toMillis(timeoutSeconds.coerceAtLeast(1L)),
+            )
+            if (reserve != CommandReserveOutcome.NEW) {
+                throw IllegalStateException("internal command launch reservation failed: $reserve")
+            }
+        }
+        val preparation = coordinator.prepareLaunch(
+            gateKey,
+            candidateId = null,
+            deadlineEpochMs = System.currentTimeMillis() +
+                TimeUnit.SECONDS.toMillis(timeoutSeconds.coerceAtLeast(1L)),
+        )
+        if (preparation.outcome !=
+            DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_SCHEDULED) {
+            if (ownsReservation) NativeCommandContinuationOwner.registry.cancel(gateKey)
+            throw IllegalStateException(
+                "durable command launch backstop unavailable: ${preparation.outcome}",
+            )
+        }
+        val gatedCommand = buildList {
+            add("/system/bin/sh")
+            add(requireNotNull(preparation.wrapperPath))
+            add(requireNotNull(preparation.attemptDirectoryPath))
+            add(requireNotNull(preparation.launchToken))
+            add(requireNotNull(preparation.parentProcessId).toString())
+            add(requireNotNull(preparation.appUid).toString())
+            add("--")
+            addAll(cmd)
+        }
 
-        val pb = ProcessBuilder(cmd)
+        val pb = ProcessBuilder(gatedCommand)
         // CRITICAL: Clear inherited Android JVM environment.
         // Without this, LD_PRELOAD, CLASSPATH, DEX2OAT vars leak into
         // proot and break fork+exec. proot-distro uses `env -i` on the
@@ -275,11 +322,145 @@ class ProcessManager(
         pb.environment().putAll(env)
         pb.redirectErrorStream(true)
 
-        val process = pb.start()
-        if (operationId != null) {
-            activeOperations[operationId] = process
+        val attemptId = requireNotNull(preparation.attemptId)
+        val launchToken = requireNotNull(preparation.launchToken)
+        val cancelledBeforeSpawn = operationId != null && cancelledOperations.contains(operationId)
+        if (cancelledBeforeSpawn ||
+            !coordinator.validateLaunchCapability(gateKey, null, attemptId, launchToken)) {
+            coordinator.acknowledgeLaunchAbandoned(gateKey, null, attemptId, launchToken)
+            coordinator.requestCleanup(gateKey)
+            if (ownsReservation) NativeCommandContinuationOwner.registry.cancel(gateKey)
+            if (cancelledBeforeSpawn) throw InterruptedException("operation cancelled")
+            throw IllegalStateException("command launch capability was revoked before spawn")
+        }
+        val process = try {
+            pb.start()
+        } catch (error: Exception) {
+            coordinator.acknowledgeLaunchAbandoned(gateKey, null, attemptId, launchToken)
+            if (ownsReservation) NativeCommandContinuationOwner.registry.cancel(gateKey)
+            throw error
+        }
+        val ownedProcess = JavaOwnedCommandProcess(process)
+        var processId = javaProcessId(process)
+        var token: PidGenerationToken? = null
+        for (attempt in 0 until 50) {
+            if (processId == null) {
+                processId = coordinator.waitingLaunchProcessId(
+                    gateKey,
+                    null,
+                    attemptId,
+                    launchToken,
+                )
+            }
+            val expected = processId
+            if (expected != null) {
+                val candidate = coordinator.activateWaitingLaunch(
+                    gateKey,
+                    candidateId = null,
+                    attemptId = attemptId,
+                    launchToken = launchToken,
+                    expectedProcessId = expected,
+                    probe = AndroidCleanupPidAccess.probe,
+                )
+                if (candidate != null) {
+                    token = candidate
+                    break
+                }
+            }
+            Thread.sleep(20L)
+        }
+        if (token == null) {
+            while (processId == null && process.isAlive) {
+                processId = coordinator.waitingLaunchProcessId(
+                    gateKey,
+                    null,
+                    attemptId,
+                    launchToken,
+                )
+                if (processId == null) Thread.sleep(100L)
+            }
+            if (processId == null) {
+                coordinator.requestCleanup(gateKey)
+                NativeCommandContinuationOwner.registry.cancel(gateKey)
+                throw IllegalStateException("command launch wrapper exited before PID handshake")
+            }
+            while (process.isAlive) {
+                coordinator.requestWaitingLaunchCleanup(
+                    gateKey,
+                    candidateId = null,
+                    attemptId = attemptId,
+                    launchToken = launchToken,
+                    expectedProcessId = requireNotNull(processId),
+                    probe = AndroidCleanupPidAccess.probe,
+                )
+                coordinator.reconcile()
+                if (process.isAlive) Thread.sleep(100L)
+            }
+            coordinator.requestWaitingLaunchCleanup(
+                gateKey,
+                candidateId = null,
+                attemptId = attemptId,
+                launchToken = launchToken,
+                expectedProcessId = requireNotNull(processId),
+                probe = AndroidCleanupPidAccess.probe,
+            )
+            NativeCommandContinuationOwner.registry.cancel(gateKey)
+            throw IllegalStateException("command launch wrapper handshake failed")
+        }
+        val legacyOwned = operationId != null && continuationKey == null
+        run {
+            var attachReceipt: CandidateReceipt
+            do {
+                attachReceipt = NativeCommandContinuationOwner.registry.attachAgent(
+                    gateKey,
+                    ownedProcess,
+                    beforeNativeOwnership = {
+                        coordinator.isActiveLaunch(
+                            gateKey,
+                            null,
+                            attemptId,
+                            launchToken,
+                            token,
+                        )
+                    },
+                    beforeSignal = { coordinator.requestCleanup(gateKey) },
+                )
+                if (attachReceipt == CandidateReceipt.UNKNOWN) {
+                    Thread.sleep(100L)
+                }
+            } while (attachReceipt == CandidateReceipt.UNKNOWN)
+            if (attachReceipt != CandidateReceipt.NATIVE_OWNS) {
+                if (attachReceipt == CandidateReceipt.NATIVE_DISPOSED) {
+                    coordinator.complete(gateKey)
+                } else {
+                    coordinator.requestCleanup(gateKey)
+                }
+                throw IllegalStateException(
+                    "foreground continuation lost before command attach: $attachReceipt"
+                )
+            }
+        }
+        if (!coordinator.releaseLaunch(
+                gateKey,
+                null,
+                attemptId,
+                launchToken,
+                token,
+            )) {
+            coordinator.requestCleanup(gateKey)
+            NativeCommandContinuationOwner.registry.cancel(gateKey)
+            throw IllegalStateException("command launch GO commit failed")
+        }
+        if (operationId != null && continuationKey == null) {
+            val existing = activeOperations.putIfAbsent(operationId, process)
+            if (existing != null) {
+                retireGatedCommand(gateKey, signal = true)
+                throw IllegalStateException("operation already active")
+            }
             if (cancelledOperations.contains(operationId)) {
-                process.destroyForcibly()
+                retireGatedCommand(gateKey, signal = true)
+                activeOperations.remove(operationId, process)
+                throw InterruptedException("operation cancelled")
             }
         }
         val output = StringBuilder()
@@ -321,17 +502,31 @@ class ProcessManager(
         val exited = try {
             process.waitFor(timeoutSeconds, TimeUnit.SECONDS)
         } catch (e: InterruptedException) {
-            process.destroyForcibly()
+            if (continuationKey != null) {
+                AgentTaskService.cancelCommand(
+                    continuationKey.sessionId,
+                    continuationKey.operationId,
+                )
+            } else {
+                retireGatedCommand(gateKey, signal = true)
+            }
             Thread.currentThread().interrupt()
             throw e
         } finally {
-            if (operationId != null) {
+            if (legacyOwned && operationId != null) {
                 activeOperations.remove(operationId, process)
                 cancelledOperations.remove(operationId)
             }
         }
         if (!exited) {
-            process.destroyForcibly()
+            if (continuationKey != null) {
+                AgentTaskService.cancelCommand(
+                    continuationKey.sessionId,
+                    continuationKey.operationId,
+                )
+            } else {
+                retireGatedCommand(gateKey, signal = true)
+            }
             readerThread.join(1000)
             val partialOutput = synchronized(outputLock) {
                 output.toString().takeLast(3000)
@@ -345,6 +540,8 @@ class ProcessManager(
         }
         readerThread.join(1000)
         readerFailure?.let { throw it }
+
+        if (ownsReservation) retireGatedCommand(gateKey, signal = false)
 
         val exitCode = process.exitValue()
         if (exitCode != 0) {
@@ -361,6 +558,30 @@ class ProcessManager(
         return synchronized(outputLock) { output.toString() }
     }
 
+    private fun retireGatedCommand(key: CommandOwnerKey, signal: Boolean) {
+        val result = if (signal) {
+            NativeCommandContinuationOwner.registry.cancel(
+                key,
+                beforeSignal = { cleanupCoordinator?.requestCleanup(key) == true },
+            )
+        } else {
+            NativeCommandContinuationOwner.registry.finish(key)
+        }
+        if (result.outcome == CommandRetireOutcome.RETIRED ||
+            result.outcome == CommandRetireOutcome.ALREADY_RETIRED) {
+            cleanupCoordinator?.complete(key)
+        } else if (result.outcome == CommandRetireOutcome.RETRYABLE_UNKNOWN) {
+            cleanupCoordinator?.requestCleanup(key)
+        }
+    }
+
+    private fun javaProcessId(process: Process): Int? = try {
+        val value = Process::class.java.getMethod("pid").invoke(process) as? Long
+        value?.takeIf { it in 1..Int.MAX_VALUE }?.toInt()
+    } catch (_: Exception) {
+        null
+    }
+
     fun cancelOperation(operationId: String) {
         cancelledOperations.add(operationId)
         activeOperations[operationId]?.destroyForcibly()
@@ -372,19 +593,4 @@ class ProcessManager(
         }
     }
 
-    // ================================================================
-    // Start a long-lived gateway process (gateway mode).
-    // Uses full proot-distro command_login() style configuration.
-    // ================================================================
-    fun startProotProcess(command: String, mountStorage: Boolean = false): Process {
-        val cmd = buildShellCommand(command, mountStorage)
-        val env = prootEnv()
-
-        val pb = ProcessBuilder(cmd)
-        pb.environment().clear()
-        pb.environment().putAll(env)
-        pb.redirectErrorStream(false)
-
-        return pb.start()
-    }
 }

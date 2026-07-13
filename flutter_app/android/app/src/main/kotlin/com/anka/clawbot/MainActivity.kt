@@ -118,9 +118,12 @@ class MainActivity : FlutterActivity() {
 
         val filesDir = applicationContext.filesDir.absolutePath
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
+        val cleanupCoordinator = CommandCleanupCoordinatorProvider.get(applicationContext)
+        TerminalSessionService.initializeCleanupCoordinator(applicationContext)
+        AgentTaskService.initializeCleanupCoordinator(applicationContext)
 
         bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
-        processManager = ProcessManager(filesDir, nativeLibDir)
+        processManager = ProcessManager(filesDir, nativeLibDir, cleanupCoordinator)
         phoneIntentManager = PhoneIntentManager(this) { activityResumed }
 
         if (setupDone.compareAndSet(false, true)) {
@@ -363,35 +366,325 @@ class MainActivity : FlutterActivity() {
                     val timeout = call.argument<Int>("timeout")?.toLong() ?: 900L
                     val mountStorage = call.argument<Boolean>("mountStorage") ?: false
                     val operationId = call.argument<String>("operationId")
-                    if (command != null) {
+                    val continuationSessionId = call.argument<String>("continuationSessionId")
+                    val requireBackgroundContinuation =
+                        call.argument<Boolean>("requireBackgroundContinuation") ?: false
+                    if (command == null) {
+                        result.error("INVALID_ARGS", "command required", null)
+                    } else if (requireBackgroundContinuation &&
+                        (operationId.isNullOrBlank() || continuationSessionId.isNullOrBlank())) {
+                        result.error(
+                            "INVALID_ARGS",
+                            "background continuation identity required",
+                            null,
+                        )
+                    } else {
+                        val continuationKey = if (requireBackgroundContinuation) {
+                            AgentTaskService.commandKey(continuationSessionId!!, operationId!!)
+                        } else {
+                            null
+                        }
+                        val reserveOutcome = if (continuationKey != null) {
+                            AgentTaskService.reserveCommand(
+                                continuationKey.sessionId,
+                                continuationKey.operationId,
+                                timeout * 1000L,
+                            )
+                        } else {
+                            CommandReserveOutcome.NEW
+                        }
+                        if (reserveOutcome != CommandReserveOutcome.NEW) {
+                            result.error(
+                                "PROOT_${reserveOutcome.name}",
+                                "command continuation not started: ${reserveOutcome.name}",
+                                null,
+                            )
+                            return@setMethodCallHandler
+                        }
                         Thread {
                             try {
+                                if (continuationKey != null) {
+                                    val continuationReady =
+                                        AgentTaskService.startReservedCommandAndAwaitReady(
+                                            applicationContext,
+                                            continuationKey.sessionId,
+                                            continuationKey.operationId,
+                                        )
+                                    if (!continuationReady) {
+                                        throw IllegalStateException(
+                                            "foreground continuation unavailable; command not started"
+                                        )
+                                    }
+                                }
                                 val output = processManager.runInProotSync(
                                     command,
                                     timeout,
                                     mountStorage,
-                                    operationId
+                                    operationId,
+                                    continuationKey,
                                 )
                                 safeRunOnUiThread { result.success(output) }
                             } catch (e: Exception) {
                                 safeRunOnUiThread { result.error("PROOT_ERROR", e.message, null) }
+                            } finally {
+                                if (continuationKey != null) {
+                                    AgentTaskService.finishCommand(
+                                        continuationKey.sessionId,
+                                        continuationKey.operationId,
+                                    )
+                                }
                             }
                         }.start()
-                    } else {
-                        result.error("INVALID_ARGS", "command required", null)
                     }
                 }
-                "startTerminalService" -> {
-                    try {
-                        TerminalSessionService.start(applicationContext)
-                        result.success(true)
-                    } catch (e: Exception) {
-                        result.error("SERVICE_ERROR", e.message, null)
+                "cancelProotOperation" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    if (operationId.isNullOrBlank() || sessionId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "command continuation identity required", null)
+                    } else {
+                        val outcome = AgentTaskService.cancelCommand(sessionId, operationId)
+                        result.success(
+                            outcome == CommandRetireOutcome.RETIRED ||
+                                outcome == CommandRetireOutcome.ALREADY_RETIRED
+                        )
+                    }
+                }
+                "replaceTerminalSession" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    val timeoutSeconds = call.argument<Number>("timeoutSeconds")?.toLong()
+                    if (operationId.isNullOrBlank() || sessionId.isNullOrBlank() ||
+                        candidateId.isNullOrBlank() ||
+                        timeoutSeconds == null || timeoutSeconds <= 0L) {
+                        result.error("INVALID_ARGS", "terminal continuation identity required", null)
+                    } else {
+                        val replacement = TerminalSessionService.replaceSession(
+                            operationId,
+                            sessionId,
+                            candidateId,
+                            timeoutSeconds * 1000L,
+                        )
+                        val outcome = replacement.outcome
+                        if (outcome != CommandReserveOutcome.NEW &&
+                            outcome != CommandReserveOutcome.ALREADY_ACTIVE) {
+                            result.success(outcome.name)
+                        } else {
+                            Thread {
+                                val ready = TerminalSessionService.startReservedAndAwaitReady(
+                                    applicationContext,
+                                    operationId,
+                                    sessionId,
+                                    candidateId,
+                                )
+                                safeRunOnUiThread {
+                                    result.success(
+                                        if (ready) outcome.name
+                                        else CommandReserveOutcome.RETIRED.name
+                                    )
+                                }
+                            }.start()
+                        }
+                    }
+                }
+                "attachTerminalProcess" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    val attemptId = call.argument<String>("attemptId")
+                    val launchToken = call.argument<String>("launchToken")
+                    val processId = call.argument<Number>("processId")?.toInt()
+                    if (operationId == null || sessionId == null || candidateId == null ||
+                        attemptId.isNullOrBlank() || launchToken.isNullOrBlank() ||
+                        processId == null) {
+                        result.error("INVALID_ARGS", "terminal process identity required", null)
+                    } else {
+                        val attachResult = TerminalSessionService.attachProcess(
+                            operationId,
+                            sessionId,
+                            candidateId,
+                            attemptId,
+                            launchToken,
+                            processId,
+                        )
+                        result.success(attachResult.name)
+                    }
+                }
+                "prepareTerminalLaunch" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    if (operationId.isNullOrBlank() || sessionId.isNullOrBlank() ||
+                        candidateId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "terminal launch identity required", null)
+                    } else {
+                        val launch = TerminalSessionService.prepareLaunch(
+                            operationId,
+                            sessionId,
+                            candidateId,
+                        )
+                        result.success(
+                            mapOf(
+                                "outcome" to launch.outcome.name,
+                                "wrapperPath" to launch.wrapperPath,
+                                "attemptDirectoryPath" to launch.attemptDirectoryPath,
+                                "stagingPath" to launch.stagingPath,
+                                "goPath" to launch.goPath,
+                                "parentProcessId" to launch.parentProcessId,
+                                "appUid" to launch.appUid,
+                                "attemptId" to launch.attemptId,
+                                "launchToken" to launch.launchToken,
+                            ),
+                        )
+                    }
+                }
+                "validateTerminalLaunchCapability" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    val attemptId = call.argument<String>("attemptId")
+                    val launchToken = call.argument<String>("launchToken")
+                    result.success(
+                        !operationId.isNullOrBlank() && !sessionId.isNullOrBlank() &&
+                            !candidateId.isNullOrBlank() && !attemptId.isNullOrBlank() &&
+                            !launchToken.isNullOrBlank() &&
+                            TerminalSessionService.validateLaunchCapability(
+                                operationId,
+                                sessionId,
+                                candidateId,
+                                attemptId,
+                                launchToken,
+                            )
+                    )
+                }
+                "acknowledgeTerminalLaunchAbandoned" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    val attemptId = call.argument<String>("attemptId")
+                    val launchToken = call.argument<String>("launchToken")
+                    result.success(
+                        !operationId.isNullOrBlank() && !sessionId.isNullOrBlank() &&
+                            !candidateId.isNullOrBlank() && !attemptId.isNullOrBlank() &&
+                            !launchToken.isNullOrBlank() &&
+                            TerminalSessionService.acknowledgeLaunchAbandoned(
+                                operationId,
+                                sessionId,
+                                candidateId,
+                                attemptId,
+                                launchToken,
+                            )
+                    )
+                }
+                "isTerminalOperationCurrent" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    result.success(
+                        operationId != null && sessionId != null && candidateId != null &&
+                            TerminalSessionService.isCurrent(operationId, sessionId, candidateId)
+                    )
+                }
+                "terminalCandidateReceipt" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    val processId = call.argument<Number>("processId")?.toInt()
+                    if (operationId == null || sessionId == null || candidateId == null ||
+                        processId == null) {
+                        result.error("INVALID_ARGS", "terminal process identity required", null)
+                    } else {
+                        result.success(
+                            TerminalSessionService.candidateReceipt(
+                                operationId,
+                                sessionId,
+                                candidateId,
+                                processId,
+                            ).name
+                        )
+                    }
+                }
+                "disposeTerminalProcessCandidate" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    val processId = call.argument<Number>("processId")?.toInt()
+                    if (operationId == null || sessionId == null || candidateId == null ||
+                        processId == null) {
+                        result.error("INVALID_ARGS", "terminal process identity required", null)
+                    } else {
+                        result.success(
+                            TerminalSessionService.disposeCandidate(
+                                operationId,
+                                sessionId,
+                                candidateId,
+                                processId,
+                            ).name
+                        )
+                    }
+                }
+                "finishTerminalService" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    if (operationId == null || sessionId == null || candidateId == null) {
+                        result.error("INVALID_ARGS", "terminal candidate identity required", null)
+                    } else {
+                        result.success(
+                            TerminalSessionService.finish(
+                                operationId,
+                                sessionId,
+                                candidateId,
+                            ).name
+                        )
+                    }
+                }
+                "cancelTerminalService" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    if (operationId == null || sessionId == null || candidateId == null) {
+                        result.error("INVALID_ARGS", "terminal candidate identity required", null)
+                    } else {
+                        result.success(
+                            TerminalSessionService.cancel(
+                                operationId,
+                                sessionId,
+                                candidateId,
+                            ).name
+                        )
+                    }
+                }
+                "acknowledgeTerminalFinalReceipt" -> {
+                    val operationId = call.argument<String>("operationId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val candidateId = call.argument<String>("candidateId")
+                    val expectedReceipt = call.argument<String>("expectedReceipt")?.let {
+                        runCatching { CandidateReceipt.valueOf(it) }.getOrNull()
+                    }
+                    if (operationId == null || sessionId == null || candidateId == null ||
+                        expectedReceipt == null) {
+                        result.error("INVALID_ARGS", "terminal candidate identity required", null)
+                    } else {
+                        result.success(
+                            TerminalSessionService.acknowledgeFinalReceipt(
+                                operationId,
+                                sessionId,
+                                candidateId,
+                                expectedReceipt,
+                            ).name
+                        )
                     }
                 }
                 "stopTerminalService" -> {
+                    val sessionId = call.argument<String>("sessionId")
+                    if (sessionId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "terminal session identity required", null)
+                        return@setMethodCallHandler
+                    }
                     try {
-                        TerminalSessionService.stop(applicationContext)
+                        TerminalSessionService.stop(applicationContext, sessionId)
                         result.success(true)
                     } catch (e: Exception) {
                         result.error("SERVICE_ERROR", e.message, null)

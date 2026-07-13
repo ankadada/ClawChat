@@ -31,6 +31,10 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import io.flutter.plugin.common.MethodChannel
 import androidx.core.content.ContextCompat
+import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 class AgentTaskService : Service() {
     companion object {
@@ -46,6 +50,8 @@ class AgentTaskService : Service() {
         private const val EXTRA_APPROVAL_ID = "approvalId"
         private const val EXTRA_APPROVAL_RISK = "approvalRisk"
         private const val EXTRA_APPROVED = "approved"
+        private const val EXTRA_COMMAND_OPERATION_ID = "commandOperationId"
+        private const val EXTRA_COMMAND_READY_REQUEST_ID = "commandReadyRequestId"
         private const val ACTION_UPDATE = "com.anka.clawbot.agent.UPDATE"
         private const val ACTION_STOP_AGENT = "com.anka.clawbot.agent.STOP"
         private const val ACTION_TOOL_APPROVAL_UPDATE = "com.anka.clawbot.agent.APPROVAL_UPDATE"
@@ -58,11 +64,26 @@ class AgentTaskService : Service() {
         private const val APPROVAL_DELIVERY_TIMEOUT_MS = 5_000L
         private const val OVERLAY_PREFS = "agent_overlay"
         private const val OVERLAY_PROMPTED = "overlay_prompted"
+        private const val COMMAND_READY_TIMEOUT_SECONDS = 5L
+        private const val COMMAND_DISPOSAL_RETRY_MS = 500L
+        private const val COMMAND_CLEANUP_WAKE_LOCK_MS = 60_000L
+        // This caps the caller-requested command runtime; it is not an orphan
+        // grace period. Normal commands use BashTool's 120-second default.
+        private const val MAX_REQUESTED_COMMAND_RUNTIME_MS = 12 * 60 * 60 * 1000L
 
         var isRunning = false
             private set
 
         private var instance: AgentTaskService? = null
+        private val commandContinuations get() = NativeCommandContinuationOwner.registry
+        @Volatile
+        private var cleanupCoordinator: CommandCleanupCoordinator? = null
+
+        internal fun initializeCleanupCoordinator(context: Context) {
+            cleanupCoordinator = CommandCleanupCoordinatorProvider.get(context.applicationContext)
+        }
+        private val commandReadiness =
+            ConcurrentHashMap<String, CompletableFuture<Boolean>>()
         private val callbackOwnership =
             ToolApprovalCallbackOwnership<MethodChannel>()
 
@@ -96,9 +117,12 @@ class AgentTaskService : Service() {
         }
 
         fun stop(context: Context) {
-            instance?.clearAllSessionNotifications()
-            instance?.hideOverlay()
-            context.stopService(Intent(context, AgentTaskService::class.java))
+            val service = instance
+            if (service != null) {
+                service.retireAllBaseSessions()
+            } else if (commandContinuations.activeCount(CommandContinuationOwner.AGENT_BASH) == 0) {
+                context.stopService(Intent(context, AgentTaskService::class.java))
+            }
         }
 
         fun updateNotification(
@@ -137,12 +161,110 @@ class AgentTaskService : Service() {
         fun stopSession(context: Context, sessionId: String) {
             val service = instance
             if (service != null) {
-                service.removeSessionNotification(sessionId)
+                service.retireBaseSession(sessionId)
                 return
             }
             val manager = context.getSystemService(NotificationManager::class.java)
             manager.cancel(notificationIdFor(sessionId))
             manager.cancel(SUMMARY_NOTIFICATION_ID)
+        }
+
+        internal fun reserveCommand(
+            sessionId: String,
+            operationId: String,
+            timeoutMs: Long,
+        ): CommandReserveOutcome {
+            val coordinator = cleanupCoordinator ?: return CommandReserveOutcome.RETRYABLE_UNKNOWN
+            if (!coordinator.canAdmit(CommandContinuationOwner.AGENT_BASH, sessionId)) {
+                return CommandReserveOutcome.RETRYABLE_UNKNOWN
+            }
+            return commandContinuations.reserve(
+                commandKey(sessionId, operationId),
+                timeoutMs.coerceIn(1L, MAX_REQUESTED_COMMAND_RUNTIME_MS),
+            )
+        }
+
+        internal fun startReservedCommandAndAwaitReady(
+            context: Context,
+            sessionId: String,
+            operationId: String,
+        ): Boolean {
+            val key = commandKey(sessionId, operationId)
+            if (!commandContinuations.isActive(key)) return false
+            val requestId = UUID.randomUUID().toString()
+            val ready = CompletableFuture<Boolean>()
+            commandReadiness[requestId] = ready
+            val intent = Intent(context, AgentTaskService::class.java).apply {
+                putExtra(EXTRA_SESSION_ID, key.sessionId)
+                putExtra(EXTRA_SESSION_TITLE, "ClawChat")
+                putExtra(EXTRA_TEXT, "命令正在后台运行...")
+                putExtra(EXTRA_STATUS, "tooling")
+                putExtra(EXTRA_TOOL_NAME, "bash")
+                putExtra(EXTRA_COMMAND_OPERATION_ID, key.operationId)
+                putExtra(EXTRA_COMMAND_READY_REQUEST_ID, requestId)
+            }
+            try {
+                startServiceCompat(context, intent)
+                val established = ready.get(COMMAND_READY_TIMEOUT_SECONDS, TimeUnit.SECONDS) == true
+                if (!established) cancelCommand(sessionId, operationId)
+                return established
+            } catch (e: Exception) {
+                cancelCommand(sessionId, operationId)
+                Log.w("ClawChat", "Agent command foreground continuation failed", e)
+                return false
+            } finally {
+                commandReadiness.remove(requestId)
+            }
+        }
+
+        internal fun finishCommand(
+            sessionId: String,
+            operationId: String,
+        ): CommandRetireOutcome {
+            val retired = commandContinuations.finish(commandKey(sessionId, operationId))
+            if (retired.outcome == CommandRetireOutcome.RETIRED ||
+                retired.outcome == CommandRetireOutcome.ALREADY_RETIRED) {
+                cleanupCoordinator?.complete(retired.key)
+                instance?.onCommandKeyRetired(retired.key)
+            } else if (retired.outcome == CommandRetireOutcome.RETRYABLE_UNKNOWN) {
+                cleanupCoordinator?.requestCleanup(retired.key)
+                instance?.scheduleCommandDisposalRetry()
+            }
+            return retired.outcome
+        }
+
+        internal fun cancelCommand(
+            sessionId: String,
+            operationId: String,
+        ): CommandRetireOutcome {
+            val key = commandKey(sessionId, operationId)
+            val retired = commandContinuations.cancel(
+                key,
+                beforeSignal = { cleanupCoordinator?.requestCleanup(key) == true },
+            )
+            if (retired.outcome == CommandRetireOutcome.RETIRED ||
+                retired.outcome == CommandRetireOutcome.ALREADY_RETIRED) {
+                cleanupCoordinator?.complete(retired.key)
+                instance?.onCommandKeyRetired(retired.key)
+            } else if (retired.outcome == CommandRetireOutcome.RETRYABLE_UNKNOWN) {
+                cleanupCoordinator?.requestCleanup(retired.key)
+                instance?.scheduleCommandDisposalRetry()
+            }
+            return retired.outcome
+        }
+
+        internal fun commandKey(sessionId: String, operationId: String) =
+            CommandOwnerKey(CommandContinuationOwner.AGENT_BASH, sessionId, operationId)
+
+        internal fun coordinator(): CommandCleanupCoordinator? = cleanupCoordinator
+
+        internal fun onCoordinatorCleanup(key: CommandOwnerKey) {
+            instance?.onCommandKeyRetired(key)
+        }
+
+        private fun completeCommandReadiness(requestId: String?, ready: Boolean) {
+            if (requestId == null) return
+            commandReadiness.remove(requestId)?.complete(ready)
         }
 
         fun showToolApproval(
@@ -331,16 +453,33 @@ class AgentTaskService : Service() {
     )
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var retiringNormally = false
     private val activeSessions = mutableMapOf<String, AgentSessionNotification>()
     private var foregroundSessionId: String? = null
     private var overlaySessionId: String? = null
     private var overlayShouldBeVisible = false
+    private val retiredBaseSessions = mutableSetOf<String>()
+    private val commandOnlySessions = mutableSetOf<String>()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val wakeLockHandler = Handler(Looper.getMainLooper())
     private val pendingNotificationSessionIds = mutableSetOf<String>()
     private var lastNotificationUpdateMs = 0L
     private var notificationUpdateScheduled = false
     private var overlay: AgentIslandOverlay? = null
+    private val expireCommandContinuations = Runnable {
+        commandContinuations.expire(
+            CommandContinuationOwner.AGENT_BASH,
+            beforeSignal = { key, _ -> cleanupCoordinator?.requestCleanup(key) == true },
+        )
+            .forEach(::onCommandKeyRetired)
+        commandContinuations.retryPending(CommandContinuationOwner.AGENT_BASH)
+            .forEach(::onCommandKeyRetired)
+        if (commandContinuations.hasPendingRetirement(CommandContinuationOwner.AGENT_BASH)) {
+            scheduleCommandDisposalRetry()
+        } else {
+            scheduleNextCommandTimeout()
+        }
+    }
     private val renewWakeLock = object : Runnable {
         override fun run() {
             if (!isRunning) return
@@ -352,6 +491,7 @@ class AgentTaskService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        cleanupCoordinator = CommandCleanupCoordinatorProvider.get(applicationContext)
         instance = this
     }
 
@@ -361,11 +501,34 @@ class AgentTaskService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        retiringNormally = false
         if (intent?.action == ACTION_STOP_AGENT) {
             val sessionId = intent.getStringExtra(EXTRA_SESSION_ID)
+            if (!sessionId.isNullOrBlank()) {
+                commandContinuations.cancelSession(
+                    CommandContinuationOwner.AGENT_BASH,
+                    sessionId,
+                    beforeSignal = { key, _ ->
+                        cleanupCoordinator?.requestCleanup(key) == true
+                    },
+                ).forEach(::onCommandKeyRetired)
+                commandContinuations.activeKeys(CommandContinuationOwner.AGENT_BASH)
+                    .filter { it.sessionId == sessionId }
+                    .forEach {
+                        cleanupCoordinator?.requestCleanup(it)
+                    }
+                if (commandContinuations.hasSession(
+                        CommandContinuationOwner.AGENT_BASH,
+                        sessionId,
+                    )) {
+                    scheduleCommandDisposalRetry()
+                } else {
+                    removeSessionNotification(sessionId)
+                }
+            }
             requestStopFromNotification(sessionId)
             mainHandler.postDelayed({
-                if (activeSessions.isEmpty()) stopSelf()
+                if (activeSessions.isEmpty()) stopSelfNormally()
             }, 1000)
             return START_NOT_STICKY
         }
@@ -385,6 +548,13 @@ class AgentTaskService : Service() {
         val toolName = intent?.getStringExtra(EXTRA_TOOL_NAME)?.takeIf { it.isNotBlank() }
         overlayShouldBeVisible = intent?.getBooleanExtra(EXTRA_OVERLAY_VISIBLE, overlayShouldBeVisible)
             ?: overlayShouldBeVisible
+        val commandOperationId = intent.getStringExtra(EXTRA_COMMAND_OPERATION_ID)
+        val commandReadyRequestId = intent.getStringExtra(EXTRA_COMMAND_READY_REQUEST_ID)
+        if (commandOperationId == null) {
+            commandOnlySessions.remove(sessionId)
+        } else if (!activeSessions.containsKey(sessionId)) {
+            commandOnlySessions.add(sessionId)
+        }
         val state = upsertAgentSessionState(sessionId, sessionTitle, status, preview, toolName)
         if (intent?.action == ACTION_TOOL_APPROVAL_UPDATE) {
             val approvalId = intent.getStringExtra(EXTRA_APPROVAL_ID)
@@ -399,30 +569,101 @@ class AgentTaskService : Service() {
             }
         }
 
-        if (!isRunning || foregroundSessionId == null) {
-            foregroundSessionId = state.sessionId
-            startForeground(state.notificationId, buildNotification(state))
-        } else {
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.notify(state.notificationId, buildNotification(state))
+        return try {
+            if (!isRunning || foregroundSessionId == null) {
+                foregroundSessionId = state.sessionId
+                startForeground(state.notificationId, buildNotification(state))
+            } else {
+                val manager = getSystemService(NotificationManager::class.java)
+                manager.notify(state.notificationId, buildNotification(state))
+            }
+            isRunning = activeSessions.isNotEmpty()
+            acquireWakeLock()
+            val commandReady = commandOperationId == null ||
+                (wakeLock?.isHeld == true &&
+                    canShowApprovalNotification(this) &&
+                    commandContinuations.isActive(
+                        commandKey(sessionId, commandOperationId)
+                    ))
+            completeCommandReadiness(commandReadyRequestId, commandReady)
+            if (!commandReady && commandOperationId != null) {
+                cancelCommand(sessionId, commandOperationId)
+                if (commandOnlySessions.remove(sessionId)) {
+                    removeSessionNotification(sessionId)
+                }
+            }
+            if (commandContinuations.hasPendingRetirement(
+                    CommandContinuationOwner.AGENT_BASH
+                )) {
+                scheduleCommandDisposalRetry()
+            } else {
+                scheduleNextCommandTimeout()
+            }
+            updateSummaryNotification()
+            updateOverlay()
+            START_NOT_STICKY
+        } catch (e: Exception) {
+            if (commandOperationId != null) {
+                cancelCommand(sessionId, commandOperationId)
+            }
+            completeCommandReadiness(commandReadyRequestId, false)
+            Log.e("ClawChat", "Unable to establish agent foreground continuation", e)
+            retireBaseSession(sessionId)
+            START_NOT_STICKY
         }
-        isRunning = activeSessions.isNotEmpty()
-        acquireWakeLock()
-        updateSummaryNotification()
-        updateOverlay()
-        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        val pendingCleanup = if (!retiringNormally) {
+            val before = commandContinuations.activeKeys(CommandContinuationOwner.AGENT_BASH)
+            commandContinuations.destroyOwner(
+                CommandContinuationOwner.AGENT_BASH,
+                beforeSignal = { key, _ -> cleanupCoordinator?.requestCleanup(key) == true },
+            )
+            val pending = commandContinuations.activeKeys(CommandContinuationOwner.AGENT_BASH)
+            for (key in before) {
+                if (key in pending) {
+                    cleanupCoordinator?.requestCleanup(key)
+                } else {
+                    cleanupCoordinator?.complete(key)
+                }
+            }
+            pending
+        } else {
+            emptyList()
+        }
         clearAllSessionNotifications()
         isRunning = false
         instance = null
         mainHandler.removeCallbacksAndMessages(null)
+        mainHandler.removeCallbacks(expireCommandContinuations)
         wakeLockHandler.removeCallbacks(renewWakeLock)
         hideOverlay()
         releaseWakeLock()
+        restartPendingCommandCleanup(pendingCleanup)
         super.onDestroy()
     }
+
+    private fun restartPendingCommandCleanup(keys: List<CommandOwnerKey>) {
+        for (key in keys) {
+            val intent = Intent(applicationContext, AgentTaskService::class.java).apply {
+                putExtra(EXTRA_SESSION_ID, key.sessionId)
+                putExtra(EXTRA_SESSION_TITLE, "ClawChat")
+                putExtra(EXTRA_TEXT, "命令清理中...")
+                putExtra(EXTRA_STATUS, "tooling")
+                putExtra(EXTRA_TOOL_NAME, "bash")
+                putExtra(EXTRA_COMMAND_OPERATION_ID, key.operationId)
+            }
+            try {
+                startServiceCompat(applicationContext, intent)
+            } catch (e: Exception) {
+                // The registry keeps the exact process owner pending; a later
+                // service/runtime reconciliation retries without false dispose.
+                Log.w("ClawChat", "Unable to restart pending command cleanup", e)
+            }
+        }
+    }
+
 
     private fun updateAgentSessionState(
         sessionId: String,
@@ -802,7 +1043,64 @@ class AgentTaskService : Service() {
         manager.notify(SUMMARY_NOTIFICATION_ID, notification)
     }
 
+    private fun retireBaseSession(sessionId: String) {
+        if (commandContinuations.hasSession(CommandContinuationOwner.AGENT_BASH, sessionId)) {
+            retiredBaseSessions.add(sessionId)
+            activeSessions[sessionId]?.let { state ->
+                state.status = "tooling"
+                state.preview = "命令正在后台运行..."
+                state.toolName = "bash"
+                val manager = getSystemService(NotificationManager::class.java)
+                manager.notify(state.notificationId, buildNotification(state))
+            }
+            return
+        }
+        removeSessionNotification(sessionId)
+    }
+
+    private fun retireAllBaseSessions() {
+        for (sessionId in activeSessions.keys.toList()) {
+            retireBaseSession(sessionId)
+        }
+        if (activeSessions.isEmpty()) hideOverlay()
+    }
+
+    private fun onCommandKeyRetired(key: CommandOwnerKey) {
+        if (key.owner != CommandContinuationOwner.AGENT_BASH) return
+        cleanupCoordinator?.complete(key)
+        if ((retiredBaseSessions.contains(key.sessionId) ||
+                commandOnlySessions.contains(key.sessionId)) &&
+            !commandContinuations.hasSession(CommandContinuationOwner.AGENT_BASH, key.sessionId)) {
+            retiredBaseSessions.remove(key.sessionId)
+            commandOnlySessions.remove(key.sessionId)
+            removeSessionNotification(key.sessionId)
+        }
+        scheduleNextCommandTimeout()
+    }
+
+    private fun scheduleNextCommandTimeout() {
+        mainHandler.removeCallbacks(expireCommandContinuations)
+        val deadline = commandContinuations.nextDeadlineEpochMs(
+            CommandContinuationOwner.AGENT_BASH
+        ) ?: return
+        mainHandler.postDelayed(
+            expireCommandContinuations,
+            if (deadline <= System.currentTimeMillis()) COMMAND_DISPOSAL_RETRY_MS
+            else deadline - System.currentTimeMillis(),
+        )
+    }
+
+    private fun scheduleCommandDisposalRetry() {
+        mainHandler.removeCallbacks(expireCommandContinuations)
+        acquireWakeLock(COMMAND_CLEANUP_WAKE_LOCK_MS, scheduleRenewal = false)
+        mainHandler.postDelayed(expireCommandContinuations, COMMAND_DISPOSAL_RETRY_MS)
+    }
+
     private fun removeSessionNotification(sessionId: String) {
+        if (commandContinuations.hasSession(CommandContinuationOwner.AGENT_BASH, sessionId)) {
+            retiredBaseSessions.add(sessionId)
+            return
+        }
         val state = activeSessions.remove(sessionId) ?: return
         state.approval?.let { cancelApprovalPendingIntents(it) }
         pendingNotificationSessionIds.remove(sessionId)
@@ -825,8 +1123,20 @@ class AgentTaskService : Service() {
         updateOverlay()
         if (activeSessions.isEmpty()) {
             hideOverlay()
-            stopSelf()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            releaseWakeLock()
+            stopSelfNormally()
         }
+    }
+
+    private fun stopSelfNormally() {
+        retiringNormally = true
+        stopSelf()
     }
 
     private fun clearAllSessionNotifications() {
@@ -837,6 +1147,8 @@ class AgentTaskService : Service() {
         }
         manager.cancel(SUMMARY_NOTIFICATION_ID)
         activeSessions.clear()
+        retiredBaseSessions.clear()
+        commandOnlySessions.clear()
         pendingNotificationSessionIds.clear()
         foregroundSessionId = null
         overlaySessionId = null
@@ -873,16 +1185,19 @@ class AgentTaskService : Service() {
         overlay = null
     }
 
-    private fun acquireWakeLock() {
+    private fun acquireWakeLock(
+        timeoutMs: Long = WAKE_LOCK_TIMEOUT_MS,
+        scheduleRenewal: Boolean = true,
+    ) {
         releaseWakeLock()
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "ClawChat::AgentTaskWakeLock"
         )
-        wakeLock?.acquire(WAKE_LOCK_TIMEOUT_MS)
+        wakeLock?.acquire(timeoutMs)
         wakeLockHandler.removeCallbacks(renewWakeLock)
-        if (isRunning) {
+        if (isRunning && scheduleRenewal) {
             wakeLockHandler.postDelayed(renewWakeLock, WAKE_LOCK_RENEWAL_MS)
         }
     }

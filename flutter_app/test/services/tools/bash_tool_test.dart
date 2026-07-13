@@ -1,6 +1,11 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/tools/bash_tool.dart';
+import 'package:clawchat/services/tools/tool_registry.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -420,5 +425,125 @@ void main() {
       isNot(contains('sentinel_value_for_test')),
     );
     prefs.envVars = {};
+  });
+
+  test('agent Bash forwards exact session and operation continuation identity',
+      () async {
+    MethodCall? runCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') {
+        runCall = call;
+        return 'configured';
+      }
+      return null;
+    });
+    final signal = ToolCancellationSignal();
+
+    final payload = await tool.executeResultWithOperationAndCancellation(
+      {'command': 'cli configure'},
+      sessionId: 'chat-session',
+      operationId: 'run:tool-operation',
+      cancellationSignal: signal,
+    );
+
+    expect(payload.forUser, 'configured');
+    final arguments = Map<Object?, Object?>.from(runCall!.arguments as Map);
+    expect(arguments['operationId'], 'run:tool-operation');
+    expect(arguments['continuationSessionId'], 'chat-session');
+    expect(arguments['requireBackgroundContinuation'], isTrue);
+    expect(arguments['mountStorage'], isFalse);
+  });
+
+  test('agent Bash CLI-like loopback callback commits once while backgrounded',
+      () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(server.close);
+    var configuredCommits = 0;
+    server.listen((request) async {
+      configuredCommits++;
+      request.response.write('configured');
+      await request.response.close();
+    });
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method != 'runInProot') return null;
+      final socket = await Socket.connect(server.address, server.port);
+      try {
+        socket.write(
+          'GET /callback HTTP/1.1\r\n'
+          'Host: ${server.address.address}:${server.port}\r\n'
+          'Connection: close\r\n\r\n',
+        );
+        await socket.flush();
+        await utf8.decoder.bind(socket).join();
+        return 'configured';
+      } finally {
+        socket.destroy();
+      }
+    });
+
+    final payload = await tool.executeResultWithOperationAndCancellation(
+      {'command': 'cli configure'},
+      sessionId: 'background-session',
+      operationId: 'background-operation',
+      cancellationSignal: ToolCancellationSignal(),
+    );
+
+    expect(payload.forUser, 'configured');
+    expect(configuredCommits, 1);
+  });
+
+  test('agent Bash explicit cancellation kills the exact native operation',
+      () async {
+    final runCompleter = Completer<String>();
+    final cancelled = Completer<Map<Object?, Object?>>();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') return runCompleter.future;
+      if (call.method == 'cancelProotOperation') {
+        final arguments = Map<Object?, Object?>.from(call.arguments as Map);
+        if (!cancelled.isCompleted) cancelled.complete(arguments);
+        runCompleter.completeError(
+          PlatformException(code: 'PROOT_ERROR', message: 'cancelled'),
+        );
+        return true;
+      }
+      return null;
+    });
+    final signal = ToolCancellationSignal();
+    final execution = tool.executeResultWithOperationAndCancellation(
+      {'command': 'cli configure'},
+      sessionId: 'cancel-session',
+      operationId: 'cancel-operation',
+      cancellationSignal: signal,
+    );
+
+    signal.cancel();
+    final arguments = await cancelled.future;
+    expect(arguments['operationId'], 'cancel-operation');
+    expect(arguments['sessionId'], 'cancel-session');
+    await expectLater(
+      execution,
+      throwsA(isA<ToolExecutionCancelledException>()),
+    );
+  });
+
+  test('foreground continuation failure is returned truthfully and fail closed',
+      () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') {
+        throw PlatformException(
+          code: 'PROOT_ERROR',
+          message: 'foreground continuation unavailable; command not started',
+        );
+      }
+      return null;
+    });
+
+    final result = await tool.execute({'command': 'cli configure'});
+    expect(result, contains('foreground continuation unavailable'));
+    expect(result, contains('command not started'));
   });
 }

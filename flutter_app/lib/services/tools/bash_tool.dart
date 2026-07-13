@@ -1,4 +1,10 @@
+import 'dart:async';
+
+import 'package:uuid/uuid.dart';
+
+import '../../models/chat_models.dart';
 import '../native_bridge.dart';
+import 'tool_result_formatter.dart';
 import 'tool_registry.dart';
 
 class BashTool extends Tool {
@@ -102,12 +108,58 @@ class BashTool extends Tool {
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
-    return _execute(input);
+    return _execute(
+      input,
+      sessionId: 'standalone-bash',
+      operationId: const Uuid().v4(),
+    );
   }
 
-  Future<String> _execute(Map<String, dynamic> input) async {
+  @override
+  Future<String> executeWithContext(
+    Map<String, dynamic> input, {
+    String? sessionId,
+  }) {
+    return _execute(
+      input,
+      sessionId: sessionId ?? 'standalone-bash',
+      operationId: const Uuid().v4(),
+    );
+  }
+
+  @override
+  Future<ToolResultPayload> executeResultWithOperationAndCancellation(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    required String operationId,
+    required ToolCancellationSignal cancellationSignal,
+  }) async {
+    final output = await _execute(
+      input,
+      sessionId: sessionId ?? 'standalone-bash',
+      operationId: operationId,
+      cancellationSignal: cancellationSignal,
+    );
+    return ToolResultFormatter.format(
+      toolName: name,
+      input: input,
+      output: output,
+      isError: output.startsWith('Error:'),
+    );
+  }
+
+  Future<String> _execute(
+    Map<String, dynamic> input, {
+    required String sessionId,
+    required String operationId,
+    ToolCancellationSignal? cancellationSignal,
+  }) async {
     final command = input['command'] as String;
     final timeout = (input['timeout'] as num?)?.toInt() ?? 120;
+
+    if (timeout < 1 || timeout > 12 * 60 * 60) {
+      return 'Error: Timeout must be between 1 and 43200 seconds.';
+    }
 
     // Command length limit to prevent abuse
     if (command.length > 10000) {
@@ -129,19 +181,53 @@ class BashTool extends Tool {
     // cannot echo, transform, persist, or export the value.
     final effectiveCommand = '$cdPrefix$command';
 
+    cancellationSignal?.throwIfCancellationRequested();
+    var settled = false;
+    if (cancellationSignal != null) {
+      unawaited(cancellationSignal.whenCancelled.then((_) async {
+        if (settled) return;
+        try {
+          await NativeBridge.cancelProotOperation(
+            operationId: operationId,
+            sessionId: sessionId,
+          );
+        } catch (_) {
+          // The native command completion remains the source of truth.
+        }
+      }));
+    }
     try {
       final output = await NativeBridge.runInProot(
         effectiveCommand,
         timeout: timeout,
         mountStorage: false,
+        operationId: operationId,
+        continuationSessionId: sessionId,
+        requireBackgroundContinuation: true,
       );
+      settled = true;
+      if (cancellationSignal?.isCancellationRequested == true) {
+        throw const ToolExecutionCancelledException(
+          sideEffectsPrevented: false,
+        );
+      }
       if (output.length > 50000) {
         return '${output.substring(0, 50000)}\n\n'
             '[Output truncated, original length: ${output.length} chars]';
       }
       return output;
+    } on ToolExecutionCancelledException {
+      rethrow;
     } catch (e) {
+      settled = true;
+      if (cancellationSignal?.isCancellationRequested == true) {
+        throw const ToolExecutionCancelledException(
+          sideEffectsPrevented: false,
+        );
+      }
       return 'Error: $e';
+    } finally {
+      settled = true;
     }
   }
 }

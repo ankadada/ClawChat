@@ -87,9 +87,212 @@ void main() {
         activity, contains('SecureImportNative.cancelOperation(operationId)'));
     expect(activity, contains('processManager.cancelOperation(operationId)'));
     expect(secureImport, contains('require_not_cancelled(operation_id)'));
-    expect(process, contains('activeOperations[operationId] = process'));
+    expect(process,
+        contains('activeOperations.putIfAbsent(operationId, process)'));
+    expect(process, contains('if (existing != null)'));
+    expect(process, contains('requestWaitingLaunchCleanup('));
     expect(
         process, contains('activeOperations[operationId]?.destroyForcibly()'));
+  });
+
+  test('retryable command cleanup renews wake locks and restarts exact owners',
+      () {
+    final terminal = File(
+      'android/app/src/main/kotlin/com/anka/clawbot/TerminalSessionService.kt',
+    ).readAsStringSync();
+    final agent = File(
+      'android/app/src/main/kotlin/com/anka/clawbot/AgentTaskService.kt',
+    ).readAsStringSync();
+
+    expect(terminal, contains('renewCleanupWakeLock()'));
+    expect(terminal, contains('acquireWakeLock(CLEANUP_WAKE_LOCK_HOLD_MS)'));
+    expect(terminal, contains('owner.activeTerminalCandidates()'));
+    expect(terminal, contains('restartPendingCleanup(candidate)'));
+    expect(
+        agent,
+        contains(
+            'acquireWakeLock(COMMAND_CLEANUP_WAKE_LOCK_MS, scheduleRenewal = false)'));
+    expect(agent, contains('commandContinuations.activeKeys('));
+    expect(agent, contains('restartPendingCommandCleanup(pendingCleanup)'));
+  });
+
+  test('durable command cleanup is shared, private, and job backed', () {
+    final coordinator = File(
+      'android/app/src/main/kotlin/com/anka/clawbot/CommandCleanupCoordinator.kt',
+    ).readAsStringSync();
+    final manifest =
+        File('android/app/src/main/AndroidManifest.xml').readAsStringSync();
+    final activity = File(
+      'android/app/src/main/kotlin/com/anka/clawbot/MainActivity.kt',
+    ).readAsStringSync();
+    final processManager = File(
+      'android/app/src/main/kotlin/com/anka/clawbot/ProcessManager.kt',
+    ).readAsStringSync();
+    final terminalRuntime =
+        File('lib/services/terminal_runtime_session.dart').readAsStringSync();
+
+    expect(coordinator, contains('AtomicCommandCleanupLedger'));
+    expect(coordinator, contains('context.noBackupFilesDir'));
+    expect(coordinator, contains('output.fd.sync()'));
+    expect(coordinator, contains('StandardCopyOption.ATOMIC_MOVE'));
+    expect(coordinator, contains('CRC32()'));
+    expect(coordinator, contains('sessionHash'));
+    expect(coordinator, contains('operationHash'));
+    expect(coordinator, contains('candidateHash'));
+    expect(coordinator, contains('setPersisted(true)'));
+    expect(coordinator, contains('setBackoffCriteria'));
+    expect(coordinator, contains('PidOwnedCommandProcess.fromGeneration'));
+    expect(coordinator, contains('ProcessDisposalResult.RETRYABLE_UNKNOWN'));
+    expect(coordinator, contains('MAX_RECORDS = 512'));
+    expect(coordinator, contains('SPAWN_CAPABILITY_ISSUED'));
+    expect(coordinator, contains('CANCEL_REQUESTED'));
+    expect(coordinator, contains('launchTokenHash'));
+    expect(coordinator, contains('parentStartTimeTicks'));
+    expect(coordinator, contains('createDirectoryExclusive'));
+    expect(coordinator, contains('createFileExclusive'));
+    expect(coordinator, contains('claim.tmp.'));
+    expect(coordinator, contains(r'''ln "${'$'}claim_temp"'''));
+    expect(coordinator, contains('/system/bin/sync'));
+    expect(coordinator, contains('normalizePublishedClaim'));
+    expect(coordinator, contains('acknowledgeLaunchAbandoned'));
+    expect(coordinator, contains('AttemptNodeClassification'));
+    expect(coordinator, contains('classifyAttemptNode'));
+    expect(coordinator, contains('isSafeAttemptEntry'));
+    expect(coordinator, contains('recoverInvalidAttemptLocked'));
+    expect(coordinator, contains('retireRecordLocked'));
+    expect(coordinator, contains('bestEffortCleanupKnownValidAttempt'));
+    expect(coordinator, contains('deviceId'));
+    expect(coordinator, contains('inode'));
+    expect(coordinator, contains('listEntriesIfSame'));
+    expect(coordinator, contains('deleteFileIfSame'));
+    expect(coordinator, contains('deleteEmptyDirectoryIfSame'));
+    expect(coordinator, isNot(contains('moveNodeNoReplace')));
+    expect(coordinator, isNot(contains('deleteTree')));
+    expect(coordinator, isNot(contains('Files.walkFileTree')));
+    expect(coordinator, isNot(contains('retired-command-cleanup')));
+    expect(coordinator, isNot(contains('cleanupClassifiedAttemptNode')));
+    expect(coordinator, isNot(contains('cleanupLaunchArtifacts')));
+    expect(coordinator, isNot(contains('removeOrRetireNodeNoFollow')));
+    final retireStart = coordinator.indexOf(
+      'private fun retireRecordLocked',
+    );
+    final retireEnd = coordinator.indexOf(
+      'private fun setPrivateFilePermissions',
+      retireStart,
+    );
+    expect(retireStart, greaterThanOrEqualTo(0));
+    expect(retireEnd, greaterThan(retireStart));
+    expect(
+      coordinator.substring(retireStart, retireEnd),
+      isNot(contains('bestEffortCleanupKnownValidAttempt')),
+    );
+    expect(coordinator, contains('validateLaunchRoot'));
+    expect(coordinator, isNot(contains('.canonicalFile')));
+    expect(coordinator, contains('go.consumed'));
+    expect(coordinator, isNot(contains(r'''mkdir "${'$'}attempt/claim"''')));
+    expect(coordinator, isNot(contains("cut -d ' ' -f 22")));
+    expect(coordinator, isNot(contains('awk ')));
+    expect(coordinator, contains('BACKSTOP_PENDING'));
+    expect(coordinator, contains('SIGNAL_INTENT'));
+    expect(coordinator, contains('expected_parent'));
+    expect(coordinator, contains('exec "\${\'\$\'}@"'));
+    expect(coordinator, contains('LinkOption.NOFOLLOW_LINKS'));
+    expect(coordinator, contains('fileOps.syncParent'));
+    expect(coordinator, contains('input.available() != 0'));
+    expect(coordinator, contains('duplicate record'));
+    expect(coordinator, isNot(contains('command: String')));
+    expect(coordinator, isNot(contains('environment:')));
+    expect(coordinator, isNot(contains('callbackPayload')));
+    expect(coordinator, isNot(contains('output: String')));
+    final claimWrite = coordinator.indexOf('(set -C; printf');
+    final claimSync = coordinator.indexOf(
+      r'''durable_sync "${'$'}claim_temp"''',
+      claimWrite,
+    );
+    final claimLink = coordinator.indexOf(
+      r'''ln "${'$'}claim_temp" "${'$'}attempt/claim"''',
+      claimSync,
+    );
+    final linkedDirectorySync = coordinator.indexOf(
+      r'''durable_sync "${'$'}attempt"''',
+      claimLink,
+    );
+    final unlinkBarrier = coordinator.indexOf(
+      'Durable publication barrier:',
+      linkedDirectorySync,
+    );
+    final tempUnlink = coordinator.indexOf(
+      r'''rm -f "${'$'}claim_temp" || exit 118''',
+      unlinkBarrier,
+    );
+    final unlinkedDirectorySync = coordinator.indexOf(
+      r'''durable_sync "${'$'}attempt"''',
+      tempUnlink,
+    );
+    expect(claimWrite, greaterThanOrEqualTo(0));
+    expect(claimWrite, lessThan(claimSync));
+    expect(claimSync, lessThan(claimLink));
+    expect(claimLink, lessThan(linkedDirectorySync));
+    expect(linkedDirectorySync, lessThan(unlinkBarrier));
+    expect(linkedDirectorySync, lessThan(tempUnlink));
+    expect(tempUnlink, lessThan(unlinkedDirectorySync));
+    final normalizeStart = coordinator.indexOf(
+      'private fun normalizePublishedClaim',
+    );
+    final normalizeValidation = coordinator.indexOf(
+      'validateAttemptDirectory(paths, claimed = true)',
+      normalizeStart,
+    );
+    final normalizeChildRead = coordinator.indexOf(
+      'launchFileOps.metadata(paths.claimFile)',
+      normalizeStart,
+    );
+    expect(normalizeStart, lessThan(normalizeValidation));
+    expect(normalizeValidation, lessThan(normalizeChildRead));
+    final revocationStart = coordinator.indexOf(
+      'private fun createRevocationLocked',
+    );
+    final revocationValidation = coordinator.indexOf(
+      'validateAttemptDirectory(paths, claimed = true)',
+      revocationStart,
+    );
+    final revocationChildRead = coordinator.indexOf(
+      'launchFileOps.metadata(paths.revokedFile)',
+      revocationStart,
+    );
+    expect(revocationStart, lessThan(revocationValidation));
+    expect(revocationValidation, lessThan(revocationChildRead));
+    expect(manifest, contains('android.permission.RECEIVE_BOOT_COMPLETED'));
+    expect(manifest, contains('.CommandCleanupJobService'));
+    expect(manifest, contains('android.permission.BIND_JOB_SERVICE'));
+    expect(activity, contains('CommandCleanupCoordinatorProvider.get'));
+    expect(activity, contains('"prepareTerminalLaunch"'));
+    expect(activity, contains('"validateTerminalLaunchCapability"'));
+    expect(processManager, contains('coordinator.prepareLaunch('));
+    expect(processManager, contains('ProcessBuilder(gatedCommand)'));
+    expect(processManager, isNot(contains('ProcessBuilder(cmd)')));
+    expect(
+      processManager.indexOf('coordinator.prepareLaunch('),
+      lessThan(processManager.indexOf('ProcessBuilder(gatedCommand)')),
+    );
+    expect(
+      processManager.indexOf('coordinator.validateLaunchCapability('),
+      lessThan(processManager.indexOf('val process = try')),
+    );
+    expect(
+      processManager.indexOf('coordinator.acknowledgeLaunchAbandoned('),
+      lessThan(processManager.indexOf('val process = try')),
+    );
+    expect(terminalRuntime, contains("Pty.start(\n      '/system/bin/sh'"));
+    expect(terminalRuntime, contains('launchGate.parentProcessId.toString()'));
+    expect(
+      terminalRuntime.indexOf('.prepareLaunch('),
+      lessThan(terminalRuntime.indexOf('final process = _processLauncher(')),
+    );
+    expect(
+      terminalRuntime.indexOf('.validateLaunchCapability('),
+      lessThan(terminalRuntime.indexOf('final process = _processLauncher(')),
+    );
   });
 
   test('native workspace publication rolls back every incomplete outcome', () {

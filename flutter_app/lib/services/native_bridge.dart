@@ -278,13 +278,28 @@ class NativeBridge {
     int timeout = 900,
     bool mountStorage = false,
     String? operationId,
+    String? continuationSessionId,
+    bool requireBackgroundContinuation = false,
   }) async {
     return (await _channel.invokeMethod<String>('runInProot', {
       'command': command,
       'timeout': timeout,
       'mountStorage': mountStorage,
       if (operationId != null) 'operationId': operationId,
+      if (continuationSessionId != null)
+        'continuationSessionId': continuationSessionId,
+      'requireBackgroundContinuation': requireBackgroundContinuation,
     }))!;
+  }
+
+  static Future<void> cancelProotOperation({
+    required String operationId,
+    required String sessionId,
+  }) async {
+    await _channel.invokeMethod<bool>('cancelProotOperation', {
+      'operationId': operationId,
+      'sessionId': sessionId,
+    });
   }
 
   static Future<void> cancelImportOperation(String operationId) async {
@@ -315,12 +330,200 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('writeResolv'))!;
   }
 
-  static Future<bool> startTerminalService() async {
-    return (await _channel.invokeMethod<bool>('startTerminalService'))!;
+  static Future<String> replaceTerminalSession({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+    required Duration timeout,
+  }) async {
+    return await _channel.invokeMethod<String>('replaceTerminalSession', {
+          'operationId': operationId,
+          'sessionId': sessionId,
+          'candidateId': candidateId,
+          'timeoutSeconds': timeout.inSeconds,
+        }) ??
+        'CONFLICT';
   }
 
-  static Future<bool> stopTerminalService() async {
-    return (await _channel.invokeMethod<bool>('stopTerminalService'))!;
+  static Future<String> attachTerminalProcess({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+    required String attemptId,
+    required String launchToken,
+    required int processId,
+  }) async {
+    return await _channel.invokeMethod<String>('attachTerminalProcess', {
+          'operationId': operationId,
+          'sessionId': sessionId,
+          'candidateId': candidateId,
+          'attemptId': attemptId,
+          'launchToken': launchToken,
+          'processId': processId,
+        }) ??
+        'UNKNOWN';
+  }
+
+  static Future<Map<String, Object?>> prepareTerminalLaunch({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+  }) async {
+    final value = await _channel.invokeMapMethod<String, dynamic>(
+      'prepareTerminalLaunch',
+      {
+        'operationId': operationId,
+        'sessionId': sessionId,
+        'candidateId': candidateId,
+      },
+    );
+    return <String, Object?>{
+      'outcome': value?['outcome'] as String?,
+      'wrapperPath': value?['wrapperPath'] as String?,
+      'attemptDirectoryPath': value?['attemptDirectoryPath'] as String?,
+      'stagingPath': value?['stagingPath'] as String?,
+      'goPath': value?['goPath'] as String?,
+      'parentProcessId': value?['parentProcessId'] as int?,
+      'appUid': value?['appUid'] as int?,
+      'attemptId': value?['attemptId'] as String?,
+      'launchToken': value?['launchToken'] as String?,
+    };
+  }
+
+  static Future<bool> validateTerminalLaunchCapability({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+    required String attemptId,
+    required String launchToken,
+  }) async {
+    return await _channel.invokeMethod<bool>(
+          'validateTerminalLaunchCapability',
+          {
+            'operationId': operationId,
+            'sessionId': sessionId,
+            'candidateId': candidateId,
+            'attemptId': attemptId,
+            'launchToken': launchToken,
+          },
+        ) ??
+        false;
+  }
+
+  static Future<bool> acknowledgeTerminalLaunchAbandoned({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+    required String attemptId,
+    required String launchToken,
+  }) async {
+    return await _channel.invokeMethod<bool>(
+          'acknowledgeTerminalLaunchAbandoned',
+          {
+            'operationId': operationId,
+            'sessionId': sessionId,
+            'candidateId': candidateId,
+            'attemptId': attemptId,
+            'launchToken': launchToken,
+          },
+        ) ??
+        false;
+  }
+
+  static Future<bool> isTerminalOperationCurrent({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+  }) async {
+    return await _channel.invokeMethod<bool>('isTerminalOperationCurrent', {
+          'operationId': operationId,
+          'sessionId': sessionId,
+          'candidateId': candidateId,
+        }) ??
+        false;
+  }
+
+  static Future<String> terminalCandidateReceipt({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+    required int processId,
+  }) async {
+    return await _channel.invokeMethod<String>('terminalCandidateReceipt', {
+          'operationId': operationId,
+          'sessionId': sessionId,
+          'candidateId': candidateId,
+          'processId': processId,
+        }) ??
+        'UNKNOWN';
+  }
+
+  static Future<String> disposeTerminalProcessCandidate({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+    required int processId,
+  }) async {
+    return await _channel.invokeMethod<String>(
+          'disposeTerminalProcessCandidate',
+          {
+            'operationId': operationId,
+            'sessionId': sessionId,
+            'candidateId': candidateId,
+            'processId': processId,
+          },
+        ) ??
+        'UNKNOWN';
+  }
+
+  static Future<String> finishTerminalService({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+  }) async {
+    return await _channel.invokeMethod<String>('finishTerminalService', {
+          'operationId': operationId,
+          'sessionId': sessionId,
+          'candidateId': candidateId,
+        }) ??
+        'UNKNOWN';
+  }
+
+  static Future<String> cancelTerminalService({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+  }) async {
+    return await _channel.invokeMethod<String>('cancelTerminalService', {
+          'operationId': operationId,
+          'sessionId': sessionId,
+          'candidateId': candidateId,
+        }) ??
+        'UNKNOWN';
+  }
+
+  static Future<String> acknowledgeTerminalFinalReceipt({
+    required String operationId,
+    required String sessionId,
+    required String candidateId,
+    required String expectedReceipt,
+  }) async {
+    return await _channel.invokeMethod<String>(
+          'acknowledgeTerminalFinalReceipt',
+          {
+            'operationId': operationId,
+            'sessionId': sessionId,
+            'candidateId': candidateId,
+            'expectedReceipt': expectedReceipt,
+          },
+        ) ??
+        'UNKNOWN';
+  }
+
+  static Future<bool> stopTerminalService({required String sessionId}) async {
+    return (await _channel.invokeMethod<bool>('stopTerminalService', {
+      'sessionId': sessionId,
+    }))!;
   }
 
   static Future<bool> isTerminalServiceRunning() async {
