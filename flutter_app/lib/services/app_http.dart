@@ -419,6 +419,39 @@ final class AppWebFetchClient extends http.BaseClient {
   Future<http.StreamedResponse> sendWithDeadline(
     http.BaseRequest request, {
     required Duration remainingTimeout,
+  }) =>
+      _sendWithNetworkPolicy(
+        request,
+        remainingTimeout: remainingTimeout,
+        allowUserAuthorizedPrivateNetwork: false,
+      );
+
+  /// Sends to the exact HTTPS authority the user configured as an OpenClaw
+  /// Gateway. Unlike ordinary WebFetch, this permits RFC1918, CGNAT/Tailscale,
+  /// and IPv6 ULA targets while retaining DNS pinning, TLS hostname checks,
+  /// link-local/loopback rejection, and the caller's cancellation budget.
+  Future<http.StreamedResponse> sendToUserAuthorizedGateway(
+    http.BaseRequest request, {
+    required Uri authorizedEndpoint,
+    required Duration remainingTimeout,
+  }) {
+    if (authorizedEndpoint.scheme.toLowerCase() != 'https' ||
+        !_sameAuthority(request.url, authorizedEndpoint)) {
+      throw const SocketException(
+        'Remote Gateway request does not match the authorized HTTPS target',
+      );
+    }
+    return _sendWithNetworkPolicy(
+      request,
+      remainingTimeout: remainingTimeout,
+      allowUserAuthorizedPrivateNetwork: true,
+    );
+  }
+
+  Future<http.StreamedResponse> _sendWithNetworkPolicy(
+    http.BaseRequest request, {
+    required Duration remainingTimeout,
+    required bool allowUserAuthorizedPrivateNetwork,
   }) async {
     if (_closed) throw StateError('AppWebFetchClient is closed');
     if (remainingTimeout <= Duration.zero) {
@@ -471,9 +504,12 @@ final class AppWebFetchClient extends http.BaseClient {
       throw SocketException('Could not resolve host: ${target.host}');
     }
     for (final address in addresses) {
-      if (!_isPublicIp(address)) {
+      final allowed = allowUserAuthorizedPrivateNetwork
+          ? _isAllowedExplicitGatewayIp(address)
+          : _isPublicIp(address);
+      if (!allowed) {
         throw SocketException(
-          'Blocked connection to non-public IP ${address.address} '
+          'Blocked connection to disallowed IP ${address.address} '
           '(SSRF protection)',
         );
       }
@@ -719,6 +755,24 @@ final class AppWebFetchClient extends http.BaseClient {
         return _isPublicIp(InternetAddress.fromRawAddress(raw.sublist(12)));
       }
       return true;
+    }
+    return false;
+  }
+
+  static bool _isAllowedExplicitGatewayIp(InternetAddress address) {
+    if (_isPublicIp(address)) return true;
+    if (address.isLoopback || address.isLinkLocal) return false;
+    final raw = address.rawAddress;
+    if (address.type == InternetAddressType.IPv4 && raw.length == 4) {
+      final a = raw[0];
+      final b = raw[1];
+      return a == 10 ||
+          (a == 100 && b >= 64 && b <= 127) ||
+          (a == 172 && b >= 16 && b <= 31) ||
+          (a == 192 && b == 168);
+    }
+    if (address.type == InternetAddressType.IPv6 && raw.length == 16) {
+      return (raw[0] & 0xfe) == 0xfc;
     }
     return false;
   }

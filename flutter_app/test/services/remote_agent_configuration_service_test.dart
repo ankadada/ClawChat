@@ -7,6 +7,50 @@ import 'package:clawchat/services/remote_agent_connector.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('legacy Coze metadata is disabled until OpenClaw is reconfigured',
+      () async {
+    final metadata = _MemoryMetadataStorage();
+    final secrets = _MemorySecretStorage();
+    final reference = RemoteAgentCredentialReference.parse(
+      'cred_0123456789abcdefghijklmnopqrstuv',
+    );
+    final legacy = RemoteAgentConnectorConfig(
+      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      id: 'primary_remote',
+      displayName: 'Remote Agent',
+      baseUrl: 'https://legacy.example/v3/chat',
+      credentialReference: reference,
+      remoteAgentId: 'legacy_agent',
+      enabled: true,
+    );
+    metadata.values['remote_agent_connector_config_v1'] =
+        jsonEncode(legacy.toJson());
+    metadata.values['remote_agent_connector_consent_v1'] = jsonEncode(
+      RemoteAgentConsent.grant(
+        legacy,
+        acceptedAt: DateTime.utc(2026, 7, 11),
+      ).toJson(),
+    );
+    secrets.values['remote_agent_credential_${reference.value}'] =
+        'legacy-secret';
+
+    final service = RemoteAgentConfigurationService(
+      metadataStorage: metadata,
+      secretStorage: secrets,
+    );
+    await service.init();
+
+    expect(service.config!.kind, RemoteAgentConnectorKind.cozeOpenApi);
+    expect(service.config!.enabled, isFalse);
+    expect(service.consent, isNull);
+    expect(service.isReady, isFalse);
+    expect(
+      metadata.values,
+      isNot(contains('remote_agent_connector_consent_v1')),
+    );
+    expect(secrets.values.values, contains('legacy-secret'));
+  });
+
   test('issues opaque reference and stores raw credential only as a secret',
       () async {
     final metadata = _MemoryMetadataStorage();
@@ -18,10 +62,10 @@ void main() {
 
     const rawCredential = 'credential-only-for-secure-store';
     final reference = await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
       credential: rawCredential,
     );
@@ -42,10 +86,10 @@ void main() {
       secretStorage: secrets,
     );
     await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
       credential: 'first-secret',
     );
@@ -57,10 +101,10 @@ void main() {
     expect(service.consent!.allows(service.config!), isTrue);
 
     await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://changed.example/v3/chat',
+      baseUrl: 'https://changed.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
     );
 
@@ -78,18 +122,18 @@ void main() {
       secretStorage: secrets,
     );
     final first = await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
       credential: 'first-secret',
     );
     final second = await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
       credential: 'second-secret',
     );
@@ -118,10 +162,10 @@ void main() {
         secretStorage: secrets,
       );
       final oldReference = await initial.saveConfiguration(
-        kind: RemoteAgentConnectorKind.cozeOpenApi,
+        kind: RemoteAgentConnectorKind.openClawGateway,
         connectorId: 'primary_remote',
         displayName: 'Remote Agent',
-        baseUrl: 'https://agent.example/v3/chat',
+        baseUrl: 'https://agent.example/v1/chat/completions',
         remoteAgentId: 'agent_1',
         credential: 'initial-secret',
       );
@@ -142,10 +186,10 @@ void main() {
       await faulted.init();
       await expectLater(
         faulted.saveConfiguration(
-          kind: RemoteAgentConnectorKind.cozeOpenApi,
+          kind: RemoteAgentConnectorKind.openClawGateway,
           connectorId: 'primary_remote',
           displayName: 'Remote Agent',
-          baseUrl: 'https://changed.example/v3/chat',
+          baseUrl: 'https://changed.example/v1/chat/completions',
           remoteAgentId: 'agent_2',
           credential: 'replacement-secret',
         ),
@@ -197,10 +241,10 @@ void main() {
       secretStorage: secrets,
     );
     await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
       credential: 'initial-secret',
     );
@@ -211,10 +255,10 @@ void main() {
 
     await expectLater(
       service.saveConfiguration(
-        kind: RemoteAgentConnectorKind.cozeOpenApi,
+        kind: RemoteAgentConnectorKind.openClawGateway,
         connectorId: 'primary_remote',
         displayName: 'Remote Agent',
-        baseUrl: 'https://changed.example/v3/chat',
+        baseUrl: 'https://changed.example/v1/chat/completions',
         remoteAgentId: 'agent_2',
         credential: 'replacement-secret',
       ),
@@ -247,10 +291,10 @@ void main() {
         secretStorage: secrets,
       );
       await initial.saveConfiguration(
-        kind: RemoteAgentConnectorKind.cozeOpenApi,
+        kind: RemoteAgentConnectorKind.openClawGateway,
         connectorId: 'primary_remote',
         displayName: 'Remote Agent',
-        baseUrl: 'https://agent.example/v3/chat',
+        baseUrl: 'https://agent.example/v1/chat/completions',
         remoteAgentId: 'agent_1',
         credential: 'initial-secret',
       );
@@ -298,19 +342,19 @@ void main() {
       secretStorage: secrets,
     );
     final oldReference = await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
       credential: 'initial-secret',
     );
     secrets.failNextDelete = true;
     await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://changed.example/v3/chat',
+      baseUrl: 'https://changed.example/v1/chat/completions',
       remoteAgentId: 'agent_2',
       credential: 'replacement-secret',
     );
@@ -339,19 +383,19 @@ void main() {
         faultInjector: blocker.call,
       );
       await service.saveConfiguration(
-        kind: RemoteAgentConnectorKind.cozeOpenApi,
+        kind: RemoteAgentConnectorKind.openClawGateway,
         connectorId: 'primary_remote',
         displayName: 'Remote Agent',
-        baseUrl: 'https://agent.example/v3/chat',
+        baseUrl: 'https://agent.example/v1/chat/completions',
         remoteAgentId: 'agent_1',
         credential: 'initial-secret',
       );
       blocker.arm();
       final first = service.saveConfiguration(
-        kind: RemoteAgentConnectorKind.cozeOpenApi,
+        kind: RemoteAgentConnectorKind.openClawGateway,
         connectorId: 'primary_remote',
         displayName: 'Remote Agent',
-        baseUrl: 'https://first.example/v3/chat',
+        baseUrl: 'https://first.example/v1/chat/completions',
         remoteAgentId: 'agent_2',
         credential: 'first-replacement',
       );
@@ -360,10 +404,10 @@ void main() {
       if (scenario == 'save_save') {
         second = service
             .saveConfiguration(
-              kind: RemoteAgentConnectorKind.cozeOpenApi,
+              kind: RemoteAgentConnectorKind.openClawGateway,
               connectorId: 'primary_remote',
               displayName: 'Remote Agent',
-              baseUrl: 'https://second.example/v3/chat',
+              baseUrl: 'https://second.example/v1/chat/completions',
               remoteAgentId: 'agent_3',
               credential: 'second-replacement',
             )
@@ -404,10 +448,10 @@ void main() {
       secretStorage: secrets,
     );
     await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
       credential: 'initial-secret',
     );
@@ -447,19 +491,19 @@ void main() {
       secretStorage: secrets,
     );
     await service.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_0',
       credential: 'secret_0',
     );
     for (var index = 1; index <= 8; index += 1) {
       await service.saveConfiguration(
-        kind: RemoteAgentConnectorKind.cozeOpenApi,
+        kind: RemoteAgentConnectorKind.openClawGateway,
         connectorId: 'primary_remote',
         displayName: 'Remote Agent',
-        baseUrl: 'https://agent.example/v3/chat',
+        baseUrl: 'https://agent.example/v1/chat/completions',
         remoteAgentId: 'agent_$index',
         credential: 'secret_$index',
       );
@@ -470,10 +514,10 @@ void main() {
 
     await expectLater(
       service.saveConfiguration(
-        kind: RemoteAgentConnectorKind.cozeOpenApi,
+        kind: RemoteAgentConnectorKind.openClawGateway,
         connectorId: 'primary_remote',
         displayName: 'Remote Agent',
-        baseUrl: 'https://agent.example/v3/chat',
+        baseUrl: 'https://agent.example/v1/chat/completions',
         remoteAgentId: 'agent_9',
         credential: 'secret_9',
       ),
@@ -531,7 +575,7 @@ void main() {
       } else if (mutation == 'new-metadata') {
         durable['display_name'] = 'Cross-state metadata';
       } else {
-        durable['base_url'] = 'https://cross-state.example/v3/chat';
+        durable['base_url'] = 'https://cross-state.example/v1/chat/completions';
       }
       fixture.metadata.values[configKey] = jsonEncode(durable);
       final secretsBefore = Map<String, String>.from(fixture.secrets.values);
@@ -561,10 +605,10 @@ void main() {
       secretStorage: secrets,
     );
     await initial.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://agent.example/v3/chat',
+      baseUrl: 'https://agent.example/v1/chat/completions',
       remoteAgentId: 'agent_1',
       credential: 'initial-secret',
     );
@@ -580,10 +624,10 @@ void main() {
     await faulted.init();
     await expectLater(
       faulted.saveConfiguration(
-        kind: RemoteAgentConnectorKind.cozeOpenApi,
+        kind: RemoteAgentConnectorKind.openClawGateway,
         connectorId: 'primary_remote',
         displayName: 'Remote Agent',
-        baseUrl: 'https://changed.example/v3/chat',
+        baseUrl: 'https://changed.example/v1/chat/completions',
         remoteAgentId: 'agent_2',
         credential: 'replacement-secret',
       ),
@@ -848,10 +892,10 @@ Future<
     secretStorage: secrets,
   );
   await initial.saveConfiguration(
-    kind: RemoteAgentConnectorKind.cozeOpenApi,
+    kind: RemoteAgentConnectorKind.openClawGateway,
     connectorId: 'primary_remote',
     displayName: 'Remote Agent',
-    baseUrl: 'https://agent.example/v3/chat',
+    baseUrl: 'https://agent.example/v1/chat/completions',
     remoteAgentId: 'agent_1',
     credential: 'initial-secret',
   );
@@ -867,10 +911,10 @@ Future<
   await faulted.init();
   await expectLater(
     faulted.saveConfiguration(
-      kind: RemoteAgentConnectorKind.cozeOpenApi,
+      kind: RemoteAgentConnectorKind.openClawGateway,
       connectorId: 'primary_remote',
       displayName: 'Remote Agent',
-      baseUrl: 'https://changed.example/v3/chat',
+      baseUrl: 'https://changed.example/v1/chat/completions',
       remoteAgentId: 'agent_2',
       credential: 'replacement-secret',
     ),

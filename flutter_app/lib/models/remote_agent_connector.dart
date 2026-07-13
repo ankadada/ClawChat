@@ -6,15 +6,24 @@ import 'chat_models.dart';
 
 const remoteAgentDisclosureVersion = 1;
 
-enum RemoteAgentConnectorKind { cozeOpenApi, genericOpenApi }
+enum RemoteAgentConnectorKind {
+  openClawGateway,
+
+  /// Read-only migration input for the mistakenly shipped 2.5.0 connector.
+  /// New configuration must never be saved with this kind.
+  cozeOpenApi,
+  genericOpenApi,
+}
 
 extension RemoteAgentConnectorKindWire on RemoteAgentConnectorKind {
   String get wireName => switch (this) {
+        RemoteAgentConnectorKind.openClawGateway => 'openclaw_gateway',
         RemoteAgentConnectorKind.cozeOpenApi => 'coze_openapi',
         RemoteAgentConnectorKind.genericOpenApi => 'generic_openapi',
       };
 
   static RemoteAgentConnectorKind parse(Object? value) => switch (value) {
+        'openclaw_gateway' => RemoteAgentConnectorKind.openClawGateway,
         'coze_openapi' => RemoteAgentConnectorKind.cozeOpenApi,
         'generic_openapi' => RemoteAgentConnectorKind.genericOpenApi,
         _ => throw const FormatException('Invalid remote connector kind'),
@@ -345,9 +354,14 @@ String canonicalizeRemoteAgentEndpoint(String raw) {
     throw const FormatException('Invalid remote connector endpoint');
   }
   final normalized = parsed.normalizePath();
-  final path = normalized.path.isEmpty || normalized.path == '/'
-      ? '/v3/chat'
-      : normalized.path;
+  final rawPath = normalized.path.isEmpty || normalized.path == '/'
+      ? ''
+      : normalized.path.replaceFirst(RegExp(r'/+$'), '');
+  final path = rawPath.endsWith('/v1/chat/completions')
+      ? rawPath
+      : rawPath.endsWith('/v1')
+          ? '$rawPath/chat/completions'
+          : '$rawPath/v1/chat/completions';
   if (path.length > 1024) {
     throw const FormatException('Invalid remote connector endpoint');
   }

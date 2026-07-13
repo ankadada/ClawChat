@@ -561,10 +561,10 @@ RemoteAgentConfigurationService _configuration() =>
 Future<RemoteAgentConfigurationService> _readyConfiguration() async {
   final configuration = _configuration();
   await configuration.saveConfiguration(
-    kind: RemoteAgentConnectorKind.cozeOpenApi,
+    kind: RemoteAgentConnectorKind.openClawGateway,
     connectorId: 'primary_remote',
     displayName: 'Remote Agent',
-    baseUrl: 'https://agent.example/v3/chat',
+    baseUrl: 'https://agent.example/v1/chat/completions',
     remoteAgentId: 'agent_1',
     credential: 'secure-value',
   );

@@ -182,7 +182,9 @@ final class RemoteAgentConfigurationService
   RemoteAgentConnectorConfig? get config => _config;
   RemoteAgentConsent? get consent => _consent;
   int get generation => _generation;
-  bool get isReady => _config != null && _consent?.allows(_config!) == true;
+  bool get isReady =>
+      _config?.kind == RemoteAgentConnectorKind.openClawGateway &&
+      _consent?.allows(_config!) == true;
 
   static Future<RemoteAgentConfigurationService> createForApp() async {
     final preferences = await SharedPreferences.getInstance();
@@ -317,6 +319,15 @@ final class RemoteAgentConfigurationService
       await _reconcileIncompleteMutation();
       await _publishDurableState();
       await _drainRetirements();
+      if (_config != null &&
+          _config!.kind != RemoteAgentConnectorKind.openClawGateway &&
+          (_config!.enabled || _consent != null)) {
+        final disabled = _copyConfig(_config!, enabled: false);
+        await _persistConfig(disabled);
+        await _metadataStorage.delete(_consentKey);
+        _config = disabled;
+        _consent = null;
+      }
       if (_config == null) {
         await _metadataStorage.delete(_consentKey);
         _consent = null;
@@ -431,6 +442,11 @@ final class RemoteAgentConfigurationService
     required String remoteAgentId,
     String? credential,
   }) async {
+    if (kind != RemoteAgentConnectorKind.openClawGateway) {
+      throw const RemoteAgentFailure(
+        RemoteAgentErrorCode.invalidConfiguration,
+      );
+    }
     await init();
     return _serialized(() async {
       await _prepareForMutation();
@@ -480,6 +496,7 @@ final class RemoteAgentConfigurationService
       await _prepareForMutation();
       final current = _config;
       if (current == null ||
+          current.kind != RemoteAgentConnectorKind.openClawGateway ||
           (await _secretStorage.read(
                 _secretKey(current.credentialReference),
               ))

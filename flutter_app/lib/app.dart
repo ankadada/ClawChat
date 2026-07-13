@@ -125,7 +125,7 @@ class _ClawChatAppState extends State<ClawChatApp> {
       _attachedRemoteConfiguration = configuration;
       await _remoteAgentRuntime.attach(
         configuration,
-        CozeOpenApiRemoteAgentConnector(
+        OpenClawGatewayRemoteAgentConnector(
           client: widget.httpRegistry.webFetchClient,
           credentialResolver: configuration,
         ),

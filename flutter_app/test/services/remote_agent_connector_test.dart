@@ -26,7 +26,7 @@ void main() {
     messages: [RemoteAgentMessage(role: 'user', text: 'hello')],
   );
 
-  test('production path uses pinned transport, fixed UA, and no remote history',
+  test('production path uses pinned transport, fixed UA, and opaque session',
       () async {
     final server = await _secureServer();
     final runtimeInfo = AppRuntimeInfo.forTesting();
@@ -46,16 +46,18 @@ void main() {
         'event-stream',
         charset: 'utf-8',
       );
-      incoming.response.write('data: {"content":"safe reply"}\n');
+      incoming.response.write(
+        'data: {"choices":[{"delta":{"content":"safe reply"}}]}\n',
+      );
       incoming.response.write('data: [DONE]\n\n');
       await incoming.response.close();
     });
     final liveConfig = _config(
       reference: reference,
-      baseUrl: 'https://public.example:${server.port}/v3/chat',
+      baseUrl: 'https://public.example:${server.port}/v1/chat/completions',
     );
     try {
-      final events = await CozeOpenApiRemoteAgentConnector(
+      final events = await OpenClawGatewayRemoteAgentConnector(
         client: client,
         credentialResolver: const _CredentialResolver(credential),
       ).send(liveConfig, _consent(liveConfig), request).toList();
@@ -66,9 +68,14 @@ void main() {
       expect((events.single as RemoteAgentComplete).text, 'safe reply');
       expect(observed['authorization'], 'Bearer $credential');
       expect(observed['user_agent'], runtimeInfo.userAgent);
-      expect(body['auto_save_history'], isFalse);
-      expect(body, isNot(contains('conversation_id')));
-      expect(body['user_id'], isNot(request.localSessionId));
+      expect(body['model'], 'openclaw/agent-1');
+      expect(body['stream'], isTrue);
+      expect(body['messages'], [
+        {'role': 'user', 'content': 'hello'},
+      ]);
+      expect(body['user'], isNot(request.localSessionId));
+      expect(body, isNot(contains('bot_id')));
+      expect(body, isNot(contains('auto_save_history')));
     } finally {
       client.close();
       await server.close(force: true);
@@ -89,7 +96,7 @@ void main() {
     );
     try {
       await expectLater(
-        CozeOpenApiRemoteAgentConnector(
+        OpenClawGatewayRemoteAgentConnector(
           client: client,
           credentialResolver: const _CredentialResolver(credential),
         ).send(config, consent, request).toList(),
@@ -101,12 +108,63 @@ void main() {
     }
   });
 
+  test(
+      'explicit OpenClaw target permits Tailscale CGNAT without widening WebFetch',
+      () async {
+    final server = await _secureServer();
+    var connectCalls = 0;
+    final client = AppWebFetchClient.forTesting(
+      AppRuntimeInfo.forTesting(),
+      tlsSecurityContext: _trustedClientContext(),
+      resolveHost: (_) async => [InternetAddress('100.64.12.34')],
+      connectSocket: (_, port) {
+        connectCalls += 1;
+        return Socket.startConnect(InternetAddress.loopbackIPv4, port);
+      },
+    );
+    server.listen((incoming) async {
+      await incoming.drain<void>();
+      incoming.response.headers.contentType = ContentType(
+        'text',
+        'event-stream',
+        charset: 'utf-8',
+      );
+      incoming.response.write(
+        'data: {"choices":[{"delta":{"content":"tailnet reply"}}]}\n',
+      );
+      incoming.response.write('data: [DONE]\n\n');
+      await incoming.response.close();
+    });
+    final liveConfig = _config(
+      reference: reference,
+      baseUrl: 'https://public.example:${server.port}/v1/chat/completions',
+    );
+    try {
+      await expectLater(
+        client.send(http.Request('GET', Uri.parse(liveConfig.baseUrl))),
+        throwsA(isA<SocketException>()),
+      );
+      expect(connectCalls, 0);
+
+      final events = await OpenClawGatewayRemoteAgentConnector(
+        client: client,
+        credentialResolver: const _CredentialResolver(credential),
+      ).send(liveConfig, _consent(liveConfig), request).toList();
+
+      expect((events.single as RemoteAgentComplete).text, 'tailnet reply');
+      expect(connectCalls, 1);
+    } finally {
+      client.close();
+      await server.close(force: true);
+    }
+  });
+
   test('missing disclosure fails before credential resolution', () async {
     final resolver = _CountingCredentialResolver(credential);
     final client = _pinnedClient(AppRuntimeInfo.forTesting());
     try {
       await expectLater(
-        CozeOpenApiRemoteAgentConnector(
+        OpenClawGatewayRemoteAgentConnector(
           client: client,
           credentialResolver: resolver,
         ).send(config, null, request).toList(),
@@ -122,7 +180,7 @@ void main() {
     final client = _pinnedClient(AppRuntimeInfo.forTesting());
     try {
       await expectLater(
-        CozeOpenApiRemoteAgentConnector(
+        OpenClawGatewayRemoteAgentConnector(
           client: client,
           credentialResolver: const _NullCredentialResolver(),
         ).send(config, consent, request).toList(),
@@ -148,7 +206,7 @@ void main() {
     );
     try {
       await expectLater(
-        CozeOpenApiRemoteAgentConnector(
+        OpenClawGatewayRemoteAgentConnector(
           client: client,
           credentialResolver: _RevokingCredentialResolver(
             credential,
@@ -177,29 +235,15 @@ void main() {
     );
   });
 
-  test('explicit DONE and exact provider terminal succeed', () async {
+  test('official OpenClaw SSE chunks and terminal succeed', () async {
     expect(
       await _decodeSse(
-        'event: conversation.message.delta\n'
-        'data: {"content":"one"}\n\n'
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
         'data: [DONE]\n\n',
       ),
       'one',
-    );
-    expect(
-      await _decodeSse(
-        'event: conversation.chat.created\n'
-        'data: {"status":"created"}\n\n'
-        'event: conversation.message.delta\n'
-        'data: {"content":"two"}\n\n'
-        'event: conversation.message.completed\n'
-        'data: {"content":"two"}\n\n'
-        'event: conversation.chat.completed\n'
-        'data: {"status":"completed"}\n\n'
-        'event: done\n'
-        'data: [DONE]\n\n',
-      ),
-      'two',
     );
   });
 
@@ -239,9 +283,8 @@ void main() {
     RemoteAgentComplete? durable;
     try {
       final text = await _decodeSse(
-        'data: {"content":"partial"}\n\n'
-        'event: conversation.chat.failed\n'
-        'data: {"code":"failed"}\n\n',
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        'data: {"error":{"type":"api_error"}}\n\n',
       );
       durable = RemoteAgentComplete(text: text);
     } on RemoteAgentFailure catch (error) {
@@ -264,7 +307,9 @@ void main() {
         'event-stream',
         charset: 'utf-8',
       );
-      incoming.response.write('data: {"content":"partial"}\n\n');
+      incoming.response.write(
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+      );
       await incoming.response.flush();
       deltaFlushed.complete();
       await release.future;
@@ -276,14 +321,14 @@ void main() {
     });
     final liveConfig = _config(
       reference: reference,
-      baseUrl: 'https://public.example:${server.port}/v3/chat',
+      baseUrl: 'https://public.example:${server.port}/v1/chat/completions',
     );
     final cancellation = RemoteAgentCancellation();
     final events = <RemoteAgentEvent>[];
     Object? caught;
     final finished = Completer<void>();
     final resolver = _CountingCredentialResolver(credential);
-    final connector = CozeOpenApiRemoteAgentConnector(
+    final connector = OpenClawGatewayRemoteAgentConnector(
       client: client,
       credentialResolver: resolver,
     );
@@ -346,7 +391,9 @@ void main() {
         'event-stream',
         charset: 'utf-8',
       );
-      incoming.response.write('data: {"content":"partial"}\n\n');
+      incoming.response.write(
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+      );
       await incoming.response.flush();
       deltaFlushed.complete();
       await release.future;
@@ -358,11 +405,11 @@ void main() {
     });
     final liveConfig = _config(
       reference: reference,
-      baseUrl: 'https://public.example:${server.port}/v3/chat',
+      baseUrl: 'https://public.example:${server.port}/v1/chat/completions',
     );
     final cancellation = RemoteAgentCancellation();
     final resolver = _CountingCredentialResolver(credential);
-    final connector = CozeOpenApiRemoteAgentConnector(
+    final connector = OpenClawGatewayRemoteAgentConnector(
       client: client,
       credentialResolver: resolver,
       totalDeadline: const Duration(milliseconds: 200),
@@ -409,10 +456,10 @@ void main() {
     final cancellation = RemoteAgentCancellation();
     final liveConfig = _config(
       reference: reference,
-      baseUrl: 'https://public.example:${server.port}/v3/chat',
+      baseUrl: 'https://public.example:${server.port}/v1/chat/completions',
     );
     try {
-      final events = await CozeOpenApiRemoteAgentConnector(
+      final events = await OpenClawGatewayRemoteAgentConnector(
         client: client,
         credentialResolver: const _CredentialResolver(credential),
       )
@@ -429,7 +476,7 @@ void main() {
       expect(cancellation.isCancelled, isFalse);
       expect(cancellation.isDeadlineExpired, isFalse);
       await expectLater(
-        CozeOpenApiRemoteAgentConnector(
+        OpenClawGatewayRemoteAgentConnector(
           client: client,
           credentialResolver: const _CredentialResolver(credential),
         )
@@ -459,17 +506,17 @@ void main() {
       incoming.response.statusCode = HttpStatus.temporaryRedirect;
       incoming.response.headers.set(
         HttpHeaders.locationHeader,
-        'https://other.example/v3/chat',
+        'https://other.example/v1/chat/completions',
       );
       await incoming.response.close();
     });
     final liveConfig = _config(
       reference: reference,
-      baseUrl: 'https://public.example:${server.port}/v3/chat',
+      baseUrl: 'https://public.example:${server.port}/v1/chat/completions',
     );
     try {
       await expectLater(
-        CozeOpenApiRemoteAgentConnector(
+        OpenClawGatewayRemoteAgentConnector(
           client: client,
           credentialResolver: const _CredentialResolver(credential),
         ).send(liveConfig, _consent(liveConfig), request).toList(),
@@ -484,22 +531,28 @@ void main() {
 
   test('response and output bounds and unsafe output fail closed', () async {
     await expectLater(
-      const CozeOpenApiResponseDecoder(maxResponseBytes: 8).decode(
-        _response('application/json', '{"content":"too large"}'),
-      ),
-      throwsA(_failure(RemoteAgentErrorCode.responseTooLarge)),
-    );
-    await expectLater(
-      const CozeOpenApiResponseDecoder(maxOutputCharacters: 3).decode(
-        _response('application/json', '{"content":"four"}'),
-      ),
-      throwsA(_failure(RemoteAgentErrorCode.responseTooLarge)),
-    );
-    await expectLater(
-      const CozeOpenApiResponseDecoder().decode(
+      const OpenClawGatewayResponseDecoder(maxResponseBytes: 8).decode(
         _response(
           'application/json',
-          '{"content":"authorization: Bearer $credential"}',
+          '{"choices":[{"message":{"content":"too large"}}]}',
+        ),
+      ),
+      throwsA(_failure(RemoteAgentErrorCode.responseTooLarge)),
+    );
+    await expectLater(
+      const OpenClawGatewayResponseDecoder(maxOutputCharacters: 3).decode(
+        _response(
+          'application/json',
+          '{"choices":[{"message":{"content":"four"}}]}',
+        ),
+      ),
+      throwsA(_failure(RemoteAgentErrorCode.responseTooLarge)),
+    );
+    await expectLater(
+      const OpenClawGatewayResponseDecoder().decode(
+        _response(
+          'application/json',
+          '{"choices":[{"message":{"content":"authorization: Bearer $credential"}}]}',
         ),
       ),
       throwsA(_failure(RemoteAgentErrorCode.unsafeOutput)),
@@ -509,12 +562,12 @@ void main() {
   test('SSE line bound checks complete lines and accepts exact boundary',
       () async {
     const lineLimit = 64;
-    const prefix = 'data: {"content":"';
-    const suffix = '"}';
+    const prefix = 'data: {"choices":[{"delta":{"content":"';
+    const suffix = '"}}]}';
     final exactContent = 'x' * (lineLimit - prefix.length - suffix.length);
     final exactLine = '$prefix$exactContent$suffix';
     expect(utf8.encode(exactLine), hasLength(lineLimit));
-    const decoder = CozeOpenApiResponseDecoder(
+    const decoder = OpenClawGatewayResponseDecoder(
       maxSseLineBytes: lineLimit,
     );
     expect(
@@ -539,13 +592,13 @@ void main() {
 
   test('many tiny deltas stay bounded and cooperatively cancellable', () async {
     const responseLimit = 128 * 1024;
-    const frame = 'data: {"content":"x"}\n\n';
+    const frame = 'data: {"choices":[{"delta":{"content":"x"}}]}\n\n';
     const terminal = 'data: [DONE]\n\n';
     const frameCount = (responseLimit - terminal.length) ~/ frame.length - 1;
     final frames = List.filled(frameCount, frame).join();
     final completeBody = '${frames}data: [DONE]\n\n';
     final metrics = RemoteAgentParserMetrics();
-    final output = await CozeOpenApiResponseDecoder(
+    final output = await OpenClawGatewayResponseDecoder(
       maxResponseBytes: responseLimit,
       maxOutputCharacters: frameCount,
       cooperativeYieldEvery: 16,
@@ -563,7 +616,7 @@ void main() {
 
     var checks = 0;
     await expectLater(
-      CozeOpenApiResponseDecoder(
+      OpenClawGatewayResponseDecoder(
         maxResponseBytes: responseLimit,
         maxOutputCharacters: frameCount,
         cooperativeYieldEvery: 8,
@@ -581,11 +634,11 @@ void main() {
   test('consent binding covers every routing field and disclosure version', () {
     final original = RemoteAgentConsent.bindingFor(config);
     final edits = [
-      _config(
-          reference: reference, kind: RemoteAgentConnectorKind.genericOpenApi),
+      _config(reference: reference, kind: RemoteAgentConnectorKind.cozeOpenApi),
       _config(reference: reference, id: 'connector-2'),
       _config(
-          reference: reference, baseUrl: 'https://replacement.example/v3/chat'),
+          reference: reference,
+          baseUrl: 'https://replacement.example/v1/chat/completions'),
       _config(reference: reference, remoteAgentId: 'agent-2'),
       _config(
         reference: RemoteAgentCredentialReference.parse(
@@ -610,12 +663,26 @@ void main() {
     );
     final equivalent = _config(
       reference: reference,
-      baseUrl: 'https://agent.example/v3/../v3/chat',
+      baseUrl: 'https://agent.example/v1/../v1/chat/completions',
     );
     expect(canonical.baseUrl, equivalent.baseUrl);
     expect(
       RemoteAgentConsent.bindingFor(canonical),
       RemoteAgentConsent.bindingFor(equivalent),
+    );
+    expect(
+      _config(
+        reference: reference,
+        baseUrl: 'https://agent.example/v1',
+      ).baseUrl,
+      'https://agent.example/v1/chat/completions',
+    );
+    expect(
+      _config(
+        reference: reference,
+        baseUrl: 'https://agent.example/openclaw',
+      ).baseUrl,
+      'https://agent.example/openclaw/v1/chat/completions',
     );
     final reversedJson = Map<String, Object?>.fromEntries(
       canonical.toJson().entries.toList().reversed,
@@ -630,10 +697,10 @@ void main() {
 
   test('endpoint factory rejects non-HTTPS and credential-bearing syntax', () {
     for (final invalid in [
-      'http://agent.example/v3/chat',
-      'https://user@agent.example/v3/chat',
-      'https://agent.example/v3/chat?key=value',
-      ' https://agent.example/v3/chat',
+      'http://agent.example/v1/chat/completions',
+      'https://user@agent.example/v1/chat/completions',
+      'https://agent.example/v1/chat/completions?key=value',
+      ' https://agent.example/v1/chat/completions',
     ]) {
       expect(
         () => _config(reference: reference, baseUrl: invalid),
@@ -722,9 +789,9 @@ void main() {
 
 RemoteAgentConnectorConfig _config({
   required RemoteAgentCredentialReference reference,
-  RemoteAgentConnectorKind kind = RemoteAgentConnectorKind.cozeOpenApi,
+  RemoteAgentConnectorKind kind = RemoteAgentConnectorKind.openClawGateway,
   String id = 'connector-1',
-  String baseUrl = 'https://agent.example/v3/chat',
+  String baseUrl = 'https://agent.example/v1/chat/completions',
   String remoteAgentId = 'agent-1',
 }) {
   return RemoteAgentConnectorConfig(
@@ -748,7 +815,7 @@ Matcher _failure(RemoteAgentErrorCode code) =>
     isA<RemoteAgentFailure>().having((error) => error.code, 'code', code);
 
 Future<String> _decodeSse(String body) =>
-    const CozeOpenApiResponseDecoder().decode(
+    const OpenClawGatewayResponseDecoder().decode(
       _response('text/event-stream', body),
     );
 
@@ -828,7 +895,9 @@ Future<HttpServer> _completedServer() async {
       'event-stream',
       charset: 'utf-8',
     );
-    incoming.response.write('data: {"content":"complete"}\n');
+    incoming.response.write(
+      'data: {"choices":[{"delta":{"content":"complete"}}]}\n',
+    );
     incoming.response.write('data: [DONE]\n\n');
     await incoming.response.close();
   });

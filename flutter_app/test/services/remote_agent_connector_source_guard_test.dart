@@ -7,6 +7,7 @@ void main() {
       File('lib/services/remote_agent_connector.dart').readAsStringSync();
   final model =
       File('lib/models/remote_agent_connector.dart').readAsStringSync();
+  final appHttp = File('lib/services/app_http.dart').readAsStringSync();
 
   test('production connector has one non-bypassable pinned transport policy',
       () {
@@ -25,7 +26,7 @@ void main() {
     expect(service, contains('_RemoteAgentCancellationLifecycle.claimed'));
     expect(service, contains('_RemoteAgentCancellationLifecycle.retired'));
     final connectorStart = service.indexOf(
-      'final class CozeOpenApiRemoteAgentConnector',
+      'final class OpenClawGatewayRemoteAgentConnector',
     );
     final sendStart = service.indexOf(
       'Stream<RemoteAgentEvent> send(',
@@ -48,7 +49,6 @@ void main() {
     expect(service, isNot(contains('RemoteAgentTextDelta')));
     expect(service, contains('enum _SseState'));
     expect(service, contains('_SseState.accumulating'));
-    expect(service, contains('_SseState.messageCompleted'));
     expect(service, contains('_SseState.streamTerminal'));
     expect(service, contains('final output = StringBuffer()'));
     expect(RegExp(r'sanitizeText\(').allMatches(service), hasLength(1));
@@ -70,11 +70,15 @@ void main() {
       'backgroundUpload',
       'telemetry',
       'Timer.periodic',
-      'auto_save_history\': true',
+      "'bot_id'",
+      "'additional_messages'",
+      "'auto_save_history'",
     ]) {
       expect(service, isNot(contains(forbidden)), reason: forbidden);
     }
-    expect(service, contains("'auto_save_history': false"));
+    expect(service, contains("'model': 'openclaw/\${config.remoteAgentId}'"));
+    expect(service, contains("'user': _opaqueLocalUserId"));
+    expect(service, contains("'messages':"));
   });
 
   test('persisted consent uses SHA-256 and exact schemas', () {
@@ -84,5 +88,26 @@ void main() {
     expect(service, isNot(contains('0x811c9dc5')));
     expect(model, contains('_requireExactKeys'));
     expect(model, contains('RemoteAgentCredentialReference'));
+  });
+
+  test('private-network exception is target-bound and connector-only', () {
+    expect(appHttp, contains('sendToUserAuthorizedGateway'));
+    expect(appHttp, contains('_isAllowedExplicitGatewayIp'));
+    expect(appHttp,
+        contains("authorizedEndpoint.scheme.toLowerCase() != 'https'"));
+    expect(service, contains('_client.sendToUserAuthorizedGateway('));
+
+    final unexpected = <String>[];
+    for (final entity in Directory('lib').listSync(recursive: true)) {
+      if (entity is! File || !entity.path.endsWith('.dart')) continue;
+      if (entity.path.endsWith('/services/app_http.dart') ||
+          entity.path.endsWith('/services/remote_agent_connector.dart')) {
+        continue;
+      }
+      if (entity.readAsStringSync().contains('sendToUserAuthorizedGateway')) {
+        unexpected.add(entity.path);
+      }
+    }
+    expect(unexpected, isEmpty);
   });
 }

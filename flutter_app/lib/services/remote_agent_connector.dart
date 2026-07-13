@@ -130,7 +130,7 @@ final class _RemoteAgentCancellationClaim {
   }
 }
 
-enum _SseState { accumulating, messageCompleted, streamTerminal }
+enum _SseState { accumulating, streamTerminal }
 
 final class RemoteAgentParserMetrics {
   int _inputBytesScanned = 0;
@@ -145,8 +145,8 @@ final class RemoteAgentParserMetrics {
 /// Decodes a bounded response and returns only terminally validated output.
 /// It never exposes partial deltas, so failed/cancelled runs have no
 /// commit-eligible connector event.
-final class CozeOpenApiResponseDecoder {
-  const CozeOpenApiResponseDecoder({
+final class OpenClawGatewayResponseDecoder {
+  const OpenClawGatewayResponseDecoder({
     this.maxResponseBytes = 512 * 1024,
     this.maxOutputCharacters = 64 * 1024,
     this.maxSseLineBytes = 64 * 1024,
@@ -154,20 +154,6 @@ final class CozeOpenApiResponseDecoder {
     this.cooperativeAbortCheck,
     this.metrics,
   });
-
-  static const _terminalEvent = 'done';
-  static const _deltaEvent = 'conversation.message.delta';
-  static const _messageCompletedEvent = 'conversation.message.completed';
-  static const _nonOutputEvents = {
-    'conversation.chat.created',
-    'conversation.chat.in_progress',
-    'conversation.chat.completed',
-  };
-  static const _failureEvents = {
-    'error',
-    'conversation.chat.failed',
-    'conversation.chat.requires_action',
-  };
 
   final int maxResponseBytes;
   final int maxOutputCharacters;
@@ -195,7 +181,6 @@ final class CozeOpenApiResponseDecoder {
         : contentType.contains('application/json') || contentType.isEmpty
             ? _textFromPayload(
                 _decodeObject(await _readBounded(response.stream)),
-                eventName: null,
               )
             : null;
     if (output == null || output.isEmpty) {
@@ -212,7 +197,6 @@ final class CozeOpenApiResponseDecoder {
     final lineBytes = <int>[];
     final output = StringBuffer();
     var outputLength = 0;
-    String? eventName;
     var state = _SseState.accumulating;
     var terminalDelimiterSeen = false;
     var processedLines = 0;
@@ -268,23 +252,13 @@ final class CozeOpenApiResponseDecoder {
           );
         }
         if (line.isEmpty) {
-          eventName = null;
           continue;
         }
         if (line.startsWith(':')) continue;
         if (line.startsWith('event:')) {
-          if (eventName != null) {
-            throw const RemoteAgentFailure(
-              RemoteAgentErrorCode.unsupportedResponse,
-            );
-          }
-          eventName = line.substring(6).trim();
-          if (eventName.isEmpty) {
-            throw const RemoteAgentFailure(
-              RemoteAgentErrorCode.unsupportedResponse,
-            );
-          }
-          continue;
+          throw const RemoteAgentFailure(
+            RemoteAgentErrorCode.unsupportedResponse,
+          );
         }
         if (!line.startsWith('data:')) {
           throw const RemoteAgentFailure(
@@ -294,11 +268,6 @@ final class CozeOpenApiResponseDecoder {
 
         final data = line.substring(5).trim();
         if (data == '[DONE]') {
-          if (eventName != null && eventName != _terminalEvent) {
-            throw const RemoteAgentFailure(
-              RemoteAgentErrorCode.unsupportedResponse,
-            );
-          }
           state = _SseState.streamTerminal;
           continue;
         }
@@ -307,61 +276,21 @@ final class CozeOpenApiResponseDecoder {
             RemoteAgentErrorCode.unsupportedResponse,
           );
         }
-        if (_failureEvents.contains(eventName)) {
+        final payload = _decodeObject(data);
+        if (payload is Map && payload['error'] != null) {
           throw const RemoteAgentFailure(
             RemoteAgentErrorCode.providerRejected,
             retryable: true,
           );
         }
-        final payload = _decodeObject(data);
-        if (eventName == _terminalEvent) {
+        final delta = _textFromPayload(payload);
+        if (delta == null) {
+          if (_isValidNoOutputChunk(payload)) continue;
           throw const RemoteAgentFailure(
             RemoteAgentErrorCode.unsupportedResponse,
           );
         }
-        if (_nonOutputEvents.contains(eventName)) {
-          if (payload is! Map ||
-              _textFromPayload(payload, eventName: eventName) != null) {
-            throw const RemoteAgentFailure(
-              RemoteAgentErrorCode.unsupportedResponse,
-            );
-          }
-          eventName = null;
-          continue;
-        }
-        if (eventName == _messageCompletedEvent) {
-          final completedText = _textFromPayload(payload, eventName: eventName);
-          if (completedText == null ||
-              completedText.isEmpty ||
-              state == _SseState.messageCompleted ||
-              (outputLength > 0 && output.toString() != completedText)) {
-            throw const RemoteAgentFailure(
-              RemoteAgentErrorCode.unsupportedResponse,
-            );
-          }
-          if (outputLength == 0) {
-            output.write(completedText);
-            outputLength = completedText.length;
-            _checkOutputLength(outputLength);
-          }
-          state = _SseState.messageCompleted;
-          eventName = null;
-          continue;
-        }
-        if (eventName != null && eventName != _deltaEvent) {
-          throw const RemoteAgentFailure(
-            RemoteAgentErrorCode.unsupportedResponse,
-          );
-        }
-        final delta = _textFromPayload(payload, eventName: eventName);
-        eventName = null;
-        if (delta == null ||
-            delta.isEmpty ||
-            state == _SseState.messageCompleted) {
-          throw const RemoteAgentFailure(
-            RemoteAgentErrorCode.unsupportedResponse,
-          );
-        }
+        if (delta.isEmpty) continue;
         output.write(delta);
         outputLength += delta.length;
         _checkOutputLength(outputLength);
@@ -399,17 +328,11 @@ final class CozeOpenApiResponseDecoder {
 
   Object? _decodeObject(String input) => jsonDecode(input);
 
-  String? _textFromPayload(Object? payload, {required String? eventName}) {
+  String? _textFromPayload(Object? payload) {
     if (payload is! Map) return null;
     final map = Map<String, Object?>.from(payload);
-    final direct = map['content'];
-    if (direct is String) return direct;
-    final data = map['data'];
-    if (data is Map && data['content'] is String) {
-      return data['content']! as String;
-    }
     final choices = map['choices'];
-    if (choices is List && choices.isNotEmpty && choices.first is Map) {
+    if (choices is List && choices.length == 1 && choices.first is Map) {
       final choice = choices.first as Map;
       for (final key in ['delta', 'message']) {
         final container = choice[key];
@@ -419,6 +342,19 @@ final class CozeOpenApiResponseDecoder {
       }
     }
     return null;
+  }
+
+  bool _isValidNoOutputChunk(Object? payload) {
+    if (payload is! Map) return false;
+    final choices = payload['choices'];
+    if (choices is! List) return false;
+    if (choices.isEmpty) return true;
+    if (choices.length != 1 || choices.first is! Map) return false;
+    final choice = choices.first as Map;
+    final delta = choice['delta'];
+    if (delta is! Map || delta['tool_calls'] != null) return false;
+    final content = delta['content'];
+    return content == null || content == '';
   }
 
   void _validateOutput(String output) {
@@ -436,10 +372,12 @@ final class CozeOpenApiResponseDecoder {
   }
 }
 
-/// Production Coze/OpenAPI connector. Its transport is structurally fixed to
+/// Production OpenClaw Gateway connector using its official OpenAI-compatible
+/// `/v1/chat/completions` endpoint. Its transport is structurally fixed to
 /// the root-owned, DNS/IP-pinning [AppWebFetchClient].
-final class CozeOpenApiRemoteAgentConnector implements RemoteAgentConnector {
-  CozeOpenApiRemoteAgentConnector({
+final class OpenClawGatewayRemoteAgentConnector
+    implements RemoteAgentConnector {
+  OpenClawGatewayRemoteAgentConnector({
     required AppWebFetchClient client,
     required RemoteAgentCredentialResolver credentialResolver,
     this.totalDeadline = const Duration(seconds: 90),
@@ -473,7 +411,7 @@ final class CozeOpenApiRemoteAgentConnector implements RemoteAgentConnector {
 
     try {
       _requireAuthorized(authorizationGuard);
-      if (config.kind != RemoteAgentConnectorKind.cozeOpenApi) {
+      if (config.kind != RemoteAgentConnectorKind.openClawGateway) {
         throw const RemoteAgentFailure(
           RemoteAgentErrorCode.invalidConfiguration,
         );
@@ -519,7 +457,7 @@ final class CozeOpenApiRemoteAgentConnector implements RemoteAgentConnector {
           retryable: response.statusCode == 429 || response.statusCode >= 500,
         );
       }
-      final output = await CozeOpenApiResponseDecoder(
+      final output = await OpenClawGatewayResponseDecoder(
         maxResponseBytes: maxResponseBytes,
         maxOutputCharacters: maxOutputCharacters,
         cooperativeAbortCheck: () {
@@ -600,14 +538,17 @@ final class CozeOpenApiRemoteAgentConnector implements RemoteAgentConnector {
           HttpHeaders.acceptHeader: 'text/event-stream, application/json',
         })
         ..body = jsonEncode({
-          'bot_id': config.remoteAgentId,
-          'user_id': _opaqueLocalUserId(request.localSessionId),
+          'model': 'openclaw/${config.remoteAgentId}',
+          'user': _opaqueLocalUserId(request.localSessionId),
           'stream': true,
-          'auto_save_history': false,
-          'additional_messages':
+          'messages':
               request.messages.map((message) => message.toWireJson()).toList(),
         });
-      final response = await _client.send(outgoing);
+      final response = await _client.sendToUserAuthorizedGateway(
+        outgoing,
+        authorizedEndpoint: initialEndpoint,
+        remainingTimeout: totalDeadline,
+      );
       if (!_isRedirect(response.statusCode)) return response;
       await _discardBounded(response.stream);
       final location = response.headers['location'];

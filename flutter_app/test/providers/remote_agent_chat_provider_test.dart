@@ -358,18 +358,18 @@ void main() {
       switch (mutation) {
         case 'edit':
           await fixture.configuration.saveConfiguration(
-            kind: RemoteAgentConnectorKind.cozeOpenApi,
+            kind: RemoteAgentConnectorKind.openClawGateway,
             connectorId: 'primary_remote',
             displayName: 'Remote Agent',
-            baseUrl: 'https://edited.example/v3/chat',
+            baseUrl: 'https://edited.example/v1/chat/completions',
             remoteAgentId: 'agent_2',
           );
         case 'replace':
           await fixture.configuration.saveConfiguration(
-            kind: RemoteAgentConnectorKind.cozeOpenApi,
+            kind: RemoteAgentConnectorKind.openClawGateway,
             connectorId: 'primary_remote',
             displayName: 'Remote Agent',
-            baseUrl: 'https://edited.example/v3/chat',
+            baseUrl: 'https://edited.example/v1/chat/completions',
             remoteAgentId: 'agent_2',
             credential: 'replacement-secret',
           );
@@ -806,10 +806,10 @@ Future<_Fixture> _fixture({
     secretStorage: secrets,
   );
   await configuration.saveConfiguration(
-    kind: RemoteAgentConnectorKind.cozeOpenApi,
+    kind: RemoteAgentConnectorKind.openClawGateway,
     connectorId: 'primary_remote',
     displayName: 'Remote Agent',
-    baseUrl: 'https://agent.example/v3/chat',
+    baseUrl: 'https://agent.example/v1/chat/completions',
     remoteAgentId: 'agent_1',
     credential: 'secure-value',
   );
@@ -850,10 +850,10 @@ Future<
     secretStorage: secrets,
   );
   await configuration.saveConfiguration(
-    kind: RemoteAgentConnectorKind.cozeOpenApi,
+    kind: RemoteAgentConnectorKind.openClawGateway,
     connectorId: 'primary_remote',
     displayName: 'Remote Agent',
-    baseUrl: 'https://agent.example/v3/chat',
+    baseUrl: 'https://agent.example/v1/chat/completions',
     remoteAgentId: 'agent_1',
     credential: 'secure-value',
   );
