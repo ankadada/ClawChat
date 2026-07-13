@@ -129,7 +129,7 @@ class ToolRegistry {
       mcpService: prefs == null ? null : McpService(prefs: prefs),
     );
     registry.register(BashTool(), risk: ToolRisk.dangerous);
-    registry.register(LoadSkillTool(), risk: ToolRisk.safe);
+    registry.register(LoadSkillTool(), risk: ToolRisk.moderate);
     registry.register(ReadFileTool(), risk: ToolRisk.moderate);
     registry.register(WriteFileTool(), risk: ToolRisk.dangerous);
     registry.register(WebFetchTool(), risk: ToolRisk.moderate);

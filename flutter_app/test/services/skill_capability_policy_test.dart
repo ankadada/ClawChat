@@ -47,7 +47,12 @@ ToolApprovalRequest _request(
   Map<String, dynamic> arguments, {
   ToolRisk risk = ToolRisk.dangerous,
 }) =>
-    ToolApprovalRequest(toolName: tool, arguments: arguments, risk: risk);
+    ToolApprovalRequest(
+      toolName: tool,
+      arguments: arguments,
+      risk: risk,
+      operationId: 'test-operation',
+    );
 
 void main() {
   test(

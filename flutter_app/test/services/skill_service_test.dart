@@ -910,6 +910,7 @@ void main() {
       toolName: 'bash',
       arguments: {'command': 'git status'},
       risk: ToolRisk.moderate,
+      operationId: 'test-operation',
     ));
     expect(approved, isFalse);
   });

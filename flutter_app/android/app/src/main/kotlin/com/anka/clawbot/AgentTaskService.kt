@@ -1,5 +1,6 @@
 package com.anka.clawbot
 
+import android.Manifest
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.app.Notification
@@ -8,6 +9,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -28,6 +30,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import io.flutter.plugin.common.MethodChannel
+import androidx.core.content.ContextCompat
 
 class AgentTaskService : Service() {
     companion object {
@@ -40,13 +43,19 @@ class AgentTaskService : Service() {
         private const val EXTRA_PREVIEW = "previewText"
         private const val EXTRA_TOOL_NAME = "toolName"
         private const val EXTRA_OVERLAY_VISIBLE = "overlayVisible"
+        private const val EXTRA_APPROVAL_ID = "approvalId"
+        private const val EXTRA_APPROVAL_RISK = "approvalRisk"
+        private const val EXTRA_APPROVED = "approved"
         private const val ACTION_UPDATE = "com.anka.clawbot.agent.UPDATE"
         private const val ACTION_STOP_AGENT = "com.anka.clawbot.agent.STOP"
+        private const val ACTION_TOOL_APPROVAL_UPDATE = "com.anka.clawbot.agent.APPROVAL_UPDATE"
+        private const val ACTION_TOOL_APPROVAL_DECISION = "com.anka.clawbot.agent.APPROVAL_DECISION"
         private const val DEFAULT_TEXT = "AI 正在执行任务..."
         private const val DEFAULT_STATUS = "thinking"
         private const val WAKE_LOCK_TIMEOUT_MS = 60 * 60 * 1000L
         private const val WAKE_LOCK_RENEWAL_MS = 55 * 60 * 1000L
         private const val NOTIFICATION_THROTTLE_MS = 500L
+        private const val APPROVAL_DELIVERY_TIMEOUT_MS = 5_000L
         private const val OVERLAY_PREFS = "agent_overlay"
         private const val OVERLAY_PROMPTED = "overlay_prompted"
 
@@ -54,10 +63,21 @@ class AgentTaskService : Service() {
             private set
 
         private var instance: AgentTaskService? = null
-        private var callbackChannel: MethodChannel? = null
+        private val callbackOwnership =
+            ToolApprovalCallbackOwnership<MethodChannel>()
 
-        fun setCallbackChannel(channel: MethodChannel) {
-            callbackChannel = channel
+        fun attachCallbackChannel(channel: MethodChannel): Long {
+            val attachment = callbackOwnership.attach(channel)
+            val invalidated = attachment.invalidatedGeneration
+            if (invalidated != null) {
+                instance?.invalidateCallbackOwner(invalidated)
+            }
+            return attachment.owner.generation
+        }
+
+        fun detachCallbackChannel(channel: MethodChannel, generation: Long) {
+            val invalidated = callbackOwnership.detach(channel, generation) ?: return
+            instance?.invalidateCallbackOwner(invalidated)
         }
 
         fun start(
@@ -123,6 +143,66 @@ class AgentTaskService : Service() {
             val manager = context.getSystemService(NotificationManager::class.java)
             manager.cancel(notificationIdFor(sessionId))
             manager.cancel(SUMMARY_NOTIFICATION_ID)
+        }
+
+        fun showToolApproval(
+            context: Context,
+            sessionId: String,
+            sessionTitle: String,
+            approvalId: String,
+            toolName: String,
+            risk: String
+        ): Boolean {
+            if (!canShowApprovalNotification(context)) return false
+            val service = instance
+            if (service != null) {
+                service.showToolApproval(
+                    sessionId,
+                    sessionTitle,
+                    approvalId,
+                    toolName,
+                    risk
+                )
+                return true
+            }
+            val intent = Intent(context, AgentTaskService::class.java).apply {
+                action = ACTION_TOOL_APPROVAL_UPDATE
+                putExtra(EXTRA_SESSION_ID, sessionId)
+                putExtra(EXTRA_SESSION_TITLE, sessionTitle)
+                putExtra(EXTRA_APPROVAL_ID, approvalId)
+                putExtra(EXTRA_TOOL_NAME, toolName)
+                putExtra(EXTRA_APPROVAL_RISK, risk)
+                putExtra(EXTRA_STATUS, "tooling")
+            }
+            startServiceCompat(context, intent)
+            return true
+        }
+
+        private fun canShowApprovalNotification(context: Context): Boolean {
+            val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+            val manager = context.getSystemService(NotificationManager::class.java)
+            val notificationsEnabled = Build.VERSION.SDK_INT < Build.VERSION_CODES.N ||
+                manager.areNotificationsEnabled()
+            val channel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                manager.getNotificationChannel(MainActivity.CHANNEL_ID)
+            } else {
+                null
+            }
+            return ToolApprovalNotificationCapability.isVisible(
+                permissionGranted = permissionGranted,
+                notificationsEnabled = notificationsEnabled,
+                channelExists = Build.VERSION.SDK_INT < Build.VERSION_CODES.O || channel != null,
+                channelEnabled = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                    channel?.importance != NotificationManager.IMPORTANCE_NONE
+            )
+        }
+
+        fun clearToolApproval(sessionId: String, approvalId: String) {
+            instance?.clearToolApproval(sessionId, approvalId)
         }
 
         fun showCompletionNotification(
@@ -225,7 +305,7 @@ class AgentTaskService : Service() {
         }
 
         private fun requestStopFromNotification(sessionId: String?) {
-            callbackChannel?.invokeMethod(
+            callbackOwnership.current?.value?.invokeMethod(
                 "onAgentStopRequested",
                 sessionId?.let { mapOf("sessionId" to it) }
             )
@@ -246,7 +326,8 @@ class AgentTaskService : Service() {
         var status: String,
         var preview: String,
         var toolName: String?,
-        val notificationId: Int
+        val notificationId: Int,
+        var approval: ToolApprovalNotificationState? = null
     )
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -275,12 +356,21 @@ class AgentTaskService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) {
+            clearAllSessionNotifications()
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (intent?.action == ACTION_STOP_AGENT) {
             val sessionId = intent.getStringExtra(EXTRA_SESSION_ID)
             requestStopFromNotification(sessionId)
             mainHandler.postDelayed({
                 if (activeSessions.isEmpty()) stopSelf()
             }, 1000)
+            return START_NOT_STICKY
+        }
+        if (intent?.action?.startsWith(ACTION_TOOL_APPROVAL_DECISION) == true) {
+            handleToolApprovalDecision(intent)
             return START_NOT_STICKY
         }
 
@@ -296,6 +386,18 @@ class AgentTaskService : Service() {
         overlayShouldBeVisible = intent?.getBooleanExtra(EXTRA_OVERLAY_VISIBLE, overlayShouldBeVisible)
             ?: overlayShouldBeVisible
         val state = upsertAgentSessionState(sessionId, sessionTitle, status, preview, toolName)
+        if (intent?.action == ACTION_TOOL_APPROVAL_UPDATE) {
+            val approvalId = intent.getStringExtra(EXTRA_APPROVAL_ID)
+            val approvalRisk = intent.getStringExtra(EXTRA_APPROVAL_RISK)
+            if (!approvalId.isNullOrBlank() && !toolName.isNullOrBlank() && !approvalRisk.isNullOrBlank()) {
+                state.approval = ToolApprovalNotificationState(
+                    sessionId = state.sessionId,
+                    approvalId = approvalId,
+                    toolName = toolName,
+                    risk = approvalRisk
+                )
+            }
+        }
 
         if (!isRunning || foregroundSessionId == null) {
             foregroundSessionId = state.sessionId
@@ -308,7 +410,7 @@ class AgentTaskService : Service() {
         acquireWakeLock()
         updateSummaryNotification()
         updateOverlay()
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -348,6 +450,170 @@ class AgentTaskService : Service() {
             scheduleNotificationUpdate(state.sessionId)
         }
         updateOverlay()
+    }
+
+    private fun showToolApproval(
+        sessionId: String,
+        sessionTitle: String,
+        approvalId: String,
+        toolName: String,
+        risk: String
+    ) {
+        val state = upsertAgentSessionState(
+            sessionId,
+            sessionTitle,
+            "tooling",
+            "",
+            toolName
+        )
+        state.approval?.let { cancelApprovalPendingIntents(it) }
+        state.approval = ToolApprovalNotificationState(
+            sessionId = state.sessionId,
+            approvalId = approvalId,
+            toolName = toolName,
+            risk = risk
+        )
+        if (!isRunning || foregroundSessionId == null) {
+            foregroundSessionId = state.sessionId
+            startForeground(state.notificationId, buildNotification(state))
+            isRunning = true
+            acquireWakeLock()
+        } else {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(state.notificationId, buildNotification(state))
+        }
+        updateSummaryNotification()
+    }
+
+    private fun clearToolApproval(sessionId: String, approvalId: String) {
+        val state = activeSessions[sessionId] ?: return
+        if (state.approval?.approvalId != approvalId) return
+        state.approval?.let { cancelApprovalPendingIntents(it) }
+        state.approval = null
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(state.notificationId, buildNotification(state))
+    }
+
+    private fun handleToolApprovalDecision(intent: Intent) {
+        val sessionId = intent.getStringExtra(EXTRA_SESSION_ID) ?: return
+        val approvalId = intent.getStringExtra(EXTRA_APPROVAL_ID) ?: return
+        val approved = intent.getBooleanExtra(EXTRA_APPROVED, false)
+        val state = activeSessions[sessionId] ?: return
+        val approval = state.approval ?: return
+        val owner = callbackOwnership.current ?: return
+        if (!approval.beginDecision(sessionId, approvalId, owner.generation)) return
+        getSystemService(NotificationManager::class.java)
+            .notify(state.notificationId, buildNotification(state))
+        val timeout = Runnable {
+            if (approval.deliveryFailed(owner.generation)) {
+                getSystemService(NotificationManager::class.java)
+                    .notify(state.notificationId, buildNotification(state))
+            }
+        }
+        mainHandler.postDelayed(timeout, APPROVAL_DELIVERY_TIMEOUT_MS)
+        try {
+            owner.value.invokeMethod(
+                "onToolApprovalDecision",
+                mapOf(
+                    "sessionId" to sessionId,
+                    "approvalId" to approvalId,
+                    "approved" to approved
+                ),
+                object : MethodChannel.Result {
+                    override fun success(result: Any?) {
+                        mainHandler.removeCallbacks(timeout)
+                        val ownerStillCurrent =
+                            callbackOwnership.current?.generation == owner.generation
+                        val acknowledged = ownerStillCurrent &&
+                            result == true &&
+                            approval.acknowledge(owner.generation)
+                        if (acknowledged && state.approval === approval) {
+                            cancelApprovalPendingIntents(approval)
+                            state.approval = null
+                        } else {
+                            approval.deliveryFailed(owner.generation)
+                        }
+                        getSystemService(NotificationManager::class.java)
+                            .notify(state.notificationId, buildNotification(state))
+                    }
+
+                    override fun error(code: String, message: String?, details: Any?) {
+                        failDelivery()
+                    }
+
+                    override fun notImplemented() {
+                        failDelivery()
+                    }
+
+                    private fun failDelivery() {
+                        mainHandler.removeCallbacks(timeout)
+                        if (approval.deliveryFailed(owner.generation)) {
+                            getSystemService(NotificationManager::class.java)
+                                .notify(state.notificationId, buildNotification(state))
+                        }
+                    }
+                }
+            )
+        } catch (_: Throwable) {
+            mainHandler.removeCallbacks(timeout)
+            if (approval.deliveryFailed(owner.generation)) {
+                getSystemService(NotificationManager::class.java)
+                    .notify(state.notificationId, buildNotification(state))
+            }
+        }
+    }
+
+    private fun invalidateCallbackOwner(generation: Long) {
+        for (state in activeSessions.values) {
+            val approval = state.approval ?: continue
+            if (approval.deliveryFailed(generation)) {
+                getSystemService(NotificationManager::class.java)
+                    .notify(state.notificationId, buildNotification(state))
+            }
+        }
+    }
+
+    private fun approvalDecisionIntent(
+        approval: ToolApprovalNotificationState,
+        approved: Boolean
+    ): Intent {
+        val identity = ToolApprovalPendingIntentIdentity.create(
+            ACTION_TOOL_APPROVAL_DECISION,
+            approval.sessionId,
+            approval.approvalId,
+            approved
+        )
+        return Intent(this, AgentTaskService::class.java).apply {
+            action = identity.action
+            data = Uri.parse(identity.data)
+            setPackage(packageName)
+            putExtra(EXTRA_SESSION_ID, approval.sessionId)
+            putExtra(EXTRA_APPROVAL_ID, approval.approvalId)
+            putExtra(EXTRA_APPROVED, approved)
+        }
+    }
+
+    private fun approvalPendingIntent(
+        approval: ToolApprovalNotificationState,
+        approved: Boolean
+    ): PendingIntent = PendingIntent.getService(
+        this,
+        0,
+        approvalDecisionIntent(approval, approved),
+        PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+
+    private fun cancelApprovalPendingIntents(
+        approval: ToolApprovalNotificationState
+    ) {
+        for (approved in listOf(false, true)) {
+            PendingIntent.getService(
+                this,
+                0,
+                approvalDecisionIntent(approval, approved),
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            )?.cancel()
+        }
     }
 
     private fun upsertAgentSessionState(
@@ -462,6 +728,9 @@ class AgentTaskService : Service() {
             stopIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val approval = state.approval
+        val approvePendingIntent = approval?.let { approvalPendingIntent(it, true) }
+        val denyPendingIntent = approval?.let { approvalPendingIntent(it, false) }
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, MainActivity.CHANNEL_ID)
@@ -470,7 +739,11 @@ class AgentTaskService : Service() {
         }
 
         val ongoing = state.status != "complete" && state.status != "error"
-        val preview = compactPreview(state)
+        val preview = when {
+            approval?.decisionInFlight == true -> "正在提交工具审批决定..."
+            approval != null -> "${approval.toolName} (${approval.risk}) 等待你的明确批准"
+            else -> compactPreview(state)
+        }
         builder
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(statusTitle(state))
@@ -482,11 +755,20 @@ class AgentTaskService : Service() {
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(Notification.PRIORITY_LOW)
             .setGroup(AGENT_GROUP_KEY)
-            .addAction(R.mipmap.ic_launcher, "查看", openPendingIntent)
-        if (ongoing) {
+        if (approval == null) {
+            builder.addAction(R.mipmap.ic_launcher, "查看", openPendingIntent)
+        }
+        if (ongoing && approval == null) {
             builder
                 .addAction(R.mipmap.ic_launcher, "停止", stopPendingIntent)
                 .setProgress(0, 0, state.status == "thinking")
+        }
+        if (approval != null && !approval.decisionInFlight &&
+            approvePendingIntent != null && denyPendingIntent != null) {
+            builder
+                .addAction(R.mipmap.ic_launcher, "拒绝", denyPendingIntent)
+                .addAction(R.mipmap.ic_launcher, "允许一次", approvePendingIntent)
+                .addAction(R.mipmap.ic_launcher, "停止", stopPendingIntent)
         }
         return builder.build()
     }
@@ -522,6 +804,7 @@ class AgentTaskService : Service() {
 
     private fun removeSessionNotification(sessionId: String) {
         val state = activeSessions.remove(sessionId) ?: return
+        state.approval?.let { cancelApprovalPendingIntents(it) }
         pendingNotificationSessionIds.remove(sessionId)
         if (overlaySessionId == sessionId) {
             overlaySessionId = activeSessions.keys.lastOrNull()
@@ -549,6 +832,7 @@ class AgentTaskService : Service() {
     private fun clearAllSessionNotifications() {
         val manager = getSystemService(NotificationManager::class.java)
         for (state in activeSessions.values) {
+            state.approval?.let { cancelApprovalPendingIntents(it) }
             manager.cancel(state.notificationId)
         }
         manager.cancel(SUMMARY_NOTIFICATION_ID)

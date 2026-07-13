@@ -991,6 +991,57 @@ void main() {
       expect(policyB.activeSkill?.id, skillB.id);
     });
 
+    test('repeated load_skill in one run receives fresh immutable operations',
+        () async {
+      final approvals = <ToolApprovalRequest>[];
+      final verified = _verifiedSkill(const ExtensionCapabilitySnapshot(
+        tools: [],
+        commands: [],
+        networkDomains: [],
+        filesystemRead: [],
+        filesystemWrite: [],
+        androidIntents: [],
+        androidPermissions: [],
+        secretNames: [],
+        runtimes: [],
+        subprocessRequired: false,
+        riskTier: 'low',
+        updatePolicy: 'manual',
+      ));
+      final policy = SkillCapabilityPolicy(loader: (_) async => verified);
+      final service = AgentService(
+        llm: _RepeatedToolCallLlmService(
+          _config,
+          toolName: 'load_skill',
+          arguments: {'id': verified.id},
+          repeats: 2,
+        ),
+        tools: ToolRegistry()
+          ..register(LoadSkillTool(), risk: ToolRisk.moderate),
+        systemPrompt: 'system',
+        runAttemptId: 'same-run',
+        skillCapabilityPolicy: policy,
+        toolPolicy: ToolPolicy(
+          additionalDenyCheck: policy.denyFor,
+          onApprovalRequired: (request) {
+            approvals.add(request);
+            return false;
+          },
+        ),
+      );
+
+      await service.runAgentLoop([]).drain<void>();
+
+      expect(approvals, hasLength(2));
+      expect(approvals.map((request) => request.runAttemptId).toSet(), {
+        'same-run',
+      });
+      expect(approvals.map((request) => request.operationId).toSet(),
+          hasLength(2));
+      expect(
+          approvals.every((request) => request.operationId.isNotEmpty), isTrue);
+    });
+
     test('MCP tools require approval before execution', () async {
       var approvalCount = 0;
       final tool = _RecordingTool(name: 'mcp_12345678_echo_abcd1234');
@@ -1243,6 +1294,47 @@ class _ToolBatchLlmService extends LlmService {
               toolName: calls[index].$1,
               toolInput: calls[index].$2,
             ),
+        ],
+      ));
+      return;
+    }
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'done')],
+    ));
+  }
+}
+
+class _RepeatedToolCallLlmService extends LlmService {
+  final String toolName;
+  final Map<String, dynamic> arguments;
+  final int repeats;
+  var calls = 0;
+
+  _RepeatedToolCallLlmService(
+    super.config, {
+    required this.toolName,
+    required this.arguments,
+    required this.repeats,
+  });
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    calls++;
+    if (calls <= repeats) {
+      yield StreamDone(LlmResponse(
+        stopReason: 'tool_use',
+        content: [
+          ContentBlock(
+            type: 'tool_use',
+            toolUseId: 'repeated_$calls',
+            toolName: toolName,
+            toolInput: arguments,
+          ),
         ],
       ));
       return;

@@ -11,14 +11,14 @@ class ToolApprovalRequest {
   final Map<String, dynamic> arguments;
   final ToolRisk risk;
   final String? runAttemptId;
-  final String? operationId;
+  final String operationId;
 
   const ToolApprovalRequest({
     required this.toolName,
     required this.arguments,
     required this.risk,
+    required this.operationId,
     this.runAttemptId,
-    this.operationId,
   });
 }
 

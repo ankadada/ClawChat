@@ -12,6 +12,7 @@ import 'package:clawchat/screens/chat_screen.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/session_storage.dart';
+import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -20,6 +21,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('only resumed lifecycle is interactive for approvals', () {
+    expect(isInteractiveChatLifecycle(AppLifecycleState.resumed), isTrue);
+    expect(isInteractiveChatLifecycle(AppLifecycleState.inactive), isFalse);
+    expect(isInteractiveChatLifecycle(AppLifecycleState.paused), isFalse);
+    expect(isInteractiveChatLifecycle(AppLifecycleState.hidden), isFalse);
+    expect(isInteractiveChatLifecycle(AppLifecycleState.detached), isFalse);
+    expect(isInteractiveChatLifecycle(null), isFalse);
+  });
 
   const nativeChannel = MethodChannel(AppConstants.channelName);
   const secureStorageChannel =
@@ -570,6 +580,34 @@ void main() {
     expect(requests, 2);
     expect(find.text('draft survives'), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('foreground approval renders explicit allow and deny controls',
+      (tester) async {
+    final session = ChatSession(id: 'approval_ui', title: 'Approval UI');
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+    await _pumpChatScreen(tester, provider);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump();
+
+    provider.pendingApproval = const ToolApprovalRequest(
+      toolName: 'bash',
+      arguments: {'command': 'safe-placeholder'},
+      risk: ToolRisk.dangerous,
+      runAttemptId: 'run-ui',
+      operationId: 'operation-ui',
+    );
+    provider.notifyListeners();
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    expect(find.text(AppStrings.toolApprovalDeny), findsOneWidget);
+    expect(find.text(AppStrings.toolApprovalAllowOnce), findsOneWidget);
+    expect(find.text(AppStrings.toolApprovalAllowSession), findsOneWidget);
+    await tester.tap(find.text(AppStrings.toolApprovalAllowOnce));
+    await tester.pumpAndSettle();
+    expect(provider.pendingApproval, isNull);
   });
 }
 

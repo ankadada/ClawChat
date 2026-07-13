@@ -43,6 +43,10 @@ import 'chat_sessions_screen.dart';
 import 'terminal_screen.dart';
 import '../l10n/app_strings.dart';
 
+@visibleForTesting
+bool isInteractiveChatLifecycle(AppLifecycleState? state) =>
+    state == AppLifecycleState.resumed;
+
 enum _NativeSpeechOutcome {
   recognized,
   empty,
@@ -81,7 +85,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final UsageSummaryService _usageSummaryService = const UsageSummaryService();
   bool _showScrollToBottom = false;
   bool _approvalDialogOpen = false;
+  bool _approvalSurfaceEstablished = false;
   bool _appInBackground = false;
+  bool _lifecycleSynced = false;
   ToolApprovalRequest? _shownApprovalRequest;
   final List<MessageContent> _pendingAttachments = [];
   final List<_PendingAttachmentPreview> _pendingAttachmentPreviews = [];
@@ -203,6 +209,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _scheduleToolApprovalDialog(ToolApprovalRequest? request) {
     if (request == null) {
       _shownApprovalRequest = null;
+      _approvalSurfaceEstablished = false;
       return;
     }
     if (_appInBackground ||
@@ -211,21 +218,37 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
     _approvalDialogOpen = true;
+    _approvalSurfaceEstablished = false;
     _shownApprovalRequest = request;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
       if (!identical(context.read<ChatProvider>().pendingApproval, request)) {
         _approvalDialogOpen = false;
+        _approvalSurfaceEstablished = false;
         _shownApprovalRequest = null;
         return;
       }
-      await _showToolApprovalDialog(request);
+      final dialog = _showToolApprovalDialog(request);
+      _approvalSurfaceEstablished = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _appInBackground) return;
+        final provider = context.read<ChatProvider>();
+        if (identical(provider.pendingApproval, request) &&
+            _approvalDialogOpen &&
+            _approvalSurfaceEstablished) {
+          provider.confirmAppResumedApprovalSurface(
+            approvalId: request.operationId,
+          );
+        }
+      });
+      await dialog;
       if (!mounted) return;
       final provider = context.read<ChatProvider>();
       if (identical(provider.pendingApproval, request)) {
         provider.resolveToolApproval(false);
       }
       _approvalDialogOpen = false;
+      _approvalSurfaceEstablished = false;
       if (provider.pendingApproval == null) {
         _shownApprovalRequest = null;
       }
@@ -733,11 +756,26 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final inBackground = state == AppLifecycleState.paused ||
-        state == AppLifecycleState.hidden ||
-        state == AppLifecycleState.detached;
+    final inBackground = !isInteractiveChatLifecycle(state);
     _appInBackground = inBackground;
-    context.read<ChatProvider>().setAppInBackground(inBackground);
+    final provider = context.read<ChatProvider>();
+    if (inBackground) {
+      provider.setAppInBackground(true);
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _appInBackground) return;
+      final pending = provider.pendingApproval;
+      if (pending == null) {
+        provider.confirmAppResumedApprovalSurface();
+      } else if (_approvalDialogOpen && _approvalSurfaceEstablished) {
+        provider.confirmAppResumedApprovalSurface(
+          approvalId: pending.operationId,
+        );
+      } else {
+        setState(() {});
+      }
+    });
   }
 
   String? _lastSessionId;
@@ -745,6 +783,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    if (!_lifecycleSynced) {
+      _lifecycleSynced = true;
+      final state = WidgetsBinding.instance.lifecycleState;
+      final inBackground = !isInteractiveChatLifecycle(state);
+      _appInBackground = inBackground;
+      final provider = context.read<ChatProvider>();
+      if (inBackground) {
+        provider.setAppInBackground(true);
+      } else {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || _appInBackground) return;
+          if (provider.pendingApproval == null) {
+            provider.confirmAppResumedApprovalSurface();
+          }
+        });
+      }
+    }
     _syncDraftForSession();
   }
 

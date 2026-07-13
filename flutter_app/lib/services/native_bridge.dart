@@ -52,6 +52,11 @@ class NativeBridge {
   static const _shareCallbackChannel =
       MethodChannel('${AppConstants.channelName}/share_callbacks');
   static void Function({String? sessionId})? _agentStopRequestedHandler;
+  static Future<bool> Function({
+    required String sessionId,
+    required String approvalId,
+    required bool approved,
+  })? _toolApprovalDecisionHandler;
   static void Function(String sessionId)? _navigateToSessionHandler;
   static Future<void> Function(SharedContent content)? _shareIntentHandler;
   static bool _agentCallbackInitialized = false;
@@ -113,6 +118,17 @@ class NativeBridge {
     _ensureAgentCallbackHandler();
   }
 
+  static void setToolApprovalDecisionHandler(
+    Future<bool> Function({
+      required String sessionId,
+      required String approvalId,
+      required bool approved,
+    })? handler,
+  ) {
+    _toolApprovalDecisionHandler = handler;
+    _ensureAgentCallbackHandler();
+  }
+
   static void setNavigateToSessionHandler(
     void Function(String sessionId)? handler,
   ) {
@@ -135,6 +151,26 @@ class NativeBridge {
         final args = call.arguments;
         final sessionId = args is Map ? args['sessionId'] as String? : null;
         _agentStopRequestedHandler?.call(sessionId: sessionId);
+      } else if (call.method == 'onToolApprovalDecision') {
+        final args = call.arguments;
+        if (args is! Map) return false;
+        final sessionId = args['sessionId'] as String?;
+        final approvalId = args['approvalId'] as String?;
+        final approved = args['approved'] as bool?;
+        final handler = _toolApprovalDecisionHandler;
+        if (sessionId == null ||
+            sessionId.isEmpty ||
+            approvalId == null ||
+            approvalId.isEmpty ||
+            approved == null ||
+            handler == null) {
+          return false;
+        }
+        return handler(
+          sessionId: sessionId,
+          approvalId: approvalId,
+          approved: approved,
+        );
       } else if (call.method == 'navigateToSession') {
         final args = call.arguments;
         final sessionId = args is Map ? args['sessionId'] as String? : null;
@@ -332,6 +368,34 @@ class NativeBridge {
           'previewText': previewText,
           if (toolName != null) 'toolName': toolName,
           'overlayVisible': overlayVisible,
+        }) ??
+        false;
+  }
+
+  static Future<bool> showToolApprovalNotification({
+    required String sessionId,
+    required String sessionTitle,
+    required String approvalId,
+    required String toolName,
+    required String risk,
+  }) async {
+    return await _channel.invokeMethod<bool>('showToolApprovalNotification', {
+          'sessionId': sessionId,
+          'sessionTitle': sessionTitle,
+          'approvalId': approvalId,
+          'toolName': toolName,
+          'risk': risk,
+        }) ??
+        false;
+  }
+
+  static Future<bool> clearToolApprovalNotification({
+    required String sessionId,
+    required String approvalId,
+  }) async {
+    return await _channel.invokeMethod<bool>('clearToolApprovalNotification', {
+          'sessionId': sessionId,
+          'approvalId': approvalId,
         }) ??
         false;
   }

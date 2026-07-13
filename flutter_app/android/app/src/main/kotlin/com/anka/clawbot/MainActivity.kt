@@ -34,6 +34,7 @@ import java.security.Signature as CryptoSignature
 import java.security.cert.CertificateFactory
 import android.util.Base64
 import java.util.UUID
+import java.util.IdentityHashMap
 import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
@@ -53,6 +54,8 @@ class MainActivity : FlutterActivity() {
     private var pendingNavigateToSessionId: String? = null
     private var pendingShareIntent: Map<String, Any?>? = null
     private var shareCallbackChannel: MethodChannel? = null
+    private val agentCallbackOwners =
+        IdentityHashMap<FlutterEngine, Pair<MethodChannel, Long>>()
     private var mediaPlayer: MediaPlayer? = null
     private var mediaPlaybackPath: String? = null
     private var mediaPlaybackOperationId: String? = null
@@ -422,6 +425,40 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     } catch (e: Exception) {
                         result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "showToolApprovalNotification" -> {
+                    val sessionId = call.argument<String>("sessionId")
+                    val sessionTitle = call.argument<String>("sessionTitle")
+                    val approvalId = call.argument<String>("approvalId")
+                    val toolName = call.argument<String>("toolName")
+                    val risk = call.argument<String>("risk")
+                    if (sessionId.isNullOrBlank() || approvalId.isNullOrBlank() ||
+                        toolName.isNullOrBlank() || risk.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "approval metadata required", null)
+                    } else {
+                        val shown = AgentTaskService.showToolApproval(
+                            applicationContext,
+                            sessionId,
+                            sessionTitle ?: "ClawChat",
+                            approvalId,
+                            toolName,
+                            risk
+                        )
+                        result.success(shown)
+                    }
+                }
+                "clearToolApprovalNotification" -> {
+                    val sessionId = call.argument<String>("sessionId")
+                    val approvalId = call.argument<String>("approvalId")
+                    if (sessionId.isNullOrBlank() || approvalId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "approval identity required", null)
+                    } else {
+                        AgentTaskService.clearToolApproval(
+                            sessionId,
+                            approvalId
+                        )
+                        result.success(true)
                     }
                 }
                 "stopAgentService" -> {
@@ -1061,14 +1098,28 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        AgentTaskService.setCallbackChannel(
-            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AGENT_CALLBACK_CHANNEL)
+        val callbackChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            AGENT_CALLBACK_CHANNEL
         )
+        detachAgentCallbackChannel(flutterEngine)
+        val callbackGeneration = AgentTaskService.attachCallbackChannel(callbackChannel)
+        agentCallbackOwners[flutterEngine] = callbackChannel to callbackGeneration
         createNotificationChannel()
         createAgentCompleteNotificationChannel()
         requestNotificationPermission()
         handleNavigateToSession(intent)
         handleShareIntent(intent)
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        detachAgentCallbackChannel(flutterEngine)
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    private fun detachAgentCallbackChannel(flutterEngine: FlutterEngine) {
+        val owner = agentCallbackOwners.remove(flutterEngine) ?: return
+        AgentTaskService.detachCallbackChannel(owner.first, owner.second)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -1513,6 +1564,9 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        for (engine in agentCallbackOwners.keys.toList()) {
+            detachAgentCallbackChannel(engine)
+        }
         try { pendingSpeechResult?.success("") } catch (_: Exception) {}
         pendingSpeechResult = null
         val abandonedRecordingPath = recordingPath

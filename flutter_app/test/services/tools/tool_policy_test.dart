@@ -13,6 +13,7 @@ void main() {
         toolName: 'read_file',
         arguments: {'path': '/root/workspace/file.txt'},
         risk: ToolRisk.safe,
+        operationId: 'safe-operation',
       ));
 
       expect(approved, isTrue);
@@ -31,6 +32,7 @@ void main() {
         toolName: 'bash',
         arguments: {'command': 'ls'},
         risk: ToolRisk.dangerous,
+        operationId: 'dangerous-operation',
       ));
 
       expect(approved, isTrue);
@@ -45,6 +47,7 @@ void main() {
         toolName: 'write_file',
         arguments: {'path': '/root/workspace/file.txt'},
         risk: ToolRisk.moderate,
+        operationId: 'denied-operation',
       ));
 
       expect(approved, isFalse);
@@ -66,6 +69,7 @@ void main() {
         toolName: 'bash',
         arguments: {'command': 'pwd'},
         risk: ToolRisk.dangerous,
+        operationId: 'remember-operation',
       );
 
       expect(await policy.approve(request), isTrue);
@@ -87,6 +91,7 @@ void main() {
         toolName: 'bash',
         arguments: {'command': 'pwd'},
         risk: ToolRisk.dangerous,
+        operationId: 'blocked-operation',
       );
 
       final deny = policy.denyFor(request);
@@ -110,6 +115,7 @@ void main() {
         toolName: 'bash',
         arguments: {'command': 'rm -rf /tmp/example'},
         risk: ToolRisk.dangerous,
+        operationId: 'pattern-operation',
       );
 
       final deny = policy.denyFor(request);
@@ -133,6 +139,7 @@ void main() {
         toolName: 'mcp_12345678_shell_abcd1234',
         arguments: {'command': 'rm -rf /tmp/example'},
         risk: ToolRisk.moderate,
+        operationId: 'mcp-pattern-operation',
       );
 
       final deny = policy.denyFor(request);

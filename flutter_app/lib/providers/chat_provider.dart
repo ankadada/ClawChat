@@ -88,6 +88,8 @@ enum AssistantRetryStatus {
   missingApiKey,
 }
 
+enum _ToolApprovalDecisionSource { inApp, notification }
+
 typedef SkillCapabilityPolicyFactory = SkillCapabilityPolicy Function(
   Map<String, String> fixedToolDomains,
 );
@@ -477,6 +479,7 @@ class ChatProvider extends ChangeNotifier {
   ToolApprovalRequest? pendingApproval;
   AgentState? _pendingApprovalState;
   Completer<bool>? _approvalCompleter;
+  _ToolApprovalDecisionSource? _approvalDecisionSource;
   bool _appInBackground = false;
 
   static const _agentServiceThinkingText = 'AI 正在思考...';
@@ -493,6 +496,8 @@ class ChatProvider extends ChangeNotifier {
       '上次工具操作的完成结果未知。请把它视为一次新的恢复请求，不要重放或假定旧调用成功；如仍需执行任何操作，请先说明风险并重新请求授权。';
   static const _agentRunPersistedResultPrompt =
       '上次任务被中断，但已完成工具的结果已经保存在当前会话。请从已保存结果继续，不要再次执行已经完成的工具调用。';
+  static const _backgroundApprovalUnavailableMessage =
+      '后台工具审批不可用。请回到 ClawChat，启用系统通知后重试；本次工具不会执行。';
 
   AgentState _getOrCreateState(String sessionId) {
     return _agentStates.putIfAbsent(sessionId, () => AgentState(sessionId));
@@ -1222,6 +1227,18 @@ class ChatProvider extends ChangeNotifier {
     NativeBridge.setAgentStopRequestedHandler(
       ({String? sessionId}) => cancelAgent(sessionId: sessionId),
     );
+    NativeBridge.setToolApprovalDecisionHandler(
+      ({
+        required sessionId,
+        required approvalId,
+        required approved,
+      }) async =>
+          _resolveToolApprovalFromNotification(
+        sessionId: sessionId,
+        approvalId: approvalId,
+        approved: approved,
+      ),
+    );
     NativeBridge.setNavigateToSessionHandler((sessionId) {
       if (!_startupRestoreGuardReady) {
         _pendingStartupSessionId = sessionId;
@@ -1251,6 +1268,7 @@ class ChatProvider extends ChangeNotifier {
       _remoteAgentRuntimeBinding.dispose();
     }
     NativeBridge.setAgentStopRequestedHandler(null);
+    NativeBridge.setToolApprovalDecisionHandler(null);
     NativeBridge.setNavigateToSessionHandler(null);
     unawaited(_stopAgentService());
     unawaited(_tools.dispose());
@@ -1836,15 +1854,16 @@ class ChatProvider extends ChangeNotifier {
 
     final policy = _prefs.toolApprovalPolicy;
     final isCurrentSession = state.sessionId == currentSession?.id;
-    final userPresent = isCurrentSession && !_appInBackground;
-    if (!userPresent) return false;
+    if (!isCurrentSession) return false;
 
     final forceRenewedApproval = state.forceToolApprovalForRun;
-    if (!forceRenewedApproval &&
+    if (!_appInBackground &&
+        !forceRenewedApproval &&
         policy == PreferencesService.toolApprovalAuto) {
       return true;
     }
-    if (!forceRenewedApproval &&
+    if (!_appInBackground &&
+        !forceRenewedApproval &&
         policy == PreferencesService.toolApprovalSessionFirst &&
         state.sessionApprovedTools.contains(request.toolName)) {
       return true;
@@ -1865,14 +1884,20 @@ class ChatProvider extends ChangeNotifier {
     _completePendingApproval(false, notify: false);
     final completer = Completer<bool>();
     _approvalCompleter = completer;
+    _approvalDecisionSource = null;
     _pendingApprovalState = state;
     pendingApproval = approvalRequest;
     notifyListeners();
+    if (_appInBackground) {
+      await _publishPendingToolApprovalNotification();
+    }
     final approvedByUser = await completer.future;
+    final decisionSource = _approvalDecisionSource;
     final approvalStillCurrent = !_disposed &&
         _runMayContinue(runToken) &&
         state.sessionId == currentSession?.id &&
-        !_appInBackground;
+        (decisionSource == _ToolApprovalDecisionSource.notification ||
+            !_appInBackground);
     final approved = approvedByUser && approvalStillCurrent;
     return approved;
   }
@@ -1886,14 +1911,115 @@ class ChatProvider extends ChangeNotifier {
         explicitSessionApproval: rememberForSession,
       );
     }
+    _approvalDecisionSource = _ToolApprovalDecisionSource.inApp;
     _completePendingApproval(approved);
   }
+
+  String _toolApprovalId(ToolApprovalRequest request) => request.operationId;
+
+  Future<bool> _showPendingToolApprovalNotification() async {
+    final request = pendingApproval;
+    final state = _pendingApprovalState;
+    if (request == null || state == null || !_appInBackground) return false;
+    try {
+      return await NativeBridge.showToolApprovalNotification(
+        sessionId: state.sessionId,
+        sessionTitle: _sessionTitleForState(state),
+        approvalId: _toolApprovalId(request),
+        toolName: request.toolName,
+        risk: request.risk.name,
+      );
+    } catch (e) {
+      debugPrint('Failed to show tool approval notification: $e');
+      return false;
+    }
+  }
+
+  Future<void> _publishPendingToolApprovalNotification() async {
+    final request = pendingApproval;
+    final state = _pendingApprovalState;
+    if (request == null || state == null || !_appInBackground) return;
+    final shown = await _showPendingToolApprovalNotification();
+    if (shown ||
+        !_appInBackground ||
+        !identical(pendingApproval, request) ||
+        !identical(_pendingApprovalState, state)) {
+      return;
+    }
+    state.errorMessage = _backgroundApprovalUnavailableMessage;
+    final session = currentSession;
+    if (session?.id == state.sessionId) {
+      if (session!.messages.isEmpty ||
+          !session.messages.last.isSystemNotice ||
+          session.messages.last.textContent !=
+              _backgroundApprovalUnavailableMessage) {
+        session.messages.add(
+          ChatMessage.systemNotice(_backgroundApprovalUnavailableMessage),
+        );
+        try {
+          await _storage.saveSession(session);
+        } catch (_) {
+          // The in-memory notice remains visible; approval still fails closed.
+        }
+      }
+    }
+    _approvalDecisionSource = _ToolApprovalDecisionSource.notification;
+    _completePendingApproval(false);
+  }
+
+  Future<void> _hidePendingToolApprovalNotification() async {
+    final request = pendingApproval;
+    final state = _pendingApprovalState;
+    if (request == null || state == null) return;
+    try {
+      await NativeBridge.clearToolApprovalNotification(
+        sessionId: state.sessionId,
+        approvalId: _toolApprovalId(request),
+      );
+    } catch (_) {
+      // Foreground UI remains authoritative if notification cleanup fails.
+    }
+  }
+
+  Future<bool> _resolveToolApprovalFromNotification({
+    required String sessionId,
+    required String approvalId,
+    required bool approved,
+  }) async {
+    final request = pendingApproval;
+    final state = _pendingApprovalState;
+    final matches = !_disposed &&
+        _appInBackground &&
+        request != null &&
+        state != null &&
+        state.sessionId == sessionId &&
+        currentSession?.id == sessionId &&
+        _toolApprovalId(request) == approvalId &&
+        _approvalCompleter?.isCompleted == false;
+    if (!matches) return false;
+    _approvalDecisionSource = _ToolApprovalDecisionSource.notification;
+    _completePendingApproval(approved);
+    return true;
+  }
+
+  @visibleForTesting
+  Future<bool> resolveToolApprovalFromNotificationForTesting({
+    required String sessionId,
+    required String approvalId,
+    required bool approved,
+  }) =>
+      _resolveToolApprovalFromNotification(
+        sessionId: sessionId,
+        approvalId: approvalId,
+        approved: approved,
+      );
 
   void setAppInBackground(bool inBackground) {
     if (_appInBackground == inBackground) return;
     _appInBackground = inBackground;
     if (!_appInBackground) {
       unawaited(NativeBridge.setAgentOverlayVisible(false));
+      unawaited(_hidePendingToolApprovalNotification());
       _resumeActiveAgentStreamAfterForeground();
       if (pendingApproval != null && !_disposed) notifyListeners();
     } else if (_activeAgentStates.isNotEmpty) {
@@ -1904,7 +2030,19 @@ class ChatProvider extends ChangeNotifier {
           _statusForAgentServiceText(_agentServiceTextForState(state)),
         ));
       }
+      unawaited(_publishPendingToolApprovalNotification());
     }
+  }
+
+  bool confirmAppResumedApprovalSurface({String? approvalId}) {
+    final request = pendingApproval;
+    if (approvalId == null) {
+      if (request != null) return false;
+    } else if (request == null || request.operationId != approvalId) {
+      return false;
+    }
+    setAppInBackground(false);
+    return true;
   }
 
   void _resumeActiveAgentStreamAfterForeground() {
@@ -1944,12 +2082,22 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _completePendingApproval(bool approved, {bool notify = true}) {
+    final request = pendingApproval;
+    final state = _pendingApprovalState;
     pendingApproval = null;
     _pendingApprovalState = null;
     final completer = _approvalCompleter;
     _approvalCompleter = null;
     if (completer != null && !completer.isCompleted) {
       completer.complete(approved);
+    }
+    if (request != null && state != null) {
+      unawaited(
+        NativeBridge.clearToolApprovalNotification(
+          sessionId: state.sessionId,
+          approvalId: _toolApprovalId(request),
+        ).catchError((Object _) => false),
+      );
     }
     if (notify && !_disposed) notifyListeners();
   }

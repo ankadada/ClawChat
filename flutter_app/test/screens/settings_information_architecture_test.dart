@@ -355,8 +355,8 @@ void main() {
 AppUpdateStagingState _appUpdateState(AppUpdateStage stage) =>
     AppUpdateStagingState(
       targetId: AppConstants.packageName,
-      version: '2.5.1',
-      revision: 7,
+      version: '2.5.2',
+      revision: 8,
       sha256: 'a' * 64,
       size: 1024,
       path: '/tmp/staged-update.apk',

@@ -255,6 +255,7 @@ void main() {
           ),
         );
 
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await pumpWithFeatures(const []);
     await tester.pump();
     await tester.tap(

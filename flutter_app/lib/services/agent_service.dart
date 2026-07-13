@@ -398,6 +398,7 @@ class AgentService {
           : await _prepareSkillBatch(
               toolBlocks,
               toolInputs,
+              toolAttempts,
             );
       ToolDenyDecision? secretBatchDenialFor(ContentBlock block) =>
           hasSecretConfiguration && block.toolName != 'set_env_var'
@@ -913,6 +914,7 @@ class AgentService {
   Future<_SkillBatchPlan> _prepareSkillBatch(
     List<ContentBlock> toolBlocks,
     Map<ContentBlock, Map<String, dynamic>> toolInputs,
+    Map<ContentBlock, _ToolAttemptContext> toolAttempts,
   ) async {
     final policy = _skillCapabilityPolicy;
     if (policy == null) return const _SkillBatchPlan();
@@ -945,6 +947,17 @@ class AgentService {
       );
     }
     final activation = activations.single;
+    final activationAttempt = toolAttempts[activation];
+    if (activationAttempt == null) {
+      return _SkillBatchPlan.failed(
+        toolBlocks,
+        const ToolDenyDecision(
+          ruleType: 'approval',
+          ruleId: 'approval_identity_missing',
+          message: 'Tool approval identity is unavailable.',
+        ),
+      );
+    }
     final activationIndex = toolBlocks.indexOf(activation);
     final input = toolInputs[activation] ?? const <String, dynamic>{};
     final request = ToolApprovalRequest(
@@ -952,6 +965,7 @@ class AgentService {
       arguments: Map<String, dynamic>.from(input),
       risk: _tools.riskFor('load_skill'),
       runAttemptId: runAttemptId,
+      operationId: activationAttempt.operationId,
     );
     final globalDenial = _toolPolicy.denyFor(request);
     if (globalDenial != null) {
@@ -961,6 +975,13 @@ class AgentService {
       final verified = await policy.prepareSkillActivation(request);
       if (verified == null) {
         throw StateError('Skill activation was not prepared.');
+      }
+      if (_toolPolicy.requiresApproval(request.risk)) {
+        await _reportToolAttempt(
+          activationAttempt,
+          ToolAttemptLifecycle.approvalPending,
+          executionOutcomeKnown: false,
+        );
       }
       if (!await _toolPolicy.approve(request)) {
         return _SkillBatchPlan.failed(

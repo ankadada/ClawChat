@@ -14,9 +14,11 @@ sourceSets {
     main.kotlin {
         srcDir '../app/src/main/kotlin'
         include '**/VerifiedApkUpdate.kt'
+        include '**/ToolApprovalNotificationState.kt'
     }
     test.kotlin {
         srcDir '../app/src/test/kotlin'
         include '**/VerifiedApkUpdateTest.kt'
+        include '**/ToolApprovalNotificationStateTest.kt'
     }
 }
