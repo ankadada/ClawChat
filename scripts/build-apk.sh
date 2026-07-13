@@ -9,28 +9,43 @@ FLUTTER_DIR="$PROJECT_DIR/flutter_app"
 echo "=== ClawChat APK Build ==="
 echo ""
 
-# Step 1: Fetch proot binaries if not present
-if [ ! -f "$FLUTTER_DIR/android/app/src/main/jniLibs/arm64-v8a/libproot.so" ]; then
-    echo "[1/3] Fetching PRoot binaries..."
-    bash "$SCRIPT_DIR/fetch-proot-binaries.sh"
-else
-    echo "[1/3] PRoot binaries already present"
-fi
+# Step 1: Exercise the verifier before it guards a release build.
+echo "[1/6] Testing PRoot packaging verifier..."
+python3 "$SCRIPT_DIR/test_verify_proot_packaging.py"
 echo ""
 
-# Step 2: Get Flutter dependencies
-echo "[2/3] Getting Flutter dependencies..."
+# Step 2: Always restore the pinned payload. A structurally valid local matrix
+# may still contain stale bytes and is not a reproducible release input.
+echo "[2/6] Fetching pinned PRoot binaries..."
+bash "$SCRIPT_DIR/fetch-proot-binaries.sh"
+echo ""
+
+# Step 3: Verify the complete native payload before Gradle runs. This catches
+# clean/isolated checkouts where gitignored jniLibs were never fetched.
+echo "[3/6] Verifying PRoot binaries..."
+python3 "$SCRIPT_DIR/verify-proot-packaging.py" \
+    --jni-dir "$FLUTTER_DIR/android/app/src/main/jniLibs" \
+    --artifact-mode source
+echo ""
+
+# Step 4: Get Flutter dependencies
+echo "[4/6] Getting Flutter dependencies..."
 cd "$FLUTTER_DIR"
 flutter pub get
 echo ""
 
-# Step 3: Build APK
-echo "[3/3] Building release APK..."
+# Step 5: Build and verify the actual APK archive.
+echo "[5/6] Building release APK..."
 flutter build apk --release
 echo ""
 
 APK_PATH="$FLUTTER_DIR/build/app/outputs/flutter-apk/app-release.apk"
 if [ -f "$APK_PATH" ]; then
+    echo "[6/6] Verifying packaged PRoot payload..."
+    python3 "$SCRIPT_DIR/verify-proot-packaging.py" \
+        --apk "$APK_PATH" \
+        --artifact-mode universal
+    echo ""
     echo "=== Build Successful ==="
     echo "APK: $APK_PATH"
     echo "Size: $(du -h "$APK_PATH" | cut -f1)"

@@ -111,14 +111,15 @@ See the Releases page for the latest screenshots.
 git clone https://github.com/ankadada/ClawChat.git
 cd ClawChat
 
-# Fetch proot native binaries
-bash scripts/fetch-proot-binaries.sh
-
-# Build
-cd flutter_app
-flutter pub get
-flutter build apk --release
+# Canonical release build: fetches and verifies PRoot before the build,
+# then verifies the packaged APK before reporting success.
+bash scripts/build-apk.sh
 ```
+
+Releases are APK-only. Android App Bundle publication is intentionally disabled
+until the repository has a post-package base-module and delivery verifier with
+the same fail-closed PRoot guarantees. PRoot binary provenance and licenses are
+recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 

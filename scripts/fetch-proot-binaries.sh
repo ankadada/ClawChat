@@ -1,167 +1,130 @@
 #!/bin/bash
-# Fetch pre-compiled PRoot binaries from Termux packages for Android.
-# Extracts proot, libtalloc, and loader from Termux .deb packages.
-# Places them in jniLibs/<abi>/lib*.so so Android auto-extracts
-# them to nativeLibraryDir with execute permission (bypasses W^X).
-#
-# At runtime, BootstrapManager copies libtalloc.so → libtalloc.so.2
-# (matching the SONAME proot expects) in a writable directory.
+# Restore the known-good PRoot payload from the published v2.0.0 APKs.
+# Exact release asset names and SHA-256 digests pin the binary identity;
+# extracting their JNI entries avoids a moving Termux stable repository.
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-JNILIBS_DIR="$SCRIPT_DIR/../flutter_app/android/app/src/main/jniLibs"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+JNILIBS_DIR="$PROJECT_DIR/flutter_app/android/app/src/main/jniLibs"
 TMP_DIR=$(mktemp -d)
+STAGE_DIR="$TMP_DIR/jniLibs"
 
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-TERMUX_REPO="https://packages.termux.dev/apt/termux-main"
-
-# Fetch a Termux package and extract binaries
-fetch_termux_pkg() {
-    local pkg_name="$1"
-    local deb_arch="$2"
-    local extract_dir="$3"
-
-    echo "    Fetching $pkg_name for $deb_arch..."
-
-    # Get package filename from repo index
-    local pkg_url
-    pkg_url=$(curl -fsSL "${TERMUX_REPO}/dists/stable/main/binary-${deb_arch}/Packages" \
-        | grep -A 20 "^Package: ${pkg_name}$" \
-        | grep "^Filename:" \
-        | head -1 \
-        | awk '{print $2}')
-
-    if [ -z "$pkg_url" ]; then
-        echo "    WARN: $pkg_name not found in Termux repo for $deb_arch"
-        return 1
-    fi
-
-    local deb_file="$TMP_DIR/${pkg_name}-${deb_arch}.deb"
-    curl -fsSL "${TERMUX_REPO}/${pkg_url}" -o "$deb_file"
-
-    mkdir -p "$extract_dir"
-    (
-        cd "$extract_dir"
-        # Extract .deb archive — use dpkg-deb if available, else bsdtar/ar
-        if command -v dpkg-deb &>/dev/null; then
-            dpkg-deb -x "$deb_file" .
-        else
-            # macOS ar can't handle Debian .deb files; use bsdtar which can
-            if command -v bsdtar &>/dev/null; then
-                bsdtar xf "$deb_file"
-            else
-                ar x "$deb_file"
-            fi
-            # Handle different compression formats
-            if [ -f data.tar.xz ]; then
-                tar xf data.tar.xz
-            elif [ -f data.tar.gz ]; then
-                tar xf data.tar.gz
-            elif [ -f data.tar.zst ]; then
-                zstd -d data.tar.zst -o data.tar && tar xf data.tar
-            else
-                tar xf data.tar.* || { echo "ERROR: Failed to extract data archive"; return 1; }
-            fi
-        fi
-    )
-}
+PINNED_RELEASE_TAG="v2.0.0"
+PINNED_RELEASE_BASE="https://github.com/ankadada/ClawChat/releases/download/$PINNED_RELEASE_TAG"
 
 fetch_for_abi() {
-    local jni_abi="$1"
-    local deb_arch="$2"
-    local out_dir="$JNILIBS_DIR/$jni_abi"
-    local extract_base="$TMP_DIR/extract-$jni_abi"
+    local abi="$1"
+    local asset="$2"
+    local expected_sha256="$3"
+    shift 3
+    local libraries=("$@")
+    local apk="$TMP_DIR/$asset"
+    local out_dir="$STAGE_DIR/$abi"
 
-    mkdir -p "$out_dir"
-    echo "  [$jni_abi]"
+    echo "  [$abi] Fetching pinned $asset..."
+    curl -fsSL --retry 3 "$PINNED_RELEASE_BASE/$asset" -o "$apk"
 
-    # Fetch proot package (includes proot binary + loader)
-    local proot_dir="$extract_base/proot"
-    if ! fetch_termux_pkg "proot" "$deb_arch" "$proot_dir"; then
-        return 1
-    fi
+    python3 - "$apk" "$expected_sha256" "$abi" "$out_dir" "${libraries[@]}" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+import zipfile
 
-    # Fetch libtalloc package
-    local talloc_dir="$extract_base/talloc"
-    if ! fetch_termux_pkg "libtalloc" "$deb_arch" "$talloc_dir"; then
-        return 1
-    fi
+apk = Path(sys.argv[1])
+expected_sha256 = sys.argv[2]
+abi = sys.argv[3]
+out_dir = Path(sys.argv[4])
+libraries = sys.argv[5:]
 
-    # Copy proot binary
-    local proot_bin
-    proot_bin=$(find "$proot_dir" -name "proot" -path "*/bin/*" -type f | head -1)
-    if [ -z "$proot_bin" ]; then
-        echo "  [$jni_abi] ERROR: proot binary not found"
-        return 1
-    fi
-    cp "$proot_bin" "$out_dir/libproot.so"
-    chmod 755 "$out_dir/libproot.so"
+actual_sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
+if actual_sha256 != expected_sha256:
+    raise SystemExit(
+        f"ERROR: {apk.name} SHA-256 mismatch: "
+        f"expected {expected_sha256}, got {actual_sha256}"
+    )
 
-    # Copy loader (64-bit or matching arch)
-    local loader
-    loader=$(find "$proot_dir" -name "loader" -not -name "loader32" -path "*/proot/*" -type f | head -1)
-    if [ -n "$loader" ]; then
-        cp "$loader" "$out_dir/libprootloader.so"
-        chmod 755 "$out_dir/libprootloader.so"
-    fi
+out_dir.mkdir(parents=True, exist_ok=True)
+with zipfile.ZipFile(apk) as archive:
+    names = archive.namelist()
+    for library in libraries:
+        entry = f"lib/{abi}/{library}"
+        if names.count(entry) != 1:
+            raise SystemExit(
+                f"ERROR: {apk.name} expected exactly one {entry}, "
+                f"found {names.count(entry)}"
+            )
+        info = archive.getinfo(entry)
+        mode = (info.external_attr >> 16) & 0xFFFF
+        file_type = stat.S_IFMT(mode)
+        if info.is_dir() or file_type not in (0, stat.S_IFREG):
+            raise SystemExit(f"ERROR: {apk.name} {entry} is not a regular file")
+        target = out_dir / library
+        target.write_bytes(archive.read(info))
+        os.chmod(target, 0o755)
+PY
 
-    # Copy loader32 (for 32-bit compat)
-    local loader32
-    loader32=$(find "$proot_dir" -name "loader32" -path "*/proot/*" -type f | head -1)
-    if [ -n "$loader32" ]; then
-        cp "$loader32" "$out_dir/libprootloader32.so"
-        chmod 755 "$out_dir/libprootloader32.so"
-    fi
-
-    # Copy libtalloc (renamed to lib*.so for Android packaging)
-    local talloc_lib
-    talloc_lib=$(find "$talloc_dir" -name "libtalloc.so.*" -not -name "*.py" -type f | head -1)
-    if [ -z "$talloc_lib" ]; then
-        # Try the symlink target
-        talloc_lib=$(find "$talloc_dir" -name "libtalloc.so" -type f -o -name "libtalloc.so" -type l | head -1)
-    fi
-    if [ -n "$talloc_lib" ]; then
-        # Resolve symlink and copy actual file
-        cp -L "$talloc_lib" "$out_dir/libtalloc.so"
-        chmod 755 "$out_dir/libtalloc.so"
-    else
-        echo "  [$jni_abi] WARN: libtalloc not found"
-    fi
-
-    echo "  [$jni_abi] OK — $(ls "$out_dir"/ | tr '\n' ' ')"
+    echo "  [$abi] OK — ${libraries[*]}"
 }
 
-echo "=== Fetching PRoot + libtalloc from Termux packages ==="
+echo "=== Restoring pinned PRoot payload from ClawChat $PINNED_RELEASE_TAG ==="
 echo ""
 
-SUCCESS=0
-FAILED=0
-
-for entry in "arm64-v8a:aarch64" "armeabi-v7a:arm" "x86_64:x86_64"; do
-    IFS=':' read -r abi deb_arch <<< "$entry"
-
-    if fetch_for_abi "$abi" "$deb_arch"; then
-        SUCCESS=$((SUCCESS + 1))
-    else
-        echo "  [$abi] FAILED"
-        FAILED=$((FAILED + 1))
-    fi
-    echo ""
-done
-
-echo "=== Summary ==="
-echo "Success: $SUCCESS / 3"
-if [ "$FAILED" -gt 0 ]; then
-    echo "Failed: $FAILED"
-fi
-
-echo ""
-echo "Files:"
-ls -la "$JNILIBS_DIR"/*/lib*.so 2>/dev/null || echo "  (none)"
-
-if [ "$FAILED" -gt 0 ]; then
-    echo "ERROR: $FAILED ABI(s) failed to fetch"
+# jniLibs is gitignored and owned by this fetch step. Download into a staging
+# tree and run the shared structural verifier before replacing the current
+# payload, so a network or upstream failure cannot leave a partial matrix.
+if [[ "$JNILIBS_DIR" != "$PROJECT_DIR/flutter_app/android/app/src/main/jniLibs" ]]; then
+    echo "ERROR: refusing to clear unexpected jniLibs path: $JNILIBS_DIR" >&2
     exit 1
 fi
+mkdir -p "$STAGE_DIR"
+
+fetch_for_abi \
+    "arm64-v8a" \
+    "OpenClaw-v2.0.0-arm64-v8a.apk" \
+    "2e176888652afd51ffa02b3a63e667be188e5b0191ffccab1a935d72eb14a5f1" \
+    libproot.so libprootloader.so libprootloader32.so libtalloc.so
+
+fetch_for_abi \
+    "armeabi-v7a" \
+    "OpenClaw-v2.0.0-armeabi-v7a.apk" \
+    "159ba0486a4863f2d41228477e616261fc2a91e6449e7be62ca9900f80757de1" \
+    libproot.so libprootloader.so libtalloc.so
+
+fetch_for_abi \
+    "x86_64" \
+    "OpenClaw-v2.0.0-x86_64.apk" \
+    "f52b64191e250b4d3a9d3285f47df4e163aa349e9f31384c9ce2a1b6621c33e1" \
+    libproot.so libprootloader.so libprootloader32.so libtalloc.so
+
+python3 "$SCRIPT_DIR/verify-proot-packaging.py" \
+    --jni-dir "$STAGE_DIR" \
+    --artifact-mode source
+
+# The target is hard-coded above. Refuse symlinks and re-check the cleanup
+# boundary immediately before installing the fully verified staged matrix.
+if [[ -L "$JNILIBS_DIR" ]]; then
+    echo "ERROR: refusing to replace symlinked jniLibs: $JNILIBS_DIR" >&2
+    exit 1
+fi
+if [[ "$JNILIBS_DIR" != "$PROJECT_DIR/flutter_app/android/app/src/main/jniLibs" ]]; then
+    echo "ERROR: cleanup guard changed unexpectedly: $JNILIBS_DIR" >&2
+    exit 1
+fi
+JNILIBS_PARENT="$(cd "$(dirname "$JNILIBS_DIR")" && pwd -P)"
+if [[ "$JNILIBS_PARENT" != "$PROJECT_DIR/flutter_app/android/app/src/main" ]]; then
+    echo "ERROR: refusing cleanup through unexpected parent: $JNILIBS_PARENT" >&2
+    exit 1
+fi
+rm -rf "$JNILIBS_DIR"
+mkdir -p "$(dirname "$JNILIBS_DIR")"
+mv "$STAGE_DIR" "$JNILIBS_DIR"
+
+echo ""
+echo "=== Restored 11/11 pinned PRoot files ==="
+find "$JNILIBS_DIR" -type f -name 'lib*.so' -print | LC_ALL=C sort

@@ -92,8 +92,28 @@ android {
 
 dependencies {
     implementation 'org.apache.commons:commons-compress:1.26.0'
+    testImplementation 'junit:junit:4.13.2'
 }
 
 flutter {
     source = "../.."
+}
+
+def prootVerifier = rootProject.file("../../scripts/verify-proot-packaging.py")
+def prootJniDir = file("src/main/jniLibs")
+def verifyProotNativePayloads = tasks.register("verifyProotNativePayloads", Exec) {
+    group = "verification"
+    description = "Fails before Android builds if the fetched PRoot JNI payload is incomplete."
+    commandLine(
+        "python3",
+        prootVerifier,
+        "--jni-dir",
+        prootJniDir,
+        "--artifact-mode",
+        "source",
+    )
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(verifyProotNativePayloads)
 }

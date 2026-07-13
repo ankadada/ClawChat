@@ -19,13 +19,23 @@ flutter pub get
 flutter run
 ```
 
-For release builds, fetch native PRoot binaries first:
+For release builds, use the canonical repository-root command. It fetches and
+verifies every PRoot ABI payload before building, then verifies the APK archive:
 
 ```bash
-bash scripts/fetch-proot-binaries.sh
-cd flutter_app
-flutter build apk --release
+bash scripts/build-apk.sh
 ```
+
+The PRoot payload is a reviewed release dependency, pinned by release tag and
+SHA-256 in `scripts/fetch-proot-binaries.sh`. Updating it requires one
+coordinated review of the fetch pins, the verifier's ELF/dependency contract,
+and the Android runtime loader paths. Gradle intentionally never fetches
+binaries: a raw build from a clean checkout fails closed until the canonical
+lane has populated the complete ABI matrix.
+
+Do not add App Bundle build, artifact upload, or release attachment steps without
+a verifier that proves the packaged base-module contents and bundletool delivery.
+The supported release lane is APK-only.
 
 ## 代码风格
 

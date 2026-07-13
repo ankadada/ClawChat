@@ -6,8 +6,8 @@
 
 Any command that deploys to a real device (`flutter install`, `adb install`, `adb push`, etc.) is a **destructive operation** — it may uninstall the previous version and wipe all user data (API keys, provider profiles, environment variables stored in FlutterSecureStorage are irrecoverable after uninstall).
 
-- "Verify the build works" = run `flutter build apk --release` and confirm the artifact is produced. Do NOT install.
-- "Check it compiles" = run `flutter analyze` + `flutter build`. Do NOT install.
+- "Verify the build works" = run `bash scripts/build-apk.sh` from the repository root and confirm its PRoot/APK gates pass. Do NOT install.
+- "Check it compiles" = run `flutter analyze` + the canonical `bash scripts/build-apk.sh` release lane. Do NOT install.
 - Even if the user says "install it", warn them that `flutter install` uninstalls the old version first, causing data loss. Suggest `adb install -r` instead.
 - This rule exists because a previous incident wiped all configured API keys and environment variables by running `flutter install` without authorization.
 
@@ -32,7 +32,7 @@ cd flutter_app && flutter analyze
 cd flutter_app && flutter test test/services/llm_service_test.dart
 
 # Build release APK (verify only — do NOT install)
-cd flutter_app && flutter build apk --release
+bash scripts/build-apk.sh
 ```
 
 ## Architecture Notes

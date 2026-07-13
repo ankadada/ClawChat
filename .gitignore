@@ -2,6 +2,10 @@
 .env
 .env.local
 
+# Python verifier test caches
+__pycache__/
+*.py[cod]
+
 # Android signing
 flutter_app/android/key.properties
 *.jks

@@ -8,6 +8,8 @@ on:
       - 'flutter_app/**'
       - 'scripts/fetch-proot-binaries.sh'
       - 'scripts/build-apk.sh'
+      - 'scripts/test_verify_proot_packaging.py'
+      - 'scripts/verify-proot-packaging.py'
       - '.github/workflows/flutter-build.yml'
   pull_request:
     branches: [main]
@@ -15,12 +17,14 @@ on:
       - 'flutter_app/**'
       - 'scripts/fetch-proot-binaries.sh'
       - 'scripts/build-apk.sh'
+      - 'scripts/test_verify_proot_packaging.py'
+      - 'scripts/verify-proot-packaging.py'
       - '.github/workflows/flutter-build.yml'
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build APK & AAB
+    name: Build verified APKs
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write  # needed for PR comments
@@ -78,33 +82,17 @@ jobs:
           EOF
           sed -i 's/^[[:space:]]*//' flutter_app/android/key.properties
 
+      - name: Test PRoot packaging verifier
+        run: python3 scripts/test_verify_proot_packaging.py
+
       - name: Fetch PRoot binaries
         run: bash scripts/fetch-proot-binaries.sh
 
       - name: Verify PRoot binaries
-        run: |
-          echo "Checking jniLibs contents..."
-          MIN_SIZE=102400
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            for lib in libproot.so libprootloader.so; do
-              FILE="flutter_app/android/app/src/main/jniLibs/${abi}/${lib}"
-              if [ ! -f "$FILE" ]; then
-                echo "ERROR: Missing $FILE"
-                exit 1
-              fi
-              SIZE=$(stat -c%s "$FILE")
-              if [ "$SIZE" -lt "$MIN_SIZE" ]; then
-                echo "ERROR: $FILE looks like a placeholder (${SIZE} bytes; minimum ${MIN_SIZE})"
-                exit 1
-              fi
-              MAGIC=$(xxd -p -l 4 "$FILE")
-              if [ "$MAGIC" != "7f454c46" ]; then
-                echo "ERROR: $FILE is not an ELF binary"
-                exit 1
-              fi
-              echo "OK: $FILE (${SIZE} bytes)"
-            done
-          done
+        run: >-
+          python3 scripts/verify-proot-packaging.py
+          --jni-dir flutter_app/android/app/src/main/jniLibs
+          --artifact-mode source
 
       - name: Get Flutter dependencies
         working-directory: flutter_app
@@ -126,9 +114,23 @@ jobs:
         working-directory: flutter_app
         run: flutter build apk --release --split-per-abi
 
-      - name: Build AAB (App Bundle)
-        working-directory: flutter_app
-        run: flutter build appbundle --release
+      - name: Verify packaged PRoot payloads
+        run: |
+          python3 scripts/verify-proot-packaging.py \
+            --apk flutter_app/build/app/outputs/flutter-apk/app-release.apk \
+            --artifact-mode universal
+          python3 scripts/verify-proot-packaging.py \
+            --apk flutter_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+            --artifact-mode split \
+            --expected-abi arm64-v8a
+          python3 scripts/verify-proot-packaging.py \
+            --apk flutter_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk \
+            --artifact-mode split \
+            --expected-abi armeabi-v7a
+          python3 scripts/verify-proot-packaging.py \
+            --apk flutter_app/build/app/outputs/flutter-apk/app-x86_64-release.apk \
+            --artifact-mode split \
+            --expected-abi x86_64
 
       - name: Rename and collect artifacts
         id: apks
@@ -145,16 +147,8 @@ jobs:
           # Per-ABI APKs
           for abi in arm64-v8a armeabi-v7a x86_64; do
             SRC="flutter_app/build/app/outputs/flutter-apk/app-${abi}-release.apk"
-            if [ -f "$SRC" ]; then
-              cp "$SRC" "artifacts/ClawChat-v${VERSION}-${abi}.apk"
-            fi
+            cp "$SRC" "artifacts/ClawChat-v${VERSION}-${abi}.apk"
           done
-
-          # AAB
-          AAB="flutter_app/build/app/outputs/bundle/release/app-release.aab"
-          if [ -f "$AAB" ]; then
-            cp "$AAB" "artifacts/ClawChat-v${VERSION}.aab"
-          fi
 
           # Summary
           echo "### Build Artifacts" >> "$GITHUB_STEP_SUMMARY"
@@ -174,13 +168,6 @@ jobs:
         with:
           name: clawchat-apks
           path: artifacts/*.apk
-          retention-days: 30
-
-      - name: Upload AAB artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
-        with:
-          name: clawchat-aab
-          path: artifacts/*.aab
           retention-days: 30
 
       - name: Comment on PR
@@ -204,7 +191,6 @@ jobs:
               `| armeabi-v7a (32-bit) | [ClawChat-v${version}-armeabi-v7a.apk](${runUrl}#artifacts) |`,
               `| x86_64 (emulator) | [ClawChat-v${version}-x86_64.apk](${runUrl}#artifacts) |`,
               `| Universal (all ABIs) | [ClawChat-v${version}-universal.apk](${runUrl}#artifacts) |`,
-              `| App Bundle (Play Store) | [ClawChat-v${version}.aab](${runUrl}#artifacts) |`,
               ``,
               `> Download from [**Actions Artifacts**](${runUrl}#artifacts)`,
               ``,
@@ -277,12 +263,6 @@ jobs:
           name: clawchat-apks
           path: artifacts
 
-      - name: Download AAB artifact
-        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.0
-        with:
-          name: clawchat-aab
-          path: artifacts
-
       - name: Get version
         id: version
         run: |
@@ -314,7 +294,6 @@ jobs:
             | `ClawChat-v${{ steps.version.outputs.version }}-armeabi-v7a.apk` | Older 32-bit ARM devices |
             | `ClawChat-v${{ steps.version.outputs.version }}-x86_64.apk` | Emulators / x86 devices |
             | `ClawChat-v${{ steps.version.outputs.version }}-universal.apk` | All architectures (larger) |
-            | `ClawChat-v${{ steps.version.outputs.version }}.aab` | Android App Bundle (Play Store) |
 
             ### First Run
             1. Install the APK
@@ -326,7 +305,7 @@ jobs:
             - Android 10+ (API 29)
             - ~300-500MB free storage after package installation
             - Internet connection for first-time setup
-          files: artifacts/*
+          files: artifacts/*.apk
           draft: false
           prerelease: false
 
