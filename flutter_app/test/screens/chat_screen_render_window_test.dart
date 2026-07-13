@@ -13,6 +13,7 @@ import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/session_storage.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
+import 'package:clawchat/services/tools/tool_registry.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -582,31 +583,227 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('foreground approval renders explicit allow and deny controls',
+  testWidgets(
+      'public foreground agent flow shows approval before one execution',
       (tester) async {
-    final session = ChatSession(id: 'approval_ui', title: 'Approval UI');
-    await storage.saveSession(session);
-    await provider.selectSession(session.id);
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(800, 900);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    provider.dispose();
+    final profile = ProviderProfile.defaults().copyWith(
+      id: 'approval-profile',
+      apiKey: 'test-key',
+      model: 'approval-model',
+    );
+    secureStorage['provider_profiles'] = jsonEncode([profile.toJson()]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'approval-profile',
+      'tool_approval_policy': PreferencesService.toolApprovalAlways,
+    });
+    PreferencesService.resetForTesting();
+    final tool = _ApprovalCommandTool();
+    var requestCount = 0;
+    provider = ChatProvider(
+      storage: storage,
+      toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+      llmServiceFactory: (config, {isInBackground}) =>
+          _ApprovalLlmService(config, onRequest: () => ++requestCount),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    await provider.createSession();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await _pumpChatScreen(tester, provider);
+
+    late Future<void> send;
+    await tester.runAsync(() async {
+      send = provider.sendMessage('run harmless approval check');
+      for (var attempt = 0;
+          attempt < 200 && provider.pendingApproval == null;
+          attempt++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(provider.pendingApproval, isNotNull);
+    });
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      find.text(AppStrings.toolApprovalAllowOnce),
+      findsOneWidget,
+      reason:
+          'provider=${provider.pendingApproval?.toolName} requests=$requestCount '
+          'executions=${tool.executionCount}',
+    );
+    expect(provider.pendingApproval, isNotNull);
+    expect(find.text(AppStrings.toolApprovalTitle), findsOneWidget);
+    expect(find.text(AppStrings.toolApprovalDeny), findsOneWidget);
+    expect(find.text(AppStrings.toolApprovalAllowSession), findsOneWidget);
+    expect(find.text(AppStrings.toolApprovalAllowOnce), findsOneWidget);
+    expect(tool.executionCount, 0);
+
+    await tester.tap(find.text(AppStrings.toolApprovalAllowOnce));
+    await tester.pump();
+    await tester.runAsync(() => send.timeout(const Duration(seconds: 5)));
+    await tester.pump();
+
+    expect(requestCount, 2);
+    expect(tool.executionCount, 1);
+    expect(
+      provider.currentSession!.messages
+          .expand((m) => m.toolResults)
+          .single
+          .output,
+      'approved harmless command',
+    );
+  });
+
+  testWidgets('stale approval dialog cannot decide a replacement operation',
+      (tester) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(800, 900);
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final nativeCalls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(nativeChannel, (call) async {
+      nativeCalls.add(call);
+      if (call.method == 'consumePendingNavigateToSession') return null;
+      return true;
+    });
+    provider.dispose();
+    final profile = ProviderProfile.defaults().copyWith(
+      id: 'approval-identity-profile',
+      apiKey: 'test-key',
+      model: 'approval-identity-model',
+    );
+    secureStorage['provider_profiles'] = jsonEncode([profile.toJson()]);
+    SharedPreferences.setMockInitialValues({
+      'active_provider_profile_id': 'approval-identity-profile',
+      'tool_approval_policy': PreferencesService.toolApprovalAlways,
+    });
+    PreferencesService.resetForTesting();
+    final tool = _ApprovalCommandTool();
+    var requestCount = 0;
+    provider = ChatProvider(
+      storage: storage,
+      toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+      llmServiceFactory: (config, {isInBackground}) =>
+          _SequentialApprovalLlmService(
+        config,
+        onRequest: () => ++requestCount,
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    await provider.createSession();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await _pumpChatScreen(tester, provider);
+
+    late Future<void> send;
+    await tester.runAsync(() async {
+      send = provider.sendMessage('run two approval checks');
+      for (var attempt = 0;
+          attempt < 200 && provider.pendingApproval == null;
+          attempt++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(provider.pendingApproval, isNotNull);
+    });
+    await tester.pump();
+    await tester.pump();
+    final firstId = provider.pendingApproval!.operationId;
+    final firstAllow = find.byKey(
+      ValueKey('tool-approval-allow-once:$firstId'),
+    );
+    expect(firstAllow, findsOneWidget);
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump();
+    await tester.runAsync(() async {
+      expect(
+        await provider.resolveToolApprovalFromNotificationForTesting(
+          sessionId: provider.currentSession!.id,
+          approvalId: firstId,
+          approved: true,
+        ),
+        isTrue,
+      );
+      for (var attempt = 0;
+          attempt < 200 &&
+              (provider.pendingApproval == null ||
+                  provider.pendingApproval!.operationId == firstId);
+          attempt++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(provider.pendingApproval, isNotNull);
+    });
+    final secondId = provider.pendingApproval!.operationId;
+    expect(secondId, isNot(firstId));
+    expect(tool.executionCount, 1);
+    expect(firstAllow, findsOneWidget);
+    expect(
+      nativeCalls.where(
+        (call) =>
+            call.method == 'showToolApprovalNotification' &&
+            (call.arguments as Map)['approvalId'] == secondId,
+      ),
+      hasLength(1),
+    );
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.tap(firstAllow);
+    await tester.pump();
+    await tester.pump();
+    await tester.pump();
+
+    expect(tool.executionCount, 1);
+    expect(provider.pendingApproval!.operationId, secondId);
+    expect(firstAllow, findsNothing);
+    final secondAllow = find.byKey(
+      ValueKey('tool-approval-allow-once:$secondId'),
+    );
+    expect(secondAllow, findsOneWidget);
+    expect(
+      nativeCalls.where(
+        (call) =>
+            call.method == 'clearToolApprovalNotification' &&
+            (call.arguments as Map)['approvalId'] == secondId,
+      ),
+      hasLength(1),
+    );
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await tester.pump();
+    await tester.runAsync(() async {
+      expect(
+        await provider.resolveToolApprovalFromNotificationForTesting(
+          sessionId: provider.currentSession!.id,
+          approvalId: secondId,
+          approved: true,
+        ),
+        isTrue,
+      );
+      await send.timeout(const Duration(seconds: 5));
+    });
+    expect(secondAllow, findsOneWidget);
+    expect(provider.pendingApproval, isNull);
+
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pump();
-
-    provider.pendingApproval = const ToolApprovalRequest(
-      toolName: 'bash',
-      arguments: {'command': 'safe-placeholder'},
-      risk: ToolRisk.dangerous,
-      runAttemptId: 'run-ui',
-      operationId: 'operation-ui',
-    );
-    provider.notifyListeners();
     await tester.pump();
-    await tester.pumpAndSettle();
+    await tester.pump();
 
-    expect(find.text(AppStrings.toolApprovalDeny), findsOneWidget);
-    expect(find.text(AppStrings.toolApprovalAllowOnce), findsOneWidget);
-    expect(find.text(AppStrings.toolApprovalAllowSession), findsOneWidget);
-    await tester.tap(find.text(AppStrings.toolApprovalAllowOnce));
-    await tester.pumpAndSettle();
+    expect(requestCount, 2);
+    expect(tool.executionCount, 2);
+    expect(
+      tool.executedCommands,
+      ['printf approval-a', 'printf approval-b'],
+    );
+    expect(secondAllow, findsNothing);
     expect(provider.pendingApproval, isNull);
   });
 }
@@ -645,6 +842,105 @@ ChatSession _syntheticSession(int totalMessages) {
 }
 
 String _messageText(int index) => 'synthetic render window message $index';
+
+class _ApprovalLlmService extends LlmService {
+  _ApprovalLlmService(super.config, {required this.onRequest});
+
+  final int Function() onRequest;
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    final request = onRequest();
+    if (request == 1) {
+      yield StreamDone(const LlmResponse(
+        stopReason: 'tool_use',
+        content: [
+          ContentBlock(
+            type: 'tool_use',
+            toolUseId: 'approval-call',
+            toolName: 'bash',
+            toolInput: {'command': 'printf harmless-approval'},
+          ),
+        ],
+      ));
+      return;
+    }
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'approval complete')],
+    ));
+  }
+}
+
+class _SequentialApprovalLlmService extends LlmService {
+  _SequentialApprovalLlmService(super.config, {required this.onRequest});
+
+  final int Function() onRequest;
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    final request = onRequest();
+    if (request == 1) {
+      yield StreamDone(const LlmResponse(
+        stopReason: 'tool_use',
+        content: [
+          ContentBlock(
+            type: 'tool_use',
+            toolUseId: 'approval-a',
+            toolName: 'bash',
+            toolInput: {'command': 'printf approval-a'},
+          ),
+          ContentBlock(
+            type: 'tool_use',
+            toolUseId: 'approval-b',
+            toolName: 'bash',
+            toolInput: {'command': 'printf approval-b'},
+          ),
+        ],
+      ));
+      return;
+    }
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'approvals complete')],
+    ));
+  }
+}
+
+class _ApprovalCommandTool extends Tool {
+  int executionCount = 0;
+  final List<String> executedCommands = [];
+
+  @override
+  String get name => 'bash';
+
+  @override
+  String get description => 'Execute a harmless command';
+
+  @override
+  Map<String, dynamic> get inputSchema => const {
+        'type': 'object',
+        'properties': {
+          'command': {'type': 'string'},
+        },
+        'required': ['command'],
+      };
+
+  @override
+  Future<String> execute(Map<String, dynamic> input) async {
+    executionCount++;
+    executedCommands.add(input['command']?.toString() ?? '');
+    return 'approved harmless command';
+  }
+}
 
 class _CompareCompositionLlmService extends LlmService {
   _CompareCompositionLlmService(super.config, {required this.onRequest});

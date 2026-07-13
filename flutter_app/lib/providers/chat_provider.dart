@@ -1853,21 +1853,23 @@ class ChatProvider extends ChangeNotifier {
     if (_disposed || !_runMayContinue(runToken)) return false;
 
     final policy = _prefs.toolApprovalPolicy;
-    final isCurrentSession = state.sessionId == currentSession?.id;
-    if (!isCurrentSession) return false;
-
     final forceRenewedApproval = state.forceToolApprovalForRun;
-    if (!_appInBackground &&
-        !forceRenewedApproval &&
+    // Auto Allow is an authorization decision, not an approval-surface
+    // preference. Run validity, hard-deny, and interrupted-run reauthorization
+    // checks happen before it; lifecycle, session visibility, and notification
+    // capability must not downgrade an otherwise valid operation to Ask or Deny.
+    if (!forceRenewedApproval &&
         policy == PreferencesService.toolApprovalAuto) {
       return true;
     }
-    if (!_appInBackground &&
-        !forceRenewedApproval &&
+    if (!forceRenewedApproval &&
         policy == PreferencesService.toolApprovalSessionFirst &&
         state.sessionApprovedTools.contains(request.toolName)) {
       return true;
     }
+
+    final isCurrentSession = state.sessionId == currentSession?.id;
+    if (!isCurrentSession) return false;
 
     final approvalRequest = request.toolName == 'set_env_var'
         ? ToolApprovalRequest(
@@ -1902,9 +1904,19 @@ class ChatProvider extends ChangeNotifier {
     return approved;
   }
 
-  void resolveToolApproval(bool approved, {bool rememberForSession = false}) {
+  bool resolveToolApproval({
+    required String operationId,
+    required bool approved,
+    bool rememberForSession = false,
+  }) {
     final request = pendingApproval;
-    if (approved && request != null) {
+    if (_disposed ||
+        request == null ||
+        request.operationId != operationId ||
+        _approvalCompleter?.isCompleted != false) {
+      return false;
+    }
+    if (approved) {
       _rememberToolApproval(
         _pendingApprovalState,
         request.toolName,
@@ -1913,6 +1925,7 @@ class ChatProvider extends ChangeNotifier {
     }
     _approvalDecisionSource = _ToolApprovalDecisionSource.inApp;
     _completePendingApproval(approved);
+    return true;
   }
 
   String _toolApprovalId(ToolApprovalRequest request) => request.operationId;

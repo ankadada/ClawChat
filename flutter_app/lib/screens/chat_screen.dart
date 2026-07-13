@@ -84,11 +84,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       const SharedContentPreparer();
   final UsageSummaryService _usageSummaryService = const UsageSummaryService();
   bool _showScrollToBottom = false;
-  bool _approvalDialogOpen = false;
   bool _approvalSurfaceEstablished = false;
+  bool _approvalDialogRetirementScheduled = false;
   bool _appInBackground = false;
   bool _lifecycleSynced = false;
   ToolApprovalRequest? _shownApprovalRequest;
+  DialogRoute<void>? _approvalDialogRoute;
   final List<MessageContent> _pendingAttachments = [];
   final List<_PendingAttachmentPreview> _pendingAttachmentPreviews = [];
   final Set<String> _workspaceImportsBeingCommitted = {};
@@ -208,33 +209,43 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _scheduleToolApprovalDialog(ToolApprovalRequest? request) {
     if (request == null) {
-      _shownApprovalRequest = null;
-      _approvalSurfaceEstablished = false;
+      _retireToolApprovalDialog();
       return;
     }
-    if (_appInBackground ||
-        _approvalDialogOpen ||
-        identical(request, _shownApprovalRequest)) {
+    if (_shownApprovalRequest != null) {
+      if (_shownApprovalRequest?.operationId != request.operationId) {
+        _retireToolApprovalDialog();
+      }
       return;
     }
-    _approvalDialogOpen = true;
+    if (_appInBackground) {
+      return;
+    }
     _approvalSurfaceEstablished = false;
     _shownApprovalRequest = request;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
-      if (!identical(context.read<ChatProvider>().pendingApproval, request)) {
-        _approvalDialogOpen = false;
+      final provider = context.read<ChatProvider>();
+      if (_shownApprovalRequest?.operationId != request.operationId ||
+          provider.pendingApproval?.operationId != request.operationId) {
         _approvalSurfaceEstablished = false;
         _shownApprovalRequest = null;
         return;
       }
-      final dialog = _showToolApprovalDialog(request);
+      final navigator = Navigator.of(context, rootNavigator: true);
+      final route = DialogRoute<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => _buildToolApprovalDialog(ctx, request),
+      );
+      _approvalDialogRoute = route;
+      final dialog = navigator.push(route);
       _approvalSurfaceEstablished = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || _appInBackground) return;
         final provider = context.read<ChatProvider>();
-        if (identical(provider.pendingApproval, request) &&
-            _approvalDialogOpen &&
+        if (provider.pendingApproval?.operationId == request.operationId &&
+            identical(_approvalDialogRoute, route) &&
             _approvalSurfaceEstablished) {
           provider.confirmAppResumedApprovalSurface(
             approvalId: request.operationId,
@@ -243,132 +254,165 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       });
       await dialog;
       if (!mounted) return;
-      final provider = context.read<ChatProvider>();
-      if (identical(provider.pendingApproval, request)) {
-        provider.resolveToolApproval(false);
+      final currentProvider = context.read<ChatProvider>();
+      if (currentProvider.pendingApproval?.operationId == request.operationId) {
+        currentProvider.resolveToolApproval(
+          operationId: request.operationId,
+          approved: false,
+        );
       }
-      _approvalDialogOpen = false;
+      if (!identical(_approvalDialogRoute, route)) return;
+      _approvalDialogRoute = null;
+      _approvalDialogRetirementScheduled = false;
       _approvalSurfaceEstablished = false;
-      if (provider.pendingApproval == null) {
-        _shownApprovalRequest = null;
-      }
+      _shownApprovalRequest = null;
+      setState(() {});
     });
   }
 
-  Future<void> _showToolApprovalDialog(ToolApprovalRequest request) {
+  void _retireToolApprovalDialog() {
+    _approvalSurfaceEstablished = false;
+    final route = _approvalDialogRoute;
+    if (route == null) {
+      _shownApprovalRequest = null;
+      return;
+    }
+    if (_approvalDialogRetirementScheduled) return;
+    _approvalDialogRetirementScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !identical(_approvalDialogRoute, route)) return;
+      final navigator = route.navigator;
+      if (navigator != null && route.isActive) {
+        navigator.removeRoute(route);
+        return;
+      }
+      _approvalDialogRoute = null;
+      _approvalDialogRetirementScheduled = false;
+      _shownApprovalRequest = null;
+      setState(() {});
+    });
+  }
+
+  Widget _buildToolApprovalDialog(
+    BuildContext dialogContext,
+    ToolApprovalRequest request,
+  ) {
     final provider = context.read<ChatProvider>();
     final riskColor = _riskColor(request.risk);
     final arguments = _formatToolArguments(request);
-    return showModalBottomSheet<void>(
-      context: context,
-      isDismissible: false,
-      enableDrag: false,
-      showDragHandle: false,
-      builder: (ctx) {
-        final theme = Theme.of(ctx);
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    CircleAvatar(
-                      backgroundColor: riskColor.withAlpha(28),
-                      foregroundColor: riskColor,
-                      child: Icon(_riskIcon(request.risk)),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            AppStrings.toolApprovalTitle,
-                            style: theme.textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            '${request.toolName} · ${_riskLabel(request.risk)}',
-                            style: theme.textTheme.bodySmall?.copyWith(
-                              color: riskColor,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  AppStrings.toolApprovalArguments,
-                  style: theme.textTheme.labelMedium?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Container(
-                  width: double.infinity,
-                  constraints: const BoxConstraints(maxHeight: 220),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(AppRadii.s),
-                    border: Border.all(
-                      color: theme.colorScheme.outline.withAlpha(50),
-                    ),
-                  ),
-                  child: SingleChildScrollView(
-                    child: SelectableText(
-                      arguments,
-                      style: const TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 12,
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Wrap(
-                  alignment: WrapAlignment.end,
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    TextButton(
-                      onPressed: () {
-                        Navigator.pop(ctx);
-                        provider.resolveToolApproval(false);
-                      },
-                      child: const Text(AppStrings.toolApprovalDeny),
-                    ),
-                    OutlinedButton(
-                      onPressed: () {
-                        Navigator.pop(ctx);
-                        provider.resolveToolApproval(
-                          true,
-                          rememberForSession: true,
-                        );
-                      },
-                      child: const Text(AppStrings.toolApprovalAllowSession),
-                    ),
-                    FilledButton(
-                      onPressed: () {
-                        Navigator.pop(ctx);
-                        provider.resolveToolApproval(true);
-                      },
-                      child: const Text(AppStrings.toolApprovalAllowOnce),
-                    ),
-                  ],
-                ),
-              ],
+    final theme = Theme.of(dialogContext);
+    return PopScope(
+      canPop: false,
+      child: AlertDialog(
+        titlePadding: const EdgeInsets.fromLTRB(24, 20, 24, 0),
+        title: Row(
+          children: [
+            CircleAvatar(
+              backgroundColor: riskColor.withAlpha(28),
+              foregroundColor: riskColor,
+              child: Icon(_riskIcon(request.risk)),
             ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    AppStrings.toolApprovalTitle,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    '${request.toolName} · ${_riskLabel(request.risk)}',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: riskColor,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 560),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                AppStrings.toolApprovalArguments,
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Container(
+                width: double.infinity,
+                constraints: const BoxConstraints(maxHeight: 220),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(AppRadii.s),
+                  border: Border.all(
+                    color: theme.colorScheme.outline.withAlpha(50),
+                  ),
+                ),
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    arguments,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
-        );
-      },
+        ),
+        actions: [
+          TextButton(
+            key: ValueKey('tool-approval-deny:${request.operationId}'),
+            onPressed: () {
+              provider.resolveToolApproval(
+                operationId: request.operationId,
+                approved: false,
+              );
+              Navigator.pop(dialogContext);
+            },
+            child: const Text(AppStrings.toolApprovalDeny),
+          ),
+          OutlinedButton(
+            key: ValueKey(
+              'tool-approval-allow-session:${request.operationId}',
+            ),
+            onPressed: () {
+              provider.resolveToolApproval(
+                operationId: request.operationId,
+                approved: true,
+                rememberForSession: true,
+              );
+              Navigator.pop(dialogContext);
+            },
+            child: const Text(AppStrings.toolApprovalAllowSession),
+          ),
+          FilledButton(
+            key: ValueKey(
+              'tool-approval-allow-once:${request.operationId}',
+            ),
+            onPressed: () {
+              provider.resolveToolApproval(
+                operationId: request.operationId,
+                approved: true,
+              );
+              Navigator.pop(dialogContext);
+            },
+            child: const Text(AppStrings.toolApprovalAllowOnce),
+          ),
+        ],
+      ),
     );
   }
 
@@ -767,12 +811,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (!mounted || _appInBackground) return;
       final pending = provider.pendingApproval;
       if (pending == null) {
+        _retireToolApprovalDialog();
         provider.confirmAppResumedApprovalSurface();
-      } else if (_approvalDialogOpen && _approvalSurfaceEstablished) {
+      } else if (_approvalSurfaceEstablished &&
+          _shownApprovalRequest?.operationId == pending.operationId) {
         provider.confirmAppResumedApprovalSurface(
           approvalId: pending.operationId,
         );
       } else {
+        if (_shownApprovalRequest != null &&
+            _shownApprovalRequest?.operationId != pending.operationId) {
+          _retireToolApprovalDialog();
+        }
         setState(() {});
       }
     });

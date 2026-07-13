@@ -880,7 +880,7 @@ void main() {
 
       await provider.createSession();
       PreferencesService().toolApprovalPolicy =
-          PreferencesService.toolApprovalAuto;
+          PreferencesService.toolApprovalAlways;
       provider.setAppInBackground(true);
       final send = provider.sendMessage('use tool');
       await _waitUntil(() => provider.pendingApproval != null);
@@ -985,7 +985,10 @@ void main() {
         isFalse,
       );
       expect(tool.executionCount, 0);
-      provider.resolveToolApproval(false);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: false,
+      );
       await send;
       expect(tool.executionCount, 0);
     });
@@ -1075,9 +1078,144 @@ void main() {
         isFalse,
       );
 
-      provider.resolveToolApproval(false);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: false,
+      );
       await send;
       expect(tool.executionCount, 0);
+    });
+
+    test('stale in-app decision IDs cannot resolve a newer approval', () async {
+      final nativeCalls = <MethodCall>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (call) async {
+        nativeCalls.add(call);
+        if (call.method == 'consumePendingNavigateToSession') return null;
+        return true;
+      });
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'identity_a',
+                      toolName: 'echo',
+                      toolInput: {'text': 'first'},
+                    ),
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'identity_b',
+                      toolName: 'echo',
+                      toolInput: {'text': 'second'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await provider.createSession();
+
+      final send = provider.sendMessage('two approvals');
+      await _waitUntil(() => provider.pendingApproval != null);
+      final firstId = provider.pendingApproval!.operationId;
+      expect(
+        provider.resolveToolApproval(
+          operationId: firstId,
+          approved: true,
+        ),
+        isTrue,
+      );
+      await _waitUntil(
+        () =>
+            provider.pendingApproval?.operationId != null &&
+            provider.pendingApproval!.operationId != firstId,
+      );
+      final secondId = provider.pendingApproval!.operationId;
+      expect(tool.executionCount, 1);
+
+      for (final staleDecision in const [
+        (approved: false, rememberForSession: false),
+        (approved: true, rememberForSession: false),
+        (approved: true, rememberForSession: true),
+      ]) {
+        expect(
+          provider.resolveToolApproval(
+            operationId: firstId,
+            approved: staleDecision.approved,
+            rememberForSession: staleDecision.rememberForSession,
+          ),
+          isFalse,
+        );
+        expect(provider.pendingApproval!.operationId, secondId);
+        expect(tool.executionCount, 1);
+      }
+
+      provider.setAppInBackground(true);
+      await _waitUntil(
+        () => nativeCalls.any(
+          (call) =>
+              call.method == 'showToolApprovalNotification' &&
+              (call.arguments as Map)['approvalId'] == secondId,
+        ),
+      );
+      final clearSecondBeforeStaleSurface = nativeCalls.where(
+        (call) =>
+            call.method == 'clearToolApprovalNotification' &&
+            (call.arguments as Map)['approvalId'] == secondId,
+      );
+      expect(clearSecondBeforeStaleSurface, isEmpty);
+      expect(
+        provider.confirmAppResumedApprovalSurface(approvalId: firstId),
+        isFalse,
+      );
+      expect(provider.pendingApproval!.operationId, secondId);
+      expect(
+        nativeCalls.where(
+          (call) =>
+              call.method == 'clearToolApprovalNotification' &&
+              (call.arguments as Map)['approvalId'] == secondId,
+        ),
+        isEmpty,
+      );
+
+      expect(
+        await provider.resolveToolApprovalFromNotificationForTesting(
+          sessionId: provider.currentSession!.id,
+          approvalId: secondId,
+          approved: true,
+        ),
+        isTrue,
+      );
+      await send;
+
+      expect(requestCount, 2);
+      expect(tool.executionCount, 2);
+      expect(provider.pendingApproval, isNull);
     });
 
     test('disabled notification capability fails closed without waiting',
@@ -1131,7 +1269,7 @@ void main() {
 
       await provider.createSession();
       PreferencesService().toolApprovalPolicy =
-          PreferencesService.toolApprovalAuto;
+          PreferencesService.toolApprovalAlways;
       provider.setAppInBackground(true);
       await provider.sendMessage('use tool');
 
@@ -1212,6 +1350,480 @@ void main() {
       expect(toolResult.output, isNot(contains('non-current')));
     });
 
+    test('auto policy executes approval-eligible tool once in foreground',
+        () async {
+      final nativeCalls = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (call) async {
+        nativeCalls.add(call.method);
+        if (call.method == 'consumePendingNavigateToSession') return null;
+        return true;
+      });
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'auto_foreground',
+                      toolName: 'echo',
+                      toolInput: {'text': 'auto-foreground'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.createSession();
+
+      await provider.sendMessage('auto foreground');
+
+      expect(provider.pendingApproval, isNull);
+      expect(requestCount, 2);
+      expect(tool.executionCount, 1);
+      expect(nativeCalls, isNot(contains('showToolApprovalNotification')));
+    });
+
+    test('auto policy executes approval-eligible tool once in background',
+        () async {
+      final nativeCalls = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (call) async {
+        nativeCalls.add(call.method);
+        if (call.method == 'consumePendingNavigateToSession') return null;
+        if (call.method == 'showToolApprovalNotification') return false;
+        return true;
+      });
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'auto_background',
+                      toolName: 'echo',
+                      toolInput: {'text': 'auto-background'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.createSession();
+      provider.setAppInBackground(true);
+
+      await provider.sendMessage('auto background');
+
+      expect(provider.pendingApproval, isNull);
+      expect(requestCount, 2);
+      expect(tool.executionCount, 1);
+      expect(nativeCalls, isNot(contains('showToolApprovalNotification')));
+      expect(
+        provider.currentSession!.messages
+            .where((message) => message.isSystemNotice)
+            .map((message) => message.textContent),
+        isNot(contains(contains('启用系统通知'))),
+      );
+    });
+
+    const nonInteractiveLifecycleStates = [
+      'lifecycle-null',
+      'inactive',
+      'paused',
+      'hidden',
+      'detached',
+      'screen-locked',
+    ];
+    for (final lifecycle in nonInteractiveLifecycleStates) {
+      test(
+          'auto policy bypasses approval surfaces in $lifecycle with notifications unavailable',
+          () async {
+        final nativeCalls = <String>[];
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(nativeChannel, (call) async {
+          nativeCalls.add(call.method);
+          if (call.method == 'consumePendingNavigateToSession') return null;
+          if (call.method == 'showToolApprovalNotification') return false;
+          return true;
+        });
+        final tool = _EchoTool();
+        var requestCount = 0;
+        final provider = ChatProvider(
+          toolRegistry: ToolRegistry()
+            ..register(tool, risk: ToolRisk.dangerous),
+          llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+            config,
+            onMessages: (_) => throw UnimplementedError(),
+            onMessageEvents: (_) {
+              requestCount++;
+              if (requestCount == 1) {
+                return [
+                  StreamDone(LlmResponse(
+                    stopReason: 'tool_use',
+                    content: [
+                      ContentBlock(
+                        type: 'tool_use',
+                        toolUseId: 'auto_$lifecycle',
+                        toolName: 'echo',
+                        toolInput: {'text': lifecycle},
+                      ),
+                    ],
+                  )),
+                ];
+              }
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'end_turn',
+                  content: [ContentBlock(type: 'text', text: 'done')],
+                )),
+              ];
+            },
+          ),
+        );
+        addTearDown(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+          provider.dispose();
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        PreferencesService().toolApprovalPolicy =
+            PreferencesService.toolApprovalAuto;
+        await provider.createSession();
+        provider.setAppInBackground(true);
+
+        await provider.sendMessage('auto $lifecycle');
+
+        expect(provider.pendingApproval, isNull);
+        expect(requestCount, 2);
+        expect(tool.executionCount, 1);
+        expect(nativeCalls, isNot(contains('showToolApprovalNotification')));
+        expect(nativeCalls, isNot(contains('clearToolApprovalNotification')));
+        expect(
+          provider.currentSession!.messages
+              .expand((message) => message.toolResults)
+              .single
+              .output,
+          lifecycle,
+        );
+        expect(
+          provider.currentSession!.messages
+              .expand((message) => message.toolResults)
+              .map((result) => result.output)
+              .join('\n'),
+          isNot(contains('blocked by safety settings')),
+        );
+        expect(
+          provider.currentSession!.messages
+              .where((message) => message.isSystemNotice)
+              .map((message) => message.textContent),
+          isNot(contains(contains('启用系统通知'))),
+        );
+      });
+    }
+
+    test('auto policy executes a valid non-visible session operation once',
+        () async {
+      final nativeCalls = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (call) async {
+        nativeCalls.add(call.method);
+        if (call.method == 'consumePendingNavigateToSession') return null;
+        if (call.method == 'showToolApprovalNotification') return false;
+        return true;
+      });
+      final storage = SessionStorage();
+      await storage.init();
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'auto_non_visible',
+                      toolName: 'echo',
+                      toolInput: {'text': 'non-visible-auto'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      final target = await provider.createSession();
+      final visible = await provider.createSession();
+      provider.setAppInBackground(true);
+
+      await provider.sendMessage(
+        'auto non-visible',
+        targetSessionId: target.id,
+      );
+
+      expect(provider.currentSession!.id, visible.id);
+      expect(provider.pendingApproval, isNull);
+      expect(requestCount, 2);
+      expect(tool.executionCount, 1);
+      expect(nativeCalls, isNot(contains('showToolApprovalNotification')));
+      expect(
+        (await storage.getSession(target.id))!
+            .messages
+            .expand((message) => message.toolResults)
+            .single
+            .output,
+        'non-visible-auto',
+      );
+    });
+
+    test('auto policy remains direct across lifecycle transitions', () async {
+      final nativeCalls = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (call) async {
+        nativeCalls.add(call.method);
+        if (call.method == 'consumePendingNavigateToSession') return null;
+        if (call.method == 'showToolApprovalNotification') return false;
+        return true;
+      });
+      final firstRequestStarted = Completer<void>();
+      final releaseToolRequest = Completer<void>();
+      final tool = _EchoTool();
+      var gatedRequestCount = 0;
+      final provider = ChatProvider(
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) =>
+            _GatedToolRequestLlmService(
+          config,
+          firstRequestStarted: firstRequestStarted,
+          releaseToolRequest: releaseToolRequest,
+          onRequest: () => ++gatedRequestCount,
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseToolRequest.isCompleted) releaseToolRequest.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      await provider.createSession();
+
+      final send = provider.sendMessage('auto across transitions');
+      await firstRequestStarted.future.timeout(const Duration(seconds: 2));
+      provider.setAppInBackground(true);
+      provider.setAppInBackground(false);
+      provider.setAppInBackground(true);
+      releaseToolRequest.complete();
+      await send.timeout(const Duration(seconds: 5));
+
+      expect(gatedRequestCount, 2);
+      expect(provider.pendingApproval, isNull);
+      expect(tool.executionCount, 1);
+      expect(nativeCalls, isNot(contains('showToolApprovalNotification')));
+      expect(nativeCalls, isNot(contains('clearToolApprovalNotification')));
+    });
+
+    test('auto policy stays direct after provider and activity recreation',
+        () async {
+      final nativeCalls = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(nativeChannel, (call) async {
+        nativeCalls.add(call.method);
+        if (call.method == 'consumePendingNavigateToSession') return null;
+        if (call.method == 'showToolApprovalNotification') return false;
+        return true;
+      });
+      final storage = SessionStorage();
+      await storage.init();
+      final firstProvider = ChatProvider(storage: storage);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      PreferencesService().toolApprovalPolicy =
+          PreferencesService.toolApprovalAuto;
+      final session = await firstProvider.createSession();
+      firstProvider.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final recreated = ChatProvider(
+        storage: storage,
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'auto_recreated',
+                      toolName: 'echo',
+                      toolInput: {'text': 'recreated-auto'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        recreated.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await recreated.selectSession(session.id);
+      recreated.setAppInBackground(true);
+
+      await recreated.sendMessage('auto after recreation');
+
+      expect(recreated.pendingApproval, isNull);
+      expect(requestCount, 2);
+      expect(tool.executionCount, 1);
+      expect(nativeCalls, isNot(contains('showToolApprovalNotification')));
+      expect(nativeCalls, isNot(contains('clearToolApprovalNotification')));
+    });
+
+    test('auto policy does not override an explicit hard deny', () async {
+      final tool = _EchoTool();
+      var requestCount = 0;
+      final provider = ChatProvider(
+        toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          onMessageEvents: (_) {
+            requestCount++;
+            if (requestCount == 1) {
+              return [
+                StreamDone(const LlmResponse(
+                  stopReason: 'tool_use',
+                  content: [
+                    ContentBlock(
+                      type: 'tool_use',
+                      toolUseId: 'auto_hard_deny',
+                      toolName: 'echo',
+                      toolInput: {'text': 'must-not-run'},
+                    ),
+                  ],
+                )),
+              ];
+            }
+            return [
+              StreamDone(const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: 'done')],
+              )),
+            ];
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final prefs = PreferencesService()
+        ..toolApprovalPolicy = PreferencesService.toolApprovalAuto
+        ..deniedToolNames = {'echo'};
+      await provider.createSession();
+
+      await provider.sendMessage('hard deny');
+
+      expect(provider.pendingApproval, isNull);
+      expect(tool.executionCount, 0);
+      expect(
+        provider.currentSession!.messages
+            .expand((m) => m.toolResults)
+            .single
+            .output,
+        'Tool blocked by safety settings.',
+      );
+      prefs.deniedToolNames = {};
+    });
+
     test('foreground current session keeps explicit approval path', () async {
       var requestCount = 0;
       final tools = ToolRegistry()
@@ -1256,7 +1868,10 @@ void main() {
       await provider.createSession();
       final sendFuture = provider.sendMessage('use tool');
       await _waitUntil(() => provider.pendingApproval != null);
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await sendFuture;
 
       expect(requestCount, 2);
@@ -1310,13 +1925,19 @@ void main() {
 
       final first = provider.sendMessage('first');
       await _waitUntil(() => provider.pendingApproval != null);
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await first;
 
       final second = provider.sendMessage('second');
       await _waitUntil(() => provider.pendingApproval != null);
       expect(tool.executionCount, 1);
-      provider.resolveToolApproval(false);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: false,
+      );
       await second;
       expect(tool.executionCount, 1);
     });
@@ -1400,7 +2021,10 @@ void main() {
           isNot(contains(sentinel)));
       expect(await storage.searchSessions(sentinel), isEmpty);
 
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await sendFuture;
       await prefs.init();
 
@@ -1577,7 +2201,10 @@ void main() {
       final sendFuture = provider.sendMessage('use tool');
       await _waitUntil(() => provider.pendingApproval != null);
       await provider.createSession();
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await sendFuture;
 
       expect(tool.executionCount, 0);
@@ -1760,7 +2387,10 @@ void main() {
       final session = await provider.createSession();
       final sendFuture = provider.sendMessage('start slow tool');
       await _waitUntil(() => provider.pendingApproval != null);
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await tool.started.future;
 
       await provider.cancelAgent(sessionId: session.id, savePartial: false);
@@ -1865,7 +2495,10 @@ void main() {
       final session = await provider.createSession();
       final send = provider.sendMessage('delete running session');
       await _waitUntil(() => provider.pendingApproval != null);
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await tool.started.future.timeout(const Duration(seconds: 2));
 
       await provider.deleteSession(session.id);
@@ -1925,7 +2558,10 @@ void main() {
       final session = await provider.createSession();
       final sendFuture = provider.sendMessage('start cancellable tool');
       await _waitUntil(() => provider.pendingApproval != null);
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await tool.started.future;
 
       await provider.cancelAgent(sessionId: session.id, savePartial: false);
@@ -2078,7 +2714,10 @@ void main() {
       );
 
       provider.clearMessageQueue();
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await runC.timeout(const Duration(seconds: 2));
 
       expect(tool.executionCount, 1);
@@ -3012,13 +3651,21 @@ void main() {
       final approvalOperationIds = <String>[];
       await _waitUntil(() => provider.pendingApproval != null);
       approvalOperationIds.add(provider.pendingApproval!.operationId);
-      provider.resolveToolApproval(true);
+      expect(tool.executionCount, 0);
+      provider.resolveToolApproval(
+        operationId: approvalOperationIds.last,
+        approved: true,
+      );
       await _waitUntil(() => provider.pendingApproval != null);
       approvalOperationIds.add(provider.pendingApproval!.operationId);
       expect(tool.executionCount, 1);
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: approvalOperationIds.last,
+        approved: true,
+      );
       await recoveryFuture;
 
+      expect(requestCount, 2);
       expect(tool.executionCount, 2);
       expect(approvalOperationIds.toSet(), hasLength(2));
       expect(provider.pendingApproval, isNull);
@@ -3346,13 +3993,23 @@ void main() {
       expect(provider.pendingApproval, isNotNull,
           reason: 'retry completed early with $earlyRetryStatus');
       approvalIds.add(provider.pendingApproval!.operationId);
-      provider.resolveToolApproval(true);
+      expect(tool.executionCount, 0);
+      provider.resolveToolApproval(
+        operationId: approvalIds.last,
+        approved: true,
+      );
       await _waitUntil(() => provider.pendingApproval != null);
       approvalIds.add(provider.pendingApproval!.operationId);
-      provider.resolveToolApproval(true);
+      expect(tool.executionCount, 1);
+      provider.resolveToolApproval(
+        operationId: approvalIds.last,
+        approved: true,
+      );
       expect(await retry, AssistantRetryStatus.started);
 
+      expect(retryModelCalls, 2);
       expect(approvalIds.toSet(), hasLength(2));
+      expect(provider.pendingApproval, isNull);
       expect(tool.executionCount, 2);
       expect(provider.currentInterruptedAgentRun, isNull);
       expect((await storage.getSession(session.id))!.inFlightAgentRun, isNull);
@@ -3454,11 +4111,21 @@ void main() {
       );
       expect(reloaded.pendingApproval, isNotNull,
           reason: 'retry completed early with $earlyRetryStatus');
-      reloaded.resolveToolApproval(true);
+      expect(tool.executionCount, 0);
+      reloaded.resolveToolApproval(
+        operationId: reloaded.pendingApproval!.operationId,
+        approved: true,
+      );
       await _waitUntil(() => reloaded.pendingApproval != null);
-      reloaded.resolveToolApproval(true);
+      expect(tool.executionCount, 1);
+      reloaded.resolveToolApproval(
+        operationId: reloaded.pendingApproval!.operationId,
+        approved: true,
+      );
       expect(await retry, AssistantRetryStatus.started);
 
+      expect(requestCount, 2);
+      expect(reloaded.pendingApproval, isNull);
       expect(tool.executionCount, 2);
       expect(reloaded.currentInterruptedAgentRun, isNull);
       expect(
@@ -3569,20 +4236,36 @@ void main() {
       expect(pendingMarker.toJson().toString(), isNot(contains('new action')));
       expect(pendingMarker.toJson().toString(), isNot(contains('old action')));
       final firstOperationId = provider.pendingApproval!.operationId;
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: firstOperationId,
+        approved: true,
+      );
       await _waitUntil(() => provider.pendingApproval != null);
 
       expect(tool.executionCount, 1);
       expect(provider.pendingApproval!.operationId, isNot(firstOperationId));
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await recoveryFuture;
 
+      expect(requestCount, 2);
       expect(tool.executionCount, 2);
+      expect(provider.pendingApproval, isNull);
+      final recovered = (await storage.getSession(session.id))!;
+      expect(recovered.inFlightAgentRun, isNull);
       expect(
-        provider.currentSession!.messages
+        recovered.messages
             .expand((message) => message.toolUses)
             .map((toolUse) => toolUse.id),
         isNot(contains('old_call')),
+      );
+      expect(
+        recovered.messages
+            .expand((message) => message.toolResults)
+            .map((result) => result.output),
+        containsAll(['new action', 'second new action']),
       );
     });
 
@@ -5005,10 +5688,14 @@ void main() {
       expect(replacement.sourceRunAttemptId, 'skill-origin-run');
       expect(replacement.skillId, verified.id);
       expect(replacement.trustDigest, verified.trustDigest);
-      provider.resolveToolApproval(true);
+      provider.resolveToolApproval(
+        operationId: provider.pendingApproval!.operationId,
+        approved: true,
+      );
       await recovery;
 
       expect(tool.executionCount, 1);
+      expect(provider.pendingApproval, isNull);
       expect(
         provider.currentSession!.messages
             .where((message) => message.role == 'assistant')
@@ -9389,6 +10076,48 @@ class _ScriptedLlmService extends LlmService {
   void dispose() {
     onDispose?.call();
     super.dispose();
+  }
+}
+
+class _GatedToolRequestLlmService extends LlmService {
+  _GatedToolRequestLlmService(
+    super.config, {
+    required this.firstRequestStarted,
+    required this.releaseToolRequest,
+    required this.onRequest,
+  });
+
+  final Completer<void> firstRequestStarted;
+  final Completer<void> releaseToolRequest;
+  final int Function() onRequest;
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    final request = onRequest();
+    if (request == 1) {
+      if (!firstRequestStarted.isCompleted) firstRequestStarted.complete();
+      await releaseToolRequest.future;
+      yield StreamDone(const LlmResponse(
+        stopReason: 'tool_use',
+        content: [
+          ContentBlock(
+            type: 'tool_use',
+            toolUseId: 'auto_transition',
+            toolName: 'echo',
+            toolInput: {'text': 'transition-auto'},
+          ),
+        ],
+      ));
+      return;
+    }
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'done')],
+    ));
   }
 }
 
