@@ -5,6 +5,26 @@ import 'package:clawchat/services/terminal_runtime_session.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('terminal runtime error contains reason enum without identity',
+      () async {
+    final backend = _FakeContinuationBackend(
+      replaceOutcome: TerminalContinuationStartOutcome.conflict,
+      replaceReason: TerminalContinuationReason.activeSessionRecord,
+    );
+    final runtime = _runtime(
+      backend: backend,
+      operationId: 'private-operation',
+      candidateId: 'private-candidate',
+      processLauncher: () => _FakeTerminalProcess(7),
+    );
+
+    await runtime.ensureStarted(columns: 80, rows: 24);
+
+    expect(runtime.error, contains('ACTIVE_SESSION_RECORD'));
+    expect(runtime.error, isNot(contains('private-operation')));
+    expect(runtime.error, isNot(contains('private-candidate')));
+  });
+
   test(
       'CLI loopback callback completes in background and recreation does not duplicate',
       () async {
@@ -590,6 +610,7 @@ final class _Response {
 final class _FakeContinuationBackend implements TerminalContinuationBackend {
   _FakeContinuationBackend({
     this.replaceOutcome = TerminalContinuationStartOutcome.newOperation,
+    this.replaceReason,
     String? initialOperationId,
     String? initialCandidateId,
     TerminalCandidateReceipt? initialReceipt,
@@ -601,6 +622,7 @@ final class _FakeContinuationBackend implements TerminalContinuationBackend {
   }
 
   final TerminalContinuationStartOutcome replaceOutcome;
+  final TerminalContinuationReason? replaceReason;
   TerminalLaunchGate? launchGate = const TerminalLaunchGate(
     wrapperPath: '/private/wrapper',
     attemptDirectoryPath: '/private/attempt',
@@ -637,7 +659,7 @@ final class _FakeContinuationBackend implements TerminalContinuationBackend {
   final List<_Response> cancelPlan = [];
 
   @override
-  Future<TerminalContinuationStartOutcome> replace({
+  Future<TerminalContinuationStartResult> replace({
     required String operationId,
     required String sessionId,
     required String candidateId,
@@ -646,11 +668,18 @@ final class _FakeContinuationBackend implements TerminalContinuationBackend {
     _requireChannel();
     replaceCalls++;
     if (_acknowledged.contains(candidateId)) {
-      return TerminalContinuationStartOutcome.acknowledged;
+      return const TerminalContinuationStartResult(
+        TerminalContinuationStartOutcome.acknowledged,
+      );
     }
-    if (replacePlan.isNotEmpty) return replacePlan.removeAt(0);
+    if (replacePlan.isNotEmpty) {
+      return TerminalContinuationStartResult(replacePlan.removeAt(0));
+    }
     if (replaceOutcome != TerminalContinuationStartOutcome.newOperation) {
-      return replaceOutcome;
+      return TerminalContinuationStartResult(
+        replaceOutcome,
+        reason: replaceReason,
+      );
     }
     final oldCandidate = currentCandidateId;
     if (oldCandidate != null && oldCandidate != candidateId) {
@@ -666,7 +695,10 @@ final class _FakeContinuationBackend implements TerminalContinuationBackend {
     _receiptExpiryMs[candidateId] = _nowMs +
         timeout.inMilliseconds +
         const Duration(minutes: 5).inMilliseconds;
-    return replaceFuture ?? TerminalContinuationStartOutcome.newOperation;
+    return TerminalContinuationStartResult(
+      await (replaceFuture ??
+          Future.value(TerminalContinuationStartOutcome.newOperation)),
+    );
   }
 
   @override

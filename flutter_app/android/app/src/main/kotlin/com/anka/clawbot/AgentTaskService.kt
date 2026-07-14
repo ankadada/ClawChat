@@ -36,6 +36,25 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
+internal data class CommandReservationDecision(
+    val outcome: CommandReserveOutcome,
+    val admissionReason: CommandAdmissionReason,
+)
+
+internal fun reserveAgentCommand(
+    coordinator: CommandCleanupCoordinator?,
+    registry: CommandContinuationRegistry,
+    key: CommandOwnerKey,
+    timeoutMs: Long,
+): CommandReservationDecision {
+    val admission = coordinator?.admissionReason(key.owner, key.sessionId)
+        ?: CommandAdmissionReason.COORDINATOR_UNAVAILABLE
+    if (admission != CommandAdmissionReason.ADMITTED) {
+        return CommandReservationDecision(CommandReserveOutcome.RETRYABLE_UNKNOWN, admission)
+    }
+    return CommandReservationDecision(registry.reserve(key, timeoutMs), admission)
+}
+
 class AgentTaskService : Service() {
     companion object {
         private const val SUMMARY_NOTIFICATION_ID = 9999
@@ -173,12 +192,10 @@ class AgentTaskService : Service() {
             sessionId: String,
             operationId: String,
             timeoutMs: Long,
-        ): CommandReserveOutcome {
-            val coordinator = cleanupCoordinator ?: return CommandReserveOutcome.RETRYABLE_UNKNOWN
-            if (!coordinator.canAdmit(CommandContinuationOwner.AGENT_BASH, sessionId)) {
-                return CommandReserveOutcome.RETRYABLE_UNKNOWN
-            }
-            return commandContinuations.reserve(
+        ): CommandReservationDecision {
+            return reserveAgentCommand(
+                cleanupCoordinator,
+                commandContinuations,
                 commandKey(sessionId, operationId),
                 timeoutMs.coerceIn(1L, MAX_REQUESTED_COMMAND_RUNTIME_MS),
             )

@@ -327,6 +327,115 @@ internal object NioLaunchSecureFileOps : LaunchSecureFileOps {
         current.permissions == expected.permissions
 }
 
+internal fun interface AndroidLstatReader {
+    fun metadata(path: File): LaunchEntryMetadata?
+}
+
+internal object AndroidOsLstatReader : AndroidLstatReader {
+    override fun metadata(path: File): LaunchEntryMetadata? {
+        return try {
+            val stat = Os.lstat(path.absolutePath)
+            val links = stat.st_nlink.takeIf { it in 0..Int.MAX_VALUE.toLong() }?.toInt()
+                ?: return null
+            LaunchEntryMetadata(
+                deviceId = stat.st_dev,
+                inode = stat.st_ino,
+                uid = stat.st_uid,
+                permissions = stat.st_mode and 0x1ff,
+                linkCount = links,
+                size = stat.st_size,
+                isDirectory = OsConstants.S_ISDIR(stat.st_mode),
+                isRegularFile = OsConstants.S_ISREG(stat.st_mode),
+                isSymbolicLink = OsConstants.S_ISLNK(stat.st_mode),
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+}
+
+/** Android API 29-36 metadata adapter backed by the stable lstat system API. */
+internal class AndroidLaunchSecureFileOps(
+    private val lstatReader: AndroidLstatReader = AndroidOsLstatReader,
+    private val delegate: LaunchSecureFileOps = NioLaunchSecureFileOps,
+) : LaunchSecureFileOps by delegate {
+    override fun metadata(path: File): LaunchEntryMetadata? = lstatReader.metadata(path)
+
+    override fun listEntriesIfSame(
+        path: File,
+        expected: LaunchEntryMetadata,
+    ): List<File>? {
+        val before = metadata(path) ?: return null
+        if (!sameStableIdentity(before, expected) || !before.isDirectory || before.isSymbolicLink) {
+            return null
+        }
+        val entries = delegate.listEntries(path) ?: return null
+        return entries.takeIf { metadata(path)?.let { sameStableIdentity(it, expected) } == true }
+    }
+
+    override fun readFile(path: File, maxBytes: Int): ByteArray? {
+        return try {
+            val entry = metadata(path) ?: return null
+            if (!entry.isRegularFile || entry.isSymbolicLink || entry.size !in 1..maxBytes.toLong()) {
+                return null
+            }
+            Files.newInputStream(path.toPath(), LinkOption.NOFOLLOW_LINKS).use { input ->
+                val bytes = ByteArray(maxBytes + 1)
+                var size = 0
+                while (size < bytes.size) {
+                    val count = input.read(bytes, size, bytes.size - size)
+                    if (count < 0) break
+                    size += count
+                }
+                if (size > maxBytes) null else bytes.copyOf(size)
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    override fun deleteFileIfSame(path: File, expected: LaunchEntryMetadata): Boolean {
+        return try {
+            val current = metadata(path) ?: return false
+            if (current != expected || !current.isRegularFile || current.isSymbolicLink) return false
+            Files.delete(path.toPath())
+            syncParent(requireNotNull(path.parentFile))
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    override fun deleteEmptyDirectoryIfSame(
+        path: File,
+        expected: LaunchEntryMetadata,
+    ): Boolean {
+        return try {
+            val current = metadata(path) ?: return false
+            if (!sameStableIdentity(current, expected) || !current.isDirectory ||
+                current.isSymbolicLink || listEntriesIfSame(path, expected)?.isNotEmpty() != false) {
+                return false
+            }
+            Files.delete(path.toPath())
+            syncParent(requireNotNull(path.parentFile))
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    override fun syncParent(path: File): Boolean = try {
+        AndroidCleanupLedgerFileOps.syncParent(path)
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun sameStableIdentity(
+        current: LaunchEntryMetadata,
+        expected: LaunchEntryMetadata,
+    ): Boolean = current.deviceId == expected.deviceId && current.inode == expected.inode &&
+        current.uid == expected.uid && current.permissions == expected.permissions
+}
+
 /**
  * App-private, checksummed, atomic cleanup ledger.
  *
@@ -689,8 +798,33 @@ internal enum class DurableLaunchRegistrationOutcome {
     FAILED_OR_CORRUPT,
 }
 
+internal enum class CommandAdmissionReason {
+    ADMITTED,
+    COORDINATOR_UNAVAILABLE,
+    LEDGER_CORRUPT,
+    ACTIVE_SESSION_RECORD,
+    REGISTRY_RETRY,
+    REGISTRY_CONFLICT,
+    CLEANUP_REJECTED,
+    SERVICE_NOT_READY,
+}
+
+internal enum class CommandLaunchFailureReason {
+    COORDINATOR_UNAVAILABLE,
+    DEADLINE_EXPIRED,
+    LEDGER_CORRUPT,
+    STALE_EXACT_RECORD,
+    ACTIVE_SESSION_RECORD,
+    PARENT_PID_UNAVAILABLE,
+    PARENT_GENERATION_UNKNOWN,
+    ATTEMPT_ROOT_UNAVAILABLE,
+    LEDGER_WRITE_FAILED,
+    BACKSTOP_SCHEDULE_REJECTED,
+}
+
 internal data class CommandLaunchPreparation(
     val outcome: DurableLaunchRegistrationOutcome,
+    val failureReason: CommandLaunchFailureReason? = null,
     val wrapperPath: String? = null,
     val attemptDirectoryPath: String? = null,
     val stagingPath: String? = null,
@@ -752,14 +886,25 @@ internal class CommandCleanupCoordinator(
         synchronized(lock) { loadLocked() }
     }
 
-    fun canAdmit(owner: CommandContinuationOwner, sessionId: String): Boolean {
+    fun admissionReason(
+        owner: CommandContinuationOwner,
+        sessionId: String,
+    ): CommandAdmissionReason {
         reconcile()
         val hash = sessionHash(owner, sessionId)
         return synchronized(lock) {
             loadLocked()
-            !corrupt && records.values.none { it.owner == owner && it.sessionHash == hash }
+            when {
+                corrupt -> CommandAdmissionReason.LEDGER_CORRUPT
+                records.values.any { it.owner == owner && it.sessionHash == hash } ->
+                    CommandAdmissionReason.ACTIVE_SESSION_RECORD
+                else -> CommandAdmissionReason.ADMITTED
+            }
         }
     }
+
+    fun canAdmit(owner: CommandContinuationOwner, sessionId: String): Boolean =
+        admissionReason(owner, sessionId) == CommandAdmissionReason.ADMITTED
 
     fun requestSessionCleanup(
         owner: CommandContinuationOwner,
@@ -807,9 +952,16 @@ internal class CommandCleanupCoordinator(
         deadlineEpochMs: Long,
     ): CommandLaunchPreparation = synchronized(lock) {
         loadLocked()
-        if (corrupt || deadlineEpochMs <= nowEpochMs()) {
+        if (corrupt) {
             return@synchronized CommandLaunchPreparation(
                 DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                CommandLaunchFailureReason.LEDGER_CORRUPT,
+            )
+        }
+        if (deadlineEpochMs <= nowEpochMs()) {
+            return@synchronized CommandLaunchPreparation(
+                DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                CommandLaunchFailureReason.DEADLINE_EXPIRED,
             )
         }
         val sessionHash = sessionHash(key.owner, key.sessionId)
@@ -826,6 +978,7 @@ internal class CommandCleanupCoordinator(
                 ) || !matchesCapability(existing, issued.attemptId, issued.launchToken)) {
                 return@synchronized CommandLaunchPreparation(
                     DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                    CommandLaunchFailureReason.STALE_EXACT_RECORD,
                 )
             }
             liveIdentities[id] = LiveCleanupIdentity(key, candidateId)
@@ -834,20 +987,24 @@ internal class CommandCleanupCoordinator(
         if (records.values.any { it.owner == key.owner && it.sessionHash == sessionHash }) {
             return@synchronized CommandLaunchPreparation(
                 DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                CommandLaunchFailureReason.ACTIVE_SESSION_RECORD,
             )
         }
         val now = nowEpochMs()
         val parentPid = parentProcessId().takeIf { it > 0 }
             ?: return@synchronized CommandLaunchPreparation(
                 DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                CommandLaunchFailureReason.PARENT_PID_UNAVAILABLE,
             )
         val parentGeneration = (recoveryProbe?.read(parentPid) as? PidProbeResult.Present)
             ?.startTimeTicks ?: return@synchronized CommandLaunchPreparation(
             DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+            CommandLaunchFailureReason.PARENT_GENERATION_UNKNOWN,
         )
         val issued = issueCapabilityLocked()
             ?: return@synchronized CommandLaunchPreparation(
                 DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                CommandLaunchFailureReason.ATTEMPT_ROOT_UNAVAILABLE,
             )
         val record = CommandCleanupRecord(
             recordId = id,
@@ -871,6 +1028,7 @@ internal class CommandCleanupCoordinator(
         if (!ledger.write(next)) {
             return@synchronized CommandLaunchPreparation(
                 DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                CommandLaunchFailureReason.LEDGER_WRITE_FAILED,
             )
         }
         records[id] = record
@@ -1316,8 +1474,8 @@ internal class CommandCleanupCoordinator(
         record: CommandCleanupRecord,
         issued: IssuedLaunchCapability,
     ): CommandLaunchPreparation {
-        val scheduled = scheduleLocked(forceBackstopDelayMs = MIN_RETRY_MS)
-        if (!scheduled) {
+        var current = record
+        if (!scheduleLocked(forceBackstopDelayMs = MIN_RETRY_MS)) {
             val pending = record.copy(
                 disposalState = CleanupDisposalState.BACKSTOP_PENDING,
                 disposalVersion = record.disposalVersion + 1L,
@@ -1327,26 +1485,46 @@ internal class CommandCleanupCoordinator(
                 corrupt = true
                 return CommandLaunchPreparation(
                     DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                    CommandLaunchFailureReason.LEDGER_WRITE_FAILED,
                 )
             }
             records[record.recordId] = pending
-            return CommandLaunchPreparation(
-                DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_PENDING,
-            )
+            current = pending
+            if (!scheduleLocked(forceBackstopDelayMs = MIN_RETRY_MS)) {
+                // No capability has left this synchronized call, so no child
+                // can exist. Retire the durable block after the second bounded
+                // scheduling failure; cleanup is best effort and never gates it.
+                val retired = retireRecordLocked(pending)
+                if (retired) bestEffortCleanupKnownValidAttempt(pending)
+                return CommandLaunchPreparation(
+                    if (retired) {
+                        DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_PENDING
+                    } else {
+                        DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT
+                    },
+                    if (retired) {
+                        CommandLaunchFailureReason.BACKSTOP_SCHEDULE_REJECTED
+                    } else {
+                        CommandLaunchFailureReason.LEDGER_WRITE_FAILED
+                    },
+                )
+            }
         }
-        if (record.disposalState == CleanupDisposalState.BACKSTOP_PENDING) {
-            val ready = record.copy(
+        if (current.disposalState == CleanupDisposalState.BACKSTOP_PENDING) {
+            val ready = current.copy(
                 disposalState = CleanupDisposalState.SPAWN_CAPABILITY_ISSUED,
-                disposalVersion = record.disposalVersion + 1L,
+                disposalVersion = current.disposalVersion + 1L,
             )
-            val next = records.toMutableMap().apply { put(record.recordId, ready) }
+            val next = records.toMutableMap().apply { put(current.recordId, ready) }
             if (!ledger.write(next.values.toList())) {
                 corrupt = true
                 return CommandLaunchPreparation(
                     DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                    CommandLaunchFailureReason.LEDGER_WRITE_FAILED,
                 )
             }
-            records[record.recordId] = ready
+            records[current.recordId] = ready
+            current = ready
         }
         return CommandLaunchPreparation(
             DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_SCHEDULED,
@@ -1354,7 +1532,7 @@ internal class CommandCleanupCoordinator(
             attemptDirectoryPath = issued.paths.attemptDirectory.absolutePath,
             stagingPath = issued.paths.claimFile.absolutePath,
             goPath = issued.paths.goFile.absolutePath,
-            parentProcessId = record.parentProcessId.takeIf { it > 0 },
+            parentProcessId = current.parentProcessId.takeIf { it > 0 },
             appUid = currentUid().takeIf { it >= 0 },
             attemptId = issued.attemptId,
             launchToken = issued.launchToken,
@@ -1855,6 +2033,10 @@ internal class CommandCleanupCoordinator(
         for (record in records.values.toList()) {
             if (!record.disposalState.isPreLaunch) continue
             val recovering = record.recordId in recoveryPendingIds
+            if (recovering && record.disposalState == CleanupDisposalState.BACKSTOP_PENDING) {
+                reconcileUnpublishedBackstopPendingLocked(record, probe)
+                continue
+            }
             val cancelled = record.disposalState in setOf(
                 CleanupDisposalState.CANCEL_REQUESTED,
                 CleanupDisposalState.CANCELLED,
@@ -1873,15 +2055,13 @@ internal class CommandCleanupCoordinator(
                 record.launchTokenHash == opaqueIdHash("launch-token", it.launchToken)
             }
             if (exactClaim == null) {
-                if (record.disposalState == CleanupDisposalState.BACKSTOP_PENDING &&
-                    !backstop.schedule(MIN_RETRY_MS)) continue
                 when (val parent = probe.read(record.parentProcessId)) {
                     PidProbeResult.RetryableUnknown -> Unit
                     PidProbeResult.Missing -> removeDefinitivePendingLaunchLocked(record)
-                    is PidProbeResult.Present -> if (
-                        parent.startTimeTicks != record.parentStartTimeTicks
-                    ) {
-                        removeDefinitivePendingLaunchLocked(record)
+                    is PidProbeResult.Present -> {
+                        if (parent.startTimeTicks != record.parentStartTimeTicks) {
+                            removeDefinitivePendingLaunchLocked(record)
+                        }
                     }
                 }
                 continue
@@ -1918,13 +2098,28 @@ internal class CommandCleanupCoordinator(
         if (retired) bestEffortCleanupKnownValidAttempt(record)
     }
 
+    private fun reconcileUnpublishedBackstopPendingLocked(
+        record: CommandCleanupRecord,
+        probe: PidProcessProbe,
+    ) {
+        when (val parent = probe.read(record.parentProcessId)) {
+            PidProbeResult.Missing -> removeDefinitivePendingLaunchLocked(record)
+            PidProbeResult.RetryableUnknown -> Unit
+            is PidProbeResult.Present -> {
+                if (parent.startTimeTicks != record.parentStartTimeTicks) {
+                    removeDefinitivePendingLaunchLocked(record)
+                }
+            }
+        }
+    }
+
     private fun loadLocked() {
         if (loaded) return
         loaded = true
         when (val read = ledger.read()) {
             is CleanupLedgerRead.Corrupt -> {
                 corrupt = true
-                backstop.schedule(MIN_RETRY_MS)
+                scheduleBackstopSafely(MIN_RETRY_MS)
             }
             is CleanupLedgerRead.Success -> {
                 // Records loaded in a fresh process have no live registry owner.
@@ -1943,7 +2138,6 @@ internal class CommandCleanupCoordinator(
                 }
                 if (records.isNotEmpty()) {
                     if (!ledger.write(records.values.toList())) corrupt = true
-                    scheduleLocked(immediate = true)
                 }
             }
         }
@@ -1954,7 +2148,7 @@ internal class CommandCleanupCoordinator(
         forceBackstopDelayMs: Long? = null,
     ): Boolean {
         if (corrupt) {
-            backstop.schedule(MIN_RETRY_MS)
+            scheduleBackstopSafely(MIN_RETRY_MS)
             return false
         }
         if (records.isEmpty()) {
@@ -1976,16 +2170,18 @@ internal class CommandCleanupCoordinator(
         } else {
             (records.values.minOf { it.deadlineEpochMs } - now).coerceAtLeast(0L)
         }
-        val backstopAccepted = try {
-            backstop.schedule(delay)
-        } catch (_: Exception) {
-            false
-        }
-        if (delay == 0L && !retryScheduled) {
+        val backstopAccepted = scheduleBackstopSafely(delay)
+        if ((delay == 0L || !backstopAccepted) && !retryScheduled) {
             retryScheduled = true
             immediateScheduler.schedule(MIN_RETRY_MS) { reconcile() }
         }
         return backstopAccepted
+    }
+
+    private fun scheduleBackstopSafely(delayMs: Long): Boolean = try {
+        backstop.schedule(delayMs)
+    } catch (_: Exception) {
+        false
     }
 
     companion object {
@@ -2232,6 +2428,7 @@ internal object CommandCleanupCoordinatorProvider {
             immediateScheduler = ExecutorCleanupScheduler(),
             backstop = AndroidCleanupBackstop(context),
             launchDirectory = File(context.noBackupFilesDir, "command_launch_gate_v1"),
+            launchFileOps = AndroidLaunchSecureFileOps(),
             recoveryProbe = AndroidCleanupPidAccess.probe,
             currentUid = { android.os.Process.myUid() },
             onDefinitive = { record, liveIdentity ->

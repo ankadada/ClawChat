@@ -384,19 +384,30 @@ class MainActivity : FlutterActivity() {
                         } else {
                             null
                         }
-                        val reserveOutcome = if (continuationKey != null) {
+                        val reservation = if (continuationKey != null) {
                             AgentTaskService.reserveCommand(
                                 continuationKey.sessionId,
                                 continuationKey.operationId,
                                 timeout * 1000L,
                             )
                         } else {
-                            CommandReserveOutcome.NEW
+                            CommandReservationDecision(
+                                CommandReserveOutcome.NEW,
+                                CommandAdmissionReason.ADMITTED,
+                            )
                         }
+                        val reserveOutcome = reservation.outcome
                         if (reserveOutcome != CommandReserveOutcome.NEW) {
+                            val reason = if (
+                                reservation.admissionReason == CommandAdmissionReason.ADMITTED
+                            ) {
+                                "REGISTRY_${reserveOutcome.name}"
+                            } else {
+                                reservation.admissionReason.name
+                            }
                             result.error(
                                 "PROOT_${reserveOutcome.name}",
-                                "command continuation not started: ${reserveOutcome.name}",
+                                "command continuation not started: ${reserveOutcome.name} ($reason)",
                                 null,
                             )
                             return@setMethodCallHandler
@@ -411,9 +422,17 @@ class MainActivity : FlutterActivity() {
                                             continuationKey.operationId,
                                         )
                                     if (!continuationReady) {
-                                        throw IllegalStateException(
-                                            "foreground continuation unavailable; command not started"
-                                        )
+                                        safeRunOnUiThread {
+                                            result.error(
+                                                "PROOT_SERVICE_NOT_READY",
+                                                "command continuation not started: SERVICE_NOT_READY",
+                                                mapOf(
+                                                    "reason" to
+                                                        CommandAdmissionReason.SERVICE_NOT_READY.name,
+                                                ),
+                                            )
+                                        }
+                                        return@Thread
                                     }
                                 }
                                 val output = processManager.runInProotSync(
@@ -469,7 +488,12 @@ class MainActivity : FlutterActivity() {
                         val outcome = replacement.outcome
                         if (outcome != CommandReserveOutcome.NEW &&
                             outcome != CommandReserveOutcome.ALREADY_ACTIVE) {
-                            result.success(outcome.name)
+                            result.success(
+                                mapOf(
+                                    "outcome" to outcome.name,
+                                    "reason" to replacement.reason?.name,
+                                )
+                            )
                         } else {
                             Thread {
                                 val ready = TerminalSessionService.startReservedAndAwaitReady(
@@ -480,8 +504,18 @@ class MainActivity : FlutterActivity() {
                                 )
                                 safeRunOnUiThread {
                                     result.success(
-                                        if (ready) outcome.name
-                                        else CommandReserveOutcome.RETIRED.name
+                                        mapOf(
+                                            "outcome" to if (ready) {
+                                                outcome.name
+                                            } else {
+                                                CommandReserveOutcome.RETIRED.name
+                                            },
+                                            "reason" to if (ready) {
+                                                replacement.reason?.name
+                                            } else {
+                                                CommandAdmissionReason.SERVICE_NOT_READY.name
+                                            },
+                                        )
                                     )
                                 }
                             }.start()
@@ -527,6 +561,7 @@ class MainActivity : FlutterActivity() {
                         result.success(
                             mapOf(
                                 "outcome" to launch.outcome.name,
+                                "failureReason" to launch.failureReason?.name,
                                 "wrapperPath" to launch.wrapperPath,
                                 "attemptDirectoryPath" to launch.attemptDirectoryPath,
                                 "stagingPath" to launch.stagingPath,

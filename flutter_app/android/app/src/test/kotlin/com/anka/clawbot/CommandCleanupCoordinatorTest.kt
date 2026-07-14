@@ -375,7 +375,7 @@ class CommandCleanupCoordinatorTest {
     }
 
     @Test
-    fun initialBackstopRejectionRetainsDurableBlockAndFailsOwnershipClosed() {
+    fun persistentBackstopRejectionRetiresUnpublishedCapabilityWithoutPoisoningSession() {
         val ledger = FakeLedger()
         val backstop = FakeBackstop(acceptSchedules = false)
         val coordinator = coordinator(ledger, FakeImmediateScheduler(), backstop) {
@@ -392,17 +392,409 @@ class CommandCleanupCoordinatorTest {
                 60_000L,
             ),
         )
-        assertEquals(1, ledger.records.size)
-        assertEquals(
-            CleanupDisposalState.BACKSTOP_PENDING,
-            ledger.records.single().disposalState,
-        )
-        assertFalse(
+        assertTrue(ledger.records.isEmpty())
+        assertTrue(
             coordinator.canAdmit(
                 CommandContinuationOwner.TERMINAL,
                 "backstop-rejected",
             ),
         )
+    }
+
+    @Test
+    fun freshAndroidTerminalLaunchDoesNotReturnProotRetryableUnknown() {
+        val ledger = FakeLedger()
+        val backstop = FakeBackstop(scheduleResults = listOf(false, true))
+        val coordinator = CommandCleanupCoordinator(
+            ledger = ledger,
+            disposer = CleanupProcessDisposer {
+                CleanupDisposalAttempt(ProcessDisposalResult.DISPOSED)
+            },
+            immediateScheduler = FakeImmediateScheduler(),
+            backstop = backstop,
+            launchDirectory = Files.createTempDirectory("fresh-android-echo").toFile(),
+            launchFileOps = AndroidLaunchSecureFileOps(
+                lstatReader = AndroidLstatReader(NioLaunchSecureFileOps::metadata),
+            ),
+            recoveryProbe = PidProcessProbe { PidProbeResult.Present(1L) },
+            parentProcessId = ::currentProcessId,
+            nowEpochMs = { 1_000L },
+        )
+        coordinator.initialize()
+        val registry = CommandContinuationRegistry(nowEpochMs = { 1_000L })
+        val key = agentKey("echo-ok-session", "echo-ok-operation")
+
+        val reservation = reserveAgentCommand(coordinator, registry, key, 30_000L)
+        assertEquals(CommandReserveOutcome.NEW, reservation.outcome)
+        assertEquals(CommandAdmissionReason.ADMITTED, reservation.admissionReason)
+        val launch = coordinator.prepareLaunch(key, null, 31_000L)
+        assertEquals(
+            DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_SCHEDULED,
+            launch.outcome,
+        )
+        assertTrue(launch.failureReason == null)
+        assertEquals(2, backstop.scheduledDelays.size)
+        assertEquals(CleanupDisposalState.SPAWN_CAPABILITY_ISSUED, ledger.records.single().disposalState)
+        assertTrue(
+            coordinator.acknowledgeLaunchAbandoned(
+                key,
+                null,
+                requireNotNull(launch.attemptId),
+                requireNotNull(launch.launchToken),
+            )
+        )
+    }
+
+    @Test
+    fun rejectedBackstopCannotTurnNextEchoIntoProotRetryableUnknown() {
+        val ledger = FakeLedger()
+        val backstop = FakeBackstop(acceptSchedules = false)
+        val coordinator = coordinator(ledger, FakeImmediateScheduler(), backstop) {
+            ProcessDisposalResult.DISPOSED
+        }
+        coordinator.initialize()
+        val registry = CommandContinuationRegistry(nowEpochMs = { 1_000L })
+        val firstKey = agentKey("echo-retry-session", "first-operation")
+        assertEquals(
+            CommandReserveOutcome.NEW,
+            reserveAgentCommand(coordinator, registry, firstKey, 30_000L).outcome,
+        )
+        val rejected = coordinator.prepareLaunch(firstKey, null, 31_000L)
+        assertEquals(
+            DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_PENDING,
+            rejected.outcome,
+        )
+        assertEquals(
+            CommandLaunchFailureReason.BACKSTOP_SCHEDULE_REJECTED,
+            rejected.failureReason,
+        )
+        assertTrue(ledger.records.isEmpty())
+        registry.cancel(firstKey)
+
+        backstop.acceptSchedules = true
+        val secondKey = agentKey("echo-retry-session", "second-operation")
+        val retry = reserveAgentCommand(coordinator, registry, secondKey, 30_000L)
+        assertEquals(CommandReserveOutcome.NEW, retry.outcome)
+        assertEquals(CommandAdmissionReason.ADMITTED, retry.admissionReason)
+        val recovered = coordinator.prepareLaunch(secondKey, null, 31_000L)
+        assertEquals(
+            DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_SCHEDULED,
+            recovered.outcome,
+        )
+    }
+
+    @Test
+    fun crashedBackstopPendingProbesParentBeforeSchedulerAcrossFreshProcessMatrix() {
+        val parentCases = listOf(
+            Triple("same", PidProbeResult.Present(91L), false),
+            Triple("unknown", PidProbeResult.RetryableUnknown, false),
+            Triple("missing", PidProbeResult.Missing, true),
+            Triple("reused", PidProbeResult.Present(92L), true),
+        )
+        val schedulerCases = listOf(
+            Triple("accepted", true, false),
+            Triple("rejected", false, false),
+            Triple("throws", false, true),
+        )
+
+        for ((parentName, initialParent, initiallyDefinitive) in parentCases) {
+            for ((schedulerName, accepts, throws) in schedulerCases) {
+                val base = Files.createTempDirectory(
+                    "backstop-crash-$parentName-$schedulerName",
+                ).toFile()
+                val launchRoot = File(base, "launch").apply {
+                    assertTrue(mkdir())
+                    setPrivateDirectory(this)
+                }
+                File(launchRoot, "command_launch_gate.sh").apply {
+                    writeText("#!/system/bin/sh\nexit 0\n")
+                    setPrivateFile(this)
+                }
+                val attemptId = "a".repeat(64)
+                val attemptHash = CommandCleanupCoordinator.opaqueIdHash("attempt", attemptId)
+                File(launchRoot, "attempt-$attemptHash").apply {
+                    assertTrue(mkdir())
+                    setPrivateDirectory(this)
+                }
+                val sessionId = "crashed-backstop-$parentName-$schedulerName"
+                val operationId = "echo-ok"
+                val owner = CommandContinuationOwner.AGENT_BASH
+                val sessionHash = CommandCleanupCoordinator.sessionHash(owner, sessionId)
+                val record = CommandCleanupRecord(
+                    recordId = CommandCleanupCoordinator.recordId(
+                        owner,
+                        sessionHash,
+                        operationId,
+                        null,
+                    ),
+                    owner = owner,
+                    sessionHash = sessionHash,
+                    operationHash = CommandCleanupCoordinator.opaqueIdHash(
+                        "operation",
+                        operationId,
+                    ),
+                    candidateHash = null,
+                    attemptHash = attemptHash,
+                    launchTokenHash = CommandCleanupCoordinator.opaqueIdHash(
+                        "launch-token",
+                        "b".repeat(64),
+                    ),
+                    parentProcessId = 900,
+                    parentStartTimeTicks = 91L,
+                    processId = 0,
+                    startTimeTicks = 0L,
+                    deadlineEpochMs = 60_000L,
+                    launchExpiresEpochMs = 30_000L,
+                    disposalState = CleanupDisposalState.BACKSTOP_PENDING,
+                    disposalVersion = 2L,
+                )
+                val ledgerFile = File(base, "ledger.bin")
+                assertTrue(AtomicCommandCleanupLedger(ledgerFile).write(listOf(record)))
+                var parent = initialParent
+                val backstop = FakeBackstop(
+                    acceptSchedules = accepts,
+                    throwSchedules = throws,
+                )
+                val immediate = FakeImmediateScheduler()
+                val recreated = CommandCleanupCoordinator(
+                    ledger = AtomicCommandCleanupLedger(ledgerFile),
+                    disposer = CleanupProcessDisposer {
+                        throw AssertionError("unpublished capability has no PID authority")
+                    },
+                    immediateScheduler = immediate,
+                    backstop = backstop,
+                    launchDirectory = launchRoot,
+                    recoveryProbe = PidProcessProbe { parent },
+                    parentProcessId = { 901 },
+                    nowEpochMs = { 1_000L },
+                )
+
+                recreated.initialize()
+                assertEquals(0, backstop.scheduleAttempts)
+                assertEquals(0, immediate.pendingCount)
+                assertEquals(
+                    if (initiallyDefinitive) {
+                        CommandAdmissionReason.ADMITTED
+                    } else {
+                        CommandAdmissionReason.ACTIVE_SESSION_RECORD
+                    },
+                    recreated.admissionReason(owner, sessionId),
+                )
+                if (initiallyDefinitive) {
+                    assertEquals(0, backstop.scheduleAttempts)
+                    assertTrue(persistedRecords(ledgerFile).isEmpty())
+                } else {
+                    assertTrue(backstop.scheduleAttempts > 0)
+                    if (!accepts || throws) assertTrue(immediate.pendingCount > 0)
+                    assertEquals(1, persistedRecords(ledgerFile).size)
+                    parent = PidProbeResult.Missing
+                    recreated.reconcile()
+                    assertEquals(CommandAdmissionReason.ADMITTED, recreated.admissionReason(owner, sessionId))
+                    assertTrue(persistedRecords(ledgerFile).isEmpty())
+                }
+            }
+        }
+    }
+
+    @Test
+    fun commandAdmissionReportsExactFailClosedReason() {
+        val registry = CommandContinuationRegistry(nowEpochMs = { 1_000L })
+        val unavailable = reserveAgentCommand(
+            null,
+            registry,
+            agentKey("unavailable", "operation"),
+            30_000L,
+        )
+        assertEquals(CommandReserveOutcome.RETRYABLE_UNKNOWN, unavailable.outcome)
+        assertEquals(CommandAdmissionReason.COORDINATOR_UNAVAILABLE, unavailable.admissionReason)
+
+        val corrupt = coordinator(
+            FakeLedger(CleanupLedgerRead.Corrupt("injected")),
+            FakeImmediateScheduler(),
+            FakeBackstop(),
+        ) { ProcessDisposalResult.RETRYABLE_UNKNOWN }
+        corrupt.initialize()
+        val corruptDecision = reserveAgentCommand(
+            corrupt,
+            registry,
+            agentKey("corrupt", "operation"),
+            30_000L,
+        )
+        assertEquals(CommandReserveOutcome.RETRYABLE_UNKNOWN, corruptDecision.outcome)
+        assertEquals(CommandAdmissionReason.LEDGER_CORRUPT, corruptDecision.admissionReason)
+
+        val active = coordinator(FakeLedger(), FakeImmediateScheduler(), FakeBackstop()) {
+            ProcessDisposalResult.RETRYABLE_UNKNOWN
+        }
+        active.initialize()
+        val activeKey = agentKey("active-session", "first")
+        val preparation = active.prepareLaunch(activeKey, null, 31_000L)
+        assertEquals(
+            DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_SCHEDULED,
+            preparation.outcome,
+        )
+        val blocked = reserveAgentCommand(
+            active,
+            registry,
+            agentKey("active-session", "second"),
+            30_000L,
+        )
+        assertEquals(CommandReserveOutcome.RETRYABLE_UNKNOWN, blocked.outcome)
+        assertEquals(CommandAdmissionReason.ACTIVE_SESSION_RECORD, blocked.admissionReason)
+    }
+
+    @Test
+    fun terminalAdmissionReportsCoordinatorLedgerAndActiveSessionReasons() {
+        assertEquals(
+            CommandAdmissionReason.COORDINATOR_UNAVAILABLE,
+            terminalSessionAdmissionReason(null, "terminal-unavailable"),
+        )
+
+        val corrupt = coordinator(
+            FakeLedger(CleanupLedgerRead.Corrupt("injected")),
+            FakeImmediateScheduler(),
+            FakeBackstop(),
+        ) { ProcessDisposalResult.RETRYABLE_UNKNOWN }
+        corrupt.initialize()
+        assertEquals(
+            CommandAdmissionReason.LEDGER_CORRUPT,
+            terminalSessionAdmissionReason(corrupt, "terminal-corrupt"),
+        )
+
+        val active = coordinator(FakeLedger(), FakeImmediateScheduler(), FakeBackstop()) {
+            ProcessDisposalResult.RETRYABLE_UNKNOWN
+        }
+        active.initialize()
+        val key = terminalKey("terminal-active", "operation")
+        assertEquals(
+            DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_SCHEDULED,
+            active.prepareLaunch(key, "candidate", 31_000L).outcome,
+        )
+        assertEquals(
+            CommandAdmissionReason.ACTIVE_SESSION_RECORD,
+            terminalSessionAdmissionReason(active, key.sessionId),
+        )
+
+        val fresh = coordinator(FakeLedger(), FakeImmediateScheduler(), FakeBackstop()) {
+            ProcessDisposalResult.RETRYABLE_UNKNOWN
+        }
+        fresh.initialize()
+        assertEquals(
+            CommandAdmissionReason.ADMITTED,
+            terminalSessionAdmissionReason(fresh, "terminal-fresh"),
+        )
+    }
+
+    @Test
+    fun prepareLaunchReportsExactFailClosedReason() {
+        val deadline = coordinator(FakeLedger(), FakeImmediateScheduler(), FakeBackstop()) {
+            ProcessDisposalResult.RETRYABLE_UNKNOWN
+        }
+        deadline.initialize()
+        assertEquals(
+            CommandLaunchFailureReason.DEADLINE_EXPIRED,
+            deadline.prepareLaunch(agentKey("deadline", "operation"), null, 1_000L).failureReason,
+        )
+
+        val parentUnknown = CommandCleanupCoordinator(
+            ledger = FakeLedger(),
+            disposer = CleanupProcessDisposer {
+                CleanupDisposalAttempt(ProcessDisposalResult.RETRYABLE_UNKNOWN)
+            },
+            immediateScheduler = FakeImmediateScheduler(),
+            backstop = FakeBackstop(),
+            launchDirectory = Files.createTempDirectory("parent-unknown").toFile(),
+            recoveryProbe = PidProcessProbe { PidProbeResult.RetryableUnknown },
+            parentProcessId = ::currentProcessId,
+            nowEpochMs = { 1_000L },
+        )
+        parentUnknown.initialize()
+        assertEquals(
+            CommandLaunchFailureReason.PARENT_GENERATION_UNKNOWN,
+            parentUnknown.prepareLaunch(
+                agentKey("parent-unknown", "operation"),
+                null,
+                30_000L,
+            ).failureReason,
+        )
+
+        val noUnixMetadata = object : LaunchSecureFileOps by NioLaunchSecureFileOps {
+            override fun metadata(path: File): LaunchEntryMetadata? = null
+        }
+        val rootUnavailable = CommandCleanupCoordinator(
+            ledger = FakeLedger(),
+            disposer = CleanupProcessDisposer {
+                CleanupDisposalAttempt(ProcessDisposalResult.RETRYABLE_UNKNOWN)
+            },
+            immediateScheduler = FakeImmediateScheduler(),
+            backstop = FakeBackstop(),
+            launchDirectory = Files.createTempDirectory("root-unavailable").toFile(),
+            launchFileOps = noUnixMetadata,
+            recoveryProbe = PidProcessProbe { PidProbeResult.Present(1L) },
+            parentProcessId = ::currentProcessId,
+            nowEpochMs = { 1_000L },
+        )
+        rootUnavailable.initialize()
+        assertEquals(
+            CommandLaunchFailureReason.ATTEMPT_ROOT_UNAVAILABLE,
+            rootUnavailable.prepareLaunch(
+                agentKey("root-unavailable", "operation"),
+                null,
+                30_000L,
+            ).failureReason,
+        )
+
+        val failedLedger = FakeLedger().apply { failWrites = true }
+        val ledgerFailure = coordinator(
+            failedLedger,
+            FakeImmediateScheduler(),
+            FakeBackstop(),
+        ) { ProcessDisposalResult.RETRYABLE_UNKNOWN }
+        ledgerFailure.initialize()
+        assertEquals(
+            CommandLaunchFailureReason.LEDGER_WRITE_FAILED,
+            ledgerFailure.prepareLaunch(
+                agentKey("ledger-write", "operation"),
+                null,
+                30_000L,
+            ).failureReason,
+        )
+    }
+
+    @Test
+    fun androidLstatAdapterDoesNotDependOnNioUnixAttributeView() {
+        val directory = Files.createTempDirectory("android-lstat-adapter").toFile()
+        val payload = File(directory, "payload").apply { writeText("ok") }
+        val expectedDirectory = requireNotNull(NioLaunchSecureFileOps.metadata(directory))
+        val expectedPayload = requireNotNull(NioLaunchSecureFileOps.metadata(payload))
+        val nioWithoutUnixAttributes = object : LaunchSecureFileOps by NioLaunchSecureFileOps {
+            override fun metadata(path: File): LaunchEntryMetadata? = null
+        }
+        val android = AndroidLaunchSecureFileOps(
+            lstatReader = AndroidLstatReader { path ->
+                when (path) {
+                    directory -> expectedDirectory
+                    payload -> expectedPayload
+                    else -> NioLaunchSecureFileOps.metadata(path)
+                }
+            },
+            delegate = nioWithoutUnixAttributes,
+        )
+
+        assertEquals(expectedDirectory, android.metadata(directory))
+        assertEquals(expectedPayload, android.metadata(payload))
+        assertEquals(listOf(payload), android.listEntriesIfSame(directory, expectedDirectory))
+        assertEquals("ok", android.readFile(payload, 16)?.toString(Charsets.UTF_8))
+        for (links in listOf(1, 2, 7)) {
+            assertEquals(
+                links,
+                AndroidLaunchSecureFileOps(
+                    lstatReader = AndroidLstatReader {
+                        expectedDirectory.copy(linkCount = links)
+                    },
+                ).metadata(directory)?.linkCount,
+            )
+        }
     }
 
     @Test
@@ -2264,7 +2656,8 @@ class CommandCleanupCoordinatorTest {
             rejected.outcome,
         )
         assertTrue(rejected.wrapperPath == null)
-        assertEquals(CleanupDisposalState.BACKSTOP_PENDING, ledger.records.single().disposalState)
+        assertTrue(ledger.records.isEmpty())
+        assertTrue(coordinator.canAdmit(CommandContinuationOwner.TERMINAL, key.sessionId))
 
         val accepted = coordinator(
             FakeLedger(),
@@ -2356,7 +2749,7 @@ class CommandCleanupCoordinatorTest {
             pending.outcome,
         )
         assertTrue(pending.wrapperPath == null)
-        assertEquals(CleanupDisposalState.BACKSTOP_PENDING, throwingLedger.records.single().disposalState)
+        assertTrue(throwingLedger.records.isEmpty())
     }
 
     @Test
@@ -2712,6 +3105,16 @@ class CommandCleanupCoordinatorTest {
         )
     }
 
+    private fun setPrivateFile(file: File) {
+        Files.setPosixFilePermissions(
+            file.toPath(),
+            setOf(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE,
+            ),
+        )
+    }
+
     private fun persistedRecords(file: File): List<CommandCleanupRecord> =
         (AtomicCommandCleanupLedger(file).read() as CleanupLedgerRead.Success).records
 
@@ -2805,22 +3208,29 @@ class CommandCleanupCoordinatorTest {
             actions.addLast(action)
         }
 
+        val pendingCount: Int
+            get() = actions.size
+
         fun runNext() {
             actions.removeFirst().invoke()
         }
     }
 
     private class FakeBackstop(
-        private val acceptSchedules: Boolean = true,
+        var acceptSchedules: Boolean = true,
         private val throwSchedules: Boolean = false,
+        scheduleResults: List<Boolean> = emptyList(),
     ) : CleanupBackstop {
+        private val queuedResults = ArrayDeque(scheduleResults)
         val scheduledDelays = mutableListOf<Long>()
+        var scheduleAttempts = 0
         var cancelCount = 0
 
         override fun schedule(minimumLatencyMs: Long): Boolean {
+            scheduleAttempts++
             if (throwSchedules) throw IllegalStateException("injected scheduler failure")
             scheduledDelays.add(minimumLatencyMs)
-            return acceptSchedules
+            return if (queuedResults.isEmpty()) acceptSchedules else queuedResults.removeFirst()
         }
 
         override fun cancel() {

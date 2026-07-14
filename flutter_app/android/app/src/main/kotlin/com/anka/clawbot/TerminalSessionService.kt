@@ -23,6 +23,26 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
+internal fun terminalSessionAdmissionReason(
+    coordinator: CommandCleanupCoordinator?,
+    sessionId: String,
+): CommandAdmissionReason {
+    coordinator ?: return CommandAdmissionReason.COORDINATOR_UNAVAILABLE
+    val cleanupAccepted = coordinator.requestSessionCleanup(
+        CommandContinuationOwner.TERMINAL,
+        sessionId,
+    )
+    val admission = coordinator.admissionReason(
+        CommandContinuationOwner.TERMINAL,
+        sessionId,
+    )
+    return if (!cleanupAccepted && admission == CommandAdmissionReason.ADMITTED) {
+        CommandAdmissionReason.CLEANUP_REJECTED
+    } else {
+        admission
+    }
+}
+
 class TerminalSessionService : Service() {
     companion object {
         private const val CHANNEL_ID = "clawchat_terminal"
@@ -60,17 +80,12 @@ class TerminalSessionService : Service() {
         ): TerminalSessionReplacementResult {
             val key = terminalKey(operationId, sessionId)
             val coordinator = cleanupCoordinator
-                ?: return TerminalSessionReplacementResult(
-                    CommandReserveOutcome.RETRYABLE_UNKNOWN,
-                    TerminalCandidateKey(key, candidateId),
-                )
-            if (!coordinator.requestSessionCleanup(
-                    CommandContinuationOwner.TERMINAL,
-                    sessionId,
-                ) || !coordinator.canAdmit(CommandContinuationOwner.TERMINAL, sessionId)) {
+            val admission = terminalSessionAdmissionReason(coordinator, sessionId)
+            if (admission != CommandAdmissionReason.ADMITTED) {
                 return TerminalSessionReplacementResult(
                     CommandReserveOutcome.RETRYABLE_UNKNOWN,
                     TerminalCandidateKey(key, candidateId),
+                    reason = admission,
                 )
             }
             val result = owner.replaceTerminalSession(
@@ -193,10 +208,12 @@ class TerminalSessionService : Service() {
             val deadline = owner.deadlineEpochMs(key)
                 ?: return CommandLaunchPreparation(
                     DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                    CommandLaunchFailureReason.STALE_EXACT_RECORD,
                 )
             return cleanupCoordinator?.prepareLaunch(key, candidateId, deadline)
                 ?: CommandLaunchPreparation(
                     DurableLaunchRegistrationOutcome.FAILED_OR_CORRUPT,
+                    CommandLaunchFailureReason.COORDINATOR_UNAVAILABLE,
                 )
         }
 

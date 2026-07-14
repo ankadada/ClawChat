@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/services/preferences_service.dart';
+import 'package:clawchat/services/terminal_runtime_session.dart';
 import 'package:clawchat/services/tools/bash_tool.dart';
 import 'package:clawchat/services/tools/tool_registry.dart';
 import 'package:flutter/services.dart';
@@ -455,6 +456,139 @@ void main() {
     expect(arguments['mountStorage'], isFalse);
   });
 
+  test('fresh Android echo ok does not surface PROOT_RETRYABLE_UNKNOWN',
+      () async {
+    final calls = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'runInProot') return 'ok\n';
+      return null;
+    });
+
+    final output = await tool.executeWithContext(
+      const {'command': 'echo ok', 'timeout': 30},
+      sessionId: 'fresh-echo-session',
+    );
+    expect(output.trim(), 'ok');
+    final run = calls.singleWhere((call) => call.method == 'runInProot');
+    final args = Map<String, Object?>.from(run.arguments as Map);
+    expect(args['continuationSessionId'], 'fresh-echo-session');
+    expect(args['requireBackgroundContinuation'], isTrue);
+    expect(args['operationId'], isA<String>());
+  });
+
+  test('fresh Android Terminal replacement does not return generic retry',
+      () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'replaceTerminalSession');
+      return <String, Object?>{'outcome': 'NEW', 'reason': null};
+    });
+
+    final result = await const NativeTerminalContinuationBackend().replace(
+      operationId: 'fresh-operation',
+      sessionId: TerminalRuntimeSession.sessionId,
+      candidateId: 'fresh-candidate',
+      timeout: const Duration(seconds: 30),
+    );
+
+    expect(result.outcome, TerminalContinuationStartOutcome.newOperation);
+    expect(result.reason, isNull);
+  });
+
+  test('Terminal replacement propagates exact non-secret admission reasons',
+      () async {
+    const cases = <String,
+        (String, TerminalContinuationStartOutcome, TerminalContinuationReason)>{
+      'ACTIVE_SESSION_RECORD': (
+        'RETRYABLE_UNKNOWN',
+        TerminalContinuationStartOutcome.cleanupPending,
+        TerminalContinuationReason.activeSessionRecord,
+      ),
+      'LEDGER_CORRUPT': (
+        'RETRYABLE_UNKNOWN',
+        TerminalContinuationStartOutcome.cleanupPending,
+        TerminalContinuationReason.ledgerCorrupt,
+      ),
+      'COORDINATOR_UNAVAILABLE': (
+        'RETRYABLE_UNKNOWN',
+        TerminalContinuationStartOutcome.cleanupPending,
+        TerminalContinuationReason.coordinatorUnavailable,
+      ),
+      'REGISTRY_RETRY': (
+        'RETRYABLE_UNKNOWN',
+        TerminalContinuationStartOutcome.cleanupPending,
+        TerminalContinuationReason.registryRetry,
+      ),
+      'REGISTRY_CONFLICT': (
+        'CONFLICT',
+        TerminalContinuationStartOutcome.conflict,
+        TerminalContinuationReason.registryConflict,
+      ),
+    };
+
+    for (final entry in cases.entries) {
+      final value = entry.value;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+              channel,
+              (_) async =>
+                  <String, Object?>{'outcome': value.$1, 'reason': entry.key});
+      final result = await const NativeTerminalContinuationBackend().replace(
+        operationId: 'operation',
+        sessionId: TerminalRuntimeSession.sessionId,
+        candidateId: 'candidate',
+        timeout: const Duration(seconds: 30),
+      );
+      expect(result.outcome, value.$2);
+      expect(result.reason, value.$3);
+    }
+  });
+
+  test('Terminal replacement accepts legacy outcome-only channel response',
+      () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (_) async => 'NEW');
+
+    final result = await const NativeTerminalContinuationBackend().replace(
+      operationId: 'legacy-operation',
+      sessionId: TerminalRuntimeSession.sessionId,
+      candidateId: 'legacy-candidate',
+      timeout: const Duration(seconds: 30),
+    );
+
+    expect(result.outcome, TerminalContinuationStartOutcome.newOperation);
+    expect(result.reason, isNull);
+  });
+
+  test('Terminal launch scheduler failure exposes exact typed reason',
+      () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'prepareTerminalLaunch');
+      return <String, Object?>{
+        'outcome': 'DURABLY_REGISTERED_BACKSTOP_PENDING',
+        'failureReason': 'BACKSTOP_SCHEDULE_REJECTED',
+      };
+    });
+
+    await expectLater(
+      const NativeTerminalContinuationBackend().prepareLaunch(
+        operationId: 'operation',
+        sessionId: TerminalRuntimeSession.sessionId,
+        candidateId: 'candidate',
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('BACKSTOP_SCHEDULE_REJECTED'),
+        ),
+      ),
+    );
+  });
+
   test('agent Bash CLI-like loopback callback commits once while backgrounded',
       () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -535,15 +669,39 @@ void main() {
         .setMockMethodCallHandler(channel, (call) async {
       if (call.method == 'runInProot') {
         throw PlatformException(
-          code: 'PROOT_ERROR',
-          message: 'foreground continuation unavailable; command not started',
+          code: 'PROOT_SERVICE_NOT_READY',
+          message: 'private-operation PRIVATE_ENV_VALUE',
+          details: <String, Object?>{
+            'reason': 'SERVICE_NOT_READY',
+            'operationId': 'private-operation',
+          },
         );
       }
       return null;
     });
 
     final result = await tool.execute({'command': 'cli configure'});
-    expect(result, contains('foreground continuation unavailable'));
-    expect(result, contains('command not started'));
+    expect(
+        result, 'Error: command continuation not started: SERVICE_NOT_READY');
+    expect(result, isNot(contains('private-operation')));
+    expect(result, isNot(contains('PRIVATE_ENV_VALUE')));
+    expect(result, isNot(contains('cli configure')));
+  });
+
+  test('legacy generic PRoot error payload remains readable', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') {
+        throw PlatformException(
+          code: 'PROOT_ERROR',
+          message: 'legacy foreground continuation unavailable',
+        );
+      }
+      return null;
+    });
+
+    final result = await tool.execute({'command': 'echo ok'});
+    expect(result, contains('PROOT_ERROR'));
+    expect(result, contains('legacy foreground continuation unavailable'));
   });
 }

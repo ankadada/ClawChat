@@ -128,6 +128,9 @@ void main() {
     final processManager = File(
       'android/app/src/main/kotlin/com/anka/clawbot/ProcessManager.kt',
     ).readAsStringSync();
+    final agent = File(
+      'android/app/src/main/kotlin/com/anka/clawbot/AgentTaskService.kt',
+    ).readAsStringSync();
     final terminalRuntime =
         File('lib/services/terminal_runtime_session.dart').readAsStringSync();
 
@@ -166,6 +169,21 @@ void main() {
     expect(coordinator, contains('listEntriesIfSame'));
     expect(coordinator, contains('deleteFileIfSame'));
     expect(coordinator, contains('deleteEmptyDirectoryIfSame'));
+    expect(coordinator, contains('AndroidLaunchSecureFileOps'));
+    expect(coordinator, contains('Os.lstat'));
+    expect(coordinator, contains('CommandAdmissionReason'));
+    expect(coordinator, contains('BACKSTOP_SCHEDULE_REJECTED'));
+    expect(
+      coordinator,
+      contains('launchFileOps = AndroidLaunchSecureFileOps()'),
+    );
+    expect(agent, contains('reserveAgentCommand'));
+    expect(agent, contains('CommandReservationDecision'));
+    expect(activity, contains('"PROOT_SERVICE_NOT_READY"'));
+    expect(
+      activity,
+      contains('CommandAdmissionReason.SERVICE_NOT_READY.name'),
+    );
     expect(coordinator, isNot(contains('moveNodeNoReplace')));
     expect(coordinator, isNot(contains('deleteTree')));
     expect(coordinator, isNot(contains('Files.walkFileTree')));

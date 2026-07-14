@@ -44,7 +44,7 @@ final class FlutterPtyProcessHandle implements TerminalProcessHandle {
 }
 
 abstract interface class TerminalContinuationBackend {
-  Future<TerminalContinuationStartOutcome> replace({
+  Future<TerminalContinuationStartResult> replace({
     required String operationId,
     required String sessionId,
     required String candidateId,
@@ -131,6 +131,36 @@ enum TerminalContinuationStartOutcome {
   conflict,
 }
 
+enum TerminalContinuationReason {
+  coordinatorUnavailable('COORDINATOR_UNAVAILABLE'),
+  ledgerCorrupt('LEDGER_CORRUPT'),
+  activeSessionRecord('ACTIVE_SESSION_RECORD'),
+  registryRetry('REGISTRY_RETRY'),
+  registryConflict('REGISTRY_CONFLICT'),
+  cleanupRejected('CLEANUP_REJECTED'),
+  serviceNotReady('SERVICE_NOT_READY'),
+  unknown('UNKNOWN');
+
+  const TerminalContinuationReason(this.wireName);
+
+  final String wireName;
+
+  static TerminalContinuationReason? fromWire(Object? value) {
+    if (value is! String) return null;
+    return TerminalContinuationReason.values.firstWhere(
+      (reason) => reason.wireName == value,
+      orElse: () => TerminalContinuationReason.unknown,
+    );
+  }
+}
+
+final class TerminalContinuationStartResult {
+  const TerminalContinuationStartResult(this.outcome, {this.reason});
+
+  final TerminalContinuationStartOutcome outcome;
+  final TerminalContinuationReason? reason;
+}
+
 final class TerminalLaunchGate {
   const TerminalLaunchGate({
     required this.wrapperPath,
@@ -179,19 +209,19 @@ final class NativeTerminalContinuationBackend
   const NativeTerminalContinuationBackend();
 
   @override
-  Future<TerminalContinuationStartOutcome> replace({
+  Future<TerminalContinuationStartResult> replace({
     required String operationId,
     required String sessionId,
     required String candidateId,
     required Duration timeout,
   }) async {
-    final outcome = await NativeBridge.replaceTerminalSession(
+    final value = await NativeBridge.replaceTerminalSession(
       operationId: operationId,
       sessionId: sessionId,
       candidateId: candidateId,
       timeout: timeout,
     );
-    return switch (outcome) {
+    final outcome = switch (value['outcome']) {
       'NEW' => TerminalContinuationStartOutcome.newOperation,
       'ALREADY_ACTIVE' => TerminalContinuationStartOutcome.alreadyActive,
       'RETIRED' => TerminalContinuationStartOutcome.retired,
@@ -199,6 +229,10 @@ final class NativeTerminalContinuationBackend
       'RETRYABLE_UNKNOWN' => TerminalContinuationStartOutcome.cleanupPending,
       _ => TerminalContinuationStartOutcome.conflict,
     };
+    return TerminalContinuationStartResult(
+      outcome,
+      reason: TerminalContinuationReason.fromWire(value['reason']),
+    );
   }
 
   @override
@@ -225,7 +259,10 @@ final class NativeTerminalContinuationBackend
       candidateId: candidateId,
     );
     if (value['outcome'] != 'DURABLY_REGISTERED_BACKSTOP_SCHEDULED') {
-      return null;
+      throw StateError(
+        'durable terminal launch unavailable: '
+        '${value['failureReason'] ?? value['outcome'] ?? 'UNKNOWN'}',
+      );
     }
     final wrapperPath = value['wrapperPath'];
     final attemptDirectoryPath = value['attemptDirectoryPath'];
@@ -520,11 +557,12 @@ class TerminalRuntimeSession {
     var leaseStarted = false;
     TerminalLaunchGate? preparedLaunch;
     try {
-      final startOutcome = await _reserveCandidate(
+      final startResult = await _reserveCandidate(
         operationId: operationId,
         candidateId: candidateId,
         generation: generation,
       );
+      final startOutcome = startResult.outcome;
       leaseStarted =
           startOutcome == TerminalContinuationStartOutcome.newOperation ||
               startOutcome == TerminalContinuationStartOutcome.alreadyActive;
@@ -539,7 +577,8 @@ class TerminalRuntimeSession {
       }
       if (!leaseStarted) {
         throw StateError(
-          'foreground continuation unavailable: ${startOutcome.name}',
+          'foreground continuation unavailable: '
+          '${startResult.reason?.wireName ?? startOutcome.name}',
         );
       }
 
@@ -692,11 +731,12 @@ class TerminalRuntimeSession {
     }
   }
 
-  Future<TerminalContinuationStartOutcome> _reserveCandidate({
+  Future<TerminalContinuationStartResult> _reserveCandidate({
     required String operationId,
     required String candidateId,
     required int generation,
   }) async {
+    TerminalContinuationReason? pendingReason;
     while (true) {
       if (generation != _generation || _deadlineExpired) {
         final receipt = await _tryReceipt(() => _backend.cancel(
@@ -706,14 +746,23 @@ class TerminalRuntimeSession {
             ));
         if (receipt == TerminalCandidateReceipt.callerOwns) {
           await _acknowledgeFinalReceipt(operationId, candidateId, receipt);
-          return TerminalContinuationStartOutcome.retired;
+          return TerminalContinuationStartResult(
+            TerminalContinuationStartOutcome.retired,
+            reason: pendingReason,
+          );
         }
         if (receipt == TerminalCandidateReceipt.nativeDisposed) {
           await _acknowledgeFinalReceipt(operationId, candidateId, receipt);
-          return TerminalContinuationStartOutcome.retired;
+          return TerminalContinuationStartResult(
+            TerminalContinuationStartOutcome.retired,
+            reason: pendingReason,
+          );
         }
         if (receipt == TerminalCandidateReceipt.acknowledged) {
-          return TerminalContinuationStartOutcome.acknowledged;
+          return TerminalContinuationStartResult(
+            TerminalContinuationStartOutcome.acknowledged,
+            reason: pendingReason,
+          );
         }
         if (receipt == TerminalCandidateReceipt.unknown) {
           // Materialize this exact candidate before retrying cancellation.
@@ -736,7 +785,7 @@ class TerminalRuntimeSession {
         continue;
       }
       try {
-        final outcome = await _backend
+        final result = await _backend
             .replace(
               operationId: operationId,
               sessionId: sessionId,
@@ -744,11 +793,12 @@ class TerminalRuntimeSession {
               timeout: continuationTimeout,
             )
             .timeout(receiptCallTimeout);
-        if (outcome == TerminalContinuationStartOutcome.cleanupPending) {
+        if (result.outcome == TerminalContinuationStartOutcome.cleanupPending) {
+          pendingReason = result.reason ?? pendingReason;
           await _reconciliationDelay(_retryDelay);
           continue;
         }
-        return outcome;
+        return result;
       } catch (_) {
         await _reconciliationDelay(_retryDelay);
       }

@@ -205,6 +205,11 @@ internal data class TerminalSessionReplacementResult(
     val outcome: CommandReserveOutcome,
     val candidate: TerminalCandidateKey,
     val retiredCandidates: List<TerminalCandidateKey> = emptyList(),
+    val reason: CommandAdmissionReason? = when (outcome) {
+        CommandReserveOutcome.RETRYABLE_UNKNOWN -> CommandAdmissionReason.REGISTRY_RETRY
+        CommandReserveOutcome.CONFLICT -> CommandAdmissionReason.REGISTRY_CONFLICT
+        else -> null
+    },
 )
 
 private enum class CommandLeasePhase {

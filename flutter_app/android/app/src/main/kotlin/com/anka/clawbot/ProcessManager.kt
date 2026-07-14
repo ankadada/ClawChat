@@ -297,7 +297,7 @@ internal class ProcessManager(
             DurableLaunchRegistrationOutcome.DURABLY_REGISTERED_BACKSTOP_SCHEDULED) {
             if (ownsReservation) NativeCommandContinuationOwner.registry.cancel(gateKey)
             throw IllegalStateException(
-                "durable command launch backstop unavailable: ${preparation.outcome}",
+                "durable command launch unavailable: ${preparation.failureReason ?: preparation.outcome}",
             )
         }
         val gatedCommand = buildList {

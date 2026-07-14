@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/services.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../models/chat_models.dart';
@@ -225,9 +226,21 @@ class BashTool extends Tool {
           sideEffectsPrevented: false,
         );
       }
+      final continuationReason = _continuationFailureReason(e);
+      if (continuationReason != null) {
+        return 'Error: command continuation not started: $continuationReason';
+      }
       return 'Error: $e';
     } finally {
       settled = true;
     }
+  }
+
+  String? _continuationFailureReason(Object error) {
+    if (error is! PlatformException) return null;
+    final details = error.details;
+    final reason = details is Map ? details['reason'] : null;
+    if (reason == 'SERVICE_NOT_READY') return 'SERVICE_NOT_READY';
+    return error.code == 'PROOT_SERVICE_NOT_READY' ? 'SERVICE_NOT_READY' : null;
   }
 }

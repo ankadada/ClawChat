@@ -782,10 +782,13 @@ class CommandContinuationRegistryTest {
         assertEquals(CommandReserveOutcome.NEW, registry.reserveTerminal(oldKey, oldCandidate, 60_000L))
         assertEquals(CandidateReceipt.NATIVE_OWNS, registry.attachTerminal(oldKey, oldCandidate, oldProcess))
         val newKey = terminalKey(oldKey.sessionId, "replacement-new")
-        assertEquals(
-            CommandReserveOutcome.RETRYABLE_UNKNOWN,
-            registry.replaceTerminalSession(newKey, "replacement-new-candidate", 60_000L).outcome,
+        val retry = registry.replaceTerminalSession(
+            newKey,
+            "replacement-new-candidate",
+            60_000L,
         )
+        assertEquals(CommandReserveOutcome.RETRYABLE_UNKNOWN, retry.outcome)
+        assertEquals(CommandAdmissionReason.REGISTRY_RETRY, retry.reason)
         assertTrue(registry.isActiveCandidate(oldKey, oldCandidate))
         assertFalse(registry.isActiveCandidate(newKey, "replacement-new-candidate"))
         assertEquals(listOf(oldKey), registry.retryPending(CommandContinuationOwner.TERMINAL))
@@ -793,6 +796,13 @@ class CommandContinuationRegistryTest {
             CommandReserveOutcome.NEW,
             registry.replaceTerminalSession(newKey, "replacement-new-candidate", 60_000L).outcome,
         )
+        val conflict = registry.replaceTerminalSession(
+            newKey,
+            "replacement-conflict-candidate",
+            60_000L,
+        )
+        assertEquals(CommandReserveOutcome.CONFLICT, conflict.outcome)
+        assertEquals(CommandAdmissionReason.REGISTRY_CONFLICT, conflict.reason)
     }
 
     @Test

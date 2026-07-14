@@ -330,19 +330,29 @@ class NativeBridge {
     return (await _channel.invokeMethod<bool>('writeResolv'))!;
   }
 
-  static Future<String> replaceTerminalSession({
+  static Future<Map<String, Object?>> replaceTerminalSession({
     required String operationId,
     required String sessionId,
     required String candidateId,
     required Duration timeout,
   }) async {
-    return await _channel.invokeMethod<String>('replaceTerminalSession', {
-          'operationId': operationId,
-          'sessionId': sessionId,
-          'candidateId': candidateId,
-          'timeoutSeconds': timeout.inSeconds,
-        }) ??
-        'CONFLICT';
+    final value =
+        await _channel.invokeMethod<Object?>('replaceTerminalSession', {
+      'operationId': operationId,
+      'sessionId': sessionId,
+      'candidateId': candidateId,
+      'timeoutSeconds': timeout.inSeconds,
+    });
+    if (value is String) {
+      return <String, Object?>{'outcome': value, 'reason': null};
+    }
+    if (value is Map) {
+      return <String, Object?>{
+        'outcome': value['outcome'] as String? ?? 'CONFLICT',
+        'reason': value['reason'] as String?,
+      };
+    }
+    return <String, Object?>{'outcome': 'CONFLICT', 'reason': null};
   }
 
   static Future<String> attachTerminalProcess({
@@ -379,6 +389,7 @@ class NativeBridge {
     );
     return <String, Object?>{
       'outcome': value?['outcome'] as String?,
+      'failureReason': value?['failureReason'] as String?,
       'wrapperPath': value?['wrapperPath'] as String?,
       'attemptDirectoryPath': value?['attemptDirectoryPath'] as String?,
       'stagingPath': value?['stagingPath'] as String?,
