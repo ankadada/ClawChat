@@ -290,30 +290,30 @@ void main() {
     expect(activity, contains('"validateTerminalLaunchCapability"'));
     expect(processManager, contains('coordinator.prepareLaunch('));
     expect(
-        processManager, contains('startDirectCommand(cmd, env, operationId)'));
+        processManager, contains('startDirectCommand(cmd, env, operationId,'));
     final directStart =
         processManager.indexOf('private fun startDirectCommand');
     final continuationStart =
         processManager.indexOf('private fun startContinuationCommand');
     final directPath = processManager.substring(directStart, continuationStart);
-    expect(
-        directPath, contains('configuredProcessBuilder(command, environment)'));
+    expect(directPath, contains('startConfiguredProcess(command, environment'));
     expect(directPath, isNot(contains('cleanupCoordinator')));
     expect(directPath, isNot(contains('NativeCommandContinuationOwner')));
     expect(directPath, isNot(contains('prepareLaunch')));
     expect(directPath, isNot(contains('/system/bin/sh')));
     expect(
       processManager.indexOf('coordinator.prepareLaunch('),
-      lessThan(processManager
-          .indexOf('configuredProcessBuilder(gatedCommand, env)')),
+      lessThan(
+          processManager.indexOf('startConfiguredProcess(gatedCommand, env')),
+    );
+    final continuationPath = processManager.substring(continuationStart);
+    expect(
+      continuationPath.indexOf('coordinator.validateLaunchCapability('),
+      lessThan(continuationPath.indexOf('val process = try')),
     );
     expect(
-      processManager.indexOf('coordinator.validateLaunchCapability('),
-      lessThan(processManager.indexOf('val process = try')),
-    );
-    expect(
-      processManager.indexOf('coordinator.acknowledgeLaunchAbandoned('),
-      lessThan(processManager.indexOf('val process = try')),
+      continuationPath.indexOf('coordinator.acknowledgeLaunchAbandoned('),
+      lessThan(continuationPath.indexOf('val process = try')),
     );
     expect(terminalRuntime, contains("Pty.start(\n      '/system/bin/sh'"));
     expect(terminalRuntime, contains('launchGate.parentProcessId.toString()'));
@@ -332,6 +332,32 @@ void main() {
         contains('NativeBridge.stopTerminalService().ignore()'));
     expect(terminalScreen, isNot(contains('TerminalRuntimeSession.shared')));
     expect(terminalScreen, isNot(contains('prepareTerminalLaunch')));
+  });
+
+  test('lark credentials are explicit, approved, and ephemeral', () {
+    final bash = File('lib/services/tools/bash_tool.dart').readAsStringSync();
+    final bridge = File('lib/services/native_bridge.dart').readAsStringSync();
+    final activity = File(
+      'android/app/src/main/kotlin/com/anka/clawbot/MainActivity.kt',
+    ).readAsStringSync();
+    final process = File(
+      'android/app/src/main/kotlin/com/anka/clawbot/ProcessManager.kt',
+    ).readAsStringSync();
+
+    expect(bash, contains("'lark_cli_credentials'"));
+    expect(bash, contains('PreferencesService'));
+    expect(bash, contains("'FEISHU_APP_ID'"));
+    expect(bash, contains("'FEISHU_APP_SECRET'"));
+    expect(bash, contains("'LARKSUITE_CLI_APP_ID'"));
+    expect(bash, contains("'LARKSUITE_CLI_APP_SECRET'"));
+    expect(bridge, contains("'larkCliCredentialScope'"));
+    expect(bridge, contains("'scopedEnvironment'"));
+    expect(activity, contains('LARK_CLI_ENVIRONMENT_KEYS'));
+    expect(activity, contains('PROOT_LARK_CREDENTIAL_SCOPE_INVALID'));
+    expect(process, contains('SCOPED_GUEST_ENV_BOOTSTRAP'));
+    expect(process, contains('redactCredentialValues'));
+    expect(process, isNot(contains('FEISHU_APP_SECRET')));
+    expect(process, isNot(contains('writeText(scoped')));
   });
 
   test('native workspace publication rolls back every incomplete outcome', () {

@@ -5,10 +5,41 @@ import 'package:uuid/uuid.dart';
 
 import '../../models/chat_models.dart';
 import '../native_bridge.dart';
+import '../preferences_service.dart';
 import 'tool_result_formatter.dart';
 import 'tool_registry.dart';
 
+enum LarkCliCredentialScopeFailure {
+  storeUnavailable,
+  missingConfiguredCredentials,
+  invalidConfiguredCredentials,
+}
+
+class LarkCliCredentialScopeException implements Exception {
+  const LarkCliCredentialScopeException(this.reason);
+
+  final LarkCliCredentialScopeFailure reason;
+
+  String get wireReason => switch (reason) {
+        LarkCliCredentialScopeFailure.storeUnavailable =>
+          'LARK_CREDENTIAL_STORE_UNAVAILABLE',
+        LarkCliCredentialScopeFailure.missingConfiguredCredentials =>
+          'LARK_CREDENTIALS_MISSING',
+        LarkCliCredentialScopeFailure.invalidConfiguredCredentials =>
+          'LARK_CREDENTIALS_INVALID',
+      };
+
+  @override
+  String toString() => wireReason;
+}
+
 class BashTool extends Tool {
+  BashTool({Future<Map<String, String>> Function()? larkCredentialLoader})
+      : _larkCredentialLoader =
+            larkCredentialLoader ?? _loadConfiguredLarkCredentials;
+
+  final Future<Map<String, String>> Function() _larkCredentialLoader;
+
   @override
   String get name => 'bash';
 
@@ -19,6 +50,7 @@ class BashTool extends Tool {
       'Shared Android storage is not mounted for agent commands. '
       'Use this for file operations, running scripts, installing packages, etc. '
       'Set background_continuation to true only when the command must survive an external browser or app-background handoff. '
+      'Set lark_cli_credentials to true only for an approved lark-cli/Feishu integration call; it is false by default and never inferred from command text. '
       'Sensitive-file blocking is defense-in-depth only and must not be treated as a complete sandbox.';
 
   @override
@@ -37,6 +69,11 @@ class BashTool extends Tool {
             'type': 'boolean',
             'description':
                 'Opt in to durable background continuation for an external browser or app-background handoff (default: false)',
+          },
+          'lark_cli_credentials': {
+            'type': 'boolean',
+            'description':
+                'Explicitly scope configured Feishu/Lark credentials to this lark-cli invocation (default: false)',
           },
         },
         'required': ['command'],
@@ -169,6 +206,11 @@ class BashTool extends Tool {
       return 'Error: background_continuation must be a boolean.';
     }
     final backgroundContinuation = backgroundContinuationValue == true;
+    final larkCredentialScopeValue = input['lark_cli_credentials'];
+    if (larkCredentialScopeValue != null && larkCredentialScopeValue is! bool) {
+      return 'Error: lark_cli_credentials must be a boolean.';
+    }
+    final larkCredentialScope = larkCredentialScopeValue == true;
 
     if (timeout < 1 || timeout > 12 * 60 * 60) {
       return 'Error: Timeout must be between 1 and 43200 seconds.';
@@ -189,64 +231,130 @@ class BashTool extends Tool {
     final cdPrefix = command.trimLeft().startsWith('cd ')
         ? ''
         : 'cd $workingDir 2>/dev/null; ';
-    // Raw user-configured secrets are never injected into a general-purpose
-    // shell. A future secret consumer must use a purpose-specific broker that
-    // cannot echo, transform, persist, or export the value.
+    // Generic commands remain secret-free. Only the explicit lark-cli scope
+    // below reads the two configured Feishu values and maps approved aliases.
     final effectiveCommand = '$cdPrefix$command';
 
     cancellationSignal?.throwIfCancellationRequested();
-    var settled = false;
-    if (cancellationSignal != null) {
-      unawaited(cancellationSignal.whenCancelled.then((_) async {
-        if (settled) return;
+    final scopedEnvironment = <String, String>{};
+    try {
+      if (larkCredentialScope) {
         try {
-          await NativeBridge.cancelProotOperation(
-            operationId: operationId,
-            sessionId: sessionId,
-            requireBackgroundContinuation: backgroundContinuation,
-          );
+          scopedEnvironment.addAll(await _larkCredentialLoader());
+        } on LarkCliCredentialScopeException {
+          rethrow;
         } catch (_) {
-          // The native command completion remains the source of truth.
+          throw const LarkCliCredentialScopeException(
+            LarkCliCredentialScopeFailure.storeUnavailable,
+          );
         }
-      }));
+      }
+      cancellationSignal?.throwIfCancellationRequested();
+      var settled = false;
+      if (cancellationSignal != null) {
+        unawaited(cancellationSignal.whenCancelled.then((_) async {
+          if (settled) return;
+          try {
+            await NativeBridge.cancelProotOperation(
+              operationId: operationId,
+              sessionId: sessionId,
+              requireBackgroundContinuation: backgroundContinuation,
+            );
+          } catch (_) {
+            // The native command completion remains the source of truth.
+          }
+        }));
+      }
+      try {
+        final output = await NativeBridge.runInProot(
+          effectiveCommand,
+          timeout: timeout,
+          mountStorage: false,
+          operationId: operationId,
+          continuationSessionId: backgroundContinuation ? sessionId : null,
+          requireBackgroundContinuation: backgroundContinuation,
+          larkCliCredentialScope: larkCredentialScope,
+          scopedEnvironment: scopedEnvironment,
+        );
+        settled = true;
+        if (cancellationSignal?.isCancellationRequested == true) {
+          throw const ToolExecutionCancelledException(
+            sideEffectsPrevented: false,
+          );
+        }
+        if (output.length > 50000) {
+          return '${output.substring(0, 50000)}\n\n'
+              '[Output truncated, original length: ${output.length} chars]';
+        }
+        return output;
+      } on ToolExecutionCancelledException {
+        rethrow;
+      } catch (e) {
+        settled = true;
+        if (cancellationSignal?.isCancellationRequested == true) {
+          throw const ToolExecutionCancelledException(
+            sideEffectsPrevented: false,
+          );
+        }
+        final credentialReason = _credentialScopeFailureReason(e);
+        if (credentialReason != null) {
+          return 'Error: lark-cli credential scope unavailable: $credentialReason';
+        }
+        final continuationReason = _continuationFailureReason(e);
+        if (continuationReason != null) {
+          return 'Error: command continuation not started: $continuationReason';
+        }
+        return 'Error: $e';
+      } finally {
+        settled = true;
+      }
+    } on LarkCliCredentialScopeException catch (error) {
+      return 'Error: lark-cli credential scope unavailable: ${error.wireReason}';
+    } finally {
+      scopedEnvironment.clear();
+    }
+  }
+
+  static Future<Map<String, String>> _loadConfiguredLarkCredentials() async {
+    final preferences = PreferencesService();
+    Map<String, String> configured = {};
+    try {
+      await preferences.init();
+      configured = preferences.envVars;
+    } catch (_) {
+      throw const LarkCliCredentialScopeException(
+        LarkCliCredentialScopeFailure.storeUnavailable,
+      );
     }
     try {
-      final output = await NativeBridge.runInProot(
-        effectiveCommand,
-        timeout: timeout,
-        mountStorage: false,
-        operationId: operationId,
-        continuationSessionId: backgroundContinuation ? sessionId : null,
-        requireBackgroundContinuation: backgroundContinuation,
-      );
-      settled = true;
-      if (cancellationSignal?.isCancellationRequested == true) {
-        throw const ToolExecutionCancelledException(
-          sideEffectsPrevented: false,
+      final appId = configured['FEISHU_APP_ID']?.trim();
+      final appSecret = configured['FEISHU_APP_SECRET']?.trim();
+      if (appId == null ||
+          appSecret == null ||
+          appId.isEmpty ||
+          appSecret.isEmpty) {
+        throw const LarkCliCredentialScopeException(
+          LarkCliCredentialScopeFailure.missingConfiguredCredentials,
         );
       }
-      if (output.length > 50000) {
-        return '${output.substring(0, 50000)}\n\n'
-            '[Output truncated, original length: ${output.length} chars]';
-      }
-      return output;
-    } on ToolExecutionCancelledException {
-      rethrow;
-    } catch (e) {
-      settled = true;
-      if (cancellationSignal?.isCancellationRequested == true) {
-        throw const ToolExecutionCancelledException(
-          sideEffectsPrevented: false,
+      if (!_validCredentialValue(appId, maxLength: 256) ||
+          !_validCredentialValue(appSecret, maxLength: 512)) {
+        throw const LarkCliCredentialScopeException(
+          LarkCliCredentialScopeFailure.invalidConfiguredCredentials,
         );
       }
-      final continuationReason = _continuationFailureReason(e);
-      if (continuationReason != null) {
-        return 'Error: command continuation not started: $continuationReason';
-      }
-      return 'Error: $e';
+      return <String, String>{
+        'LARKSUITE_CLI_APP_ID': appId,
+        'LARKSUITE_CLI_APP_SECRET': appSecret,
+      };
     } finally {
-      settled = true;
+      configured.clear();
     }
+  }
+
+  static bool _validCredentialValue(String value, {required int maxLength}) {
+    if (value.isEmpty || value.length > maxLength) return false;
+    return !value.codeUnits.any((unit) => unit < 0x20 || unit == 0x7f);
   }
 
   String? _continuationFailureReason(Object error) {
@@ -255,5 +363,21 @@ class BashTool extends Tool {
     final reason = details is Map ? details['reason'] : null;
     if (reason == 'SERVICE_NOT_READY') return 'SERVICE_NOT_READY';
     return error.code == 'PROOT_SERVICE_NOT_READY' ? 'SERVICE_NOT_READY' : null;
+  }
+
+  String? _credentialScopeFailureReason(Object error) {
+    if (error is! PlatformException) return null;
+    const allowed = <String>{
+      'LARK_CREDENTIAL_SCOPE_INVALID',
+      'LARK_CREDENTIAL_STORE_UNAVAILABLE',
+      'LARK_CREDENTIALS_MISSING',
+      'LARK_CREDENTIALS_INVALID',
+    };
+    final details = error.details;
+    final reason = details is Map ? details['reason'] : null;
+    if (reason is String && allowed.contains(reason)) return reason;
+    return error.code == 'PROOT_LARK_CREDENTIAL_SCOPE_INVALID'
+        ? 'LARK_CREDENTIAL_SCOPE_INVALID'
+        : null;
   }
 }

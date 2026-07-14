@@ -280,6 +280,8 @@ class NativeBridge {
     String? operationId,
     String? continuationSessionId,
     bool requireBackgroundContinuation = false,
+    bool larkCliCredentialScope = false,
+    Map<String, String>? scopedEnvironment,
   }) async {
     return (await _channel.invokeMethod<String>('runInProot', {
       'command': command,
@@ -289,6 +291,9 @@ class NativeBridge {
       if (continuationSessionId != null)
         'continuationSessionId': continuationSessionId,
       'requireBackgroundContinuation': requireBackgroundContinuation,
+      'larkCliCredentialScope': larkCliCredentialScope,
+      if (scopedEnvironment != null && scopedEnvironment.isNotEmpty)
+        'scopedEnvironment': Map<String, String>.from(scopedEnvironment),
     }))!;
   }
 

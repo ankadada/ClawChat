@@ -11,11 +11,29 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProcessManagerDirectTest {
+    @Test
+    fun nativeScopedLarkParserRequiresExactScopeAndEnvironmentPair() {
+        val validEnvironment = mapOf(
+            "LARKSUITE_CLI_APP_ID" to "test-app-id",
+            "LARKSUITE_CLI_APP_SECRET" to "test-app-secret",
+        )
+
+        assertEquals(emptyMap<String, String>(), parseScopedLarkEnvironment(null, null))
+        assertEquals(emptyMap<String, String>(), parseScopedLarkEnvironment(false, null))
+        assertNull(parseScopedLarkEnvironment(true, null))
+        assertNull(parseScopedLarkEnvironment(true, emptyMap<String, String>()))
+        assertNull(parseScopedLarkEnvironment(false, validEnvironment))
+        assertNull(parseScopedLarkEnvironment(false, emptyMap<String, String>()))
+        assertNull(parseScopedLarkEnvironment("true", validEnvironment))
+        assertEquals(validEnvironment, parseScopedLarkEnvironment(true, validEnvironment))
+    }
+
     @Test
     fun freshDirectEchoStartsRealProotWithoutCoordinator() = withManager { manager, starts ->
         val output = manager.runInProotSync(
@@ -29,6 +47,138 @@ class ProcessManagerDirectTest {
         assertEquals(1, starts.size)
         assertTrue(starts.single().first().endsWith("/libproot.so"))
         assertFalse(starts.single().contains("/system/bin/sh"))
+    }
+
+    @Test
+    fun genericDirectProcessEnvironmentContainsNoCredentialNames() {
+        val root = Files.createTempDirectory("generic-secret-free-env").toFile()
+        var launchEnvironment = emptyMap<String, String>()
+        val manager = ProcessManager(
+            filesDir = root.absolutePath,
+            nativeLibDir = File(root, "lib").absolutePath,
+            cleanupCoordinator = null,
+            processStarter = { builder ->
+                launchEnvironment = builder.environment().toMap()
+                CompletedProcess("not-present\n")
+            },
+        )
+
+        try {
+            assertEquals(
+                "not-present\n",
+                manager.runInProotSync("env", operationId = "generic-environment"),
+            )
+            assertTrue(launchEnvironment.keys.none { it.startsWith("FEISHU_") })
+            assertTrue(launchEnvironment.keys.none { it.startsWith("LARKSUITE_") })
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun scopedEnvironmentUsesOnlyApprovedLarkKeysAndNeverPlacesValuesInArgv() {
+        val root = Files.createTempDirectory("scoped-lark-env").toFile()
+        val appId = "scoped-app-id-sentinel"
+        val appSecret = "scoped-secret-$appId-sentinel"
+        val builders = mutableListOf<ProcessBuilder>()
+        val launchEnvironments = mutableListOf<Set<String>>()
+        val manager = ProcessManager(
+            filesDir = root.absolutePath,
+            nativeLibDir = File(root, "lib").absolutePath,
+            cleanupCoordinator = null,
+            processStarter = { builder ->
+                builders += builder
+                launchEnvironments += builder.environment().keys.toSet()
+                CompletedProcess("$appId\n$appSecret\n")
+            },
+        )
+
+        try {
+            val output = manager.runInProotSync(
+                command = "lark-cli configure",
+                operationId = "scoped-operation",
+                scopedEnvironment = mapOf(
+                    "LARKSUITE_CLI_APP_ID" to appId,
+                    "LARKSUITE_CLI_APP_SECRET" to appSecret,
+                ),
+            )
+
+            assertEquals("[REDACTED]\n[REDACTED]\n", output)
+            assertEquals(1, builders.size)
+            val builder = builders.single()
+            assertTrue(builder.command().contains("/bin/sh"))
+            assertTrue(builder.command().contains("lark-cli configure"))
+            assertTrue(builder.command().none { it.contains(appId) || it.contains(appSecret) })
+            assertEquals(
+                setOf(
+                    "PROOT_TMP_DIR", "PROOT_LOADER", "PROOT_LOADER_32", "LD_LIBRARY_PATH",
+                    "LARKSUITE_CLI_APP_ID", "LARKSUITE_CLI_APP_SECRET",
+                ),
+                launchEnvironments.single(),
+            )
+            // The credential keys are removed from the mutable ProcessBuilder after start.
+            assertTrue(builder.environment().keys.none { it.startsWith("LARKSUITE_CLI_") })
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun scopedStartFailureRedactsCredentialValuesFromException() {
+        val root = Files.createTempDirectory("scoped-lark-failure").toFile()
+        val appId = "start-failure-id-sentinel"
+        val appSecret = "start-failure-secret-sentinel"
+        val manager = ProcessManager(
+            filesDir = root.absolutePath,
+            nativeLibDir = File(root, "lib").absolutePath,
+            cleanupCoordinator = null,
+            processStarter = { throw IllegalStateException("failed $appId $appSecret") },
+        )
+
+        try {
+            val error = assertThrows(IllegalStateException::class.java) {
+                manager.runInProotSync(
+                    command = "lark-cli configure",
+                    operationId = "scoped-start-failure",
+                    scopedEnvironment = mapOf(
+                        "LARKSUITE_CLI_APP_ID" to appId,
+                        "LARKSUITE_CLI_APP_SECRET" to appSecret,
+                    ),
+                )
+            }
+            assertFalse(error.message!!.contains(appId))
+            assertFalse(error.message!!.contains(appSecret))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun malformedScopedEnvironmentFailsClosedBeforeProcessBuilder() {
+        val root = Files.createTempDirectory("scoped-lark-invalid").toFile()
+        var starts = 0
+        val manager = ProcessManager(
+            filesDir = root.absolutePath,
+            nativeLibDir = File(root, "lib").absolutePath,
+            cleanupCoordinator = null,
+            processStarter = {
+                starts++
+                CompletedProcess("unexpected")
+            },
+        )
+
+        try {
+            assertThrows(IllegalArgumentException::class.java) {
+                manager.runInProotSync(
+                    command = "lark-cli configure",
+                    operationId = "scoped-invalid",
+                    scopedEnvironment = mapOf("UNAPPROVED_KEY" to "value"),
+                )
+            }
+            assertEquals(0, starts)
+        } finally {
+            root.deleteRecursively()
+        }
     }
 
     @Test

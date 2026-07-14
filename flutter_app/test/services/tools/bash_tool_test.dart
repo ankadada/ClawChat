@@ -428,6 +428,321 @@ void main() {
     prefs.envVars = {};
   });
 
+  test('lark credential scope is explicit and maps only approved aliases',
+      () async {
+    const appId = 'test-app-id-sentinel';
+    const appSecret = 'test-app-secret-sentinel';
+    MethodCall? runCall;
+    final scopedTool = BashTool(
+      larkCredentialLoader: () async => const <String, String>{
+        'LARKSUITE_CLI_APP_ID': appId,
+        'LARKSUITE_CLI_APP_SECRET': appSecret,
+      },
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') {
+        runCall = call;
+        return 'LARKSUITE_CLI_APP_ID\nLARKSUITE_CLI_APP_SECRET\n';
+      }
+      return null;
+    });
+
+    final output = await scopedTool.execute({
+      'command': 'lark-cli configure',
+      'lark_cli_credentials': true,
+    });
+
+    final arguments = Map<Object?, Object?>.from(runCall!.arguments as Map);
+    final environment = Map<Object?, Object?>.from(
+      arguments['scopedEnvironment']! as Map,
+    );
+    expect(arguments['larkCliCredentialScope'], isTrue);
+    expect(arguments['requireBackgroundContinuation'], isFalse);
+    expect(environment.keys.toSet(), {
+      'LARKSUITE_CLI_APP_ID',
+      'LARKSUITE_CLI_APP_SECRET',
+    });
+    expect(environment['LARKSUITE_CLI_APP_ID'], appId);
+    expect(environment['LARKSUITE_CLI_APP_SECRET'], appSecret);
+    expect(environment, isNot(contains('FEISHU_APP_ID')));
+    expect(environment, isNot(contains('FEISHU_APP_SECRET')));
+    expect(output, isNot(contains(appId)));
+    expect(output, isNot(contains(appSecret)));
+  });
+
+  test('configured FEISHU settings map to lark-cli aliases only', () async {
+    const appId = 'configured-app-id-sentinel';
+    const appSecret = 'configured-app-secret-sentinel';
+    final prefs = PreferencesService();
+    prefs.envVars = const <String, String>{
+      'FEISHU_APP_ID': appId,
+      'FEISHU_APP_SECRET': appSecret,
+      'UNRELATED_CONFIGURED_SECRET': 'must-not-cross-native-boundary',
+    };
+    MethodCall? runCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') {
+        runCall = call;
+        return 'configured';
+      }
+      return null;
+    });
+
+    try {
+      expect(
+        await BashTool().execute(const {
+          'command': 'lark-cli configure',
+          'lark_cli_credentials': true,
+        }),
+        'configured',
+      );
+      final arguments = Map<Object?, Object?>.from(runCall!.arguments as Map);
+      final environment = Map<Object?, Object?>.from(
+        arguments['scopedEnvironment']! as Map,
+      );
+      expect(environment, const <String, String>{
+        'LARKSUITE_CLI_APP_ID': appId,
+        'LARKSUITE_CLI_APP_SECRET': appSecret,
+      });
+      expect(environment.values,
+          isNot(contains('must-not-cross-native-boundary')));
+    } finally {
+      prefs.envVars = {};
+    }
+  });
+
+  test('configured lark credentials fail closed when missing or malformed',
+      () async {
+    final prefs = PreferencesService();
+    var invoked = false;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      invoked = true;
+      return 'unexpected';
+    });
+
+    try {
+      prefs.envVars = const <String, String>{
+        'FEISHU_APP_ID': 'configured-id-only',
+      };
+      expect(
+        await BashTool().execute(const {
+          'command': 'lark-cli configure',
+          'lark_cli_credentials': true,
+        }),
+        'Error: lark-cli credential scope unavailable: LARK_CREDENTIALS_MISSING',
+      );
+      prefs.envVars = const <String, String>{
+        'FEISHU_APP_ID': 'configured-id',
+        'FEISHU_APP_SECRET': 'invalid\nsecret',
+      };
+      expect(
+        await BashTool().execute(const {
+          'command': 'lark-cli configure',
+          'lark_cli_credentials': true,
+        }),
+        'Error: lark-cli credential scope unavailable: LARK_CREDENTIALS_INVALID',
+      );
+      expect(invoked, isFalse);
+    } finally {
+      prefs.envVars = {};
+    }
+  });
+
+  test('default lark scope never reads the store or sends an environment',
+      () async {
+    var storeReads = 0;
+    MethodCall? runCall;
+    final scopedTool = BashTool(
+      larkCredentialLoader: () async {
+        storeReads++;
+        return const <String, String>{
+          'LARKSUITE_CLI_APP_ID': 'unused-id',
+          'LARKSUITE_CLI_APP_SECRET': 'unused-secret',
+        };
+      },
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') {
+        runCall = call;
+        return 'not-present';
+      }
+      return null;
+    });
+
+    expect(
+        await scopedTool.execute({'command': 'npm --version'}), 'not-present');
+
+    final arguments = Map<Object?, Object?>.from(runCall!.arguments as Map);
+    expect(storeReads, 0);
+    expect(arguments['larkCliCredentialScope'], isFalse);
+    expect(arguments.containsKey('scopedEnvironment'), isFalse);
+  });
+
+  test('lark credential scope composes independently with continuation',
+      () async {
+    final calls = <MethodCall>[];
+    final scopedTool = BashTool(
+      larkCredentialLoader: () async => const <String, String>{
+        'LARKSUITE_CLI_APP_ID': 'continuation-id-sentinel',
+        'LARKSUITE_CLI_APP_SECRET': 'continuation-secret-sentinel',
+      },
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      if (call.method == 'runInProot') return 'configured';
+      return null;
+    });
+
+    final output = await scopedTool.executeWithContext(
+      const {
+        'command': 'lark-cli configure',
+        'background_continuation': true,
+        'lark_cli_credentials': true,
+      },
+      sessionId: 'lark-session',
+    );
+
+    expect(output, 'configured');
+    final run = calls.singleWhere((call) => call.method == 'runInProot');
+    final arguments = Map<Object?, Object?>.from(run.arguments as Map);
+    expect(arguments['larkCliCredentialScope'], isTrue);
+    expect(arguments['requireBackgroundContinuation'], isTrue);
+    expect(arguments['continuationSessionId'], 'lark-session');
+    expect(
+      (arguments['scopedEnvironment'] as Map).keys.toSet(),
+      {'LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_APP_SECRET'},
+    );
+    expect(calls.where((call) => call.method == 'runInProot'), hasLength(1));
+  });
+
+  test('lark credential scope failures are typed and never spawn', () async {
+    const cases = <LarkCliCredentialScopeFailure, String>{
+      LarkCliCredentialScopeFailure.storeUnavailable:
+          'LARK_CREDENTIAL_STORE_UNAVAILABLE',
+      LarkCliCredentialScopeFailure.missingConfiguredCredentials:
+          'LARK_CREDENTIALS_MISSING',
+      LarkCliCredentialScopeFailure.invalidConfiguredCredentials:
+          'LARK_CREDENTIALS_INVALID',
+    };
+
+    for (final entry in cases.entries) {
+      var invoked = false;
+      final scopedTool = BashTool(
+        larkCredentialLoader: () async =>
+            throw LarkCliCredentialScopeException(entry.key),
+      );
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        invoked = true;
+        return 'unexpected';
+      });
+
+      final output = await scopedTool.execute({
+        'command': 'lark-cli configure',
+        'lark_cli_credentials': true,
+      });
+
+      expect(output,
+          'Error: lark-cli credential scope unavailable: ${entry.value}');
+      expect(invoked, isFalse);
+    }
+  });
+
+  test('lark credential flag is strict and fail closed', () async {
+    var invoked = false;
+    final scopedTool = BashTool(
+      larkCredentialLoader: () async => throw StateError('must not read'),
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      invoked = true;
+      return 'unexpected';
+    });
+
+    final output = await scopedTool.execute({
+      'command': 'lark-cli configure',
+      'lark_cli_credentials': 'true',
+    });
+
+    expect(output, 'Error: lark_cli_credentials must be a boolean.');
+    expect(invoked, isFalse);
+  });
+
+  test('pre-start cancellation never reads or spawns scoped credentials',
+      () async {
+    var storeReads = 0;
+    var invoked = false;
+    final scopedTool = BashTool(
+      larkCredentialLoader: () async {
+        storeReads++;
+        return const <String, String>{
+          'LARKSUITE_CLI_APP_ID': 'cancel-id-sentinel',
+          'LARKSUITE_CLI_APP_SECRET': 'cancel-secret-sentinel',
+        };
+      },
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      invoked = true;
+      return 'unexpected';
+    });
+    final signal = ToolCancellationSignal()..cancel();
+
+    await expectLater(
+      scopedTool.executeResultWithOperationAndCancellation(
+        const {
+          'command': 'lark-cli configure',
+          'lark_cli_credentials': true,
+        },
+        sessionId: 'cancelled-lark-session',
+        operationId: 'cancelled-lark-operation',
+        cancellationSignal: signal,
+      ),
+      throwsA(isA<ToolExecutionCancelledException>()),
+    );
+    expect(storeReads, 0);
+    expect(invoked, isFalse);
+  });
+
+  test('native credential scope failures expose only the typed reason',
+      () async {
+    const appId = 'native-error-id-sentinel';
+    const appSecret = 'native-error-secret-sentinel';
+    final scopedTool = BashTool(
+      larkCredentialLoader: () async => const <String, String>{
+        'LARKSUITE_CLI_APP_ID': appId,
+        'LARKSUITE_CLI_APP_SECRET': appSecret,
+      },
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      throw PlatformException(
+        code: 'PROOT_LARK_CREDENTIAL_SCOPE_INVALID',
+        message: '$appId $appSecret',
+        details: const <String, Object?>{
+          'reason': 'LARK_CREDENTIAL_SCOPE_INVALID',
+        },
+      );
+    });
+
+    final output = await scopedTool.execute({
+      'command': 'lark-cli configure',
+      'lark_cli_credentials': true,
+    });
+
+    expect(
+      output,
+      'Error: lark-cli credential scope unavailable: LARK_CREDENTIAL_SCOPE_INVALID',
+    );
+    expect(output, isNot(contains(appId)));
+    expect(output, isNot(contains(appSecret)));
+  });
+
   test('agent Bash forwards exact session and operation continuation identity',
       () async {
     MethodCall? runCall;

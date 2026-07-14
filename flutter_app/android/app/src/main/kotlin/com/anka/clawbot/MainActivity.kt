@@ -37,6 +37,44 @@ import java.util.UUID
 import java.util.IdentityHashMap
 import java.util.concurrent.Executors
 
+private val LARK_CLI_ENVIRONMENT_KEYS = setOf(
+    "LARKSUITE_CLI_APP_ID",
+    "LARKSUITE_CLI_APP_SECRET",
+)
+
+internal fun parseScopedLarkEnvironment(
+    rawScope: Any?,
+    rawEnvironment: Any?,
+): MutableMap<String, String>? {
+    val scopeEnabled = when (rawScope) {
+        null, false -> false
+        true -> true
+        else -> return null
+    }
+    if (!scopeEnabled) {
+        return if (rawEnvironment == null) mutableMapOf() else null
+    }
+
+    val map = rawEnvironment as? Map<*, *> ?: return null
+    if (map.keys.filterIsInstance<String>().toSet() != LARK_CLI_ENVIRONMENT_KEYS) {
+        return null
+    }
+    val values = mutableMapOf<String, String>()
+    for ((key, value) in map) {
+        if (key !is String || value !is String) return null
+        values[key] = value
+    }
+    if (!validScopedLarkValue(values["LARKSUITE_CLI_APP_ID"], 256) ||
+        !validScopedLarkValue(values["LARKSUITE_CLI_APP_SECRET"], 512)) {
+        return null
+    }
+    return values
+}
+
+private fun validScopedLarkValue(value: String?, maxLength: Int): Boolean =
+    value != null && value.isNotEmpty() && value.length <= maxLength &&
+        value.none { it.code < 0x20 || it.code == 0x7f }
+
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.anka.clawbot/native"
 
@@ -376,10 +414,25 @@ class MainActivity : FlutterActivity() {
                     val continuationSessionId = call.argument<String>("continuationSessionId")
                     val requireBackgroundContinuation =
                         call.argument<Boolean>("requireBackgroundContinuation") ?: false
+                    val rawLarkCliCredentialScope =
+                        call.argument<Any?>("larkCliCredentialScope")
+                    val rawScopedEnvironment = call.argument<Any?>("scopedEnvironment")
+                    val scopedEnvironment = parseScopedLarkEnvironment(
+                        rawLarkCliCredentialScope,
+                        rawScopedEnvironment,
+                    )
                     if (command == null) {
+                        scopedEnvironment?.clear()
                         result.error("INVALID_ARGS", "command required", null)
+                    } else if (scopedEnvironment == null) {
+                        result.error(
+                            "PROOT_LARK_CREDENTIAL_SCOPE_INVALID",
+                            "lark-cli credential scope unavailable: LARK_CREDENTIAL_SCOPE_INVALID",
+                            mapOf("reason" to "LARK_CREDENTIAL_SCOPE_INVALID"),
+                        )
                     } else if (requireBackgroundContinuation &&
                         (operationId.isNullOrBlank() || continuationSessionId.isNullOrBlank())) {
+                        scopedEnvironment.clear()
                         result.error(
                             "INVALID_ARGS",
                             "background continuation identity required",
@@ -405,6 +458,7 @@ class MainActivity : FlutterActivity() {
                         }
                         val reserveOutcome = reservation.outcome
                         if (reserveOutcome != CommandReserveOutcome.NEW) {
+                            scopedEnvironment.clear()
                             val reason = if (
                                 reservation.admissionReason == CommandAdmissionReason.ADMITTED
                             ) {
@@ -448,6 +502,7 @@ class MainActivity : FlutterActivity() {
                                     mountStorage,
                                     operationId,
                                     continuationKey,
+                                    scopedEnvironment,
                                 )
                                 safeRunOnUiThread { result.success(output) }
                             } catch (e: Exception) {
@@ -459,6 +514,7 @@ class MainActivity : FlutterActivity() {
                                         continuationKey.operationId,
                                     )
                                 }
+                                scopedEnvironment.clear()
                             }
                         }.start()
                     }

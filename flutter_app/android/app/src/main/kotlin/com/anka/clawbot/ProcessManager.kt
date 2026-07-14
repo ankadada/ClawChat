@@ -34,6 +34,16 @@ internal class ProcessManager(
         const val FAKE_KERNEL_RELEASE = "6.17.0-PRoot-Distro"
         const val FAKE_KERNEL_VERSION =
             "#1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000"
+        private val SCOPED_ENVIRONMENT_KEYS = setOf(
+            "LARKSUITE_CLI_APP_ID",
+            "LARKSUITE_CLI_APP_SECRET",
+        )
+        private const val SCOPED_GUEST_ENV_BOOTSTRAP =
+            "unset PROOT_TMP_DIR PROOT_LOADER PROOT_LOADER_32 LD_LIBRARY_PATH; " +
+                "export HOME=/root LANG=C.UTF-8 " +
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin " +
+                "TERM=xterm-256color TMPDIR=/tmp; " +
+                "exec /bin/sh -c \"\$1\""
     }
 
     fun getProotPath(): String = "$nativeLibDir/libproot.so"
@@ -182,7 +192,11 @@ internal class ProcessManager(
     // Used for: apt-get, dpkg, npm install, chmod, etc.
     // Simpler: no --sysvipc, simple kernel-release, minimal guest env.
     // ================================================================
-    fun buildInstallCommand(command: String, mountStorage: Boolean = false): List<String> {
+    fun buildInstallCommand(
+        command: String,
+        mountStorage: Boolean = false,
+        preserveScopedEnvironment: Boolean = false,
+    ): List<String> {
         val flags = commonProotFlags(mountStorage).toMutableList()
 
         // --root-id: fake root identity (same as proot-distro run_proot_cmd)
@@ -195,16 +209,29 @@ internal class ProcessManager(
         // Guest environment via env -i (matching proot-distro's run_proot_cmd)
         // Use /bin/sh instead of /bin/bash because Alpine minirootfs only has
         // busybox sh initially; bash is installed later via apk add.
-        flags.addAll(listOf(
-            "/usr/bin/env", "-i",
-            "HOME=/root",
-            "LANG=C.UTF-8",
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "TERM=xterm-256color",
-            "TMPDIR=/tmp",
-            "/bin/sh", "-c",
-            command,
-        ))
+        if (preserveScopedEnvironment) {
+            // The ProcessBuilder environment was already cleared and contains
+            // only PRoot loader variables plus the two approved Lark names.
+            // A constant positional bootstrap removes loader variables without
+            // ever placing credential values in argv or a file.
+            flags.addAll(listOf(
+                "/bin/sh", "-c",
+                SCOPED_GUEST_ENV_BOOTSTRAP,
+                "clawchat-scoped-env",
+                command,
+            ))
+        } else {
+            flags.addAll(listOf(
+                "/usr/bin/env", "-i",
+                "HOME=/root",
+                "LANG=C.UTF-8",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "TERM=xterm-256color",
+                "TMPDIR=/tmp",
+                "/bin/sh", "-c",
+                command,
+            ))
+        }
 
         return flags
     }
@@ -260,6 +287,7 @@ internal class ProcessManager(
         mountStorage: Boolean = false,
         operationId: String? = null,
         continuationKey: CommandOwnerKey? = null,
+        scopedEnvironment: Map<String, String> = emptyMap(),
     ): String {
         require(continuationKey == null || continuationKey.operationId == operationId) {
             "continuation operation identity mismatch"
@@ -267,18 +295,44 @@ internal class ProcessManager(
         if (operationId != null && cancelledOperations.remove(operationId)) {
             throw InterruptedException("operation cancelled")
         }
-        val cmd = buildInstallCommand(command, mountStorage)
-        val env = prootEnv()
-        val process = if (continuationKey == null) {
-            startDirectCommand(cmd, env, operationId)
-        } else {
-            startContinuationCommand(
-                cmd = cmd,
-                env = env,
-                key = continuationKey,
-                timeoutSeconds = timeoutSeconds,
-                operationId = operationId,
-            )
+        require(validScopedEnvironment(scopedEnvironment)) {
+            "invalid scoped command environment"
+        }
+        val cmd = buildInstallCommand(
+            command,
+            mountStorage,
+            preserveScopedEnvironment = scopedEnvironment.isNotEmpty(),
+        )
+        val env = prootEnv().toMutableMap().apply { putAll(scopedEnvironment) }
+        // Keep this immutable while the reader thread is alive so a slow EOF
+        // cannot race cleanup and emit an unredacted trailing line.
+        val secretValues = scopedEnvironment.values.sortedByDescending(String::length)
+        val process = try {
+            try {
+                if (continuationKey == null) {
+                    startDirectCommand(cmd, env, operationId, scopedEnvironment.keys)
+                } else {
+                    startContinuationCommand(
+                        cmd = cmd,
+                        env = env,
+                        key = continuationKey,
+                        timeoutSeconds = timeoutSeconds,
+                        operationId = operationId,
+                        scopedEnvironmentKeys = scopedEnvironment.keys,
+                    )
+                }
+            } catch (error: Exception) {
+                val safeMessage = redactCredentialValues(
+                    error.message ?: "scoped command start failed",
+                    secretValues,
+                )
+                if (scopedEnvironment.isNotEmpty()) {
+                    throw IllegalStateException(safeMessage)
+                }
+                throw error
+            }
+        } finally {
+            scopedEnvironment.keys.forEach(env::remove)
         }
         val output = StringBuilder()
         val errorLines = StringBuilder()
@@ -293,17 +347,21 @@ internal class ProcessManager(
                     if (l.contains("proot warning") || l.contains("can't sanitize")) {
                         continue
                     }
+                    val safeLine = redactCredentialValues(l, secretValues)
                     synchronized(outputLock) {
-                        output.appendLine(l)
+                        output.appendLine(safeLine)
                         // Collect error-relevant lines (skip apt download noise)
-                        if (!l.startsWith("Get:") && !l.startsWith("Fetched ") &&
-                            !l.startsWith("Hit:") && !l.startsWith("Ign:") &&
-                            !l.contains(" kB]") && !l.contains(" MB]") &&
-                            !l.startsWith("Reading package") && !l.startsWith("Building dependency") &&
-                            !l.startsWith("Reading state") && !l.startsWith("The following") &&
-                            !l.startsWith("Need to get") && !l.startsWith("After this") &&
-                            l.trim().isNotEmpty()) {
-                            errorLines.appendLine(l)
+                        if (!safeLine.startsWith("Get:") && !safeLine.startsWith("Fetched ") &&
+                            !safeLine.startsWith("Hit:") && !safeLine.startsWith("Ign:") &&
+                            !safeLine.contains(" kB]") && !safeLine.contains(" MB]") &&
+                            !safeLine.startsWith("Reading package") &&
+                            !safeLine.startsWith("Building dependency") &&
+                            !safeLine.startsWith("Reading state") &&
+                            !safeLine.startsWith("The following") &&
+                            !safeLine.startsWith("Need to get") &&
+                            !safeLine.startsWith("After this") &&
+                            safeLine.trim().isNotEmpty()) {
+                            errorLines.appendLine(safeLine)
                         }
                     }
                 }
@@ -366,8 +424,9 @@ internal class ProcessManager(
         command: List<String>,
         environment: Map<String, String>,
         operationId: String?,
+        scopedEnvironmentKeys: Set<String>,
     ): Process {
-        val process = processStarter(configuredProcessBuilder(command, environment))
+        val process = startConfiguredProcess(command, environment, scopedEnvironmentKeys)
         if (operationId == null) return process
 
         val existing = activeOperations.putIfAbsent(operationId, process)
@@ -389,6 +448,7 @@ internal class ProcessManager(
         key: CommandOwnerKey,
         timeoutSeconds: Long,
         operationId: String?,
+        scopedEnvironmentKeys: Set<String>,
     ): Process {
         val coordinator = cleanupCoordinator
             ?: throw IllegalStateException("durable command launch gate unavailable")
@@ -426,7 +486,7 @@ internal class ProcessManager(
             throw IllegalStateException("command launch capability was revoked before spawn")
         }
         val process = try {
-            processStarter(configuredProcessBuilder(gatedCommand, env))
+            startConfiguredProcess(gatedCommand, env, scopedEnvironmentKeys)
         } catch (error: Exception) {
             coordinator.acknowledgeLaunchAbandoned(key, null, attemptId, launchToken)
             throw error
@@ -554,6 +614,33 @@ internal class ProcessManager(
         this.environment().putAll(environment)
         redirectErrorStream(true)
     }
+
+    private fun startConfiguredProcess(
+        command: List<String>,
+        environment: Map<String, String>,
+        scopedEnvironmentKeys: Set<String>,
+    ): Process {
+        val builder = configuredProcessBuilder(command, environment)
+        return try {
+            processStarter(builder)
+        } finally {
+            scopedEnvironmentKeys.forEach(builder.environment()::remove)
+        }
+    }
+
+    private fun validScopedEnvironment(environment: Map<String, String>): Boolean {
+        if (environment.isEmpty()) return true
+        if (environment.keys != SCOPED_ENVIRONMENT_KEYS) return false
+        return validScopedValue(environment["LARKSUITE_CLI_APP_ID"], 256) &&
+            validScopedValue(environment["LARKSUITE_CLI_APP_SECRET"], 512)
+    }
+
+    private fun validScopedValue(value: String?, maxLength: Int): Boolean =
+        value != null && value.isNotEmpty() && value.length <= maxLength &&
+            value.none { it.code < 0x20 || it.code == 0x7f }
+
+    private fun redactCredentialValues(line: String, values: List<String>): String =
+        values.fold(line) { redacted, value -> redacted.replace(value, "[REDACTED]") }
 
     private fun retireRunningCommand(
         process: Process,
