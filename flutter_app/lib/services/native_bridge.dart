@@ -295,10 +295,12 @@ class NativeBridge {
   static Future<void> cancelProotOperation({
     required String operationId,
     required String sessionId,
+    bool requireBackgroundContinuation = false,
   }) async {
     await _channel.invokeMethod<bool>('cancelProotOperation', {
       'operationId': operationId,
       'sessionId': sessionId,
+      'requireBackgroundContinuation': requireBackgroundContinuation,
     });
   }
 
@@ -531,9 +533,13 @@ class NativeBridge {
         'UNKNOWN';
   }
 
-  static Future<bool> stopTerminalService({required String sessionId}) async {
+  static Future<bool> startTerminalService() async {
+    return (await _channel.invokeMethod<bool>('startTerminalService'))!;
+  }
+
+  static Future<bool> stopTerminalService({String? sessionId}) async {
     return (await _channel.invokeMethod<bool>('stopTerminalService', {
-      'sessionId': sessionId,
+      if (sessionId != null) 'sessionId': sessionId,
     }))!;
   }
 

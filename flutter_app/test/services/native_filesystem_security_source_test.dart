@@ -91,8 +91,8 @@ void main() {
         contains('activeOperations.putIfAbsent(operationId, process)'));
     expect(process, contains('if (existing != null)'));
     expect(process, contains('requestWaitingLaunchCleanup('));
-    expect(
-        process, contains('activeOperations[operationId]?.destroyForcibly()'));
+    expect(process,
+        contains('activeOperations[operationId]?.let { destroyDirectProcess'));
   });
 
   test('retryable command cleanup renews wake locks and restarts exact owners',
@@ -133,6 +133,8 @@ void main() {
     ).readAsStringSync();
     final terminalRuntime =
         File('lib/services/terminal_runtime_session.dart').readAsStringSync();
+    final terminalScreen =
+        File('lib/screens/terminal_screen.dart').readAsStringSync();
 
     expect(coordinator, contains('AtomicCommandCleanupLedger'));
     expect(coordinator, contains('context.noBackupFilesDir'));
@@ -287,11 +289,23 @@ void main() {
     expect(activity, contains('"prepareTerminalLaunch"'));
     expect(activity, contains('"validateTerminalLaunchCapability"'));
     expect(processManager, contains('coordinator.prepareLaunch('));
-    expect(processManager, contains('ProcessBuilder(gatedCommand)'));
-    expect(processManager, isNot(contains('ProcessBuilder(cmd)')));
+    expect(
+        processManager, contains('startDirectCommand(cmd, env, operationId)'));
+    final directStart =
+        processManager.indexOf('private fun startDirectCommand');
+    final continuationStart =
+        processManager.indexOf('private fun startContinuationCommand');
+    final directPath = processManager.substring(directStart, continuationStart);
+    expect(
+        directPath, contains('configuredProcessBuilder(command, environment)'));
+    expect(directPath, isNot(contains('cleanupCoordinator')));
+    expect(directPath, isNot(contains('NativeCommandContinuationOwner')));
+    expect(directPath, isNot(contains('prepareLaunch')));
+    expect(directPath, isNot(contains('/system/bin/sh')));
     expect(
       processManager.indexOf('coordinator.prepareLaunch('),
-      lessThan(processManager.indexOf('ProcessBuilder(gatedCommand)')),
+      lessThan(processManager
+          .indexOf('configuredProcessBuilder(gatedCommand, env)')),
     );
     expect(
       processManager.indexOf('coordinator.validateLaunchCapability('),
@@ -311,6 +325,13 @@ void main() {
       terminalRuntime.indexOf('.validateLaunchCapability('),
       lessThan(terminalRuntime.indexOf('final process = _processLauncher(')),
     );
+    expect(
+        terminalScreen, contains("Pty.start(\n        config['executable']!"));
+    expect(terminalScreen, contains('_pty?.kill();'));
+    expect(terminalScreen,
+        contains('NativeBridge.stopTerminalService().ignore()'));
+    expect(terminalScreen, isNot(contains('TerminalRuntimeSession.shared')));
+    expect(terminalScreen, isNot(contains('prepareTerminalLaunch')));
   });
 
   test('native workspace publication rolls back every incomplete outcome', () {

@@ -118,9 +118,16 @@ class MainActivity : FlutterActivity() {
 
         val filesDir = applicationContext.filesDir.absolutePath
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
-        val cleanupCoordinator = CommandCleanupCoordinatorProvider.get(applicationContext)
-        TerminalSessionService.initializeCleanupCoordinator(applicationContext)
-        AgentTaskService.initializeCleanupCoordinator(applicationContext)
+        val cleanupCoordinator = try {
+            CommandCleanupCoordinatorProvider.get(applicationContext)
+        } catch (error: Exception) {
+            // Legacy cleanup is best effort for direct commands. Explicit
+            // continuation still fails closed through its typed unavailable path.
+            Log.w("ClawChat", "Legacy command cleanup coordinator unavailable", error)
+            null
+        }
+        TerminalSessionService.initializeCleanupCoordinator(cleanupCoordinator)
+        AgentTaskService.initializeCleanupCoordinator(cleanupCoordinator)
 
         bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
         processManager = ProcessManager(filesDir, nativeLibDir, cleanupCoordinator)
@@ -459,14 +466,22 @@ class MainActivity : FlutterActivity() {
                 "cancelProotOperation" -> {
                     val operationId = call.argument<String>("operationId")
                     val sessionId = call.argument<String>("sessionId")
-                    if (operationId.isNullOrBlank() || sessionId.isNullOrBlank()) {
-                        result.error("INVALID_ARGS", "command continuation identity required", null)
+                    val requireBackgroundContinuation =
+                        call.argument<Boolean>("requireBackgroundContinuation") ?: false
+                    if (operationId.isNullOrBlank() ||
+                        (requireBackgroundContinuation && sessionId.isNullOrBlank())) {
+                        result.error("INVALID_ARGS", "command operation identity required", null)
                     } else {
-                        val outcome = AgentTaskService.cancelCommand(sessionId, operationId)
-                        result.success(
-                            outcome == CommandRetireOutcome.RETIRED ||
-                                outcome == CommandRetireOutcome.ALREADY_RETIRED
-                        )
+                        if (requireBackgroundContinuation) {
+                            val outcome = AgentTaskService.cancelCommand(sessionId!!, operationId)
+                            result.success(
+                                outcome == CommandRetireOutcome.RETIRED ||
+                                    outcome == CommandRetireOutcome.ALREADY_RETIRED
+                            )
+                        } else {
+                            processManager.cancelOperation(operationId)
+                            result.success(true)
+                        }
                     }
                 }
                 "replaceTerminalSession" -> {
@@ -712,14 +727,22 @@ class MainActivity : FlutterActivity() {
                         )
                     }
                 }
+                "startTerminalService" -> {
+                    try {
+                        TerminalSessionService.startHelper(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
                 "stopTerminalService" -> {
                     val sessionId = call.argument<String>("sessionId")
-                    if (sessionId.isNullOrBlank()) {
-                        result.error("INVALID_ARGS", "terminal session identity required", null)
-                        return@setMethodCallHandler
-                    }
                     try {
-                        TerminalSessionService.stop(applicationContext, sessionId)
+                        if (sessionId.isNullOrBlank()) {
+                            TerminalSessionService.stopHelper(applicationContext)
+                        } else {
+                            TerminalSessionService.stop(applicationContext, sessionId)
+                        }
                         result.success(true)
                     } catch (e: Exception) {
                         result.error("SERVICE_ERROR", e.message, null)

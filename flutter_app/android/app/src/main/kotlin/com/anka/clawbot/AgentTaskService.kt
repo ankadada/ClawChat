@@ -98,8 +98,8 @@ class AgentTaskService : Service() {
         @Volatile
         private var cleanupCoordinator: CommandCleanupCoordinator? = null
 
-        internal fun initializeCleanupCoordinator(context: Context) {
-            cleanupCoordinator = CommandCleanupCoordinatorProvider.get(context.applicationContext)
+        internal fun initializeCleanupCoordinator(coordinator: CommandCleanupCoordinator?) {
+            cleanupCoordinator = coordinator
         }
         private val commandReadiness =
             ConcurrentHashMap<String, CompletableFuture<Boolean>>()
@@ -508,7 +508,9 @@ class AgentTaskService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        cleanupCoordinator = CommandCleanupCoordinatorProvider.get(applicationContext)
+        cleanupCoordinator = cleanupCoordinator ?: runCatching {
+            CommandCleanupCoordinatorProvider.get(applicationContext)
+        }.getOrNull()
         instance = this
     }
 

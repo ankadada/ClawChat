@@ -18,6 +18,7 @@ class BashTool extends Tool {
       'Commands run inside a proot container with /root/workspace as the default directory. '
       'Shared Android storage is not mounted for agent commands. '
       'Use this for file operations, running scripts, installing packages, etc. '
+      'Set background_continuation to true only when the command must survive an external browser or app-background handoff. '
       'Sensitive-file blocking is defense-in-depth only and must not be treated as a complete sandbox.';
 
   @override
@@ -31,6 +32,11 @@ class BashTool extends Tool {
           'timeout': {
             'type': 'integer',
             'description': 'Timeout in seconds (default: 120)',
+          },
+          'background_continuation': {
+            'type': 'boolean',
+            'description':
+                'Opt in to durable background continuation for an external browser or app-background handoff (default: false)',
           },
         },
         'required': ['command'],
@@ -157,6 +163,12 @@ class BashTool extends Tool {
   }) async {
     final command = input['command'] as String;
     final timeout = (input['timeout'] as num?)?.toInt() ?? 120;
+    final backgroundContinuationValue = input['background_continuation'];
+    if (backgroundContinuationValue != null &&
+        backgroundContinuationValue is! bool) {
+      return 'Error: background_continuation must be a boolean.';
+    }
+    final backgroundContinuation = backgroundContinuationValue == true;
 
     if (timeout < 1 || timeout > 12 * 60 * 60) {
       return 'Error: Timeout must be between 1 and 43200 seconds.';
@@ -191,6 +203,7 @@ class BashTool extends Tool {
           await NativeBridge.cancelProotOperation(
             operationId: operationId,
             sessionId: sessionId,
+            requireBackgroundContinuation: backgroundContinuation,
           );
         } catch (_) {
           // The native command completion remains the source of truth.
@@ -203,8 +216,8 @@ class BashTool extends Tool {
         timeout: timeout,
         mountStorage: false,
         operationId: operationId,
-        continuationSessionId: sessionId,
-        requireBackgroundContinuation: true,
+        continuationSessionId: backgroundContinuation ? sessionId : null,
+        requireBackgroundContinuation: backgroundContinuation,
       );
       settled = true;
       if (cancellationSignal?.isCancellationRequested == true) {

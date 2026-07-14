@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_pty/flutter_pty.dart';
 import 'package:xterm/xterm.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
-import '../services/terminal_runtime_session.dart';
+import '../services/terminal_service.dart';
 import '../l10n/app_strings.dart';
 
 class TerminalScreen extends StatefulWidget {
@@ -16,11 +19,10 @@ class TerminalScreen extends StatefulWidget {
 }
 
 class _TerminalScreenState extends State<TerminalScreen> {
-  static _TerminalScreenState? _inputOwner;
-  final TerminalRuntimeSession _runtime = TerminalRuntimeSession.shared;
   late final Terminal _terminal;
   late final TerminalController _controller;
-  StreamSubscription<void>? _runtimeSubscription;
+  Pty? _pty;
+  StreamSubscription<List<int>>? _ptySubscription;
   bool _loading = true;
   String? _error;
   final _ctrlNotifier = ValueNotifier<bool>(false);
@@ -48,49 +50,18 @@ class _TerminalScreenState extends State<TerminalScreen> {
   @override
   void initState() {
     super.initState();
-    _terminal = _runtime.terminal;
+    _terminal = Terminal(maxLines: 10000);
     _controller = TerminalController();
-    _loading = _runtime.loading || !_runtime.hasActiveProcess;
-    _error = _runtime.error;
     _loadTerminalPreferences();
-    _runtimeSubscription = _runtime.changes.listen((_) {
-      if (!mounted) return;
-      setState(() {
-        _loading = _runtime.loading;
-        _error = _runtime.error;
-      });
+    NativeBridge.startTerminalService().catchError((_) {
+      return false;
     });
-    _attachTerminalInput();
     // Defer PTY start until after the first frame so TerminalView has been
     // laid out and _terminal.viewWidth/viewHeight reflect real screen
     // dimensions instead of the 80×24 default.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _startPty();
     });
-  }
-
-  void _attachTerminalInput() {
-    _inputOwner = this;
-    _terminal.onOutput = (data) {
-      // Intercept keyboard input when CTRL/ALT toolbar modifiers are active.
-      if (_ctrlNotifier.value && data.length == 1) {
-        final code = data.toLowerCase().codeUnitAt(0);
-        if (code >= 97 && code <= 122) {
-          _runtime.write([code - 96]);
-          _ctrlNotifier.value = false;
-          return;
-        }
-      }
-      if (_altNotifier.value && data.isNotEmpty) {
-        _runtime.write(utf8.encode('\x1b$data'));
-        _altNotifier.value = false;
-        return;
-      }
-      _runtime.write(utf8.encode(data));
-    };
-    _terminal.onResize = (w, h, pw, ph) {
-      _runtime.resize(h, w);
-    };
   }
 
   Future<void> _loadTerminalPreferences() async {
@@ -109,31 +80,103 @@ class _TerminalScreenState extends State<TerminalScreen> {
     return _terminalFontSizeOverride ?? _adaptiveTerminalFontSize(width);
   }
 
-  Future<void> _startPty({bool restart = false}) async {
-    if (restart) {
-      await _runtime.restart(
+  Future<void> _startPty() async {
+    _pty?.kill();
+    _pty = null;
+    try {
+      // Historical direct path: service/filesystem setup is best effort and
+      // never an admission gate before the real PRoot PTY is launched.
+      try {
+        await NativeBridge.setupDirs();
+      } catch (_) {
+        // Directories may already exist.
+      }
+      try {
+        await NativeBridge.writeResolv();
+      } catch (_) {
+        // resolv.conf may already be configured.
+      }
+      try {
+        final filesDir = await NativeBridge.getFilesDir();
+        const resolvContent = 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n';
+        final resolvFile = File('$filesDir/config/resolv.conf');
+        if (!resolvFile.existsSync()) {
+          Directory('$filesDir/config').createSync(recursive: true);
+          resolvFile.writeAsStringSync(resolvContent);
+        }
+        final rootfsResolv = File('$filesDir/rootfs/alpine/etc/resolv.conf');
+        if (!rootfsResolv.existsSync()) {
+          rootfsResolv.parent.createSync(recursive: true);
+          rootfsResolv.writeAsStringSync(resolvContent);
+        }
+      } catch (_) {
+        // Filesystem fallback remains best effort.
+      }
+      final config = await TerminalService.getProotShellConfig();
+      final args = TerminalService.buildProotArgs(
+        config,
         columns: _terminal.viewWidth,
         rows: _terminal.viewHeight,
       );
-    } else {
-      await _runtime.ensureStarted(
+
+      _pty = Pty.start(
+        config['executable']!,
+        arguments: args,
+        environment: TerminalService.buildHostEnv(config),
         columns: _terminal.viewWidth,
         rows: _terminal.viewHeight,
       );
+
+      await _ptySubscription?.cancel();
+      _ptySubscription = _pty!.output.cast<List<int>>().listen((data) {
+        _terminal.write(utf8.decode(data, allowMalformed: true));
+      });
+      _pty!.exitCode.then((code) {
+        _terminal.write('\r\n[Process exited with code $code]\r\n');
+      });
+      _terminal.onOutput = (data) {
+        if (_ctrlNotifier.value && data.length == 1) {
+          final code = data.toLowerCase().codeUnitAt(0);
+          if (code >= 97 && code <= 122) {
+            _write([code - 96]);
+            _ctrlNotifier.value = false;
+            return;
+          }
+        }
+        if (_altNotifier.value && data.isNotEmpty) {
+          _write(utf8.encode('\x1b$data'));
+          _altNotifier.value = false;
+          return;
+        }
+        _write(utf8.encode(data));
+      };
+      _terminal.onResize = (w, h, pw, ph) => _pty?.resize(h, w);
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = null;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = 'Failed to start terminal: $error';
+        });
+      }
     }
   }
 
+  void _write(List<int> data) => _pty?.write(Uint8List.fromList(data));
+
   @override
   void dispose() {
-    _runtimeSubscription?.cancel();
-    if (identical(_inputOwner, this)) {
-      _inputOwner = null;
-      _terminal.onOutput = null;
-      _terminal.onResize = null;
-    }
+    _ptySubscription?.cancel();
     _ctrlNotifier.dispose();
     _altNotifier.dispose();
     _controller.dispose();
+    _pty?.kill();
+    NativeBridge.stopTerminalService().ignore();
     super.dispose();
   }
 
@@ -234,7 +277,7 @@ class _TerminalScreenState extends State<TerminalScreen> {
   Future<void> _paste() async {
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     if (data?.text != null && data!.text!.isNotEmpty) {
-      _runtime.write(utf8.encode(data.text!));
+      _write(utf8.encode(data.text!));
     }
   }
 
@@ -354,7 +397,7 @@ class _TerminalScreenState extends State<TerminalScreen> {
                 _loading = true;
                 _error = null;
               });
-              _startPty(restart: true);
+              _startPty();
             },
           ),
         ],
@@ -534,12 +577,12 @@ class _TerminalScreenState extends State<TerminalScreen> {
               _toolbarIconButton(
                 icon: Icons.keyboard_tab,
                 tooltip: 'Tab',
-                onTap: () => _runtime.write(utf8.encode('\t')),
+                onTap: () => _write(utf8.encode('\t')),
               ),
               _toolbarIconButton(
                 icon: Icons.keyboard,
                 tooltip: 'Esc',
-                onTap: () => _runtime.write(utf8.encode('\x1b')),
+                onTap: () => _write(utf8.encode('\x1b')),
               ),
               _toolbarDivider(),
               _toolbarToggleButton(
@@ -559,22 +602,22 @@ class _TerminalScreenState extends State<TerminalScreen> {
               _toolbarIconButton(
                 icon: Icons.keyboard_arrow_up,
                 tooltip: 'Up',
-                onTap: () => _runtime.write(utf8.encode('\x1b[A')),
+                onTap: () => _write(utf8.encode('\x1b[A')),
               ),
               _toolbarIconButton(
                 icon: Icons.keyboard_arrow_down,
                 tooltip: 'Down',
-                onTap: () => _runtime.write(utf8.encode('\x1b[B')),
+                onTap: () => _write(utf8.encode('\x1b[B')),
               ),
               _toolbarIconButton(
                 icon: Icons.keyboard_arrow_left,
                 tooltip: 'Left',
-                onTap: () => _runtime.write(utf8.encode('\x1b[D')),
+                onTap: () => _write(utf8.encode('\x1b[D')),
               ),
               _toolbarIconButton(
                 icon: Icons.keyboard_arrow_right,
                 tooltip: 'Right',
-                onTap: () => _runtime.write(utf8.encode('\x1b[C')),
+                onTap: () => _write(utf8.encode('\x1b[C')),
               ),
             ],
           ),

@@ -47,6 +47,7 @@ class TerminalSessionService : Service() {
     companion object {
         private const val CHANNEL_ID = "clawchat_terminal"
         private const val ACTION_START = "com.anka.clawbot.terminal.START"
+        private const val ACTION_HELPER_START = "com.anka.clawbot.terminal.HELPER_START"
         private const val ACTION_STOP = "com.anka.clawbot.terminal.STOP"
         private const val EXTRA_OPERATION_ID = "operationId"
         private const val EXTRA_SESSION_ID = "sessionId"
@@ -61,9 +62,11 @@ class TerminalSessionService : Service() {
         private val owner get() = NativeCommandContinuationOwner.registry
         @Volatile
         private var cleanupCoordinator: CommandCleanupCoordinator? = null
+        @Volatile
+        private var helperRequested = false
 
-        internal fun initializeCleanupCoordinator(context: Context) {
-            cleanupCoordinator = CommandCleanupCoordinatorProvider.get(context.applicationContext)
+        internal fun initializeCleanupCoordinator(coordinator: CommandCleanupCoordinator?) {
+            cleanupCoordinator = coordinator
         }
         private val readiness = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
         private var instance: TerminalSessionService? = null
@@ -71,6 +74,27 @@ class TerminalSessionService : Service() {
         @Volatile
         var isRunning = false
             private set
+
+        fun startHelper(context: Context) {
+            helperRequested = true
+            val intent = Intent(context, TerminalSessionService::class.java).apply {
+                action = ACTION_HELPER_START
+            }
+            try {
+                startServiceCompat(context, intent)
+            } catch (error: Exception) {
+                helperRequested = false
+                throw error
+            }
+        }
+
+        fun stopHelper(context: Context) {
+            helperRequested = false
+            if (owner.activeCount(CommandContinuationOwner.TERMINAL) == 0) {
+                instance?.retireForegroundSynchronously()
+                    ?: context.stopService(Intent(context, TerminalSessionService::class.java))
+            }
+        }
 
         internal fun replaceSession(
             operationId: String,
@@ -479,7 +503,9 @@ class TerminalSessionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        cleanupCoordinator = CommandCleanupCoordinatorProvider.get(applicationContext)
+        cleanupCoordinator = cleanupCoordinator ?: runCatching {
+            CommandCleanupCoordinatorProvider.get(applicationContext)
+        }.getOrNull()
         instance = this
         createNotificationChannel()
     }
@@ -488,6 +514,21 @@ class TerminalSessionService : Service() {
         retiringNormally = false
         val candidate = intent?.exactCandidateOrNull()
         val requestId = intent?.getStringExtra(EXTRA_READY_REQUEST_ID)
+        if (intent?.action == ACTION_HELPER_START) {
+            return try {
+                startForeground(NOTIFICATION_ID, buildNotification(null))
+                acquireWakeLock()
+                isRunning = wakeLock?.isHeld == true
+                START_STICKY
+            } catch (e: Exception) {
+                Log.w("ClawChat", "Unable to start terminal helper service", e)
+                helperRequested = false
+                isRunning = false
+                releaseWakeLock()
+                stopSelf()
+                START_NOT_STICKY
+            }
+        }
         if (intent?.action == ACTION_STOP) {
             if (candidate != null) {
                 val key = candidate.ownerKey
@@ -556,6 +597,7 @@ class TerminalSessionService : Service() {
             emptyList()
         }
         isRunning = false
+        helperRequested = false
         instance = null
         releaseWakeLock()
         for (candidate in pendingCleanup) {
@@ -565,7 +607,7 @@ class TerminalSessionService : Service() {
     }
 
     private fun retireIfIdle() {
-        if (owner.activeCount(CommandContinuationOwner.TERMINAL) == 0) {
+        if (owner.activeCount(CommandContinuationOwner.TERMINAL) == 0 && !helperRequested) {
             retireForegroundSynchronously()
         } else {
             scheduleNextTimeout()
@@ -690,7 +732,7 @@ class TerminalSessionService : Service() {
     }
 
     @Suppress("DEPRECATION")
-    private fun buildNotification(candidate: TerminalCandidateKey): Notification {
+    private fun buildNotification(candidate: TerminalCandidateKey?): Notification {
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
         }
@@ -700,22 +742,12 @@ class TerminalSessionService : Service() {
             openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val stopIntent = Intent(this, TerminalSessionService::class.java).apply {
-            action = ACTION_STOP
-            putExactCandidate(candidate)
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            candidate.hashCode(),
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
         } else {
             Notification.Builder(this)
         }
-        return builder
+        builder
             .setContentTitle("ClawChat Terminal")
             .setContentText("Terminal session is active in the background")
             .setSmallIcon(R.mipmap.ic_launcher)
@@ -724,7 +756,19 @@ class TerminalSessionService : Service() {
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(Notification.PRIORITY_LOW)
-            .addAction(R.mipmap.ic_launcher, "停止", stopPendingIntent)
-            .build()
+        if (candidate != null) {
+            val stopIntent = Intent(this, TerminalSessionService::class.java).apply {
+                action = ACTION_STOP
+                putExactCandidate(candidate)
+            }
+            val stopPendingIntent = PendingIntent.getService(
+                this,
+                candidate.hashCode(),
+                stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(R.mipmap.ic_launcher, "停止", stopPendingIntent)
+        }
+        return builder.build()
     }
 }

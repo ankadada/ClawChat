@@ -442,7 +442,7 @@ void main() {
     final signal = ToolCancellationSignal();
 
     final payload = await tool.executeResultWithOperationAndCancellation(
-      {'command': 'cli configure'},
+      {'command': 'cli configure', 'background_continuation': true},
       sessionId: 'chat-session',
       operationId: 'run:tool-operation',
       cancellationSignal: signal,
@@ -473,9 +473,42 @@ void main() {
     expect(output.trim(), 'ok');
     final run = calls.singleWhere((call) => call.method == 'runInProot');
     final args = Map<String, Object?>.from(run.arguments as Map);
-    expect(args['continuationSessionId'], 'fresh-echo-session');
-    expect(args['requireBackgroundContinuation'], isTrue);
+    expect(args.containsKey('continuationSessionId'), isFalse);
+    expect(args['requireBackgroundContinuation'], isFalse);
     expect(args['operationId'], isA<String>());
+  });
+
+  test('npm-style command uses historical direct mode by default', () async {
+    MethodCall? runCall;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'runInProot') {
+        runCall = call;
+        return 'npm-ok';
+      }
+      return null;
+    });
+
+    expect(await tool.execute({'command': 'npm --version'}), 'npm-ok');
+    final args = Map<Object?, Object?>.from(runCall!.arguments as Map);
+    expect(args['requireBackgroundContinuation'], isFalse);
+    expect(args.containsKey('continuationSessionId'), isFalse);
+  });
+
+  test('background continuation flag is strict and fail closed', () async {
+    var invoked = false;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      invoked = true;
+      return 'unexpected';
+    });
+
+    final output = await tool.execute({
+      'command': 'echo ok',
+      'background_continuation': 'true',
+    });
+    expect(output, 'Error: background_continuation must be a boolean.');
+    expect(invoked, isFalse);
   });
 
   test('fresh Android Terminal replacement does not return generic retry',
@@ -618,7 +651,7 @@ void main() {
     });
 
     final payload = await tool.executeResultWithOperationAndCancellation(
-      {'command': 'cli configure'},
+      {'command': 'cli configure', 'background_continuation': true},
       sessionId: 'background-session',
       operationId: 'background-operation',
       cancellationSignal: ToolCancellationSignal(),
@@ -657,6 +690,7 @@ void main() {
     final arguments = await cancelled.future;
     expect(arguments['operationId'], 'cancel-operation');
     expect(arguments['sessionId'], 'cancel-session');
+    expect(arguments['requireBackgroundContinuation'], isFalse);
     await expectLater(
       execution,
       throwsA(isA<ToolExecutionCancelledException>()),
@@ -680,7 +714,10 @@ void main() {
       return null;
     });
 
-    final result = await tool.execute({'command': 'cli configure'});
+    final result = await tool.execute({
+      'command': 'cli configure',
+      'background_continuation': true,
+    });
     expect(
         result, 'Error: command continuation not started: SERVICE_NOT_READY');
     expect(result, isNot(contains('private-operation')));
