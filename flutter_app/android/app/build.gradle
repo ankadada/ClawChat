@@ -24,8 +24,33 @@ if (keystorePropertiesFile.exists()) {
     }
 }
 
-def hasKeystore = keystoreProperties.containsKey('storeFile') &&
-    file(keystoreProperties['storeFile']).exists()
+def requiredKeystoreProperties = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword']
+def missingKeystoreProperties = requiredKeystoreProperties.findAll { name ->
+    !keystoreProperties.containsKey(name) ||
+        keystoreProperties[name] == null ||
+        keystoreProperties[name].toString().trim().isEmpty()
+}
+def storeFileValue = keystoreProperties.getProperty('storeFile')
+def releaseStoreFile = storeFileValue ? rootProject.file(storeFileValue) : null
+def hasKeystore = missingKeystoreProperties.isEmpty() &&
+    releaseStoreFile != null &&
+    releaseStoreFile.isFile()
+
+def releaseSigningProblem = {
+    def issues = []
+    if (!missingKeystoreProperties.isEmpty()) {
+        issues.add("missing key.properties entries: ${missingKeystoreProperties.join(', ')}")
+    }
+    if (storeFileValue == null || storeFileValue.trim().isEmpty()) {
+        issues.add("storeFile is missing")
+    } else if (releaseStoreFile == null || !releaseStoreFile.isFile()) {
+        issues.add("storeFile does not resolve to an existing file from the Android root project")
+    }
+    if (issues.isEmpty()) {
+        issues.add("unknown release signing configuration error")
+    }
+    return issues.join("; ")
+}
 android {
     namespace = "com.anka.clawbot"
     compileSdk = 36
@@ -59,7 +84,7 @@ android {
             release {
                 keyAlias keystoreProperties['keyAlias']
                 keyPassword keystoreProperties['keyPassword']
-                storeFile file(keystoreProperties['storeFile'])
+                storeFile releaseStoreFile
                 storePassword keystoreProperties['storePassword']
             }
         }
@@ -70,7 +95,9 @@ android {
             signingConfig hasKeystore ? signingConfigs.release : signingConfigs.debug
         }
         release {
-            signingConfig hasKeystore ? signingConfigs.release : signingConfigs.debug
+            if (hasKeystore) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled = false
             shrinkResources = false
         }
@@ -112,6 +139,31 @@ def verifyProotNativePayloads = tasks.register("verifyProotNativePayloads", Exec
         "--artifact-mode",
         "source",
     )
+}
+
+def validateOfficialReleaseSigning = tasks.register("validateOfficialReleaseSigning") {
+    group = "verification"
+    description = "Fails release builds when the official Android signing configuration is absent or invalid."
+    doLast {
+        if (!hasKeystore) {
+            throw new GradleException(
+                "Release signing configuration is missing or invalid: " +
+                    "${releaseSigningProblem()}. See RELEASE_SIGNING.md."
+            )
+        }
+    }
+}
+
+tasks.matching { task ->
+    task.name in [
+        "preReleaseBuild",
+        "assembleRelease",
+        "bundleRelease",
+        "packageRelease",
+        "validateSigningRelease",
+    ]
+}.configureEach {
+    dependsOn(validateOfficialReleaseSigning)
 }
 
 tasks.named("preBuild").configure {

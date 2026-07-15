@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "packageName": "com.anka.clawbot",
+  "certificateSha256": "e718246ac9a0d973534bf686e1f9fd12254909609466bd041f49930721e6d57f",
+  "publicKeySha256": "07f337ae9c83e7a055f70d9193c52070fe2b71e4d649b8933d8056103f8262db",
+  "minSdkVersion": 29,
+  "acceptedSignatureSchemes": [
+    "v2",
+    "v3"
+  ],
+  "policy": {
+    "name": "ClawChat production Android signing identity",
+    "scope": "Public signer identity for distributable APKs that must preserve Android in-place update compatibility.",
+    "rotation": "Do not change this identity unless Android signature rotation is formally implemented, documented, and verified across the supported install base."
+  },
+  "notes": [
+    "This file contains only public certificate and public-key digests. It must not contain keystore paths, aliases, passwords, or private key material.",
+    "The identity is pinned to the established upgrade lineage observed in historical release APKs and the installed 2.5.2+8 package that accepted the 2.5.3+9 overlay update."
+  ]
+}

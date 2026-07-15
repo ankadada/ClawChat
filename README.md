@@ -112,14 +112,16 @@ git clone https://github.com/ankadada/ClawChat.git
 cd ClawChat
 
 # Canonical release build: fetches and verifies PRoot before the build,
-# then verifies the packaged APK before reporting success.
+# then verifies the packaged APK and production signer before reporting success.
 bash scripts/build-apk.sh
 ```
 
 Releases are APK-only. Android App Bundle publication is intentionally disabled
 until the repository has a post-package base-module and delivery verifier with
 the same fail-closed PRoot guarantees. PRoot binary provenance and licenses are
-recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The Android
+production signing identity, release gate, and rotation procedure are recorded
+in the [release signing contract](RELEASE_SIGNING.md).
 
 ---
 

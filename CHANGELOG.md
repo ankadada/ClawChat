@@ -12,6 +12,7 @@
 ### Compatibility
 
 - Includes all v2.6.0 skill-eval, import-inspection, legacy-preset, authorization, and foldable-safety changes unchanged.
+- Release builds now fail closed unless the official signing configuration is present, and the packaged APK signer, package, and version are verified before publication.
 
 ## v2.6.0 — Host-Owned Skill Evals and Safe Import Inspection
 
