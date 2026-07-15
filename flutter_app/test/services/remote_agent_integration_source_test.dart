@@ -25,10 +25,10 @@ void main() {
 
   test('version authority has no stale runtime literal', () {
     expect(
-        File('pubspec.yaml').readAsStringSync(), contains('version: 2.6.1+11'));
+        File('pubspec.yaml').readAsStringSync(), contains('version: 2.6.2+12'));
     expect(
       File('lib/constants.dart').readAsStringSync(),
-      contains("version = '2.6.1'"),
+      contains("version = '2.6.2'"),
     );
     for (final path in [
       'lib/constants.dart',

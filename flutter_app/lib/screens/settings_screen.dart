@@ -1018,7 +1018,9 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
 
   Widget _skillUpdateTile(ThemeData theme, SkillInfo skill) {
     return FutureBuilder<ExtensionUpdateState?>(
-      future: _readExtensionUpdateState(skill.id),
+      future: skill.isCliManaged
+          ? Future<ExtensionUpdateState?>.value()
+          : _readExtensionUpdateState(skill.id),
       builder: (context, snapshot) {
         final state = snapshot.data;
         final loading = snapshot.connectionState == ConnectionState.waiting;
@@ -1035,13 +1037,19 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                       ? skill.availabilityReason!
                       : !skill.valid
                           ? '扩展无效，操作已禁用'
-                          : loading
-                              ? '正在读取本地更新历史…'
-                              : snapshot.hasError
-                                  ? '更新历史状态未知'
-                                  : state == null
-                                      ? '无本地更新历史或回滚备份'
-                                      : '已更新至 v${state.version} · 可回滚'),
+                          : skill.isCliManaged
+                              ? skill.requiresConsent
+                                  ? '由 xd-skill CLI 管理 · 授权后可启用'
+                                  : skill.enabled
+                                      ? '由 xd-skill CLI 管理 · 已启用'
+                                      : '由 xd-skill CLI 管理 · 已停用'
+                              : loading
+                                  ? '正在读取本地更新历史…'
+                                  : snapshot.hasError
+                                      ? '更新历史状态未知'
+                                      : state == null
+                                          ? '无本地更新历史或回滚备份'
+                                          : '已更新至 v${state.version} · 可回滚'),
                   value: skill.enabled,
                   onChanged: skill.valid && !skill.isUnavailable
                       ? (value) async {
@@ -1062,20 +1070,27 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                   runSpacing: 8,
                   children: [
                     OutlinedButton(
-                      onPressed: skill.valid && !skill.isUnavailable
+                      onPressed: skill.valid &&
+                              !skill.isUnavailable &&
+                              !skill.isCliManaged
                           ? () => _showRemoteExtensionUpdate(skill)
                           : null,
                       child: Text(SettingsScreen.extensionActionLabels[0]),
                     ),
                     OutlinedButton(
-                      onPressed:
-                          skill.isUnavailable || loading || snapshot.hasError
-                              ? null
-                              : () => _showExtensionHistory(skill, state),
+                      onPressed: skill.isUnavailable ||
+                              skill.isCliManaged ||
+                              loading ||
+                              snapshot.hasError
+                          ? null
+                          : () => _showExtensionHistory(skill, state),
                       child: Text(SettingsScreen.extensionActionLabels[1]),
                     ),
                     OutlinedButton(
-                      onPressed: skill.isUnavailable || loading || state == null
+                      onPressed: skill.isUnavailable ||
+                              skill.isCliManaged ||
+                              loading ||
+                              state == null
                           ? null
                           : () => _rollbackExtension(skill),
                       child: Text(SettingsScreen.extensionActionLabels[2]),
@@ -1897,6 +1912,8 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                             if (skill.valid &&
                                                 skill.requiresConsent)
                                               'Consent required before use',
+                                            if (skill.isCliManaged)
+                                              AppStrings.cliManagedSkill,
                                             if (skill.valid)
                                               'Risk: ${skill.riskTier}',
                                             skill.description,
@@ -2873,6 +2890,11 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         throw StateError('Signed update target is not installed.');
       }
       final skill = installed.single;
+      if (skill.isCliManaged) {
+        throw StateError(
+          'CLI-managed skills must be updated with xd-skill.',
+        );
+      }
       final check = await _updates.checkLocalMetadata(
         metadataSource,
         expectedKind: UpdateArtifactKind.extension,

@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.6.2 — xd-skill Discovery and Consent Repair
+
+### Skill Management
+
+- **CLI skill discovery** — Finds skills installed by `xd-skill` under `/root/workspace/.agents/skills` in addition to App-managed skills under `/root/workspace/skills`.
+- **Explicit consent and activation** — Shows CLI-managed skills in Settings, supports explicit consent/enable, and activates the uniquely installed skill by stable ID with fresh digest verification.
+- **Ownership-safe actions** — Keeps Update, History, and Rollback disabled for CLI-managed skills so package lifecycle remains owned by `xd-skill`.
+- **Conflict protection** — Excludes duplicate enabled IDs from the model index and rejects consent when the same stable ID exists at another installed path.
+
+### Compatibility
+
+- Preserves the v2.6.1 UI and brand refresh and the v2.6.0 Skill Eval, import-inspection, authorization, and foldable-safety gates.
+
 ## v2.6.1 — UI and Brand Refresh Integration
 
 ### User Experience

@@ -232,6 +232,7 @@ final class HostSkillEvalRunner {
   }
 
   static const _requiredRuntimeEvidencePaths = {
+    'lib/l10n/app_strings.dart',
     'lib/screens/settings_screen.dart',
     'lib/services/bundled_legacy_skill_catalog.dart',
     'lib/services/skill_capability_policy.dart',
@@ -239,6 +240,7 @@ final class HostSkillEvalRunner {
     'lib/services/skill_service.dart',
     'lib/services/tools/tool_policy.dart',
     'lib/widgets/skill_consent_dialog.dart',
+    'test/screens/settings_cli_skill_discovery_test.dart',
     'test/screens/settings_bundled_legacy_presets_test.dart',
     'test/services/bundled_legacy_skill_catalog_test.dart',
     'test/services/skill_capability_policy_test.dart',

@@ -304,6 +304,7 @@ class SkillCapabilityPolicy {
     if (value is String) {
       final normalized = value.replaceAll('\\', '/').toLowerCase();
       return normalized.contains('/root/workspace/skills/') ||
+          normalized.contains('/root/workspace/.agents/skills/') ||
           normalized.contains('skills/') && normalized.contains('skill.md');
     }
     if (value is Map) return value.values.any(_referencesSkillStorage);

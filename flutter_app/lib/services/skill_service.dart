@@ -77,6 +77,8 @@ class SkillInfo {
   bool get isUnavailable => availabilityReason != null;
 
   bool get requiresConsent => valid && !isUnavailable && !consentCurrent;
+
+  bool get isCliManaged => SkillService.isCliManagedSkillEntrypoint(path);
 }
 
 class PreparedSkillImport {
@@ -280,6 +282,11 @@ class SkillActivationReference {
 
 class SkillService {
   static const skillsDirectory = '/root/workspace/skills';
+  static const cliSkillsDirectory = '/root/workspace/.agents/skills';
+  static const installedSkillsDirectories = <String>[
+    skillsDirectory,
+    cliSkillsDirectory,
+  ];
   static const manifestFilename = 'skill.json';
 
   static String updateTargetPath(String id) => _targetDirForSkillId(id);
@@ -549,7 +556,7 @@ class SkillService {
       final disabled = await _loadDisabled();
       final grants = await loadTrustGrants();
       final output = await NativeBridge.runInProot(
-        'find ${_shellQuote(skillsDirectory)} -name "SKILL.md" -type f 2>/dev/null',
+        _findInstalledSkillEntrypointsCommand(),
       );
       final paths =
           output.trim().split('\n').where((p) => p.isNotEmpty).toList()..sort();
@@ -563,7 +570,7 @@ class SkillService {
               await _readOptionalRootfsText('$root/$manifestFilename');
           final candidate = inspectPackage(
             stagingPath: root,
-            sourceIdentity: 'Installed locally',
+            sourceIdentity: _installedSourceIdentity(path),
             skillContent: skillContent,
             manifestContent: manifestContent,
             previousGrant: null,
@@ -627,7 +634,7 @@ class SkillService {
   }
 
   static String buildSkillIndex(List<SkillInfo> skills) {
-    final enabled = skills
+    final eligible = skills
         .where(
           (skill) =>
               skill.enabled &&
@@ -643,6 +650,11 @@ class SkillService {
                   null,
         )
         .toList();
+    final idCounts = <String, int>{};
+    for (final skill in eligible) {
+      idCounts.update(skill.id, (count) => count + 1, ifAbsent: () => 1);
+    }
+    final enabled = eligible.where((skill) => idCounts[skill.id] == 1).toList();
     if (enabled.isEmpty) return '';
 
     final buffer = StringBuffer();
@@ -664,6 +676,9 @@ class SkillService {
   static bool isInstalledSkillEntrypoint(String path) =>
       _normalizeInstalledSkillEntrypoint(path) != null;
 
+  static bool isCliManagedSkillEntrypoint(String path) =>
+      _installedSkillsDirectoryForEntrypoint(path) == cliSkillsDirectory;
+
   /// Loads the exact skill bytes that may be returned to the model and binds
   /// them to the persisted grant. Callers must use [skillContent] instead of
   /// reading the path a second time.
@@ -679,7 +694,7 @@ class SkillService {
     final skillContent = await _readRootfsText(normalizedPath);
     final candidate = inspectPackage(
       stagingPath: root,
-      sourceIdentity: 'Installed locally',
+      sourceIdentity: _installedSourceIdentity(normalizedPath),
       skillContent: skillContent,
       manifestContent: await _readOptionalRootfsText('$root/$manifestFilename'),
       installedCandidate: true,
@@ -732,7 +747,7 @@ class SkillService {
           'Bundled legacy preset is unavailable: ${unavailable.reason}');
     }
     final output = await NativeBridge.runInProot(
-      'find ${_shellQuote(skillsDirectory)} -name "SKILL.md" -type f 2>/dev/null',
+      _findInstalledSkillEntrypointsCommand(),
     );
     String? matchedPath;
     for (final path in output.trim().split('\n')) {
@@ -741,7 +756,7 @@ class SkillService {
       try {
         final candidate = inspectPackage(
           stagingPath: root,
-          sourceIdentity: 'Installed locally',
+          sourceIdentity: _installedSourceIdentity(path),
           skillContent: await _readRootfsText(path),
           manifestContent:
               await _readOptionalRootfsText('$root/$manifestFilename'),
@@ -1044,7 +1059,9 @@ class SkillService {
     final grants = await loadTrustGrants();
     return inspectPackage(
       stagingPath: root,
-      sourceIdentity: 'Already installed locally',
+      sourceIdentity: isCliManagedSkillEntrypoint(skill.path)
+          ? 'Installed by xd-skill CLI'
+          : 'Already installed locally',
       skillContent: await _readRootfsText(skill.path),
       manifestContent: await _readOptionalRootfsText('$root/$manifestFilename'),
       previousGrant: grants[skill.id],
@@ -1096,6 +1113,15 @@ class SkillService {
           rechecked.version != candidate.version ||
           rechecked.trustDigest != candidate.trustDigest) {
         throw StateError('Installed skill changed after consent preview.');
+      }
+      final sameIdElsewhere = await _findInstalledById(
+        candidate.id,
+        excludingRoot: root,
+      );
+      if (sameIdElsewhere != null) {
+        throw StateError(
+          'Extension ID conflicts with an installed skill at another path.',
+        );
       }
       final prefs = await SharedPreferences.getInstance();
       final previousGrants = prefs.getString(_kTrustGrantsKey);
@@ -1549,7 +1575,7 @@ class SkillService {
     required String excludingRoot,
   }) async {
     final output = await NativeBridge.runInProot(
-      'find ${_shellQuote(skillsDirectory)} -name "SKILL.md" -type f 2>/dev/null',
+      _findInstalledSkillEntrypointsCommand(),
     );
     for (final path in output.trim().split('\n')) {
       if (path.isEmpty || !path.endsWith('/SKILL.md')) continue;
@@ -1558,7 +1584,7 @@ class SkillService {
       try {
         final installed = inspectPackage(
           stagingPath: root,
-          sourceIdentity: 'Installed locally',
+          sourceIdentity: _installedSourceIdentity(path),
           skillContent: await _readRootfsText(path),
           manifestContent:
               await _readOptionalRootfsText('$root/$manifestFilename'),
@@ -2088,21 +2114,50 @@ class SkillService {
       segments.add(segment);
     }
     final normalized = '/${segments.join('/')}';
-    if (!normalized.startsWith('$skillsDirectory/') ||
+    if (_installedSkillsDirectoryForNormalizedPath(normalized) == null ||
         !normalized.endsWith('/SKILL.md')) {
       return null;
     }
     return normalized;
   }
 
-  static String? _installedAssetDirectory(String path) {
+  static String? _installedSkillsDirectoryForEntrypoint(String path) {
     final normalized = _normalizeInstalledSkillEntrypoint(path);
     if (normalized == null) return null;
+    return _installedSkillsDirectoryForNormalizedPath(normalized);
+  }
+
+  static String? _installedSkillsDirectoryForNormalizedPath(String path) {
+    for (final directory in installedSkillsDirectories) {
+      if (path.startsWith('$directory/')) return directory;
+    }
+    return null;
+  }
+
+  static String? _installedAssetDirectory(String path) {
+    final normalized = _normalizeInstalledSkillEntrypoint(path);
+    if (normalized == null || !normalized.startsWith('$skillsDirectory/')) {
+      return null;
+    }
     final relative = normalized.substring('$skillsDirectory/'.length);
     final segments = relative.split('/');
     if (segments.length != 2 || segments.last != 'SKILL.md') return null;
     return segments.first;
   }
+
+  static String _findInstalledSkillEntrypointsCommand() {
+    return installedSkillsDirectories
+        .map(
+          (root) =>
+              'find ${_shellQuote(root)} -name "SKILL.md" -type f 2>/dev/null',
+        )
+        .join('; ');
+  }
+
+  static String _installedSourceIdentity(String path) =>
+      isCliManagedSkillEntrypoint(path)
+          ? 'Installed by xd-skill CLI'
+          : 'Installed locally';
 
   static void _rejectUnavailableBundledIdentity(String id) {
     final unavailable = BundledLegacySkillCatalog.entryForIdentity(id: id);

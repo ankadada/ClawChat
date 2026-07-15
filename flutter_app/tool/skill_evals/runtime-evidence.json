@@ -3,8 +3,12 @@
   "testCommand": "flutter test --no-pub",
   "files": [
     {
+      "path": "lib/l10n/app_strings.dart",
+      "sha256": "ce40887f7c5f9bcef17e10fedc8b5588bed4601aa66a7ca2a8f828a9b1f35823"
+    },
+    {
       "path": "lib/screens/settings_screen.dart",
-      "sha256": "29c9a87cb2abdf3877e4f8c4bbcccaf455a58d1a6be5f86f01a12f821a06aaf0"
+      "sha256": "0e3ad135d44a78c6ca2e0577390a6fdd19df2278d65f3db0e316e839526eb4e4"
     },
     {
       "path": "lib/services/bundled_legacy_skill_catalog.dart",
@@ -12,7 +16,7 @@
     },
     {
       "path": "lib/services/skill_capability_policy.dart",
-      "sha256": "ec7c4778bda1aeb129860b588ba9416ce425da9955a551c9b9033b7fdb32ac4b"
+      "sha256": "78eac128e76c21b486002221d2986c564b72b64b178da55b0669522a4e7763cd"
     },
     {
       "path": "lib/services/skill_import_inspector.dart",
@@ -20,7 +24,7 @@
     },
     {
       "path": "lib/services/skill_service.dart",
-      "sha256": "ed234ee7f730f6f37d0e12bef56b2ac7db3237b4de14c2077af90db68dd0591c"
+      "sha256": "b4c2acc0f3537efbd9d7f0bb885cec5ab1cf34b3f42cb7a3746ce1cca79bd4a5"
     },
     {
       "path": "lib/services/tools/tool_policy.dart",
@@ -29,6 +33,10 @@
     {
       "path": "lib/widgets/skill_consent_dialog.dart",
       "sha256": "d146f30809afac374c792f4dc911c4979d33273b05d2e28485eca98a58e6ff89"
+    },
+    {
+      "path": "test/screens/settings_cli_skill_discovery_test.dart",
+      "sha256": "024fa3e227075d2a9fdbbb1d2cd6a3ceb40a47db6e1dc8d98643c4e5a12ebb62"
     },
     {
       "path": "test/screens/settings_bundled_legacy_presets_test.dart",
@@ -40,7 +48,7 @@
     },
     {
       "path": "test/services/skill_capability_policy_test.dart",
-      "sha256": "62411d3a47ae8820cc1bb35c9bd24e190e5f4db6fad75b585d6adbb633ceb3a1"
+      "sha256": "e7a3014be318b61d0d40b1d2411bb86224e7ab91bf87cb1992735af9ed1e8358"
     },
     {
       "path": "test/services/skill_eval_authorization_invariant_test.dart",
@@ -52,7 +60,7 @@
     },
     {
       "path": "test/services/skill_service_test.dart",
-      "sha256": "80ad926f0bebbd555db43d54d3a1804b525087bed8a009ce6a11b497837579bd"
+      "sha256": "ab1aacb8a1362392948c395383689102a840c729bc05e8e5cbe5a12ae421daa3"
     },
     {
       "path": "test/tool/skill_evals/skill_eval_host_gate_test.dart",
@@ -64,7 +72,7 @@
     },
     {
       "path": "tool/skill_evals/lib/skill_eval_host_gate.dart",
-      "sha256": "3f3db269ef1ae872cfb000b23a6900b29b7e801964b69f641a9e20e8e79fbef8"
+      "sha256": "2f11dff1999f949c3a8c8a7214ae3625d47b123375bdd9903041e59e3783111a"
     },
     {
       "path": "tool/skill_evals/lib/skill_eval_runner.dart",

@@ -209,6 +209,143 @@ void main() {
     expect(findCalls, callsBeforeIdLookup);
   });
 
+  test('xd-skill CLI root is discovered consented and loaded by stable ID',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    const root = '/root/workspace/.agents/skills/xds-skills';
+    const content =
+        '---\nname: xds-skills\ndescription: XDS tools\n---\nUse XDS.';
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+      if (call.method == 'runInProot') {
+        final command = args['command'] as String;
+        if (command.contains("find '/root/workspace/.agents/skills'")) {
+          expect(command, contains("'/root/workspace/skills'"));
+          expect(command, contains("'/root/workspace/.agents/skills'"));
+          return '$root/SKILL.md';
+        }
+        return '';
+      }
+      if (call.method == 'readRootfsFile' ||
+          call.method == 'readRootfsFileBounded') {
+        final path = args['path'] as String;
+        if (path == '${root.substring(1)}/SKILL.md') {
+          return _bridgeText(call, content);
+        }
+        if (path == '${root.substring(1)}/skill.json') return null;
+      }
+      return null;
+    });
+
+    var skills = await SkillService.scanSkills();
+    expect(skills, hasLength(1));
+    expect(skills.single.validationError, isNull);
+    expect(skills.single.id, 'legacy.xds-skills');
+    expect(skills.single.isCliManaged, isTrue);
+    expect(skills.single.requiresConsent, isTrue);
+    expect(skills.single.enabled, isFalse);
+
+    final candidate =
+        await SkillService.prepareConsentForInstalledSkill(skills.single);
+    expect(candidate.sourceIdentity, 'Installed by xd-skill CLI');
+    await SkillService.installPreparedSkill(
+      candidate,
+      enabled: true,
+      inspectionReviewConfirmed: true,
+    );
+
+    skills = await SkillService.scanSkills();
+    expect(skills.single.consentCurrent, isTrue);
+    expect(skills.single.enabled, isTrue);
+    expect(SkillService.buildSkillIndex(skills), contains('legacy.xds-skills'));
+
+    final verified =
+        await SkillService.loadGrantedSkillById('legacy.xds-skills');
+    expect(verified.path, '$root/SKILL.md');
+    expect(verified.skillContent, content);
+  });
+
+  test('installed entrypoint normalization accepts only the two skill roots',
+      () {
+    expect(
+      SkillService.isInstalledSkillEntrypoint(
+        '/root/workspace/.agents/skills/xds-skills/SKILL.md',
+      ),
+      isTrue,
+    );
+    expect(
+      SkillService.isCliManagedSkillEntrypoint(
+        '/root/workspace/.agents/skills/xds-skills/SKILL.md',
+      ),
+      isTrue,
+    );
+    expect(
+      SkillService.isInstalledSkillEntrypoint(
+        '/root/workspace/.agents/xds-skills/SKILL.md',
+      ),
+      isFalse,
+    );
+    expect(
+      SkillService.isInstalledSkillEntrypoint(
+        '/root/workspace/.agents/skills/../outside/SKILL.md',
+      ),
+      isFalse,
+    );
+  });
+
+  test('installed consent rejects duplicate stable ID across skill roots',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    const appRoot = '/root/workspace/skills/shared-skill';
+    const cliRoot = '/root/workspace/.agents/skills/shared-skill';
+    const content =
+        '---\nname: shared-skill\ndescription: shared\n---\n# Shared';
+    final candidate = SkillService.inspectPackage(
+      stagingPath: cliRoot,
+      sourceIdentity: 'Installed by xd-skill CLI',
+      skillContent: content,
+      manifestContent: null,
+      installedCandidate: true,
+    );
+    var findCalls = 0;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+      if (call.method == 'runInProot') {
+        final command = args['command'] as String;
+        if (command.contains("find '/root/workspace/.agents/skills'")) {
+          findCalls += 1;
+          return '$appRoot/SKILL.md\n$cliRoot/SKILL.md';
+        }
+        fail('Unexpected mutating command: $command');
+      }
+      if (call.method == 'readRootfsFile') {
+        final path = args['path'] as String;
+        if (path.endsWith('/SKILL.md')) return content;
+        if (path.endsWith('/skill.json')) return null;
+      }
+      return null;
+    });
+
+    await expectLater(
+      SkillService.installPreparedSkill(
+        candidate,
+        enabled: true,
+        inspectionReviewConfirmed: true,
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('conflicts with an installed skill'),
+        ),
+      ),
+    );
+    expect(findCalls, 1);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('skill_trust_grants_v1'), isNull);
+    expect(prefs.getString('disabled_skills'), isNull);
+  });
+
   test(
       'catalog-disabled IDs and aliases reject enable while disable is idempotent',
       () async {
@@ -307,6 +444,26 @@ void main() {
         ),
       ]),
       contains('com.vendor.github'),
+    );
+    expect(
+      SkillService.buildSkillIndex([
+        skill(id: 'com.example.duplicate', name: 'first', legacy: false),
+        SkillInfo(
+          id: 'com.example.duplicate',
+          name: 'second',
+          description: 'CLI duplicate',
+          path: '/root/workspace/.agents/skills/com.example.duplicate/SKILL.md',
+          version: '1.0.0',
+          riskTier: 'low',
+          legacy: false,
+          valid: true,
+          consentCurrent: true,
+          storedEnabled: true,
+          capabilitySnapshot: ExtensionCapabilitySnapshot.legacy(),
+          enabled: true,
+        ),
+      ]),
+      isEmpty,
     );
   });
 

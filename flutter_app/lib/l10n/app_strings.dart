@@ -420,8 +420,9 @@ class AppStrings {
   // ── Skills ────────────────────────────────────────────────────────
   static const skills = '技能';
   static const noSkillsFound =
-      '未发现技能。将 SKILL.md 放入 /root/workspace/skills/ 目录。';
+      '未发现技能。可通过 xd-skill 安装，或将 SKILL.md 放入 /root/workspace/skills/。';
   static const skillsLoaded = '已加载技能';
+  static const cliManagedSkill = '由 xd-skill CLI 管理';
   static const importSkill = '导入技能';
   static const importLocalSkill = '导入本地技能';
   static const localFilePath = '文件路径';

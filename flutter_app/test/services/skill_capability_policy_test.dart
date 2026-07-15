@@ -71,6 +71,12 @@ void main() {
       isFalse,
     );
     expect(
+      await globalAuto.approve(_request('bash', {
+        'command': 'cat /root/workspace/.agents/skills/xds-skills/SKILL.md',
+      })),
+      isFalse,
+    );
+    expect(
       await globalAuto.approve(_request(
         'read_file',
         {'path': '/root/workspace/skills/com.example.skill/helper.txt'},
