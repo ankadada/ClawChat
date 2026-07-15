@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.6.1 — UI and Brand Refresh Integration
+
+### User Experience
+
+- **Focused chat surface** — Restores the grouped command menu, local-workspace empty state, reduced assistant chrome, and clearer session-aware actions.
+- **Production-theme contrast** — Uses the real light and dark theme surfaces for selected sessions and keeps readable on-surface foregrounds.
+- **Cleaner maintenance UI** — Reduces repeated bordered containers in settings and tool results while preserving existing interaction semantics.
+- **Brand and privacy alignment** — Adds adaptive and round launcher icons, exposes the privacy policy from About, and aligns the public privacy copy with the local-first architecture.
+
+### Compatibility
+
+- Includes all v2.6.0 skill-eval, import-inspection, legacy-preset, authorization, and foldable-safety changes unchanged.
+
 ## v2.6.0 — Host-Owned Skill Evals and Safe Import Inspection
 
 ### Security and Quality Gates

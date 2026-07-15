@@ -146,6 +146,8 @@ class SettingsScreen extends StatefulWidget {
         ['架构', 'Rootfs', 'Python']),
     SettingsControlInfo(
         SettingsDestination.appearanceAbout, '重新初始化运行时', ['Alpine', '维护']),
+    SettingsControlInfo(SettingsDestination.appearanceAbout, '隐私政策',
+        ['Privacy Policy', 'GitHub', 'GPL']),
     SettingsControlInfo(SettingsDestination.appearanceAbout, '应用版本与关于',
         ['GitHub', '隐私政策', '设置向导']),
   ];
@@ -623,9 +625,8 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: theme.colorScheme.surfaceContainerHighest.withAlpha(120),
+          color: theme.colorScheme.surfaceContainerHighest.withAlpha(80),
           borderRadius: BorderRadius.circular(AppRadii.m),
-          border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
         ),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
@@ -699,9 +700,8 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: theme.colorScheme.surfaceContainerHighest.withAlpha(120),
+          color: theme.colorScheme.surfaceContainerHighest.withAlpha(75),
           borderRadius: BorderRadius.circular(AppRadii.m),
-          border: Border.all(color: theme.colorScheme.outline.withAlpha(45)),
         ),
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
@@ -2094,14 +2094,25 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                   style: theme.textTheme.bodySmall,
                                   textAlign: TextAlign.center),
                               const SizedBox(height: 16),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
+                              Wrap(
+                                alignment: WrapAlignment.center,
+                                spacing: 8,
+                                runSpacing: 8,
                                 children: [
                                   TextButton.icon(
                                     icon: const Icon(Icons.code, size: 18),
                                     label: const Text('GitHub'),
                                     onPressed: () => launchUrl(
                                         Uri.parse(AppConstants.githubUrl)),
+                                  ),
+                                  TextButton.icon(
+                                    icon: const Icon(
+                                      Icons.privacy_tip_outlined,
+                                      size: 18,
+                                    ),
+                                    label: const Text('隐私政策'),
+                                    onPressed: () => launchUrl(Uri.parse(
+                                        AppConstants.privacyPolicyUrl)),
                                   ),
                                 ],
                               ),

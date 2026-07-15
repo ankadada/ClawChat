@@ -3,187 +3,159 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Privacy Policy - OpenClaw</title>
+    <title>Privacy Policy - ClawChat</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
-            line-height: 1.7;
-            color: #1a1a2e;
-            background: #f8f9fa;
+        :root {
+            color-scheme: light dark;
+            --accent: #2563EB;
+            --bg: #FFFFFF;
+            --surface: #F9F9F9;
+            --text: #141418;
+            --muted: #6B7280;
+            --border: #E5E5E5;
         }
-        .container {
-            max-width: 800px;
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #141418;
+                --surface: #1E1E26;
+                --text: #FFFFFF;
+                --muted: #9CA3AF;
+                --border: #343442;
+            }
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            line-height: 1.65;
+            color: var(--text);
+            background: var(--bg);
+        }
+        header, main, footer {
+            max-width: 840px;
             margin: 0 auto;
-            padding: 40px 24px;
+            padding: 0 24px;
         }
         header {
-            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-            color: #fff;
-            padding: 48px 24px;
-            text-align: center;
+            padding-top: 48px;
+            padding-bottom: 28px;
         }
-        header h1 {
+        h1 {
             font-size: 2rem;
+            line-height: 1.2;
             margin-bottom: 8px;
         }
-        header p {
-            opacity: 0.8;
-            font-size: 1rem;
+        .lede {
+            color: var(--muted);
+            max-width: 64ch;
+        }
+        .summary {
+            background: var(--surface);
+            border-left: 4px solid var(--accent);
+            border-radius: 8px;
+            padding: 16px 18px;
+            margin: 8px 0 28px;
         }
         h2 {
-            color: #302b63;
-            margin: 32px 0 12px;
-            font-size: 1.3rem;
-            border-bottom: 2px solid #e0e0e0;
-            padding-bottom: 6px;
+            font-size: 1.25rem;
+            margin: 28px 0 10px;
         }
         p, li {
-            margin-bottom: 12px;
-            color: #333;
+            margin-bottom: 10px;
         }
         ul {
-            padding-left: 24px;
-            margin-bottom: 16px;
+            padding-left: 22px;
+            margin-bottom: 14px;
         }
-        .highlight {
-            background: #e8f5e9;
-            border-left: 4px solid #4caf50;
-            padding: 16px 20px;
-            border-radius: 4px;
-            margin: 20px 0;
-        }
-        .highlight strong {
-            color: #2e7d32;
+        a {
+            color: var(--accent);
         }
         .contact-box {
-            background: #fff;
-            border: 1px solid #e0e0e0;
+            background: var(--surface);
+            border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 20px;
-            margin: 20px 0;
-        }
-        .contact-box a {
-            color: #302b63;
+            padding: 16px 18px;
+            margin-top: 12px;
         }
         footer {
-            text-align: center;
-            padding: 32px 24px;
-            color: #888;
+            color: var(--muted);
             font-size: 0.9rem;
-        }
-        footer a {
-            color: #302b63;
-            text-decoration: none;
+            padding-top: 32px;
+            padding-bottom: 40px;
         }
     </style>
 </head>
 <body>
 
 <header>
-    <h1>OpenClaw - Privacy Policy</h1>
-    <p>Last updated: February 10, 2026</p>
+    <h1>ClawChat Privacy Policy</h1>
+    <p class="lede">Last updated: July 14, 2026</p>
 </header>
 
-<div class="container">
+<main>
+    <section class="summary">
+        <p><strong>Summary:</strong> ClawChat is a local-first Android chat and agent app. Your conversations, settings, tools, skills, diagnostics, and Alpine workspace are stored on your device unless you choose an action that sends content to a model provider, a web target, or an optional user-authorized OpenClaw remote agent.</p>
+    </section>
 
-    <div class="highlight">
-        <strong>Summary:</strong> OpenClaw does not collect, store, transmit, or share any personal data. Everything runs locally on your device.
-    </div>
+    <h2>1. Scope</h2>
+    <p>ClawChat is an open-source Android application maintained by the ClawChat project. It embeds an Alpine Linux workspace for user-initiated tool execution and connects to AI model providers using credentials and endpoints that you configure.</p>
+    <p>This policy describes the ClawChat application. It does not replace the privacy terms of the model providers, websites, remote agents, or operating-system services you choose to use through the app.</p>
 
-    <h2>1. Introduction</h2>
-    <p>
-        OpenClaw ("the App") is an open-source Android application developed by Mithun Gowda B / NextGenX.
-        The App sets up a local AI gateway environment on your Android device using proot and provides
-        a native interface to manage it. This privacy policy explains how the App handles your data.
-    </p>
-
-    <h2>2. Data Collection</h2>
-    <p><strong>We do not collect any data.</strong> Specifically, the App does not collect:</p>
+    <h2>2. Data stored on your device</h2>
+    <p>ClawChat stores app data locally, including:</p>
     <ul>
-        <li>Personal information (name, email, phone number, etc.)</li>
-        <li>Device identifiers or advertising IDs</li>
-        <li>Location data</li>
-        <li>Usage analytics or telemetry</li>
-        <li>Crash reports</li>
-        <li>Browsing history</li>
-        <li>Contacts, photos, or media</li>
+        <li>Conversation history, drafts, attachments, exported files, and local recovery records.</li>
+        <li>Model/provider profiles, custom base URLs, model selections, and app preferences.</li>
+        <li>API keys and other secrets saved through Android secure storage or the local Alpine workspace.</li>
+        <li>Installed skills, extension metadata, local memory, diagnostics exports, and update/rollback records.</li>
+        <li>The Alpine root filesystem and files created by tools inside the app workspace.</li>
+    </ul>
+    <p>ClawChat does not include analytics, advertising SDKs, or a project-operated telemetry service.</p>
+
+    <h2>3. When data can leave the device</h2>
+    <p>ClawChat can send data outside the device only through features you configure or invoke:</p>
+    <ul>
+        <li><strong>Direct model providers:</strong> prompts, selected conversation context, tool schemas, and relevant outputs may be sent to providers such as Anthropic, OpenAI-compatible endpoints, DeepSeek, OpenRouter, xAI, or other endpoints you configure.</li>
+        <li><strong>Optional OpenClaw remote agent:</strong> when you explicitly authorize and enable it for a conversation, conversation text may be sent to that external agent. The app shows the connector name instead of exposing credentials.</li>
+        <li><strong>Web and network tools:</strong> user-initiated tools such as Web Fetch, Web Search, skill import, update checks, and file downloads contact the target services needed for that action.</li>
+        <li><strong>System sharing and browser actions:</strong> if you use Android share sheets, external browser links, phone, SMS, calendar, contacts, or install intents, Android and the selected target app handle the data you pass to them.</li>
+    </ul>
+    <p>Provider and remote-agent requests are governed by the service you choose. Review those services before sending sensitive content.</p>
+
+    <h2>4. Permissions</h2>
+    <p>ClawChat requests Android permissions to support local workspace and agent features:</p>
+    <ul>
+        <li><strong>INTERNET and network state:</strong> model requests, configured endpoints, skill/update downloads, and web tools.</li>
+        <li><strong>Foreground service, notifications, wake lock, and boot:</strong> keep user-initiated setup, terminal, cleanup, and agent tasks visible and recoverable.</li>
+        <li><strong>Display over other apps (<code>SYSTEM_ALERT_WINDOW</code>):</strong> support optional floating or overlay-style visibility for user-started local work. Android sends you to system overlay settings, where you decide whether to grant or revoke this access.</li>
+        <li><strong>Ignore battery optimizations (<code>REQUEST_IGNORE_BATTERY_OPTIMIZATIONS</code>):</strong> help keep user-started local workspace, terminal, setup, cleanup, or foreground agent tasks from being stopped unexpectedly. ClawChat hands you to Android battery optimization settings; the app does not grant this permission by itself.</li>
+        <li><strong>Manage external storage and file providers:</strong> import, export, attachment, workspace, and update handoff flows.</li>
+        <li><strong>Microphone and speech services:</strong> voice input and transcription when you start voice features.</li>
+        <li><strong>Calendar, contacts, call, and SMS:</strong> phone-integration tools. Higher-risk call and SMS actions remain gated by app settings and Android permissions.</li>
+        <li><strong>Request package installs:</strong> hand off a verified update package to the Android system installer after explicit user action.</li>
     </ul>
 
-    <h2>3. Local Data Storage</h2>
-    <p>The App stores the following data <strong>locally on your device only</strong>:</p>
-    <ul>
-        <li><strong>Ubuntu rootfs:</strong> A Linux environment downloaded from official Ubuntu servers (cdimage.ubuntu.com)</li>
-        <li><strong>Node.js:</strong> Downloaded from official Node.js servers (nodejs.org)</li>
-        <li><strong>App preferences:</strong> Settings such as auto-start preference, stored via Android SharedPreferences</li>
-        <li><strong>Gateway token URL:</strong> Your local authentication token for the AI gateway dashboard, stored on-device only</li>
-        <li><strong>API keys:</strong> Any API keys you configure during onboarding are stored locally within the proot Ubuntu environment on your device</li>
-    </ul>
-    <p>None of this data is transmitted to us or any third party.</p>
+    <h2>5. Diagnostics, privacy mode, and secrets</h2>
+    <p>Diagnostics and run traces are local developer/support tools. They are not uploaded automatically. When you export diagnostics, ClawChat attempts to redact secrets and avoid exposing raw prompts, tool payloads, endpoint identifiers, or credential values. You should still review exported files before sharing them.</p>
+    <p>Privacy mode masks detected environment-variable values before shell output is sent to a model. It does not change what a third-party provider may receive when you intentionally send prompts or context to that provider.</p>
 
-    <h2>4. Network Usage</h2>
-    <p>The App uses the INTERNET permission for the following purposes only:</p>
-    <ul>
-        <li><strong>Initial setup:</strong> Downloading Ubuntu rootfs and Node.js binaries from their official servers</li>
-        <li><strong>Local gateway:</strong> Communicating with the AI gateway running on localhost (127.0.0.1:18789)</li>
-        <li><strong>AI API calls:</strong> When you use the gateway, it connects to AI provider APIs (e.g., Google Gemini, OpenAI, Anthropic) using the API keys you provide. These connections are made directly from your device to the respective API providers</li>
-    </ul>
-    <p>The App does not connect to any analytics, tracking, or advertising services.</p>
+    <h2>6. Updates and extensions</h2>
+    <p>ClawChat supports signed update and extension workflows with local preview, explicit consent, and rollback records. The app does not silently install updates or extensions. Skill imports and update checks may contact the URLs or release sources involved in the action.</p>
 
-    <h2>5. Third-Party Services</h2>
-    <p>
-        The App itself does not integrate any third-party SDKs, analytics, or advertising frameworks.
-        When using the AI gateway, your device communicates directly with the AI providers whose API keys you configure.
-        Please refer to those providers' privacy policies for how they handle API requests:
-    </p>
-    <ul>
-        <li>Google Gemini: <a href="https://ai.google.dev/terms">Google AI Terms</a></li>
-        <li>OpenAI: <a href="https://openai.com/privacy">OpenAI Privacy Policy</a></li>
-        <li>Anthropic: <a href="https://www.anthropic.com/privacy">Anthropic Privacy Policy</a></li>
-    </ul>
+    <h2>7. Open source and license</h2>
+    <p>ClawChat is distributed under the GPL-3.0 license. You can inspect the source code and policy history at <a href="https://github.com/ankadada/ClawChat">github.com/ankadada/ClawChat</a>.</p>
 
-    <h2>6. Permissions</h2>
-    <p>The App requests the following Android permissions, all used for local functionality only:</p>
-    <ul>
-        <li><strong>INTERNET:</strong> Download setup files and run the local gateway</li>
-        <li><strong>FOREGROUND_SERVICE:</strong> Keep the gateway running in the background</li>
-        <li><strong>POST_NOTIFICATIONS:</strong> Show setup progress and gateway status notifications</li>
-        <li><strong>WAKE_LOCK:</strong> Prevent the CPU from sleeping during setup</li>
-        <li><strong>REQUEST_IGNORE_BATTERY_OPTIMIZATIONS:</strong> Allow the user to disable battery optimization for uninterrupted gateway operation</li>
-    </ul>
+    <h2>8. Changes to this policy</h2>
+    <p>Policy updates will be published in this repository. Material changes should describe the app behavior they reflect.</p>
 
-    <h2>7. Children's Privacy</h2>
-    <p>
-        The App is not directed at children under 13. We do not knowingly collect any information
-        from anyone, including children.
-    </p>
-
-    <h2>8. Open Source</h2>
-    <p>
-        OpenClaw is fully open source under the MIT License. You can inspect the entire source code
-        to verify our privacy practices at:
-        <a href="https://github.com/mithun50/openclawd-termux">github.com/mithun50/openclawd-termux</a>
-    </p>
-
-    <h2>9. Changes to This Policy</h2>
-    <p>
-        If we update this privacy policy, the changes will be posted on this page with an updated
-        "Last updated" date. As the App does not collect any data, significant changes are unlikely.
-    </p>
-
-    <h2>10. Contact</h2>
+    <h2>9. Contact</h2>
     <div class="contact-box">
-        <p><strong>Mithun Gowda B</strong> / NextGenX</p>
-        <p>Email: <a href="mailto:mithungowda.b7411@gmail.com">mithungowda.b7411@gmail.com</a></p>
-        <p>Email: <a href="mailto:nxgextra@gmail.com">nxgextra@gmail.com</a></p>
-        <p>GitHub: <a href="https://github.com/mithun50">@mithun50</a></p>
+        <p>Use the GitHub repository for issues, questions, and policy history:</p>
+        <p><a href="https://github.com/ankadada/ClawChat">https://github.com/ankadada/ClawChat</a></p>
     </div>
-
-</div>
+</main>
 
 <footer>
-    <p>&copy; 2026 Mithun Gowda B | <a href="https://github.com/mithun50">NextGenX</a></p>
-    <p style="margin-top: 8px;"><a href="https://github.com/mithun50/openclawd-termux">OpenClaw on GitHub</a></p>
+    <p>ClawChat Team · GPL-3.0 · <a href="https://github.com/ankadada/ClawChat">GitHub</a></p>
 </footer>
 
 </body>

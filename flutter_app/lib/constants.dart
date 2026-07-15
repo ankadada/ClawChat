@@ -1,12 +1,14 @@
 class AppConstants {
   static const String appName = 'ClawChat';
-  static const String version = '2.6.0';
+  static const String version = '2.6.1';
   static const String packageName = 'com.anka.clawbot';
 
   static final ansiEscape = RegExp(r'\x1b\[[0-9;]*[a-zA-Z]');
 
   static const String authorName = 'ClawChat Team';
   static const String githubUrl = 'https://github.com/ankadada/ClawChat';
+  static const String privacyPolicyUrl =
+      '$githubUrl/blob/main/docs/privacy-policy.html';
   static const String license = 'GPL-3.0';
 
   // ── Alpine minirootfs URL ──────────────────────────────────────

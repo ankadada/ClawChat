@@ -4,7 +4,7 @@
   "files": [
     {
       "path": "lib/screens/settings_screen.dart",
-      "sha256": "ecc3218533cf1a4553c10cde9c3cbd6fc7fef8cf0523e826c601a8891178671f"
+      "sha256": "29c9a87cb2abdf3877e4f8c4bbcccaf455a58d1a6be5f86f01a12f821a06aaf0"
     },
     {
       "path": "lib/services/bundled_legacy_skill_catalog.dart",

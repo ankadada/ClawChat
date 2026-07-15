@@ -25,10 +25,10 @@ void main() {
 
   test('version authority has no stale runtime literal', () {
     expect(
-        File('pubspec.yaml').readAsStringSync(), contains('version: 2.6.0+10'));
+        File('pubspec.yaml').readAsStringSync(), contains('version: 2.6.1+11'));
     expect(
       File('lib/constants.dart').readAsStringSync(),
-      contains("version = '2.6.0'"),
+      contains("version = '2.6.1'"),
     );
     for (final path in [
       'lib/constants.dart',
@@ -50,5 +50,27 @@ void main() {
         gradle, contains('def flutterVersionCode = pubspecVersion.group(2)'));
     expect(gradle, isNot(contains('getProperty("flutter.versionName")')));
     expect(gradle, isNot(contains('getProperty("flutter.versionCode")')));
+  });
+
+  test('android round icon has adaptive and pre-v26 fallbacks', () {
+    final manifest =
+        File('android/app/src/main/AndroidManifest.xml').readAsStringSync();
+    expect(
+      manifest,
+      contains('android:roundIcon="@mipmap/ic_launcher_round"'),
+    );
+    expect(
+      File('android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml')
+          .existsSync(),
+      isTrue,
+    );
+    for (final density in ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi']) {
+      expect(
+        File('android/app/src/main/res/mipmap-$density/ic_launcher_round.png')
+            .existsSync(),
+        isTrue,
+        reason: density,
+      );
+    }
   });
 }

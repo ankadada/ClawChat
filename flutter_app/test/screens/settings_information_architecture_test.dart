@@ -68,6 +68,7 @@ void main() {
       '隐私模式',
       '开发者模式',
       '主题',
+      '隐私政策',
       '应用版本与关于',
     ]) {
       expect(labels, contains(required));
@@ -79,6 +80,36 @@ void main() {
     expect(searchable, isNot(contains('https://')));
     expect(searchable, isNot(contains('credential')));
     expect(SettingsScreen.extensionActionLabels, ['更新', '历史', '回滚']);
+  });
+
+  testWidgets('privacy policy action is visible and searchable from About',
+      (tester) async {
+    await tester.pumpWidget(
+      const MaterialApp(home: SettingsScreen()),
+    );
+    await tester.pump();
+
+    await tester.enterText(find.byType(TextField), '隐私政策');
+    await tester.pump();
+    expect(find.text('外观与关于'), findsOneWidget);
+    expect(find.textContaining('匹配：隐私政策'), findsOneWidget);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: SettingsDetailScreen(
+          destination: SettingsDestination.appearanceAbout,
+          skipInitialLoadForTesting: true,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('隐私政策'),
+      120,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.byIcon(Icons.privacy_tip_outlined), findsOneWidget);
+    expect(find.text('隐私政策'), findsOneWidget);
   });
 
   testWidgets('updates destination labels app and extension actions',

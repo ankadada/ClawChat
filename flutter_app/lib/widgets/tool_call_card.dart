@@ -82,16 +82,16 @@ class _ToolCallCardState extends State<ToolCallCard> {
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 4),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(
-          color: isError
-              ? theme.colorScheme.error.withAlpha(100)
-              : theme.colorScheme.outline.withAlpha(50),
-        ),
-        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(AppRadii.s),
+        border: isError
+            ? Border.all(color: theme.colorScheme.error.withAlpha(110))
+            : null,
+        color: isError
+            ? theme.colorScheme.errorContainer.withAlpha(60)
+            : theme.colorScheme.surfaceContainerHighest.withAlpha(80),
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(AppRadii.s),
         child: Stack(
           children: [
             Positioned(
@@ -111,59 +111,63 @@ class _ToolCallCardState extends State<ToolCallCard> {
                   InkWell(
                     onTap: _toggleExpanded,
                     borderRadius: const BorderRadius.vertical(
-                      top: Radius.circular(8),
+                      top: Radius.circular(AppRadii.s),
                     ),
-                    child: Padding(
-                      padding: const EdgeInsets.all(12),
-                      child: Row(
-                        children: [
-                          Icon(
-                            _getToolIcon(),
-                            size: 16,
-                            color: theme.colorScheme.onSurfaceVariant,
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              _getToolLabel(),
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                fontFamily: 'monospace',
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                          if (isExecuting)
-                            const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          else if (isError)
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(minHeight: 48),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Row(
+                          children: [
                             Icon(
-                              Icons.error_outline,
+                              _getToolIcon(),
                               size: 16,
-                              color: theme.colorScheme.error,
-                            )
-                          else if (isPending)
-                            const Icon(
-                              Icons.hourglass_empty,
-                              size: 16,
-                              color: AppColors.statusAmber,
-                            )
-                          else
-                            const Icon(
-                              Icons.check_circle_outline,
-                              size: 16,
-                              color: AppColors.statusGreen,
+                              color: theme.colorScheme.onSurfaceVariant,
                             ),
-                          const SizedBox(width: 4),
-                          Icon(
-                            _expanded ? Icons.expand_less : Icons.expand_more,
-                            size: 18,
-                            color: theme.colorScheme.onSurfaceVariant,
-                          ),
-                        ],
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                _getToolLabel(),
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  fontFamily: 'monospace',
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (isExecuting)
+                              const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            else if (isError)
+                              Icon(
+                                Icons.error_outline,
+                                size: 16,
+                                color: theme.colorScheme.error,
+                              )
+                            else if (isPending)
+                              const Icon(
+                                Icons.hourglass_empty,
+                                size: 16,
+                                color: AppColors.statusAmber,
+                              )
+                            else
+                              const Icon(
+                                Icons.check_circle_outline,
+                                size: 16,
+                                color: AppColors.statusGreen,
+                              ),
+                            const SizedBox(width: 4),
+                            Icon(
+                              _expanded ? Icons.expand_less : Icons.expand_more,
+                              size: 18,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),

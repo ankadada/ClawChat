@@ -635,6 +635,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     bool isSelected,
     SessionSearchResult? searchResult,
   ) {
+    final selectedForeground = isSelected ? theme.colorScheme.onSurface : null;
     return Dismissible(
       key: Key(session.id),
       direction: DismissDirection.endToStart,
@@ -689,6 +690,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
+              color: selectedForeground,
               fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
             ),
           ),
@@ -696,16 +698,21 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
             session: session,
             timeLabel: _formatTime(session.updatedAt),
             matchPreview: searchResult?.matchPreview,
+            selectedForeground: selectedForeground,
           ),
           leading: _buildSessionIcon(
             theme,
             provider,
             session.id,
-            isSelected: isSelected,
+            selectedForeground: selectedForeground,
           ),
           trailing: PopupMenuButton<String>(
             tooltip: AppStrings.more,
-            icon: const Icon(Icons.more_vert, size: 20),
+            icon: Icon(
+              Icons.more_vert,
+              size: 20,
+              color: selectedForeground,
+            ),
             onSelected: (value) async {
               switch (value) {
                 case 'export':
@@ -773,12 +780,10 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
     ThemeData theme,
     ChatProvider provider,
     String sessionId, {
-    required bool isSelected,
+    required Color? selectedForeground,
   }) {
     final status = provider.agentStatusFor(sessionId);
-    final iconColor = isSelected
-        ? theme.colorScheme.primary
-        : theme.colorScheme.onSurfaceVariant;
+    final iconColor = selectedForeground ?? theme.colorScheme.onSurfaceVariant;
 
     return Stack(
       clipBehavior: Clip.none,
@@ -1149,11 +1154,13 @@ class _SessionMeta extends StatefulWidget {
   final SessionSummary session;
   final String timeLabel;
   final String? matchPreview;
+  final Color? selectedForeground;
 
   const _SessionMeta({
     required this.session,
     required this.timeLabel,
     this.matchPreview,
+    this.selectedForeground,
   });
 
   @override
@@ -1207,6 +1214,8 @@ class _SessionMetaState extends State<_SessionMeta> {
     final folder = widget.session.folder;
     final preview = widget.matchPreview ?? _preview;
     final isSearchMatch = widget.matchPreview != null;
+    final searchMatchColor =
+        widget.selectedForeground ?? theme.colorScheme.primary;
 
     return Padding(
       padding: const EdgeInsets.only(top: 3),
@@ -1220,7 +1229,7 @@ class _SessionMetaState extends State<_SessionMeta> {
                   Icon(
                     Icons.manage_search,
                     size: 13,
-                    color: theme.colorScheme.primary,
+                    color: searchMatchColor,
                   ),
                   const SizedBox(width: 4),
                 ],
@@ -1231,7 +1240,7 @@ class _SessionMetaState extends State<_SessionMeta> {
                     overflow: TextOverflow.ellipsis,
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: isSearchMatch
-                          ? theme.colorScheme.primary
+                          ? searchMatchColor
                           : theme.colorScheme.onSurfaceVariant,
                     ),
                   ),

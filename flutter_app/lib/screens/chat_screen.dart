@@ -26,6 +26,7 @@ import '../services/shared_content.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/usage_summary_service.dart';
 import '../services/voice_input_state.dart';
+import '../layout/foldable_layout.dart';
 import '../widgets/streaming_text.dart';
 import '../widgets/reasoning_text_panel.dart';
 import '../widgets/tool_call_card.dart';
@@ -1608,6 +1609,314 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _showCommandSurface() async {
+    final provider = context.read<ChatProvider>();
+    final parentMedia = MediaQuery.of(context);
+    final anchorLayout = FoldableLayout.resolve(
+      parentMedia.size,
+      parentMedia.displayFeatures,
+      bottomInset: parentMedia.viewInsets.bottom,
+    );
+    final hostRect = _globalHostRect();
+    final selected = await showGeneralDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
+      barrierColor: Colors.black54,
+      anchorPoint:
+          hostRect.isEmpty ? anchorLayout.primary.center : hostRect.center,
+      transitionDuration: parentMedia.disableAnimations
+          ? Duration.zero
+          : const Duration(milliseconds: 180),
+      pageBuilder: (sheetContext, _, __) {
+        return LayoutBuilder(
+          builder: (sheetContext, constraints) {
+            final media = MediaQuery.of(sheetContext);
+            final routeSize = _modalRouteSize(constraints, media);
+            final bottomInset = media.viewInsets.bottom > 0
+                ? media.viewInsets.bottom
+                : parentMedia.viewInsets.bottom;
+            final routeIsFullSize =
+                (routeSize.width - parentMedia.size.width).abs() < 1 &&
+                    (routeSize.height - parentMedia.size.height).abs() < 1;
+            final displayFeatures =
+                media.displayFeatures.isNotEmpty || !routeIsFullSize
+                    ? media.displayFeatures
+                    : parentMedia.displayFeatures;
+            final viewInsetsAlreadyApplied = bottomInset > 0 &&
+                routeSize.height <= parentMedia.size.height - bottomInset + 1;
+            final hostPrimary = displayFeatures.isEmpty
+                ? _hostPrimaryRectForRoute(
+                    routeSize: routeSize,
+                    windowSize: parentMedia.size,
+                    hostRect: hostRect,
+                  )
+                : null;
+            final foldable = FoldableLayout.resolve(
+              routeSize,
+              displayFeatures,
+              bottomInset: viewInsetsAlreadyApplied ? 0 : bottomInset,
+            );
+            final primary = _usableCommandPrimaryRect(
+              routeSize: routeSize,
+              primary: hostPrimary ?? foldable.primary,
+              posture: foldable.posture,
+              bottomInset: bottomInset,
+              viewInsetsAlreadyApplied: viewInsetsAlreadyApplied,
+            );
+            final surfaceRect = _commandSurfaceRect(
+              routeSize: routeSize,
+              primary: primary,
+            );
+            return SizedBox(
+              width: routeSize.width,
+              height: routeSize.height,
+              child: Stack(
+                children: [
+                  Positioned.fromRect(
+                    rect: surfaceRect,
+                    child: _ChatCommandSurface(
+                      key: const ValueKey('chat-command-surface'),
+                      groups: _commandGroupsFor(provider),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+      transitionBuilder: (context, animation, _, child) {
+        if (parentMedia.disableAnimations) return child;
+        final curved = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+          reverseCurve: Curves.easeInCubic,
+        );
+        return FadeTransition(opacity: curved, child: child);
+      },
+    );
+    if (selected == null || !mounted) return;
+    _handleCommandAction(selected);
+  }
+
+  Rect _globalHostRect() {
+    final renderObject = context.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) {
+      return Rect.zero;
+    }
+    return renderObject.localToGlobal(Offset.zero) & renderObject.size;
+  }
+
+  Size _modalRouteSize(BoxConstraints constraints, MediaQueryData media) {
+    final width = constraints.hasBoundedWidth
+        ? math.min(constraints.maxWidth, media.size.width)
+        : media.size.width;
+    final height = constraints.hasBoundedHeight
+        ? math.min(constraints.maxHeight, media.size.height)
+        : media.size.height;
+    return Size(width, height);
+  }
+
+  Rect? _hostPrimaryRectForRoute({
+    required Size routeSize,
+    required Size windowSize,
+    required Rect hostRect,
+  }) {
+    if (hostRect.isEmpty) return null;
+    final hostMatchesWindow = (hostRect.width - windowSize.width).abs() < 1 &&
+        (hostRect.height - windowSize.height).abs() < 1;
+    if (hostMatchesWindow) return null;
+    final routeMatchesHost = (routeSize.width - hostRect.width).abs() < 1 &&
+        (routeSize.height - hostRect.height).abs() < 1;
+    if (routeMatchesHost) {
+      return Offset.zero & routeSize;
+    }
+    final routeMatchesWindow = (routeSize.width - windowSize.width).abs() < 1 &&
+        (routeSize.height - windowSize.height).abs() < 1;
+    if (routeMatchesWindow) {
+      return hostRect.intersect(Offset.zero & routeSize);
+    }
+    return null;
+  }
+
+  Rect _commandSurfaceRect({
+    required Size routeSize,
+    required Rect primary,
+  }) {
+    final routeRect = Offset.zero & routeSize;
+    final safePrimary = primary.intersect(routeRect);
+    if (safePrimary.isEmpty) return Rect.zero;
+    final width = math.min(560.0, safePrimary.width);
+    final height = safePrimary.height * 0.88;
+    return Rect.fromLTWH(
+      safePrimary.left + (safePrimary.width - width) / 2,
+      safePrimary.bottom - height,
+      width,
+      height,
+    );
+  }
+
+  Rect _usableCommandPrimaryRect({
+    required Size routeSize,
+    required Rect primary,
+    required FoldablePosture posture,
+    required double bottomInset,
+    required bool viewInsetsAlreadyApplied,
+  }) {
+    final routeRect = Offset.zero & routeSize;
+    var usable = primary.intersect(routeRect);
+    if (usable.isEmpty) return Rect.zero;
+    final shouldClipIme = bottomInset > 0 &&
+        !viewInsetsAlreadyApplied &&
+        posture != FoldablePosture.tabletop;
+    if (!shouldClipIme) return usable;
+    final keyboardTop = (routeSize.height - bottomInset)
+        .clamp(0.0, routeSize.height)
+        .toDouble();
+    return usable.intersect(
+      Rect.fromLTRB(0, 0, routeSize.width, keyboardTop),
+    );
+  }
+
+  List<_ChatCommandGroup> _commandGroupsFor(ChatProvider provider) {
+    final hasSession = provider.currentSession != null;
+    final hasMessages = provider.currentSession?.messages.isNotEmpty == true;
+    return [
+      _ChatCommandGroup(
+        label: '对话',
+        actions: [
+          if (hasMessages)
+            const _ChatCommandAction(
+              id: 'regenerate',
+              icon: Icons.refresh,
+              label: AppStrings.regenerate,
+              description: '重新请求最近一条回复',
+            ),
+          const _ChatCommandAction(
+            id: 'compare',
+            icon: Icons.compare_arrows,
+            label: AppStrings.compareMode,
+            description: '用当前对话发起多模型对比',
+          ),
+          const _ChatCommandAction(
+            id: 'context_summary',
+            icon: Icons.summarize_outlined,
+            label: AppStrings.contextSummary,
+            description: '查看或清理当前上下文摘要',
+          ),
+          if (hasSession)
+            const _ChatCommandAction(
+              id: 'usage',
+              icon: Icons.query_stats,
+              label: AppStrings.usageSummary,
+              description: '查看本会话 token 用量',
+            ),
+          const _ChatCommandAction(
+            id: 'switch_model',
+            icon: Icons.swap_horiz,
+            label: AppStrings.switchModel,
+            description: '为当前会话选择模型',
+          ),
+          if (hasSession)
+            const _ChatCommandAction(
+              id: 'remote_agent',
+              icon: Icons.cloud_outlined,
+              label: AppStrings.sessionRemoteAgent,
+              description: '按会话切换本地或外部 Agent',
+            ),
+        ],
+      ),
+      const _ChatCommandGroup(
+        label: '工作区与工具',
+        actions: [
+          _ChatCommandAction(
+            id: 'terminal',
+            icon: Icons.terminal,
+            label: AppStrings.terminal,
+            description: '打开本机 Alpine 终端',
+          ),
+          _ChatCommandAction(
+            id: 'dashboard',
+            icon: Icons.dashboard_outlined,
+            label: AppStrings.dashboard,
+            description: '查看本地运行状态',
+          ),
+          _ChatCommandAction(
+            id: 'session_system_prompt',
+            icon: Icons.tune,
+            label: AppStrings.systemPromptTitle,
+            description: '调整当前会话提示词',
+          ),
+        ],
+      ),
+      _ChatCommandGroup(
+        label: '应用与设置',
+        actions: [
+          if (hasSession)
+            const _ChatCommandAction(
+              id: 'session_memory',
+              icon: Icons.memory_outlined,
+              label: AppStrings.sessionMemory,
+              description: '管理当前会话记忆',
+            ),
+          const _ChatCommandAction(
+            id: 'prompt_profiles',
+            icon: Icons.badge_outlined,
+            label: AppStrings.promptProfiles,
+            description: '管理可复用提示词配置',
+          ),
+          const _ChatCommandAction(
+            id: 'system_prompt',
+            icon: Icons.psychology,
+            label: AppStrings.editSystemPrompt,
+            description: '编辑全局系统提示词',
+          ),
+          const _ChatCommandAction(
+            id: 'settings',
+            icon: Icons.settings,
+            label: AppStrings.settings,
+            description: '打开配置和关于信息',
+          ),
+        ],
+      ),
+    ];
+  }
+
+  void _handleCommandAction(String value) {
+    switch (value) {
+      case 'settings':
+        Navigator.of(context)
+            .push(CupertinoPageRoute(builder: (_) => const SettingsScreen()));
+      case 'system_prompt':
+        _showSystemPromptDialog();
+      case 'session_system_prompt':
+        _showSessionSystemPromptDialog();
+      case 'session_memory':
+        _showSessionMemoryDialog();
+      case 'prompt_profiles':
+        _showPromptProfilesDialog();
+      case 'switch_model':
+        _showSwitchModelDialog();
+      case 'remote_agent':
+        _showRemoteAgentSessionDialog();
+      case 'regenerate':
+        context.read<ChatProvider>().regenerateLastResponse();
+      case 'compare':
+        _showCompareDialog();
+      case 'context_summary':
+        _showContextSummaryDialog();
+      case 'usage':
+        _showSessionUsageDialog();
+      case 'terminal':
+        Navigator.of(context)
+            .push(CupertinoPageRoute(builder: (_) => const TerminalScreen()));
+      case 'dashboard':
+        Navigator.of(context)
+            .push(CupertinoPageRoute(builder: (_) => const DashboardScreen()));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -1647,141 +1956,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             tooltip: AppStrings.newChat,
             onPressed: () => unawaited(_createNewChat()),
           ),
-          PopupMenuButton<String>(
-            onSelected: (value) {
-              switch (value) {
-                case 'settings':
-                  Navigator.of(context).push(CupertinoPageRoute(
-                      builder: (_) => const SettingsScreen()));
-                case 'system_prompt':
-                  _showSystemPromptDialog();
-                case 'session_system_prompt':
-                  _showSessionSystemPromptDialog();
-                case 'session_memory':
-                  _showSessionMemoryDialog();
-                case 'prompt_profiles':
-                  _showPromptProfilesDialog();
-                case 'switch_model':
-                  _showSwitchModelDialog();
-                case 'remote_agent':
-                  _showRemoteAgentSessionDialog();
-                case 'regenerate':
-                  context.read<ChatProvider>().regenerateLastResponse();
-                case 'compare':
-                  _showCompareDialog();
-                case 'context_summary':
-                  _showContextSummaryDialog();
-                case 'usage':
-                  _showSessionUsageDialog();
-                case 'terminal':
-                  Navigator.of(context).push(CupertinoPageRoute(
-                      builder: (_) => const TerminalScreen()));
-                case 'dashboard':
-                  Navigator.of(context).push(CupertinoPageRoute(
-                      builder: (_) => const DashboardScreen()));
-              }
-            },
-            itemBuilder: (_) {
-              final provider = context.read<ChatProvider>();
-              return [
-                if (provider.currentSession?.messages.isNotEmpty == true)
-                  const PopupMenuItem(
-                      value: 'regenerate',
-                      child: ListTile(
-                        leading: Icon(Icons.refresh),
-                        title: Text(AppStrings.regenerate),
-                        dense: true,
-                      )),
-                const PopupMenuItem(
-                    value: 'compare',
-                    child: ListTile(
-                      leading: Icon(Icons.compare_arrows),
-                      title: Text(AppStrings.compareMode),
-                      dense: true,
-                    )),
-                const PopupMenuItem(
-                    value: 'context_summary',
-                    child: ListTile(
-                      leading: Icon(Icons.summarize_outlined),
-                      title: Text(AppStrings.contextSummary),
-                      dense: true,
-                    )),
-                if (provider.currentSession != null)
-                  const PopupMenuItem(
-                      value: 'usage',
-                      child: ListTile(
-                        leading: Icon(Icons.query_stats),
-                        title: Text(AppStrings.usageSummary),
-                        dense: true,
-                      )),
-                const PopupMenuItem(
-                    value: 'switch_model',
-                    child: ListTile(
-                      leading: Icon(Icons.swap_horiz),
-                      title: Text(AppStrings.switchModel),
-                      dense: true,
-                    )),
-                if (provider.currentSession != null)
-                  const PopupMenuItem(
-                    value: 'remote_agent',
-                    child: ListTile(
-                      leading: Icon(Icons.cloud_outlined),
-                      title: Text(AppStrings.sessionRemoteAgent),
-                      dense: true,
-                    ),
-                  ),
-                const PopupMenuItem(
-                    value: 'terminal',
-                    child: ListTile(
-                      leading: Icon(Icons.terminal),
-                      title: Text(AppStrings.terminal),
-                      dense: true,
-                    )),
-                const PopupMenuItem(
-                    value: 'dashboard',
-                    child: ListTile(
-                      leading: Icon(Icons.dashboard_outlined),
-                      title: Text(AppStrings.dashboard),
-                      dense: true,
-                    )),
-                const PopupMenuItem(
-                    value: 'session_system_prompt',
-                    child: ListTile(
-                      leading: Icon(Icons.tune),
-                      title: Text(AppStrings.systemPromptTitle),
-                      dense: true,
-                    )),
-                if (provider.currentSession != null)
-                  const PopupMenuItem(
-                      value: 'session_memory',
-                      child: ListTile(
-                        leading: Icon(Icons.memory_outlined),
-                        title: Text(AppStrings.sessionMemory),
-                        dense: true,
-                      )),
-                const PopupMenuItem(
-                    value: 'prompt_profiles',
-                    child: ListTile(
-                      leading: Icon(Icons.badge_outlined),
-                      title: Text(AppStrings.promptProfiles),
-                      dense: true,
-                    )),
-                const PopupMenuItem(
-                    value: 'system_prompt',
-                    child: ListTile(
-                      leading: Icon(Icons.psychology),
-                      title: Text(AppStrings.editSystemPrompt),
-                      dense: true,
-                    )),
-                const PopupMenuItem(
-                    value: 'settings',
-                    child: ListTile(
-                      leading: Icon(Icons.settings),
-                      title: Text(AppStrings.settings),
-                      dense: true,
-                    )),
-              ];
-            },
+          IconButton(
+            icon: const Icon(Icons.more_vert),
+            tooltip: AppStrings.more,
+            onPressed: _showCommandSurface,
           ),
         ],
       ),
@@ -1853,6 +2031,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             String? sessionId,
                             int messageVersion,
                             String modelLabel,
+                            bool usesExternalExecutionContext,
+                            String executionContextLabel,
                           })>(
                         selector: (_, p) => (
                           messages: p.currentSession?.messages ?? [],
@@ -1867,6 +2047,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               ? '${p.configuredProfileName} · '
                                   '${p.currentSession!.modelOverride}'
                               : p.configuredModelLabel,
+                          usesExternalExecutionContext:
+                              p.currentSessionUsesRemoteAgent,
+                          executionContextLabel: p.currentExecutionContextLabel,
                         ),
                         builder: (context, data, __) {
                           final messages = data.messages;
@@ -1903,7 +2086,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               !hasStreaming &&
                               !showTyping) {
                             return _buildEmptyState(
-                                theme, data.modelLabel, maxContentWidth);
+                              theme,
+                              data.modelLabel,
+                              maxContentWidth,
+                              usesExternalExecutionContext:
+                                  data.usesExternalExecutionContext,
+                              executionContextLabel: data.executionContextLabel,
+                            );
                           }
 
                           final window = _messageWindowFor(messages);
@@ -2183,90 +2372,106 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Widget _buildEmptyState(
-      ThemeData theme, String modelName, double maxContentWidth) {
+    ThemeData theme,
+    String modelName,
+    double maxContentWidth, {
+    required bool usesExternalExecutionContext,
+    required String executionContextLabel,
+  }) {
     const prompts = [
-      AppStrings.emptyPromptSummarizeCode,
-      AppStrings.emptyPromptWriteEmail,
-      AppStrings.emptyPromptTranslateText,
-      AppStrings.emptyPromptExplainConcept,
+      (
+        label: AppStrings.emptyPromptSummarizeCode,
+        icon: Icons.description_outlined,
+      ),
+      (
+        label: AppStrings.emptyPromptTranslateText,
+        icon: Icons.translate_outlined,
+      ),
+      (
+        label: AppStrings.emptyPromptExplainConcept,
+        icon: Icons.psychology_alt_outlined,
+      ),
+      (
+        label: AppStrings.emptyPromptWriteEmail,
+        icon: Icons.mail_outline,
+      ),
     ];
-
-    return Center(
+    return Align(
+      alignment: Alignment.topCenter,
       child: ConstrainedBox(
-        constraints: BoxConstraints(maxWidth: math.min(480.0, maxContentWidth)),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 20),
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Container(
-                  width: 72,
-                  height: 72,
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.primary.withAlpha(18),
-                    shape: BoxShape.circle,
-                    border: Border.all(
-                        color: theme.colorScheme.primary.withAlpha(45)),
-                  ),
-                  child: Icon(Icons.auto_awesome,
-                      size: 34, color: theme.colorScheme.primary),
+        constraints: BoxConstraints(maxWidth: math.min(560.0, maxContentWidth)),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 28),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '本地工作区',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w800,
                 ),
-                const SizedBox(height: 18),
-                Text(AppStrings.sendMessageToStart,
-                    textAlign: TextAlign.center,
-                    style: theme.textTheme.titleMedium?.copyWith(
-                        color: theme.colorScheme.onSurface,
-                        fontWeight: FontWeight.w700)),
-                const SizedBox(height: 8),
-                Text(AppStrings.aiAssistantCapabilities,
-                    textAlign: TextAlign.center,
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
-                const SizedBox(height: 12),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(AppRadii.xl),
-                    border: Border.all(
-                        color: theme.colorScheme.outline.withAlpha(45)),
-                  ),
-                  child: Text(AppStrings.currentModelLabel(modelName),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.labelSmall?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant)),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '消息、附件和会话记录以这台设备为准。发送后会按当前执行上下文处理。',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
                 ),
-                const SizedBox(height: 18),
-                Wrap(
-                  alignment: WrapAlignment.center,
-                  spacing: 8,
-                  runSpacing: 8,
+              ),
+              const SizedBox(height: 18),
+              _EmptyStateFactRow(
+                icon: usesExternalExecutionContext
+                    ? Icons.public
+                    : Icons.smartphone,
+                label: '执行上下文',
+                value: executionContextLabel,
+              ),
+              const SizedBox(height: 8),
+              _EmptyStateFactRow(
+                icon: Icons.memory_outlined,
+                label: '当前模型',
+                value: modelName,
+              ),
+              const SizedBox(height: 22),
+              Text(
+                '开始任务',
+                style: theme.textTheme.labelLarge?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 8),
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color:
+                      theme.colorScheme.surfaceContainerHighest.withAlpha(80),
+                  borderRadius: BorderRadius.circular(AppRadii.m),
+                ),
+                child: Column(
                   children: [
-                    for (final prompt in prompts)
-                      ActionChip(
-                        label: Text(prompt),
-                        onPressed: () {
-                          _inputController.text = prompt;
+                    for (var index = 0; index < prompts.length; index++) ...[
+                      _EmptyStatePromptRow(
+                        icon: prompts[index].icon,
+                        label: prompts[index].label,
+                        onTap: () {
+                          _inputController.text = prompts[index].label;
                           _inputController.selection = TextSelection.collapsed(
                             offset: _inputController.text.length,
                           );
                           _focusNode.requestFocus();
                         },
-                        side: BorderSide(
-                            color: theme.colorScheme.outline.withAlpha(70)),
-                        backgroundColor: theme.colorScheme.surface,
-                        labelStyle: theme.textTheme.labelMedium,
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 6),
                       ),
+                      if (index != prompts.length - 1)
+                        Divider(
+                          height: 1,
+                          indent: 56,
+                          color: theme.colorScheme.outline.withAlpha(35),
+                        ),
+                    ],
                   ],
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -3218,13 +3423,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               decoration: BoxDecoration(
                 color: isUser
                     ? AppColors.accent.withAlpha(45)
-                    : theme.colorScheme.surface,
+                    : theme.colorScheme.surfaceContainerHighest.withAlpha(75),
                 borderRadius: _bubbleRadius(isUser),
-                border: Border.all(
-                  color: isUser
-                      ? AppColors.accent.withAlpha(90)
-                      : theme.colorScheme.outline.withAlpha(50),
-                ),
+                border: isUser
+                    ? Border.all(color: AppColors.accent.withAlpha(90))
+                    : null,
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -3316,13 +3519,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 decoration: BoxDecoration(
                   color: isUser
                       ? AppColors.accent.withAlpha(45)
-                      : theme.colorScheme.surface,
+                      : theme.colorScheme.surfaceContainerHighest.withAlpha(75),
                   borderRadius: _bubbleRadius(isUser),
-                  border: Border.all(
-                    color: isUser
-                        ? AppColors.accent.withAlpha(90)
-                        : theme.colorScheme.outline.withAlpha(50),
-                  ),
+                  border: isUser
+                      ? Border.all(color: AppColors.accent.withAlpha(90))
+                      : null,
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
@@ -5080,6 +5281,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         final isRecording = _isListening || _isWhisperRecording;
         final queueFull =
             provider.messageQueue.length >= ChatProvider.maxQueuedMessages;
+        final media = MediaQuery.of(context);
+        final imeVisible = media.viewInsets.bottom > 0;
+        final usableHeight =
+            math.max(0.0, media.size.height - media.viewInsets.bottom);
+        final maxInputHeight = imeVisible
+            ? math.min(240.0, math.max(148.0, usableHeight * 0.52))
+            : double.infinity;
 
         return Container(
           padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
@@ -5093,205 +5301,214 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             top: false,
             child: Center(
               child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 640),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _buildAttachmentPreviews(theme),
-                    _buildExecutionContextChip(theme, provider),
-                    _buildBackgroundTasksBar(theme, provider),
-                    _buildMessageQueueBar(theme, provider, isRunning),
-                    _buildVoiceState(theme),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        SizedBox(
-                          width: 44,
-                          height: 48,
-                          child: IconButton(
-                            icon: const Icon(Icons.attach_file),
-                            tooltip: AppStrings.attachFile,
-                            style: IconButton.styleFrom(
-                              backgroundColor:
-                                  theme.colorScheme.surfaceContainerHighest,
-                              foregroundColor:
-                                  theme.colorScheme.onSurfaceVariant,
-                            ),
-                            onPressed: _showAttachOptions,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: TextField(
-                            controller: _inputController,
-                            focusNode: _focusNode,
-                            enabled: true,
-                            maxLines: 5,
-                            minLines: 1,
-                            textInputAction: TextInputAction.send,
-                            onSubmitted: (_) => _sendMessage(),
-                            decoration: InputDecoration(
-                              hintText: isRunning
-                                  ? (queueFull
-                                      ? AppStrings.messageQueueFullHint(
-                                          provider.messageQueue.length,
-                                          ChatProvider.maxQueuedMessages,
-                                        )
-                                      : AppStrings.queueInputHint)
-                                  : AppStrings.inputHint,
-                              filled: true,
-                              fillColor:
-                                  theme.colorScheme.surfaceContainerHighest,
-                              border: OutlineInputBorder(
-                                borderRadius:
-                                    BorderRadius.circular(AppRadii.xl),
-                                borderSide: BorderSide(
-                                  color:
-                                      theme.colorScheme.outline.withAlpha(60),
-                                ),
-                              ),
-                              enabledBorder: OutlineInputBorder(
-                                borderRadius:
-                                    BorderRadius.circular(AppRadii.xl),
-                                borderSide: BorderSide(
-                                  color:
-                                      theme.colorScheme.outline.withAlpha(60),
-                                ),
-                              ),
-                              focusedBorder: OutlineInputBorder(
-                                borderRadius:
-                                    BorderRadius.circular(AppRadii.xl),
-                                borderSide: BorderSide(
-                                  color:
-                                      theme.colorScheme.primary.withAlpha(180),
-                                  width: 1.5,
-                                ),
-                              ),
-                              contentPadding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 12,
-                              ),
-                            ),
-                          ),
-                        ),
-                        if (!isRunning) const SizedBox(width: 6),
-                        if (!isRunning)
-                          Semantics(
-                            button: true,
-                            liveRegion: _voiceInput.isBusy,
-                            label: _isWhisperRecording
-                                ? AppStrings.voiceStopAndTranscribe
-                                : _isListening
-                                    ? AppStrings.voiceStop
-                                    : AppStrings.voiceStart,
-                            child: GestureDetector(
-                              onTap: () {
-                                if (_isWhisperRecording) {
-                                  _stopWhisperRecording();
-                                } else if (_isListening) {
-                                  _stopListening();
-                                } else {
-                                  HapticFeedback.lightImpact();
-                                  _startListening();
-                                }
-                              },
-                              child: Container(
-                                width: 48,
-                                height: 48,
-                                decoration: BoxDecoration(
-                                  color: isRecording
-                                      ? AppColors.statusRed.withAlpha(28)
-                                      : theme
-                                          .colorScheme.surfaceContainerHighest,
-                                  borderRadius:
-                                      BorderRadius.circular(AppRadii.s),
-                                  border: Border.all(
-                                    color: isRecording
-                                        ? AppColors.statusRed.withAlpha(120)
-                                        : theme.colorScheme.outline
-                                            .withAlpha(55),
-                                  ),
-                                ),
-                                child: Icon(
-                                  isRecording ? Icons.mic : Icons.mic_none,
-                                  color: isRecording
-                                      ? AppColors.statusRed
-                                      : theme.colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                            ),
-                          ),
-                        const SizedBox(width: 6),
-                        if (isRunning)
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              SizedBox(
-                                width: 48,
-                                height: 48,
-                                child: IconButton.filled(
-                                  onPressed: provider.cancelAgent,
-                                  tooltip: AppStrings.stopResponse,
-                                  icon: const Icon(Icons.stop),
-                                  iconSize: 20,
-                                  style: IconButton.styleFrom(
-                                    backgroundColor: AppColors.statusRed,
-                                    foregroundColor: Colors.white,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius:
-                                          BorderRadius.circular(AppRadii.xl),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              SizedBox(
-                                width: 48,
-                                height: 48,
-                                child: IconButton.filled(
-                                  onPressed: queueFull ? null : _sendMessage,
-                                  tooltip: AppStrings.send,
-                                  icon: const Icon(Icons.send),
-                                  iconSize: 20,
-                                  style: IconButton.styleFrom(
-                                    backgroundColor: theme.colorScheme.primary,
-                                    foregroundColor:
-                                        theme.colorScheme.onPrimary,
-                                    disabledBackgroundColor: theme
-                                        .colorScheme.surfaceContainerHighest,
-                                    disabledForegroundColor:
-                                        theme.colorScheme.onSurfaceVariant,
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius:
-                                          BorderRadius.circular(AppRadii.xl),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          )
-                        else
+                constraints: BoxConstraints(
+                  maxWidth: 640,
+                  maxHeight: maxInputHeight,
+                ),
+                child: SingleChildScrollView(
+                  physics: imeVisible
+                      ? const ClampingScrollPhysics()
+                      : const NeverScrollableScrollPhysics(),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _buildAttachmentPreviews(theme),
+                      _buildExecutionContextChip(theme, provider),
+                      _buildBackgroundTasksBar(theme, provider),
+                      _buildMessageQueueBar(theme, provider, isRunning),
+                      _buildVoiceState(theme),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
                           SizedBox(
-                            width: 52,
+                            width: 44,
                             height: 48,
-                            child: IconButton.filled(
-                              onPressed: _sendMessage,
-                              tooltip: AppStrings.send,
-                              icon: const Icon(Icons.send),
-                              iconSize: 20,
+                            child: IconButton(
+                              icon: const Icon(Icons.attach_file),
+                              tooltip: AppStrings.attachFile,
                               style: IconButton.styleFrom(
-                                backgroundColor: theme.colorScheme.primary,
-                                foregroundColor: theme.colorScheme.onPrimary,
-                                shape: RoundedRectangleBorder(
+                                backgroundColor:
+                                    theme.colorScheme.surfaceContainerHighest,
+                                foregroundColor:
+                                    theme.colorScheme.onSurfaceVariant,
+                              ),
+                              onPressed: _showAttachOptions,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: TextField(
+                              controller: _inputController,
+                              focusNode: _focusNode,
+                              enabled: true,
+                              maxLines: 5,
+                              minLines: 1,
+                              textInputAction: TextInputAction.send,
+                              onSubmitted: (_) => _sendMessage(),
+                              decoration: InputDecoration(
+                                hintText: isRunning
+                                    ? (queueFull
+                                        ? AppStrings.messageQueueFullHint(
+                                            provider.messageQueue.length,
+                                            ChatProvider.maxQueuedMessages,
+                                          )
+                                        : AppStrings.queueInputHint)
+                                    : AppStrings.inputHint,
+                                filled: true,
+                                fillColor:
+                                    theme.colorScheme.surfaceContainerHighest,
+                                border: OutlineInputBorder(
                                   borderRadius:
                                       BorderRadius.circular(AppRadii.xl),
+                                  borderSide: BorderSide(
+                                    color:
+                                        theme.colorScheme.outline.withAlpha(60),
+                                  ),
+                                ),
+                                enabledBorder: OutlineInputBorder(
+                                  borderRadius:
+                                      BorderRadius.circular(AppRadii.xl),
+                                  borderSide: BorderSide(
+                                    color:
+                                        theme.colorScheme.outline.withAlpha(60),
+                                  ),
+                                ),
+                                focusedBorder: OutlineInputBorder(
+                                  borderRadius:
+                                      BorderRadius.circular(AppRadii.xl),
+                                  borderSide: BorderSide(
+                                    color: theme.colorScheme.primary
+                                        .withAlpha(180),
+                                    width: 1.5,
+                                  ),
+                                ),
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 12,
                                 ),
                               ),
                             ),
                           ),
-                      ],
-                    ),
-                  ],
+                          if (!isRunning) const SizedBox(width: 6),
+                          if (!isRunning)
+                            Semantics(
+                              button: true,
+                              liveRegion: _voiceInput.isBusy,
+                              label: _isWhisperRecording
+                                  ? AppStrings.voiceStopAndTranscribe
+                                  : _isListening
+                                      ? AppStrings.voiceStop
+                                      : AppStrings.voiceStart,
+                              child: GestureDetector(
+                                onTap: () {
+                                  if (_isWhisperRecording) {
+                                    _stopWhisperRecording();
+                                  } else if (_isListening) {
+                                    _stopListening();
+                                  } else {
+                                    HapticFeedback.lightImpact();
+                                    _startListening();
+                                  }
+                                },
+                                child: Container(
+                                  width: 48,
+                                  height: 48,
+                                  decoration: BoxDecoration(
+                                    color: isRecording
+                                        ? AppColors.statusRed.withAlpha(28)
+                                        : theme.colorScheme
+                                            .surfaceContainerHighest,
+                                    borderRadius:
+                                        BorderRadius.circular(AppRadii.s),
+                                    border: Border.all(
+                                      color: isRecording
+                                          ? AppColors.statusRed.withAlpha(120)
+                                          : theme.colorScheme.outline
+                                              .withAlpha(55),
+                                    ),
+                                  ),
+                                  child: Icon(
+                                    isRecording ? Icons.mic : Icons.mic_none,
+                                    color: isRecording
+                                        ? AppColors.statusRed
+                                        : theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          const SizedBox(width: 6),
+                          if (isRunning)
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                SizedBox(
+                                  width: 48,
+                                  height: 48,
+                                  child: IconButton.filled(
+                                    onPressed: provider.cancelAgent,
+                                    tooltip: AppStrings.stopResponse,
+                                    icon: const Icon(Icons.stop),
+                                    iconSize: 20,
+                                    style: IconButton.styleFrom(
+                                      backgroundColor: AppColors.statusRed,
+                                      foregroundColor: Colors.white,
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius:
+                                            BorderRadius.circular(AppRadii.xl),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                SizedBox(
+                                  width: 48,
+                                  height: 48,
+                                  child: IconButton.filled(
+                                    onPressed: queueFull ? null : _sendMessage,
+                                    tooltip: AppStrings.send,
+                                    icon: const Icon(Icons.send),
+                                    iconSize: 20,
+                                    style: IconButton.styleFrom(
+                                      backgroundColor:
+                                          theme.colorScheme.primary,
+                                      foregroundColor:
+                                          theme.colorScheme.onPrimary,
+                                      disabledBackgroundColor: theme
+                                          .colorScheme.surfaceContainerHighest,
+                                      disabledForegroundColor:
+                                          theme.colorScheme.onSurfaceVariant,
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius:
+                                            BorderRadius.circular(AppRadii.xl),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            )
+                          else
+                            SizedBox(
+                              width: 52,
+                              height: 48,
+                              child: IconButton.filled(
+                                onPressed: _sendMessage,
+                                tooltip: AppStrings.send,
+                                icon: const Icon(Icons.send),
+                                iconSize: 20,
+                                style: IconButton.styleFrom(
+                                  backgroundColor: theme.colorScheme.primary,
+                                  foregroundColor: theme.colorScheme.onPrimary,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius:
+                                        BorderRadius.circular(AppRadii.xl),
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -5478,6 +5695,301 @@ class _PendingAttachmentPreview {
     required this.includeAsContentBlock,
     this.workspaceImportReceipt,
   });
+}
+
+class _EmptyStateFactRow extends StatelessWidget {
+  const _EmptyStateFactRow({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(
+          icon,
+          size: 20,
+          color: theme.colorScheme.primary,
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                value,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _EmptyStatePromptRow extends StatelessWidget {
+  const _EmptyStatePromptRow({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Semantics(
+      button: true,
+      label: label,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(AppRadii.s),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 56),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: [
+                Icon(
+                  icon,
+                  size: 22,
+                  color: theme.colorScheme.primary,
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Text(
+                    label,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                Icon(
+                  Icons.north_west,
+                  size: 18,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ChatCommandGroup {
+  const _ChatCommandGroup({
+    required this.label,
+    required this.actions,
+  });
+
+  final String label;
+  final List<_ChatCommandAction> actions;
+}
+
+class _ChatCommandAction {
+  const _ChatCommandAction({
+    required this.id,
+    required this.icon,
+    required this.label,
+    required this.description,
+  });
+
+  final String id;
+  final IconData icon;
+  final String label;
+  final String description;
+}
+
+class _ChatCommandSurface extends StatelessWidget {
+  const _ChatCommandSurface({super.key, required this.groups});
+
+  final List<_ChatCommandGroup> groups;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final visibleGroups = groups
+        .where((group) => group.actions.isNotEmpty)
+        .toList(growable: false);
+    return Material(
+      color: theme.colorScheme.surface,
+      elevation: 8,
+      borderRadius: const BorderRadius.vertical(
+        top: Radius.circular(AppRadii.l),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '命令',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 48,
+                    height: 48,
+                    child: IconButton(
+                      tooltip: AppStrings.close,
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.close),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: ListView.separated(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+                itemBuilder: (context, index) {
+                  final group = visibleGroups[index];
+                  return _ChatCommandSection(group: group);
+                },
+                separatorBuilder: (_, __) => const SizedBox(height: 8),
+                itemCount: visibleGroups.length,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ChatCommandSection extends StatelessWidget {
+  const _ChatCommandSection({required this.group});
+
+  final _ChatCommandGroup group;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+          child: Text(
+            group.label,
+            style: theme.textTheme.labelMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+        DecoratedBox(
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerHighest.withAlpha(90),
+            borderRadius: BorderRadius.circular(AppRadii.m),
+          ),
+          child: Column(
+            children: [
+              for (var index = 0; index < group.actions.length; index++) ...[
+                _ChatCommandTile(action: group.actions[index]),
+                if (index != group.actions.length - 1)
+                  Divider(
+                    height: 1,
+                    indent: 56,
+                    color: theme.colorScheme.outline.withAlpha(35),
+                  ),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ChatCommandTile extends StatelessWidget {
+  const _ChatCommandTile({required this.action});
+
+  final _ChatCommandAction action;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Semantics(
+      button: true,
+      label: action.label,
+      hint: action.description,
+      child: InkWell(
+        onTap: () => Navigator.pop(context, action.id),
+        borderRadius: BorderRadius.circular(AppRadii.s),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 56),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Icon(
+                  action.icon,
+                  size: 22,
+                  color: theme.colorScheme.primary,
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        action.label,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        action.description,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _MessageWindow {

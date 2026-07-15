@@ -4,13 +4,17 @@ import 'dart:ui';
 
 import 'package:clawchat/app.dart';
 import 'package:clawchat/constants.dart';
+import 'package:clawchat/layout/foldable_layout.dart';
 import 'package:clawchat/l10n/app_strings.dart';
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/models/provider_profile.dart';
+import 'package:clawchat/models/remote_agent_connector.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/screens/chat_screen.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
+import 'package:clawchat/services/remote_agent_configuration_service.dart';
+import 'package:clawchat/services/remote_agent_connector.dart';
 import 'package:clawchat/services/session_storage.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:clawchat/services/tools/tool_registry.dart';
@@ -127,6 +131,285 @@ void main() {
     expect(find.text(_messageText(80)), findsOneWidget);
     expect(find.text(_messageText(259)), findsOneWidget);
     expect(find.text(AppStrings.loadOlderMessages(80)), findsNothing);
+  });
+
+  testWidgets(
+      'grouped command surface preserves actions and scrolls at compact 200 percent text',
+      (tester) async {
+    final session = ChatSession(
+      id: 'command_surface_session',
+      title: 'Command Surface Session',
+      messages: [
+        ChatMessage.user('hello'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('reply')],
+          timestamp: DateTime.utc(2026, 1, 1),
+        ),
+      ],
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(320, 620),
+      textScale: 2,
+    );
+
+    await _tapRightmostMoreAction(tester);
+    await tester.pumpAndSettle();
+
+    expect(find.text('对话'), findsOneWidget);
+    for (final label in [
+      AppStrings.regenerate,
+      AppStrings.compareMode,
+      AppStrings.contextSummary,
+      AppStrings.usageSummary,
+      AppStrings.switchModel,
+      AppStrings.sessionRemoteAgent,
+      AppStrings.terminal,
+      AppStrings.dashboard,
+      AppStrings.systemPromptTitle,
+      AppStrings.sessionMemory,
+      AppStrings.promptProfiles,
+      AppStrings.editSystemPrompt,
+      AppStrings.settings,
+    ]) {
+      await tester.scrollUntilVisible(
+        find.text(label),
+        96,
+        scrollable: find.byType(Scrollable).last,
+      );
+      expect(find.text(label), findsWidgets);
+    }
+
+    expect(find.text(AppStrings.settings), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+      'command surface stays inside tabletop primary region above fold and IME',
+      (tester) async {
+    await provider.createSession();
+    const size = Size(600, 800);
+    const bottomInset = 360.0;
+    const features = [
+      DisplayFeature(
+        bounds: Rect.fromLTWH(0, 300, 600, 20),
+        type: DisplayFeatureType.fold,
+        state: DisplayFeatureState.postureHalfOpened,
+      ),
+    ];
+
+    await _pumpResponsiveShellWithMedia(
+      tester,
+      provider,
+      size: size,
+      textScale: 2,
+      viewInsets: const EdgeInsets.only(bottom: bottomInset),
+      features: features,
+    );
+
+    final layout = FoldableLayout.resolve(
+      size,
+      features,
+      bottomInset: bottomInset,
+    );
+    expect(layout.primary, const Rect.fromLTWH(0, 0, 600, 300));
+
+    await _tapRightmostMoreAction(tester);
+    await tester.pumpAndSettle();
+
+    final surface = find.byKey(const ValueKey('chat-command-surface'));
+    expect(surface, findsOneWidget);
+    final surfaceRect = tester.getRect(surface);
+    _expectRectInside(surfaceRect, layout.primary);
+    expect(surfaceRect.overlaps(layout.occlusion!), isFalse);
+    expect(
+      surfaceRect.overlaps(
+        Rect.fromLTWH(0, size.height - bottomInset, size.width, bottomInset),
+      ),
+      isFalse,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+      'command surface stays above keyboard on compact flat screen at large text',
+      (tester) async {
+    final session = ChatSession(
+      id: 'flat_ime_command_surface_session',
+      title: 'Flat IME Command Surface Session',
+      messages: [
+        ChatMessage.user('hello'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('reply')],
+          timestamp: DateTime.utc(2026, 1, 1),
+        ),
+      ],
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+    const size = Size(320, 620);
+    const bottomInset = 280.0;
+    final usable = Rect.fromLTWH(
+      0,
+      0,
+      size.width,
+      size.height - bottomInset,
+    );
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: size,
+      textScale: 2,
+      viewInsets: const EdgeInsets.only(bottom: bottomInset),
+    );
+    expect(tester.takeException(), isNull);
+
+    await _tapRightmostMoreAction(tester);
+    await tester.pumpAndSettle();
+
+    final surface = find.byKey(const ValueKey('chat-command-surface'));
+    expect(surface, findsOneWidget);
+    final surfaceRect = tester.getRect(surface);
+    _expectRectInside(surfaceRect, usable);
+    expect(
+      surfaceRect.overlaps(
+        Rect.fromLTWH(0, usable.bottom, size.width, bottomInset),
+      ),
+      isFalse,
+    );
+
+    await tester.scrollUntilVisible(
+      find.text(AppStrings.settings),
+      96,
+      scrollable: find.byType(Scrollable).last,
+    );
+    expect(find.text(AppStrings.settings), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('command surface stays inside book primary region',
+      (tester) async {
+    await provider.createSession();
+    const size = Size(800, 700);
+    const features = [
+      DisplayFeature(
+        bounds: Rect.fromLTWH(390, 0, 20, 700),
+        type: DisplayFeatureType.hinge,
+        state: DisplayFeatureState.postureFlat,
+      ),
+    ];
+
+    await _pumpResponsiveShellWithMedia(
+      tester,
+      provider,
+      size: size,
+      textScale: 2,
+      features: features,
+    );
+
+    final layout = FoldableLayout.resolve(size, features);
+    await tester.tap(
+      find.descendant(
+        of: find.byType(AppBar),
+        matching: find.byTooltip(AppStrings.more),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final surfaceRect =
+        tester.getRect(find.byKey(const ValueKey('chat-command-surface')));
+    _expectRectInside(surfaceRect, layout.primary);
+    expect(surfaceRect.overlaps(layout.occlusion!), isFalse);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+      'empty chat start surface survives compact text, fold and IME constraints',
+      (tester) async {
+    await provider.createSession();
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(320, 620),
+      textScale: 2,
+    );
+    expect(find.text('本地工作区'), findsOneWidget);
+    expect(find.text('执行上下文'), findsOneWidget);
+    expect(find.text('当前模型'), findsOneWidget);
+    expect(find.text(AppStrings.emptyPromptSummarizeCode), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await _pumpResponsiveShellWithMedia(
+      tester,
+      provider,
+      size: const Size(800, 700),
+      textScale: 2,
+      features: const [
+        DisplayFeature(
+          bounds: Rect.fromLTWH(390, 0, 20, 700),
+          type: DisplayFeatureType.hinge,
+          state: DisplayFeatureState.postureFlat,
+        ),
+      ],
+    );
+    expect(find.text('本地工作区'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await _pumpResponsiveShellWithMedia(
+      tester,
+      provider,
+      size: const Size(600, 620),
+      textScale: 2,
+      viewInsets: const EdgeInsets.only(bottom: 280),
+      features: const [
+        DisplayFeature(
+          bounds: Rect.fromLTWH(0, 300, 600, 20),
+          type: DisplayFeatureType.fold,
+          state: DisplayFeatureState.postureHalfOpened,
+        ),
+      ],
+    );
+    expect(find.text('本地工作区'), findsOneWidget);
+    expect(find.byTooltip(AppStrings.send), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('empty chat execution context updates after remote toggle',
+      (tester) async {
+    provider.dispose();
+    final runtime = await _configuredRemoteRuntime();
+    provider = ChatProvider(
+      storage: storage,
+      remoteAgentRuntimeBinding: runtime,
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    await provider.createSession();
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(360, 700),
+      textScale: 2,
+    );
+    expect(provider.currentSession!.messages, isEmpty);
+    expect(find.text('Local · default model group'), findsNWidgets(2));
+    expect(find.text('External · Remote Agent'), findsNothing);
+
+    expect(await provider.setCurrentSessionRemoteAgentEnabled(true), isTrue);
+    await tester.pump();
+
+    expect(provider.currentSession!.messages, isEmpty);
+    expect(find.text('External · Remote Agent'), findsNWidgets(2));
+    expect(find.text('Local · default model group'), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('shows interrupted run banner and dismisses it', (tester) async {
@@ -826,6 +1109,122 @@ Future<void> _pumpChatScreen(WidgetTester tester, ChatProvider provider) async {
   await tester.pump(const Duration(milliseconds: 300));
 }
 
+Future<void> _pumpChatScreenWithMedia(
+  WidgetTester tester,
+  ChatProvider provider, {
+  required Size size,
+  double textScale = 1,
+  List<DisplayFeature> features = const [],
+  EdgeInsets viewInsets = EdgeInsets.zero,
+}) async {
+  tester.view.devicePixelRatio = 1;
+  tester.view.physicalSize = size;
+  addTearDown(() {
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+  });
+  await tester.pumpWidget(
+    ChangeNotifierProvider<ChatProvider>.value(
+      value: provider,
+      child: MaterialApp(
+        theme: ThemeData(useMaterial3: true),
+        builder: (context, child) => MediaQuery(
+          data: MediaQueryData(
+            size: size,
+            displayFeatures: features,
+            viewInsets: viewInsets,
+            textScaler: TextScaler.linear(textScale),
+          ),
+          child: child!,
+        ),
+        home: const ChatScreen(),
+      ),
+    ),
+  );
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300));
+}
+
+Future<void> _pumpResponsiveShellWithMedia(
+  WidgetTester tester,
+  ChatProvider provider, {
+  required Size size,
+  double textScale = 1,
+  List<DisplayFeature> features = const [],
+  EdgeInsets viewInsets = EdgeInsets.zero,
+}) async {
+  tester.view.devicePixelRatio = 1;
+  tester.view.physicalSize = size;
+  addTearDown(() {
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+  });
+  await tester.pumpWidget(
+    ChangeNotifierProvider<ChatProvider>.value(
+      value: provider,
+      child: MaterialApp(
+        theme: ThemeData(useMaterial3: true),
+        builder: (context, child) => MediaQuery(
+          data: MediaQueryData(
+            size: size,
+            displayFeatures: features,
+            viewInsets: viewInsets,
+            textScaler: TextScaler.linear(textScale),
+          ),
+          child: child!,
+        ),
+        home: const ResponsiveShell(key: ValueKey('test-responsive-shell')),
+      ),
+    ),
+  );
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300));
+}
+
+void _expectRectInside(Rect actual, Rect expected) {
+  expect(actual.left, greaterThanOrEqualTo(expected.left));
+  expect(actual.top, greaterThanOrEqualTo(expected.top));
+  expect(actual.right, lessThanOrEqualTo(expected.right));
+  expect(actual.bottom, lessThanOrEqualTo(expected.bottom));
+}
+
+Future<void> _tapRightmostMoreAction(WidgetTester tester) async {
+  final candidates = find.byTooltip(AppStrings.more).evaluate().toList();
+  expect(candidates, isNotEmpty);
+  Element? rightmost;
+  var rightmostX = double.negativeInfinity;
+  for (final candidate in candidates) {
+    final center = tester.getCenter(find.byWidget(candidate.widget));
+    if (center.dx > rightmostX) {
+      rightmost = candidate;
+      rightmostX = center.dx;
+    }
+  }
+  await tester.tap(find.byWidget(rightmost!.widget));
+}
+
+Future<RemoteAgentRuntimeBinding> _configuredRemoteRuntime() async {
+  final configuration = RemoteAgentConfigurationService(
+    metadataStorage: _RemoteMemoryStorage(),
+    secretStorage: _RemoteMemoryStorage(),
+  );
+  await configuration.saveConfiguration(
+    kind: RemoteAgentConnectorKind.openClawGateway,
+    connectorId: 'primary_remote',
+    displayName: 'Remote Agent',
+    baseUrl: 'https://agent.example/v1/chat/completions',
+    remoteAgentId: 'agent_1',
+    credential: 'secure-value',
+  );
+  await configuration.grantConsentAndEnable(
+    acceptedAt: DateTime.utc(2026, 7, 11),
+  );
+  return RemoteAgentRuntimeBinding(
+    configuration: configuration,
+    connector: const _NoopRemoteConnector(),
+  );
+}
+
 ChatSession _syntheticSession(int totalMessages) {
   return ChatSession(
     id: 'render_window_session',
@@ -842,6 +1241,39 @@ ChatSession _syntheticSession(int totalMessages) {
 }
 
 String _messageText(int index) => 'synthetic render window message $index';
+
+final class _RemoteMemoryStorage
+    implements RemoteAgentMetadataStorage, RemoteAgentSecretStorage {
+  final Map<String, String> _values = {};
+
+  @override
+  Future<void> delete(String key) async {
+    _values.remove(key);
+  }
+
+  @override
+  Future<String?> read(String key) async => _values[key];
+
+  @override
+  Future<void> write(String key, String value) async {
+    _values[key] = value;
+  }
+}
+
+final class _NoopRemoteConnector implements RemoteAgentConnector {
+  const _NoopRemoteConnector();
+
+  @override
+  Stream<RemoteAgentEvent> send(
+    RemoteAgentConnectorConfig config,
+    RemoteAgentConsent? consent,
+    RemoteAgentRequest request, {
+    RemoteAgentCancellation? cancellation,
+    bool Function()? authorizationGuard,
+  }) {
+    return const Stream<RemoteAgentEvent>.empty();
+  }
+}
 
 class _ApprovalLlmService extends LlmService {
   _ApprovalLlmService(super.config, {required this.onRequest});
