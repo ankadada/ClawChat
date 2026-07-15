@@ -291,6 +291,85 @@ void main() {
     });
   });
 
+  group('structured-result persistence handoff', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(clearPlatformMocks);
+
+    test('persists a validated card beside its matching tool result', () async {
+      const documentJson = '''{
+        "schemaVersion":1,
+        "resultId":"123e4567-e89b-42d3-a456-426614174000",
+        "blocks":[{"kind":"notice","level":"info","text":"Stored safely"}]
+      }''';
+      var turns = 0;
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            turns += 1;
+            if (turns == 1) {
+              return StreamDone(const LlmResponse(
+                stopReason: 'tool_use',
+                content: [
+                  ContentBlock(
+                    type: 'tool_use',
+                    toolUseId: 'structured-1',
+                    toolName: 'present_structured_result',
+                    toolInput: {'documentJson': documentJson},
+                  ),
+                ],
+              ));
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'done')],
+            ));
+          },
+        ),
+      );
+      addTearDown(provider.dispose);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await provider.createSession();
+
+      await provider.sendMessage('show result');
+      await _waitUntil(() => provider.agentStatus == AgentStatus.idle);
+
+      final resultMessage = provider.currentSession!.messages.firstWhere(
+        (message) =>
+            message.content.whereType<StructuredResultContent>().isNotEmpty,
+      );
+      expect(resultMessage.role, 'user');
+      expect(resultMessage.toolResults.single.forLlm,
+          'NOTICE [info]: Stored safely');
+      expect(resultMessage.content.whereType<StructuredResultContent>(),
+          hasLength(1));
+
+      final persisted = await storage.getSession(session.id);
+      expect(persisted, isNotNull);
+      final persistedResult = persisted!.messages.firstWhere(
+        (message) =>
+            message.content.whereType<StructuredResultContent>().isNotEmpty,
+      );
+      expect(persistedResult.toolResults.single.forLlm,
+          'NOTICE [info]: Stored safely');
+      final apiBlockTypes = persisted
+          .toApiMessages()
+          .expand((message) => message['content'] is List
+              ? message['content'] as List
+              : const <Object?>[])
+          .whereType<Map>()
+          .map((block) => block['type']);
+      expect(apiBlockTypes, isNot(contains('structured_result')));
+    });
+  });
+
   group('message queue undo', () {
     setUp(() async {
       await installPlatformMocks();

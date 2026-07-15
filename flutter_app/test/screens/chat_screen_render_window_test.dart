@@ -9,15 +9,19 @@ import 'package:clawchat/l10n/app_strings.dart';
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/models/remote_agent_connector.dart';
+import 'package:clawchat/models/structured_result.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/screens/chat_screen.dart';
 import 'package:clawchat/services/llm_service.dart';
+import 'package:clawchat/services/mcp_rich_surface_protocol.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/remote_agent_configuration_service.dart';
 import 'package:clawchat/services/remote_agent_connector.dart';
 import 'package:clawchat/services/session_storage.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:clawchat/services/tools/tool_registry.dart';
+import 'package:clawchat/widgets/structured_result_card.dart';
+import 'package:clawchat/widgets/mcp_rich_surface_view.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -409,6 +413,155 @@ void main() {
     expect(provider.currentSession!.messages, isEmpty);
     expect(find.text('External · Remote Agent'), findsNWidgets(2));
     expect(find.text('Local · default model group'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+      'structured result stays chronological and outside folds at 200 percent text',
+      (tester) async {
+    final session = ChatSession(
+      id: 'structured_result_surface',
+      title: 'Structured result surface',
+      messages: [
+        ChatMessage.user('Earlier prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('Model response before the result')],
+          timestamp: DateTime.utc(2026, 7, 15),
+        ),
+        ChatMessage(
+          role: 'user',
+          content: [
+            ToolResultContent(toolUseId: 'present-1', output: ''),
+            StructuredResultContent(document: _surfaceStructuredDocument()),
+          ],
+          timestamp: DateTime.utc(2026, 7, 15, 0, 0, 1),
+        ),
+      ],
+      structuredActionReceipts: [
+        _surfaceStructuredReceipt(),
+      ],
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(600, 800),
+    );
+    final card = find.byType(StructuredResultCard);
+    expect(card, findsOneWidget);
+    final richDisclosure = find.byType(McpRichSurfaceDisclosure);
+    expect(richDisclosure, findsOneWidget);
+    final richWidget = tester.widget<McpRichSurfaceDisclosure>(richDisclosure);
+    expect(
+      richWidget.actionRouter,
+      isA<ChatProviderMcpRichSurfaceActionRouter>(),
+    );
+    expect(richWidget.surface.resultId, _surfaceStructuredDocument().resultId);
+    expect(find.byType(McpRichSurfaceView), findsNothing);
+    expect(find.text('Model response before the result'), findsOneWidget);
+    expect(find.text('Imported safely'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('Model response before the result')).dy,
+      lessThan(tester.getTopLeft(card).dy),
+    );
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(320, 700),
+      textScale: 2,
+    );
+    expect(card, findsOneWidget);
+    expect(find.byType(McpRichSurfaceDisclosure), findsOneWidget);
+    expect(find.text('Show rich view'), findsOneWidget);
+    expect(find.text('Action receipt saved'), findsOneWidget);
+    expect(
+      find.text('Action data is unavailable.'),
+      findsOneWidget,
+    );
+    final disabledAction =
+        find.widgetWithText(OutlinedButton, 'Save to local memory');
+    expect(tester.widget<OutlinedButton>(disabledAction).onPressed, isNull);
+    _expectRectInside(tester.getRect(card), Offset.zero & const Size(320, 700));
+    await tester.tap(find.byKey(const Key('mcp-rich-surface-toggle')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.byType(McpRichSurfaceView), findsOneWidget);
+    expect(find.byType(McpRichSurfaceUnavailableNotice), findsOneWidget);
+    _expectRectInside(
+      tester.getRect(find.byType(McpRichSurfaceView)),
+      Offset.zero & const Size(320, 700),
+    );
+    expect(card, findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    const bookSize = Size(800, 700);
+    const bookHinge = Rect.fromLTWH(400, 0, 20, 700);
+    await _pumpResponsiveShellWithMedia(
+      tester,
+      provider,
+      size: bookSize,
+      textScale: 2,
+      features: const [
+        DisplayFeature(
+          bounds: bookHinge,
+          type: DisplayFeatureType.hinge,
+          state: DisplayFeatureState.postureFlat,
+        ),
+      ],
+    );
+    final bookLayout = FoldableLayout.resolve(bookSize, const [
+      DisplayFeature(
+        bounds: bookHinge,
+        type: DisplayFeatureType.hinge,
+        state: DisplayFeatureState.postureFlat,
+      ),
+    ]);
+    final bookCardRect = tester.getRect(card);
+    _expectRectInside(bookCardRect, bookLayout.primary);
+    expect(bookCardRect.overlaps(bookHinge), isFalse);
+    expect(find.byType(McpRichSurfaceView), findsNothing);
+    expect(find.text('Show rich view'), findsOneWidget);
+    expect(card, findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    const tabletopSize = Size(600, 1000);
+    const tabletopFold = Rect.fromLTWH(0, 520, 600, 20);
+    const bottomInset = 400.0;
+    await _pumpResponsiveShellWithMedia(
+      tester,
+      provider,
+      size: tabletopSize,
+      textScale: 2,
+      viewInsets: const EdgeInsets.only(bottom: bottomInset),
+      features: const [
+        DisplayFeature(
+          bounds: tabletopFold,
+          type: DisplayFeatureType.fold,
+          state: DisplayFeatureState.postureHalfOpened,
+        ),
+      ],
+    );
+    final tabletopLayout = FoldableLayout.resolve(
+      tabletopSize,
+      const [
+        DisplayFeature(
+          bounds: tabletopFold,
+          type: DisplayFeatureType.fold,
+          state: DisplayFeatureState.postureHalfOpened,
+        ),
+      ],
+      bottomInset: bottomInset,
+    );
+    final tabletopCardRect = tester.getRect(card);
+    _expectRectInside(tabletopCardRect, tabletopLayout.primary);
+    expect(tabletopCardRect.overlaps(tabletopFold), isFalse);
+    expect(find.byType(McpRichSurfaceView), findsNothing);
+    expect(find.text('Show rich view'), findsOneWidget);
+    expect(card, findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -1241,6 +1394,52 @@ ChatSession _syntheticSession(int totalMessages) {
 }
 
 String _messageText(int index) => 'synthetic render window message $index';
+
+StructuredResultDocument _surfaceStructuredDocument() =>
+    const StructuredResultDocument(
+      schemaVersion: 1,
+      resultId: '00000000-0000-4000-8000-000000000010',
+      blocks: [
+        StructuredNoticeBlock(
+          level: StructuredNoticeLevel.info,
+          text: 'Imported safely',
+        ),
+        StructuredActionListBlock(
+          actions: [
+            StructuredResultAction(
+              actionId: 'save-1',
+              label: 'Save to local memory',
+              kind: 'save_to_memory',
+              payload: {'fact': 'Only local, consented data may be saved.'},
+            ),
+          ],
+        ),
+      ],
+    );
+
+StructuredActionReceipt _surfaceStructuredReceipt() => StructuredActionReceipt(
+      schemaVersion: 1,
+      receiptId: '00000000-0000-4000-8000-000000000011',
+      operationId: '00000000-0000-4000-8000-000000000012',
+      sourceKind: 'structured_result',
+      resultId: '00000000-0000-4000-8000-000000000010',
+      actionId: 'save-1',
+      actionKind: 'save_to_memory',
+      toolName: 'memory_write',
+      canonicalInputDigest: structuredActionInputDigest(
+          (_surfaceStructuredDocument().blocks[1] as StructuredActionListBlock)
+              .actions
+              .single),
+      createdAt: DateTime.utc(2026, 7, 15),
+      updatedAt: DateTime.utc(2026, 7, 15, 0, 0, 1),
+      hardDeny: 'not_denied',
+      skillDeny: 'not_applicable',
+      approval: 'approved',
+      state: 'resultPersisted',
+      outcome: 'success',
+      outcomeKnown: true,
+      safeSummary: 'Saved to local memory.',
+    );
 
 final class _RemoteMemoryStorage
     implements RemoteAgentMetadataStorage, RemoteAgentSecretStorage {

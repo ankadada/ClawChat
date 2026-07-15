@@ -18,6 +18,7 @@ import 'web_fetch_tool.dart';
 import 'web_search_tool.dart';
 import 'image_gen_tool.dart';
 import 'load_skill_tool.dart';
+import 'present_structured_result_tool.dart';
 
 class ToolCancellationSignal {
   final Completer<void> _cancelled = Completer<void>();
@@ -140,6 +141,7 @@ class ToolRegistry {
     registry.register(MemoryGetTool(), risk: ToolRisk.safe);
     registry.register(MemoryWriteTool(), risk: ToolRisk.moderate);
     registry.register(MemoryDeleteTool(), risk: ToolRisk.moderate);
+    registry.register(PresentStructuredResultTool(), risk: ToolRisk.safe);
     if (prefs != null) {
       registry.register(PhoneIntentTool(prefs), risk: ToolRisk.dangerous);
     }

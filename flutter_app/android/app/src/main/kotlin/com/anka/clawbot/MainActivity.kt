@@ -834,6 +834,74 @@ class MainActivity : FlutterActivity() {
                         result.error("SERVICE_ERROR", e.message, null)
                     }
                 }
+                "startBackgroundTaskLease" -> {
+                    val taskId = call.argument<String>("taskId")
+                    val executionOwnerId = call.argument<String>("executionOwnerId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val ownerKind = call.argument<String>("ownerKind")
+                    if (taskId.isNullOrBlank() || sessionId.isNullOrBlank() ||
+                        executionOwnerId != taskId || ownerKind != "backgroundTask") {
+                        result.error("INVALID_ARGS", "task lease identity required", null)
+                    } else {
+                        Thread {
+                            val established = try {
+                                AgentTaskService.startBackgroundTaskLeaseAndAwaitReady(
+                                    applicationContext,
+                                    taskId,
+                                    sessionId,
+                                )
+                            } catch (_: Exception) {
+                                false
+                            }
+                            safeRunOnUiThread { result.success(established) }
+                        }.start()
+                    }
+                }
+                "updateBackgroundTaskLease" -> {
+                    val taskId = call.argument<String>("taskId")
+                    val executionOwnerId = call.argument<String>("executionOwnerId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val status = call.argument<String>("status")
+                    val ownerKind = call.argument<String>("ownerKind")
+                    if (taskId.isNullOrBlank() || sessionId.isNullOrBlank() ||
+                        executionOwnerId != taskId || ownerKind != "backgroundTask" ||
+                        (status != "working" && status != "needs_review")) {
+                        result.error("INVALID_ARGS", "task lease update invalid", null)
+                    } else {
+                        try {
+                            result.success(
+                                AgentTaskService.updateBackgroundTaskLease(
+                                    taskId,
+                                    sessionId,
+                                    status,
+                                )
+                            )
+                        } catch (e: Exception) {
+                            result.error("SERVICE_ERROR", e.message, null)
+                        }
+                    }
+                }
+                "stopBackgroundTaskLease" -> {
+                    val taskId = call.argument<String>("taskId")
+                    val executionOwnerId = call.argument<String>("executionOwnerId")
+                    val sessionId = call.argument<String>("sessionId")
+                    val ownerKind = call.argument<String>("ownerKind")
+                    if (taskId.isNullOrBlank() || sessionId.isNullOrBlank() ||
+                        executionOwnerId != taskId || ownerKind != "backgroundTask") {
+                        result.error("INVALID_ARGS", "task lease identity required", null)
+                    } else {
+                        try {
+                            result.success(
+                                AgentTaskService.stopBackgroundTaskLease(
+                                    taskId,
+                                    sessionId,
+                                )
+                            )
+                        } catch (e: Exception) {
+                            result.error("SERVICE_ERROR", e.message, null)
+                        }
+                    }
+                }
                 "showToolApprovalNotification" -> {
                     val sessionId = call.argument<String>("sessionId")
                     val sessionTitle = call.argument<String>("sessionTitle")

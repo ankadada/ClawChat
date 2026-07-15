@@ -12,13 +12,16 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import '../app.dart';
 import '../constants.dart';
 import '../models/chat_models.dart';
+import '../models/mcp_rich_surface.dart';
 import '../models/provider_profile.dart';
+import '../models/structured_result.dart';
 import '../models/workspace_import_receipt.dart';
 import '../providers/chat_provider.dart';
 import '../services/preferences_service.dart';
 import '../services/current_session_search.dart';
 import '../services/file_attachment_service.dart';
 import '../services/memory_service.dart';
+import '../services/mcp_rich_surface_protocol.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/chat_render_window.dart';
@@ -32,6 +35,8 @@ import '../widgets/reasoning_text_panel.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/agent_status_bar.dart';
 import '../widgets/compare_view.dart';
+import '../widgets/structured_result_card.dart';
+import '../widgets/mcp_rich_surface_view.dart';
 import '../services/tts_service.dart';
 import '../services/whisper_service.dart';
 import 'artifact_preview_screen.dart';
@@ -2022,6 +2027,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     builder: (context, constraints) {
                       final maxContentWidth =
                           math.min(640.0, constraints.maxWidth * 0.86);
+                      final maxStructuredResultHeight = math.max(
+                        96.0,
+                        constraints.maxHeight - 72,
+                      );
                       return Selector<
                           ChatProvider,
                           ({
@@ -2204,6 +2213,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                               originalIndex,
                                               theme,
                                               maxContentWidth,
+                                              maxStructuredResultHeight:
+                                                  maxStructuredResultHeight,
                                               messages: messages,
                                               previousRole: previousRole,
                                               nextRole: nextRole,
@@ -2499,6 +2510,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     int messageIndex,
     ThemeData theme,
     double maxContentWidth, {
+    required double maxStructuredResultHeight,
     required List<ChatMessage> messages,
     String? previousRole,
     String? nextRole,
@@ -2547,6 +2559,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               isUser,
               theme,
               maxContentWidth,
+              maxStructuredResultHeight: maxStructuredResultHeight,
               messageId: messageId,
               message: message,
               messageIndex: messageIndex,
@@ -3069,6 +3082,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ? '${output.substring(0, 2000)}\n\n[tool output truncated]'
               : output);
           buffer.writeln('```');
+        case StructuredResultContent(:final projection):
+          buffer.writeln('**Structured result**:');
+          buffer.writeln('```text');
+          buffer.writeln(projection);
+          buffer.writeln('```');
       }
     }
     return buffer.toString().trimRight();
@@ -3401,6 +3419,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     bool isUser,
     ThemeData theme,
     double maxContentWidth, {
+    double? maxStructuredResultHeight,
     String? messageId,
     ChatMessage? message,
     int? messageIndex,
@@ -3491,6 +3510,83 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 onPressed: () => _openArtifactPreview(output),
                 visualDensity: VisualDensity.compact,
               ),
+            ),
+          ),
+        );
+
+      case StructuredResultContent(:final document, :final isInvalid):
+        final chatProvider = context.watch<ChatProvider>();
+        final session = chatProvider.currentSession;
+        final receipts = session?.structuredActionReceipts ??
+            const <StructuredActionReceipt>[];
+        final firstActionId = document.blocks
+            .whereType<StructuredActionListBlock>()
+            .expand((block) => block.actions)
+            .map((action) => action.actionId)
+            .firstOrNull;
+        final unavailableReason = isInvalid || firstActionId == null
+            ? null
+            : chatProvider.structuredActionUnavailableReason(
+                resultId: document.resultId,
+                actionId: firstActionId,
+              );
+        final availableActionIds = isInvalid
+            ? const <String>{}
+            : document.blocks
+                .whereType<StructuredActionListBlock>()
+                .expand((block) => block.actions)
+                .where((action) =>
+                    chatProvider.structuredActionUnavailableReason(
+                      resultId: document.resultId,
+                      actionId: action.actionId,
+                    ) ==
+                    null)
+                .map((action) => action.actionId)
+                .toSet();
+        final richSurface = session == null
+            ? null
+            : McpRichSurfaceAdapter.fromStructuredResult(
+                sessionId: session.id,
+                content: content,
+                availableActionIds: availableActionIds,
+              );
+        final nativeCardMaxHeight =
+            maxStructuredResultHeight == null || richSurface == null
+                ? maxStructuredResultHeight
+                : math.max(96.0, maxStructuredResultHeight - 64.0);
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: maxContentWidth),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                StructuredResultCard(
+                  document: document,
+                  isInvalid: isInvalid,
+                  receipts: receipts,
+                  actionUnavailableReason: unavailableReason,
+                  onAction: isInvalid || unavailableReason != null
+                      ? null
+                      : (action) => chatProvider.executeStructuredAction(
+                            resultId: document.resultId,
+                            actionId: action.actionId,
+                          ),
+                  maxHeight: nativeCardMaxHeight,
+                ),
+                if (richSurface != null)
+                  McpRichSurfaceDisclosure(
+                    key: ValueKey(
+                      'mcp-rich-${MediaQuery.sizeOf(context)}-'
+                      '${MediaQuery.viewInsetsOf(context).bottom}',
+                    ),
+                    surface: richSurface,
+                    actionRouter: ChatProviderMcpRichSurfaceActionRouter(
+                      chatProvider: chatProvider,
+                      currentSurfaceOperationId: () => richSurface.operationId,
+                    ),
+                  ),
+              ],
             ),
           ),
         );

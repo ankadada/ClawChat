@@ -35,6 +35,7 @@ import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 internal data class CommandReservationDecision(
     val outcome: CommandReserveOutcome,
@@ -55,6 +56,79 @@ internal fun reserveAgentCommand(
     return CommandReservationDecision(registry.reserve(key, timeoutMs), admission)
 }
 
+internal class BackgroundTaskLeaseStartRequest {
+    private enum class State { PENDING, PROCESSING, CANCELLED, COMPLETED }
+
+    private val state = AtomicReference(State.PENDING)
+    val result = CompletableFuture<Boolean>()
+
+    fun begin(): Boolean = state.compareAndSet(State.PENDING, State.PROCESSING)
+
+    fun cancel() {
+        while (true) {
+            when (val current = state.get()) {
+                State.CANCELLED, State.COMPLETED -> return
+                else -> if (state.compareAndSet(current, State.CANCELLED)) {
+                    result.complete(false)
+                    return
+                }
+            }
+        }
+    }
+
+    /// Returns false when the caller already timed out/cancelled. In that case
+    /// a lease established by the service must be removed immediately.
+    fun finish(established: Boolean): Boolean {
+        if (!state.compareAndSet(State.PROCESSING, State.COMPLETED)) return false
+        result.complete(established)
+        return true
+    }
+}
+
+internal class OwnerScopedNotificationIdAllocator(
+    private val base: Int,
+    private val capacity: Int = 100_000,
+    private val ownerHash: (String) -> Int = { it.hashCode() },
+) {
+    init {
+        require(base > 0)
+        require(capacity > 0)
+        require(base <= Int.MAX_VALUE - capacity)
+    }
+
+    private val ownerToId = mutableMapOf<String, Int>()
+    private val idToOwner = mutableMapOf<Int, String>()
+
+    @Synchronized
+    fun allocate(ownerId: String): Int {
+        require(ownerId.isNotBlank())
+        ownerToId[ownerId]?.let { return it }
+        val start = Math.floorMod(ownerHash(ownerId), capacity)
+        repeat(capacity) { offset ->
+            val candidate = base + ((start + offset) % capacity)
+            if (!idToOwner.containsKey(candidate)) {
+                ownerToId[ownerId] = candidate
+                idToOwner[candidate] = ownerId
+                return candidate
+            }
+        }
+        throw IllegalStateException("notification owner capacity exhausted")
+    }
+
+    @Synchronized
+    fun release(ownerId: String): Int? {
+        val notificationId = ownerToId.remove(ownerId) ?: return null
+        idToOwner.remove(notificationId)
+        return notificationId
+    }
+
+    @Synchronized
+    fun clear() {
+        ownerToId.clear()
+        idToOwner.clear()
+    }
+}
+
 class AgentTaskService : Service() {
     companion object {
         private const val SUMMARY_NOTIFICATION_ID = 9999
@@ -71,8 +145,20 @@ class AgentTaskService : Service() {
         private const val EXTRA_APPROVED = "approved"
         private const val EXTRA_COMMAND_OPERATION_ID = "commandOperationId"
         private const val EXTRA_COMMAND_READY_REQUEST_ID = "commandReadyRequestId"
+        private const val EXTRA_OWNER_KIND = "ownerKind"
+        private const val EXTRA_EXECUTION_OWNER_ID = "executionOwnerId"
+        private const val EXTRA_BACKGROUND_TASK_STATUS = "backgroundTaskStatus"
+        private const val EXTRA_BACKGROUND_TASK_READY_REQUEST_ID =
+            "backgroundTaskReadyRequestId"
         private const val ACTION_UPDATE = "com.anka.clawbot.agent.UPDATE"
         private const val ACTION_STOP_AGENT = "com.anka.clawbot.agent.STOP"
+        private const val ACTION_START_BACKGROUND_TASK_LEASE =
+            "com.anka.clawbot.agent.BACKGROUND_TASK_LEASE_START"
+        private const val ACTION_UPDATE_BACKGROUND_TASK_LEASE =
+            "com.anka.clawbot.agent.BACKGROUND_TASK_LEASE_UPDATE"
+        private const val ACTION_STOP_BACKGROUND_TASK_LEASE =
+            "com.anka.clawbot.agent.BACKGROUND_TASK_LEASE_STOP"
+        private const val OWNER_KIND_BACKGROUND_TASK = "backgroundTask"
         private const val ACTION_TOOL_APPROVAL_UPDATE = "com.anka.clawbot.agent.APPROVAL_UPDATE"
         private const val ACTION_TOOL_APPROVAL_DECISION = "com.anka.clawbot.agent.APPROVAL_DECISION"
         private const val DEFAULT_TEXT = "AI 正在执行任务..."
@@ -84,6 +170,7 @@ class AgentTaskService : Service() {
         private const val OVERLAY_PREFS = "agent_overlay"
         private const val OVERLAY_PROMPTED = "overlay_prompted"
         private const val COMMAND_READY_TIMEOUT_SECONDS = 5L
+        private const val BACKGROUND_TASK_LEASE_READY_TIMEOUT_SECONDS = 5L
         private const val COMMAND_DISPOSAL_RETRY_MS = 500L
         private const val COMMAND_CLEANUP_WAKE_LOCK_MS = 60_000L
         // This caps the caller-requested command runtime; it is not an orphan
@@ -103,6 +190,8 @@ class AgentTaskService : Service() {
         }
         private val commandReadiness =
             ConcurrentHashMap<String, CompletableFuture<Boolean>>()
+        private val backgroundTaskLeaseStartRequests =
+            ConcurrentHashMap<String, BackgroundTaskLeaseStartRequest>()
         private val callbackOwnership =
             ToolApprovalCallbackOwnership<MethodChannel>()
 
@@ -175,6 +264,62 @@ class AgentTaskService : Service() {
                 putExtra(EXTRA_OVERLAY_VISIBLE, overlayVisible)
             }
             startServiceCompat(context, intent)
+        }
+
+        /// Creates only a user-initiated Dart-owned foreground-service lease.
+        /// Native code receives no task payload and never reads or resumes task
+        /// records.
+        fun startBackgroundTaskLeaseAndAwaitReady(
+            context: Context,
+            executionOwnerId: String,
+            sessionId: String,
+        ): Boolean {
+            val requestId = UUID.randomUUID().toString()
+            val request = BackgroundTaskLeaseStartRequest()
+            backgroundTaskLeaseStartRequests[requestId] = request
+            val intent = Intent(context, AgentTaskService::class.java).apply {
+                action = ACTION_START_BACKGROUND_TASK_LEASE
+                putExtra(EXTRA_OWNER_KIND, OWNER_KIND_BACKGROUND_TASK)
+                putExtra(EXTRA_EXECUTION_OWNER_ID, executionOwnerId)
+                putExtra(EXTRA_SESSION_ID, sessionId)
+                putExtra(EXTRA_BACKGROUND_TASK_STATUS, "working")
+                putExtra(EXTRA_BACKGROUND_TASK_READY_REQUEST_ID, requestId)
+            }
+            return try {
+                startServiceCompat(context, intent)
+                request.result.get(
+                    BACKGROUND_TASK_LEASE_READY_TIMEOUT_SECONDS,
+                    TimeUnit.SECONDS,
+                ) == true
+            } catch (error: Exception) {
+                request.cancel()
+                Log.w("ClawChat", "Background task foreground lease was not confirmed", error)
+                false
+            } finally {
+                if (!request.result.isDone) request.cancel()
+                backgroundTaskLeaseStartRequests.remove(requestId, request)
+            }
+        }
+
+        fun updateBackgroundTaskLease(
+            executionOwnerId: String,
+            sessionId: String,
+            status: String,
+        ): Boolean {
+            val service = instance ?: return false
+            return service.updateBackgroundTaskLease(
+                executionOwnerId,
+                sessionId,
+                status,
+            )
+        }
+
+        fun stopBackgroundTaskLease(
+            executionOwnerId: String,
+            sessionId: String,
+        ): Boolean {
+            val service = instance ?: return false
+            return service.removeBackgroundTaskLease(executionOwnerId, sessionId)
         }
 
         fun stopSession(context: Context, sessionId: String) {
@@ -469,10 +614,24 @@ class AgentTaskService : Service() {
         var approval: ToolApprovalNotificationState? = null
     )
 
+    /// Native-only lease metadata. The task ID is an owner identity, not a
+    /// durable task record, and no payload/preview is ever retained here.
+    private data class BackgroundTaskLeaseNotification(
+        val executionOwnerId: String,
+        val sessionId: String,
+        var status: String,
+        val notificationId: Int,
+    )
+
     private var wakeLock: PowerManager.WakeLock? = null
     private var retiringNormally = false
     private val activeSessions = mutableMapOf<String, AgentSessionNotification>()
+    private val activeBackgroundTaskLeases =
+        mutableMapOf<String, BackgroundTaskLeaseNotification>()
+    private val backgroundTaskNotificationIds =
+        OwnerScopedNotificationIdAllocator(base = 210_000)
     private var foregroundSessionId: String? = null
+    private var foregroundBackgroundTaskOwnerId: String? = null
     private var overlaySessionId: String? = null
     private var overlayShouldBeVisible = false
     private val retiredBaseSessions = mutableSetOf<String>()
@@ -547,8 +706,69 @@ class AgentTaskService : Service() {
             }
             requestStopFromNotification(sessionId)
             mainHandler.postDelayed({
-                if (activeSessions.isEmpty()) stopSelfNormally()
+                if (!hasActiveForegroundLeases()) stopSelfNormally()
             }, 1000)
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_STOP_BACKGROUND_TASK_LEASE) {
+            val ownerKind = intent.getStringExtra(EXTRA_OWNER_KIND)
+            val executionOwnerId = intent.getStringExtra(EXTRA_EXECUTION_OWNER_ID)
+            val sessionId = intent.getStringExtra(EXTRA_SESSION_ID)
+            if (ownerKind == OWNER_KIND_BACKGROUND_TASK &&
+                !executionOwnerId.isNullOrBlank() &&
+                !sessionId.isNullOrBlank() &&
+                removeBackgroundTaskLease(executionOwnerId, sessionId)) {
+                requestBackgroundTaskLeaseInterruption(
+                    executionOwnerId,
+                    sessionId,
+                    "user_stop_requested",
+                )
+            }
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_START_BACKGROUND_TASK_LEASE) {
+            val ownerKind = intent.getStringExtra(EXTRA_OWNER_KIND)
+            val executionOwnerId = intent.getStringExtra(EXTRA_EXECUTION_OWNER_ID)
+            val sessionId = intent.getStringExtra(EXTRA_SESSION_ID)
+            val status = intent.getStringExtra(EXTRA_BACKGROUND_TASK_STATUS)
+            val requestId = intent.getStringExtra(EXTRA_BACKGROUND_TASK_READY_REQUEST_ID)
+            val request = requestId?.let { backgroundTaskLeaseStartRequests[it] }
+            if (ownerKind != OWNER_KIND_BACKGROUND_TASK ||
+                executionOwnerId.isNullOrBlank() ||
+                sessionId.isNullOrBlank() ||
+                status != "working" ||
+                requestId.isNullOrBlank() ||
+                request == null ||
+                !request.begin()) {
+                request?.cancel()
+                if (requestId != null && request != null) {
+                    backgroundTaskLeaseStartRequests.remove(requestId, request)
+                }
+                return START_NOT_STICKY
+            }
+            val established = upsertBackgroundTaskLease(
+                executionOwnerId,
+                sessionId,
+                status,
+            )
+            val delivered = request.finish(established)
+            backgroundTaskLeaseStartRequests.remove(requestId, request)
+            if (established && !delivered) {
+                removeBackgroundTaskLease(executionOwnerId, sessionId)
+            }
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_UPDATE_BACKGROUND_TASK_LEASE) {
+            val ownerKind = intent.getStringExtra(EXTRA_OWNER_KIND)
+            val executionOwnerId = intent.getStringExtra(EXTRA_EXECUTION_OWNER_ID)
+            val sessionId = intent.getStringExtra(EXTRA_SESSION_ID)
+            val status = intent.getStringExtra(EXTRA_BACKGROUND_TASK_STATUS)
+            if (ownerKind == OWNER_KIND_BACKGROUND_TASK &&
+                !executionOwnerId.isNullOrBlank() &&
+                !sessionId.isNullOrBlank() &&
+                status != null) {
+                updateBackgroundTaskLease(executionOwnerId, sessionId, status)
+            }
             return START_NOT_STICKY
         }
         if (intent?.action?.startsWith(ACTION_TOOL_APPROVAL_DECISION) == true) {
@@ -596,7 +816,7 @@ class AgentTaskService : Service() {
                 val manager = getSystemService(NotificationManager::class.java)
                 manager.notify(state.notificationId, buildNotification(state))
             }
-            isRunning = activeSessions.isNotEmpty()
+            isRunning = hasActiveForegroundLeases()
             acquireWakeLock()
             val commandReady = commandOperationId == null ||
                 (wakeLock?.isHeld == true &&
@@ -633,6 +853,15 @@ class AgentTaskService : Service() {
     }
 
     override fun onDestroy() {
+        if (!retiringNormally) {
+            for (lease in activeBackgroundTaskLeases.values.toList()) {
+                requestBackgroundTaskLeaseInterruption(
+                    lease.executionOwnerId,
+                    lease.sessionId,
+                    "foreground_service_interrupted",
+                )
+            }
+        }
         val pendingCleanup = if (!retiringNormally) {
             val before = commandContinuations.activeKeys(CommandContinuationOwner.AGENT_BASH)
             commandContinuations.destroyOwner(
@@ -710,6 +939,103 @@ class AgentTaskService : Service() {
             scheduleNotificationUpdate(state.sessionId)
         }
         updateOverlay()
+    }
+
+    private fun upsertBackgroundTaskLease(
+        executionOwnerId: String,
+        sessionId: String,
+        status: String,
+    ): Boolean {
+        val existing = activeBackgroundTaskLeases[executionOwnerId]
+        if (existing != null && existing.sessionId != sessionId) {
+            // Owner identity is immutable for the life of a native lease.
+            return false
+        }
+        val created = existing == null
+        val lease = existing ?: try {
+            BackgroundTaskLeaseNotification(
+                executionOwnerId = executionOwnerId,
+                sessionId = sessionId,
+                status = status,
+                notificationId = backgroundTaskNotificationIds.allocate(executionOwnerId),
+            ).also { activeBackgroundTaskLeases[executionOwnerId] = it }
+        } catch (error: Exception) {
+            Log.w("ClawChat", "Unable to allocate background task notification", error)
+            return false
+        }
+        lease.status = status
+        return try {
+            val manager = getSystemService(NotificationManager::class.java)
+            if (!isRunning ||
+                (foregroundSessionId == null && foregroundBackgroundTaskOwnerId == null)) {
+                foregroundBackgroundTaskOwnerId = lease.executionOwnerId
+                startForeground(lease.notificationId, buildBackgroundTaskNotification(lease))
+                isRunning = true
+                acquireWakeLock()
+            } else {
+                manager.notify(lease.notificationId, buildBackgroundTaskNotification(lease))
+            }
+            updateSummaryNotification()
+            true
+        } catch (error: Exception) {
+            if (created) {
+                activeBackgroundTaskLeases.remove(executionOwnerId)
+                backgroundTaskNotificationIds.release(executionOwnerId)
+            }
+            Log.w("ClawChat", "Unable to establish background task lease", error)
+            false
+        }
+    }
+
+    private fun updateBackgroundTaskLease(
+        executionOwnerId: String,
+        sessionId: String,
+        status: String,
+    ): Boolean {
+        if (status != "working" && status != "needs_review") return false
+        val lease = activeBackgroundTaskLeases[executionOwnerId] ?: return false
+        if (lease.sessionId != sessionId) return false
+        lease.status = status
+        getSystemService(NotificationManager::class.java)
+            .notify(lease.notificationId, buildBackgroundTaskNotification(lease))
+        updateSummaryNotification()
+        return true
+    }
+
+    private fun removeBackgroundTaskLease(
+        executionOwnerId: String,
+        sessionId: String,
+    ): Boolean {
+        val lease = activeBackgroundTaskLeases[executionOwnerId] ?: return false
+        if (lease.sessionId != sessionId) return false
+        activeBackgroundTaskLeases.remove(executionOwnerId)
+        backgroundTaskNotificationIds.release(executionOwnerId)
+        getSystemService(NotificationManager::class.java).cancel(lease.notificationId)
+        if (foregroundBackgroundTaskOwnerId == executionOwnerId) {
+            foregroundBackgroundTaskOwnerId = null
+            promoteForegroundLease()
+        }
+        updateSummaryNotification()
+        isRunning = hasActiveForegroundLeases()
+        if (!hasActiveForegroundLeases()) {
+            stopForegroundAndService()
+        }
+        return true
+    }
+
+    private fun requestBackgroundTaskLeaseInterruption(
+        executionOwnerId: String,
+        sessionId: String,
+        reasonCode: String,
+    ) {
+        callbackOwnership.current?.value?.invokeMethod(
+            "onBackgroundTaskLeaseInterrupted",
+            mapOf(
+                "taskId" to executionOwnerId,
+                "sessionId" to sessionId,
+                "reasonCode" to reasonCode,
+            ),
+        )
     }
 
     private fun showToolApproval(
@@ -1034,14 +1360,72 @@ class AgentTaskService : Service() {
     }
 
     @Suppress("DEPRECATION")
+    private fun buildBackgroundTaskNotification(
+        lease: BackgroundTaskLeaseNotification,
+    ): Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+        }
+        val openPendingIntent = PendingIntent.getActivity(
+            this,
+            lease.notificationId,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val stopIntent = Intent(this, AgentTaskService::class.java).apply {
+            action = ACTION_STOP_BACKGROUND_TASK_LEASE
+            data = Uri.parse(
+                "clawchat://background-task/stop/${Uri.encode(lease.executionOwnerId)}"
+            )
+            putExtra(EXTRA_OWNER_KIND, OWNER_KIND_BACKGROUND_TASK)
+            putExtra(EXTRA_EXECUTION_OWNER_ID, lease.executionOwnerId)
+            putExtra(EXTRA_SESSION_ID, lease.sessionId)
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this,
+            lease.notificationId + 1,
+            stopIntent,
+            PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val needsReview = lease.status == "needs_review"
+        val title = if (needsReview) "ClawChat 后台任务需要处理" else "ClawChat 后台任务正在执行"
+        val text = if (needsReview) "请在应用内查看任务状态" else "任务正在前台执行"
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, MainActivity.CHANNEL_ID)
+        } else {
+            Notification.Builder(this)
+        }
+        builder
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setContentIntent(openPendingIntent)
+            .setOngoing(!needsReview)
+            .setOnlyAlertOnce(true)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setPriority(Notification.PRIORITY_LOW)
+            .setGroup(AGENT_GROUP_KEY)
+            .addAction(R.mipmap.ic_launcher, "查看", openPendingIntent)
+            .addAction(R.mipmap.ic_launcher, "停止", stopPendingIntent)
+        return builder.build()
+    }
+
+    @Suppress("DEPRECATION")
     private fun updateSummaryNotification() {
         val manager = getSystemService(NotificationManager::class.java)
-        if (activeSessions.size <= 1) {
+        val activeCount = activeSessions.size + activeBackgroundTaskLeases.size
+        if (activeCount <= 1) {
             manager.cancel(SUMMARY_NOTIFICATION_ID)
             return
         }
-        val title = "${activeSessions.size} 个 AI 任务运行中"
-        val text = activeSessions.values.joinToString(", ") { it.sessionTitle }
+        val title = "${activeCount} 个 AI 任务运行中"
+        val agentTitles = activeSessions.values.map { it.sessionTitle }
+        val taskText = if (activeBackgroundTaskLeases.isEmpty()) {
+            emptyList()
+        } else {
+            listOf("${activeBackgroundTaskLeases.size} 个后台任务")
+        }
+        val text = (agentTitles + taskText).joinToString(", ")
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, MainActivity.CHANNEL_ID)
         } else {
@@ -1060,6 +1444,40 @@ class AgentTaskService : Service() {
             .setPriority(Notification.PRIORITY_LOW)
             .build()
         manager.notify(SUMMARY_NOTIFICATION_ID, notification)
+    }
+
+    private fun hasActiveForegroundLeases(): Boolean =
+        activeSessions.isNotEmpty() || activeBackgroundTaskLeases.isNotEmpty()
+
+    private fun promoteForegroundLease() {
+        val nextAgent = activeSessions.values.firstOrNull()
+        if (nextAgent != null) {
+            foregroundSessionId = nextAgent.sessionId
+            foregroundBackgroundTaskOwnerId = null
+            startForeground(nextAgent.notificationId, buildNotification(nextAgent))
+            return
+        }
+        val nextTask = activeBackgroundTaskLeases.values.firstOrNull()
+        if (nextTask != null) {
+            foregroundSessionId = null
+            foregroundBackgroundTaskOwnerId = nextTask.executionOwnerId
+            startForeground(nextTask.notificationId, buildBackgroundTaskNotification(nextTask))
+            return
+        }
+        foregroundSessionId = null
+        foregroundBackgroundTaskOwnerId = null
+    }
+
+    private fun stopForegroundAndService() {
+        hideOverlay()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        releaseWakeLock()
+        stopSelfNormally()
     }
 
     private fun retireBaseSession(sessionId: String) {
@@ -1131,25 +1549,19 @@ class AgentTaskService : Service() {
         if (foregroundSessionId == sessionId) {
             if (nextState != null) {
                 foregroundSessionId = nextState.sessionId
+                foregroundBackgroundTaskOwnerId = null
                 startForeground(nextState.notificationId, buildNotification(nextState))
             } else {
                 foregroundSessionId = null
+                promoteForegroundLease()
             }
         }
         manager.cancel(state.notificationId)
         updateSummaryNotification()
-        isRunning = activeSessions.isNotEmpty()
+        isRunning = hasActiveForegroundLeases()
         updateOverlay()
-        if (activeSessions.isEmpty()) {
-            hideOverlay()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-            releaseWakeLock()
-            stopSelfNormally()
+        if (!hasActiveForegroundLeases()) {
+            stopForegroundAndService()
         }
     }
 
@@ -1164,12 +1576,18 @@ class AgentTaskService : Service() {
             state.approval?.let { cancelApprovalPendingIntents(it) }
             manager.cancel(state.notificationId)
         }
+        for (lease in activeBackgroundTaskLeases.values) {
+            manager.cancel(lease.notificationId)
+        }
         manager.cancel(SUMMARY_NOTIFICATION_ID)
         activeSessions.clear()
+        activeBackgroundTaskLeases.clear()
+        backgroundTaskNotificationIds.clear()
         retiredBaseSessions.clear()
         commandOnlySessions.clear()
         pendingNotificationSessionIds.clear()
         foregroundSessionId = null
+        foregroundBackgroundTaskOwnerId = null
         overlaySessionId = null
         isRunning = false
     }

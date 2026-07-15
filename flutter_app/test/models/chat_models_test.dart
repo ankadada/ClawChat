@@ -1,10 +1,109 @@
 import 'dart:convert';
 
 import 'package:clawchat/models/chat_models.dart';
+import 'package:clawchat/models/structured_result.dart';
 import 'package:clawchat/models/workspace_import_receipt.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('structured result persists locally but is excluded from API content',
+      () {
+    const documentJson = '''{
+      "schemaVersion":1,
+      "resultId":"123e4567-e89b-42d3-a456-426614174000",
+      "blocks":[{"kind":"notice","level":"info","text":"Saved"}]
+    }''';
+    final document = StructuredResultDocument.parseJson(documentJson);
+    final session = ChatSession(
+      id: 'structured_projection',
+      messages: [
+        ChatMessage.userContent([
+          ToolResultContent(
+            toolUseId: 'present-1',
+            output: 'Structured result ready.',
+            forLlm: document.projection,
+          ),
+          StructuredResultContent(document: document),
+        ]),
+      ],
+    );
+
+    final restored = ChatSession.fromJson(session.toJson());
+    final api = restored.toApiMessages();
+
+    expect(
+        restored.messages.single.content.whereType<StructuredResultContent>(),
+        hasLength(1));
+    expect(api.single.toString(), isNot(contains('structured_result')));
+    expect(api.single.toString(), contains(document.projection));
+  });
+
+  test('malformed stored structured data becomes a safe non-actionable notice',
+      () {
+    final message = ChatMessage.fromJson({
+      'role': 'user',
+      'timestamp': DateTime.utc(2026).toIso8601String(),
+      'content': [
+        {
+          'type': 'structured_result',
+          'documentJson': '{"schemaVersion":1,"schemaVersion":1}',
+        },
+      ],
+    });
+
+    final content = message.content.single as StructuredResultContent;
+
+    expect(content.isInvalid, isTrue);
+    expect(content.actionById('save-1'), isNull);
+    expect(
+      content.projection,
+      'NOTICE [error]: Structured result could not be displayed safely.',
+    );
+  });
+
+  test('stored receipt digest must bind to its referenced action payload', () {
+    final document = StructuredResultDocument.parseJson('''{
+      "schemaVersion":1,
+      "resultId":"123e4567-e89b-42d3-a456-426614174000",
+      "blocks":[{"kind":"action_list","actions":[{"actionId":"save-1","label":"Save","kind":"save_to_memory","payload":{"fact":"expected"}}]}]
+    }''');
+    final action =
+        (document.blocks.single as StructuredActionListBlock).actions.single;
+    final receipt = StructuredActionReceipt(
+      schemaVersion: 1,
+      receiptId: '123e4567-e89b-42d3-a456-426614174001',
+      operationId: '123e4567-e89b-42d3-a456-426614174002',
+      sourceKind: 'structured_result',
+      resultId: document.resultId,
+      actionId: action.actionId,
+      actionKind: action.kind,
+      toolName: 'memory_write',
+      canonicalInputDigest: structuredActionInputDigest(action),
+      createdAt: DateTime.utc(2026, 7, 15),
+      updatedAt: DateTime.utc(2026, 7, 15, 0, 0, 1),
+      hardDeny: 'not_denied',
+      skillDeny: 'not_applicable',
+      approval: 'approved',
+      state: 'resultPersisted',
+      outcome: 'success',
+      outcomeKnown: true,
+      safeSummary: 'Saved to local memory.',
+    );
+    final session = ChatSession(
+      id: 'receipt_digest_binding',
+      messages: [
+        ChatMessage.userContent([StructuredResultContent(document: document)]),
+      ],
+      structuredActionReceipts: [receipt],
+    );
+    final json = session.toJson();
+    final receipts = json['structuredActionReceipts'] as List<dynamic>;
+    (receipts.single as Map<String, dynamic>)['canonicalInputDigest'] =
+        List.filled(64, '0').join();
+
+    expect(() => ChatSession.fromJson(json), throwsFormatException);
+  });
+
   test('pending workspace import receipt survives durable session JSON', () {
     final receipt = WorkspaceImportReceipt(
       operationId: 'a' * 32,

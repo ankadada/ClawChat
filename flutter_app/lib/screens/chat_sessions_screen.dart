@@ -237,6 +237,11 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           buffer.writeln('```');
           buffer.writeln(_truncateToolOutput(output));
           buffer.writeln('```');
+        case StructuredResultContent(:final projection):
+          buffer.writeln('**Structured result**:');
+          buffer.writeln('```text');
+          buffer.writeln(projection);
+          buffer.writeln('```');
       }
     }
     return buffer.toString();

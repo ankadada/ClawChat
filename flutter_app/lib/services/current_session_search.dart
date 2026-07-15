@@ -64,6 +64,8 @@ class CurrentSessionSearch {
           }
         case ImageContent(:final filename, :final mediaType):
           parts.add(_safeToolText(filename ?? mediaType));
+        case StructuredResultContent(:final projection):
+          parts.add(_safeToolText(projection));
       }
     }
     return parts.where((part) => part.trim().isNotEmpty).join('\n');

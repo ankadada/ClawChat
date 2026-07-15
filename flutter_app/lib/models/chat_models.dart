@@ -1,5 +1,6 @@
 import 'package:uuid/uuid.dart';
 
+import 'structured_result.dart';
 import 'workspace_import_receipt.dart';
 
 class ContextSummary {
@@ -601,6 +602,7 @@ class ChatSession {
   ContextSummary? contextSummary;
   AgentRunRecoveryMarker? inFlightAgentRun;
   final List<WorkspaceImportReceipt> pendingWorkspaceImports;
+  final List<StructuredActionReceipt> structuredActionReceipts;
 
   ChatSession({
     required this.id,
@@ -618,10 +620,12 @@ class ChatSession {
     this.contextSummary,
     this.inFlightAgentRun,
     List<WorkspaceImportReceipt>? pendingWorkspaceImports,
+    List<StructuredActionReceipt>? structuredActionReceipts,
   })  : createdAt = createdAt ?? DateTime.now(),
         updatedAt = updatedAt ?? DateTime.now(),
         messages = messages ?? [],
-        pendingWorkspaceImports = pendingWorkspaceImports ?? [];
+        pendingWorkspaceImports = pendingWorkspaceImports ?? [],
+        structuredActionReceipts = structuredActionReceipts ?? [];
 
   void autoTitle() {
     final firstUserMsg = messages.where((m) => m.role == 'user').firstOrNull;
@@ -637,6 +641,9 @@ class ChatSession {
     return messages
         .where((m) => !m.isSystemNotice && !m.hasAssistantError)
         .map((m) => m.toApiJson())
+        .where((m) =>
+            m['content'] != null &&
+            !(m['content'] is List && (m['content'] as List).isEmpty))
         .toList();
   }
 
@@ -661,11 +668,24 @@ class ChatSession {
           'pendingWorkspaceImports': pendingWorkspaceImports
               .map((receipt) => receipt.toJson())
               .toList(),
+        if (structuredActionReceipts.isNotEmpty)
+          'structuredActionReceipts': structuredActionReceipts
+              .map((receipt) => receipt.toJson())
+              .toList(),
       };
 
   factory ChatSession.fromJson(Map<String, dynamic> json) {
     final rawSummary = json['contextSummary'];
     final rawInFlightAgentRun = json['inFlightAgentRun'];
+    final messages = (json['messages'] as List)
+        .map((message) => ChatMessage.fromJson(message))
+        .toList();
+    final parsedStructuredActionReceipts =
+        _parseStructuredActionReceipts(json['structuredActionReceipts']);
+    _validateStructuredResultOwnership(
+      messages,
+      parsedStructuredActionReceipts,
+    );
     return ChatSession(
       id: _sanitizeId(json['id']?.toString()),
       title: json['title'] as String? ?? '新对话',
@@ -673,9 +693,7 @@ class ChatSession {
           DateTime.now(),
       updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? '') ??
           DateTime.now(),
-      messages: (json['messages'] as List)
-          .map((m) => ChatMessage.fromJson(m))
-          .toList(),
+      messages: messages,
       modelOverride: json['modelOverride'] as String?,
       baseUrlOverride: json['baseUrlOverride'] as String?,
       apiFormatOverride: json['apiFormatOverride'] as String?,
@@ -694,6 +712,7 @@ class ChatSession {
           : null,
       pendingWorkspaceImports:
           _parsePendingWorkspaceImports(json['pendingWorkspaceImports']),
+      structuredActionReceipts: parsedStructuredActionReceipts,
     );
   }
 
@@ -723,6 +742,7 @@ class ChatSession {
     ContextSummary? contextSummary,
     AgentRunRecoveryMarker? inFlightAgentRun,
     List<WorkspaceImportReceipt>? pendingWorkspaceImports,
+    List<StructuredActionReceipt>? structuredActionReceipts,
     bool clearFolder = false,
     bool clearModelGroup = false,
     bool clearRemoteAgentConnector = false,
@@ -752,6 +772,8 @@ class ChatSession {
           : (inFlightAgentRun ?? this.inFlightAgentRun),
       pendingWorkspaceImports:
           pendingWorkspaceImports ?? this.pendingWorkspaceImports,
+      structuredActionReceipts:
+          structuredActionReceipts ?? this.structuredActionReceipts,
     );
   }
 
@@ -779,6 +801,54 @@ class ChatSession {
       receipts.add(receipt);
     }
     return receipts;
+  }
+
+  static List<StructuredActionReceipt> _parseStructuredActionReceipts(
+    Object? raw,
+  ) {
+    if (raw == null) return [];
+    if (raw is! List || raw.length > 256) {
+      throw const FormatException('Invalid structured action receipts.');
+    }
+    final receipts = <StructuredActionReceipt>[];
+    final operationIds = <String>{};
+    for (final item in raw) {
+      if (item is! Map ||
+          !operationIds.add(item['operationId']?.toString() ?? '')) {
+        throw const FormatException('Invalid structured action receipt.');
+      }
+      final receipt = StructuredActionReceipt.fromJson(
+        Map<String, dynamic>.from(item),
+      );
+      receipts.add(receipt.reconcileAfterRestart());
+    }
+    return receipts;
+  }
+
+  static void _validateStructuredResultOwnership(
+    List<ChatMessage> messages,
+    List<StructuredActionReceipt> receipts,
+  ) {
+    final results = <String, StructuredResultContent>{};
+    for (final message in messages) {
+      for (final content in message.content) {
+        if (content is! StructuredResultContent || content.isInvalid) continue;
+        if (results.containsKey(content.document.resultId)) {
+          throw const FormatException('Duplicate structured result ID.');
+        }
+        results[content.document.resultId] = content;
+      }
+    }
+    for (final receipt in receipts) {
+      final result = results[receipt.resultId];
+      final action = result?.actionById(receipt.actionId);
+      if (action == null ||
+          action.kind != receipt.actionKind ||
+          structuredActionInputDigest(action) != receipt.canonicalInputDigest) {
+        throw const FormatException(
+            'Structured receipt does not match result.');
+      }
+    }
   }
 }
 
@@ -1007,9 +1077,12 @@ class ChatMessage {
             .where((reasoning) => reasoning.isNotEmpty)
             .join('\n')
         : '';
+    final apiContent = content
+        .where((item) => item is! StructuredResultContent)
+        .toList(growable: false);
     final apiJson = {
       'role': role,
-      'content': content.map((c) => c.toApiJson()).toList(),
+      'content': apiContent.map((c) => c.toApiJson()).toList(),
     };
     if (reasoningContent.isNotEmpty) {
       apiJson['reasoning_content'] = reasoningContent;
@@ -1071,6 +1144,8 @@ class ChatMessage {
                 );
               case 'tool_result':
                 return ToolResultContent.fromToolResultJson(c);
+              case 'structured_result':
+                return StructuredResultContent.fromJson(c);
               default:
                 return TextContent(c.toString());
             }
@@ -1256,6 +1331,8 @@ class AssistantErrorMetadata {
 }
 
 sealed class MessageContent {
+  const MessageContent();
+
   Map<String, dynamic> toApiJson();
   Map<String, dynamic> toJson();
 }
@@ -1418,6 +1495,93 @@ class ToolResultContent extends MessageContent {
         if (payload.metadata.isNotEmpty) 'metadata': payload.metadata,
         'is_error': isError,
       };
+}
+
+class StructuredResultContent extends MessageContent {
+  final StructuredResultDocument document;
+  final bool isInvalid;
+  final String? invalidReasonCode;
+  final StructuredResultSkillProvenance? skillProvenance;
+  final String? toolUseId;
+
+  const StructuredResultContent({
+    required this.document,
+    this.isInvalid = false,
+    this.invalidReasonCode,
+    this.skillProvenance,
+    this.toolUseId,
+  });
+
+  factory StructuredResultContent.invalid([String? reasonCode]) {
+    return StructuredResultContent(
+      document: StructuredResultDocument.invalid(),
+      isInvalid: true,
+      invalidReasonCode: reasonCode,
+    );
+  }
+
+  factory StructuredResultContent.fromJson(Map<dynamic, dynamic> json) {
+    try {
+      final raw = json['documentJson'];
+      if (raw is! String) {
+        return StructuredResultContent.invalid('missing_document');
+      }
+      return StructuredResultContent(
+        document: StructuredResultDocument.parseJson(raw),
+        skillProvenance: json['skillProvenance'] == null
+            ? null
+            : StructuredResultSkillProvenance.fromJson(
+                json['skillProvenance'],
+              ),
+        toolUseId: _structuredToolUseId(json['toolUseId']),
+      );
+    } on StructuredResultParseException catch (error) {
+      return StructuredResultContent.invalid(error.reasonCode);
+    } on Object {
+      return StructuredResultContent.invalid('invalid_document');
+    }
+  }
+
+  String get projection => document.projection;
+
+  StructuredResultAction? actionById(String actionId) {
+    for (final block in document.blocks) {
+      if (block case StructuredActionListBlock(:final actions)) {
+        for (final action in actions) {
+          if (action.actionId == actionId) return action;
+        }
+      }
+    }
+    return null;
+  }
+
+  @override
+  Map<String, dynamic> toApiJson() => const <String, dynamic>{};
+
+  @override
+  Map<String, dynamic> toJson() => {
+        'type': 'structured_result',
+        'schemaVersion': 1,
+        if (!isInvalid) 'documentJson': document.canonicalJson,
+        if (skillProvenance != null)
+          'skillProvenance': skillProvenance!.toJson(),
+        if (toolUseId != null) 'toolUseId': toolUseId,
+        if (isInvalid) ...{
+          'invalid': true,
+          if (invalidReasonCode != null) 'reasonCode': invalidReasonCode,
+        },
+      };
+
+  static String? _structuredToolUseId(Object? raw) {
+    if (raw == null) return null;
+    if (raw is! String ||
+        raw.isEmpty ||
+        raw.length > 160 ||
+        !RegExp(r'^[A-Za-z0-9._:-]+$').hasMatch(raw)) {
+      throw const FormatException('invalid_structured_tool_use_id');
+    }
+    return raw;
+  }
 }
 
 class ToolResultPayload {

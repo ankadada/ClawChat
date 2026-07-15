@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.8.0 — Safe Background Tasks
+
+### Durable local tasks
+
+- **Preview-first task state** — Adds bounded protected local task records, explicit finite task definitions, durable receipts, recovery-required/unknown-outcome states, and no automatic retry or resume.
+- **Owner-scoped foreground lease** — Native Android only holds a task owner lease and privacy-safe notification; request-level readiness, interruption fencing, collision-safe notification IDs, and stop isolation prevent effects without the active lease.
+- **Two-confirmation external flow** — External work requires plan approval plus just-in-time confirmation with task-bound target evidence; task center recovery exposes inspect/discard only and never dispatches from notifications.
+
+### Compatibility
+
+- Includes the v2.7 fixed-schema result/action UI and all v2.6 Skill discovery, consent, import-inspection, authorization, and foldable-safety gates.
+
+## v2.7.0 — Fixed Schema Results and Optional Rich Display
+
+### Results and actions
+
+- **Strict structured results** — Accepts only the bounded v1 document schema with deterministic plain-text projection, API chronology preservation, invalid-data fallback, and durable local presentation.
+- **Native action lifecycle** — Keeps approval, hard-deny, skill authorization, fresh operation IDs, receipt persistence, restart reconciliation, and effect execution in native Flutter; the only initial action is the exact app-owned local memory write.
+- **Accessible result UI** — Provides four fixed block renderers, 48dp semantics-aware controls, 200% text support, and compact/book/tabletop/IME geometry protection.
+
+### Optional rich surface
+
+- **MCP App-style supplement** — A host-owned fixed local WebView renderer can be explicitly expanded beside the native card for bounded detail display. It accepts no arbitrary HTML, URL, tool, secret, or payload; actions return only result/action IDs to the native policy and receipt path, and geometry changes collapse it safely.
+
 ## v2.6.2 — xd-skill Discovery and Consent Repair
 
 ### Skill Management

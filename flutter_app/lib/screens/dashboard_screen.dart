@@ -6,11 +6,14 @@ import 'package:provider/provider.dart';
 
 import '../constants.dart';
 import '../layout/foldable_layout.dart';
+import '../models/background_task.dart';
 import '../providers/chat_provider.dart';
 import '../services/native_bridge.dart';
 import '../services/skill_service.dart';
 import '../services/update_service.dart';
 import '../services/update_transaction.dart';
+import '../services/background_task_center_controller.dart';
+import 'background_task_center_screen.dart';
 import 'settings_screen.dart';
 import 'agent_run_center_screen.dart';
 
@@ -187,6 +190,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
       );
 
   Widget _statusList(SystemHealthSnapshot status) {
+    final backgroundTasks =
+        context.watch<BackgroundTaskCenterController?>()?.tasks ??
+            const <BackgroundTaskRecord>[];
     final provider = context.watch<ChatProvider>();
     final active = provider.activeAgentSessionIds.length;
     final localStorageKind = provider.safeMode
@@ -254,8 +260,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
           onAction: () => _openSettings(SettingsDestination.updatesExtensions),
         ),
         _healthTile(
+          title: '后台任务',
+          detail: _backgroundTaskDetail(context),
+          kind: backgroundTasks.any(
+            (task) =>
+                task.state == BackgroundTaskState.executing ||
+                task.state == BackgroundTaskState.awaitingExternalApproval ||
+                task.state == BackgroundTaskState.recoveryRequired ||
+                task.state == BackgroundTaskState.unknownOutcome,
+          )
+              ? SystemHealthKind.actionNeeded
+              : SystemHealthKind.ready,
+          action: '任务中心',
+          onAction: () => Navigator.of(context).push(
+            MaterialPageRoute(
+                builder: (_) => const BackgroundTaskCenterScreen()),
+          ),
+        ),
+        _healthTile(
           title: 'Agent 任务',
-          detail: active == 0 ? '没有活动或后台任务' : '$active 个任务正在运行',
+          detail: active == 0 ? '没有活动 Agent 任务' : '$active 个 Agent 任务正在运行',
           kind: active == 0
               ? SystemHealthKind.ready
               : SystemHealthKind.actionNeeded,
@@ -273,6 +297,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ),
       ],
     );
+  }
+
+  String _backgroundTaskDetail(BuildContext context) {
+    final tasks = context.watch<BackgroundTaskCenterController?>()?.tasks ??
+        const <BackgroundTaskRecord>[];
+    if (tasks.isEmpty) return '没有保存的后台任务';
+    final needsReview = tasks.where(
+      (task) =>
+          task.state == BackgroundTaskState.awaitingExternalApproval ||
+          task.state == BackgroundTaskState.recoveryRequired ||
+          task.state == BackgroundTaskState.unknownOutcome,
+    );
+    if (needsReview.isNotEmpty) return '${needsReview.length} 个任务需要检查';
+    return '${tasks.length} 个本地任务';
   }
 
   Widget _healthTile({

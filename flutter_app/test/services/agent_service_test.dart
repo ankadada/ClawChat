@@ -10,11 +10,159 @@ import 'package:clawchat/services/skill_service.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:clawchat/services/tools/tool_registry.dart';
 import 'package:clawchat/services/tools/load_skill_tool.dart';
+import 'package:clawchat/services/tools/present_structured_result_tool.dart';
 import 'package:clawchat/services/tools/read_file_tool.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('AgentService tool safety', () {
+    test('registers the fixed one-field structured ingress schema', () {
+      final definition = ToolRegistry.withDefaults()
+          .getToolDefinitions()
+          .singleWhere((tool) => tool.name == 'present_structured_result');
+
+      expect(definition.inputSchema['required'], ['documentJson']);
+      expect(definition.inputSchema['additionalProperties'], isFalse);
+      expect(
+        (definition.inputSchema['properties'] as Map).keys,
+        ['documentJson'],
+      );
+    });
+
+    test('strict structured ingress awaits its typed persistence sink',
+        () async {
+      const documentJson = '''{
+        "schemaVersion":1,
+        "resultId":"123e4567-e89b-42d3-a456-426614174000",
+        "blocks":[{"kind":"notice","level":"info","text":"Imported safely"}]
+      }''';
+      final tools = ToolRegistry()
+        ..register(PresentStructuredResultTool(), risk: ToolRisk.safe);
+      final deliveries = <StructuredResultDelivery>[];
+      final lifecycles = <ToolAttemptLifecycle>[];
+      var sinkCompleted = false;
+      final service = AgentService(
+        llm: _ToolCallLlmService(
+          _config,
+          toolName: 'present_structured_result',
+          arguments: const {'documentJson': documentJson},
+        ),
+        tools: tools,
+        systemPrompt: 'system',
+        onStructuredResultDelivery: (delivery) async {
+          deliveries.add(delivery);
+          sinkCompleted = true;
+          return true;
+        },
+        onToolAttemptUpdate: (update) {
+          lifecycles.add(update.lifecycle);
+        },
+      );
+      final messages = <Map<String, dynamic>>[];
+      final events = <AgentEvent>[];
+      await for (final event in service.runAgentLoop(messages)) {
+        events.add(event);
+      }
+
+      expect(
+        deliveries,
+        hasLength(1),
+        reason: events
+            .whereType<AgentToolDone>()
+            .map((event) => event.output)
+            .join(' | '),
+      );
+      expect(deliveries.single.presentations.single.document.projection,
+          'NOTICE [info]: Imported safely');
+      expect(deliveries.single.toolResults.single['for_llm'],
+          'NOTICE [info]: Imported safely');
+      expect(events.whereType<AgentToolDone>().single.isError, isFalse);
+      expect(sinkCompleted, isTrue);
+      expect(
+          lifecycles,
+          containsAllInOrder([
+            ToolAttemptLifecycle.proposed,
+            ToolAttemptLifecycle.approvedNotStarted,
+            ToolAttemptLifecycle.started,
+            ToolAttemptLifecycle.completed,
+            ToolAttemptLifecycle.resultPersisted,
+          ]));
+      final toolResult = (messages[1]['content'] as List).single as Map;
+      expect(toolResult['for_llm'], 'NOTICE [info]: Imported safely');
+      expect(
+        messages
+            .expand((message) => message['content'] is List
+                ? message['content'] as List
+                : const <Object?>[])
+            .whereType<Map>()
+            .map((content) => content['type']),
+        isNot(contains('structured_result')),
+      );
+    });
+
+    test('structured ingress rejects repaired outer aliases without a sink',
+        () async {
+      final tools = ToolRegistry()
+        ..register(PresentStructuredResultTool(), risk: ToolRisk.safe);
+      var sinkCalls = 0;
+      final service = AgentService(
+        llm: _ToolCallLlmService(
+          _config,
+          toolName: 'present_structured_result',
+          arguments: const {'document_json': '{}'},
+        ),
+        tools: tools,
+        systemPrompt: 'system',
+        onStructuredResultDelivery: (_) async {
+          sinkCalls += 1;
+          return true;
+        },
+      );
+      final messages = <Map<String, dynamic>>[];
+      final events = <AgentEvent>[];
+      await for (final event in service.runAgentLoop(messages)) {
+        events.add(event);
+      }
+
+      expect(sinkCalls, 0);
+      expect(events.whereType<AgentToolDone>().single.isError, isTrue);
+      final toolResult = (messages[1]['content'] as List).single as Map;
+      expect(toolResult['is_error'], isTrue);
+      expect(toolResult.toString(), contains('invalid_structured_result'));
+    });
+
+    test('structured ingress turns a failed awaited sink into a tool error',
+        () async {
+      const documentJson = '''{
+        "schemaVersion":1,
+        "resultId":"123e4567-e89b-42d3-a456-426614174000",
+        "blocks":[{"kind":"notice","level":"info","text":"Saved"}]
+      }''';
+      final tools = ToolRegistry()
+        ..register(PresentStructuredResultTool(), risk: ToolRisk.safe);
+      final service = AgentService(
+        llm: _ToolCallLlmService(
+          _config,
+          toolName: 'present_structured_result',
+          arguments: const {'documentJson': documentJson},
+        ),
+        tools: tools,
+        systemPrompt: 'system',
+        onStructuredResultDelivery: (_) async => false,
+      );
+      final messages = <Map<String, dynamic>>[];
+      final events = <AgentEvent>[];
+      await for (final event in service.runAgentLoop(messages)) {
+        events.add(event);
+      }
+
+      expect(events.whereType<AgentToolDone>().single.isError, isTrue);
+      final toolResult = (messages[1]['content'] as List).single as Map;
+      expect(toolResult['is_error'], isTrue);
+      expect(toolResult.toString(), contains('persistence unavailable'));
+      expect(toolResult.toString(), isNot(contains('NOTICE [info]')));
+    });
+
     test('forwards reasoning deltas separately from visible text', () async {
       final service = AgentService(
         llm: _ReasoningStreamLlmService(_config),

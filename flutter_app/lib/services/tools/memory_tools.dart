@@ -36,6 +36,20 @@ class MemoryGetTool extends Tool {
 }
 
 class MemoryWriteTool extends Tool {
+  static const structuredActionInputSchema = <String, dynamic>{
+    'type': 'object',
+    'additionalProperties': false,
+    'properties': {
+      'fact': {
+        'type': 'string',
+        'description': 'The concise fact or preference to remember.',
+        'minLength': 1,
+        'maxLength': 2000,
+      },
+    },
+    'required': ['fact'],
+  };
+
   @override
   String get name => 'memory_write';
 
@@ -44,16 +58,44 @@ class MemoryWriteTool extends Tool {
       'Request adding a durable user memory; writes an audit entry when executed. The app may ask for confirmation depending on the tool approval policy.';
 
   @override
-  Map<String, dynamic> get inputSchema => const {
-        'type': 'object',
-        'properties': {
-          'fact': {
-            'type': 'string',
-            'description': 'The concise fact or preference to remember.',
-          },
-        },
-        'required': ['fact'],
-      };
+  Map<String, dynamic> get inputSchema => structuredActionInputSchema;
+
+  /// The structured-action registry checks this exact, app-owned shape before
+  /// dispatching.  A same-named plugin/tool cannot quietly widen the v2.7
+  /// `save_to_memory` input surface.
+  static bool isStructuredActionCompatibleSchema(Map<String, dynamic> schema) {
+    if (schema['type'] != 'object' ||
+        schema['additionalProperties'] != false ||
+        schema['required'] is! List ||
+        (schema['required'] as List).length != 1 ||
+        (schema['required'] as List).single != 'fact') {
+      return false;
+    }
+    final properties = schema['properties'];
+    if (properties is! Map || properties.length != 1) return false;
+    final fact = properties['fact'];
+    return fact is Map &&
+        fact['type'] == 'string' &&
+        fact['minLength'] == 1 &&
+        fact['maxLength'] == 2000;
+  }
+
+  /// The legacy adapter returns JSON, rather than throwing, for known memory
+  /// outcomes.  Treat malformed/disabled results as failure; a duplicate fact
+  /// is a known successful idempotent outcome and may be safely acknowledged.
+  static bool isKnownSuccessfulOutput(String output) {
+    try {
+      final value = jsonDecode(output);
+      if (value is! Map || value['ok'] != true) return false;
+      return value['added'] is bool &&
+          value['index'] is int &&
+          (value['index'] as int) >= 0 &&
+          value['count'] is int &&
+          (value['count'] as int) > 0;
+    } on FormatException {
+      return false;
+    }
+  }
 
   @override
   Future<String> execute(Map<String, dynamic> input) async {
@@ -81,7 +123,9 @@ class MemoryWriteTool extends Tool {
       sessionId: sessionId,
     );
     return jsonEncode({
-      'ok': result.added,
+      // A duplicate means this exact local memory is already durable; it is a
+      // known idempotent success for a user-initiated structured retry.
+      'ok': result.added || result.index >= 0,
       'added': result.added,
       'truncated': result.truncated,
       'index': result.index,

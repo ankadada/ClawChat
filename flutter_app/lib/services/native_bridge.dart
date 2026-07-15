@@ -46,6 +46,7 @@ typedef ApkInstallerHandoff = Future<bool> Function(
 );
 
 class NativeBridge {
+  static const _backgroundTaskOwnerKind = 'backgroundTask';
   static const _channel = MethodChannel(AppConstants.channelName);
   static const _agentCallbackChannel =
       MethodChannel('${AppConstants.channelName}/agent_callbacks');
@@ -57,6 +58,11 @@ class NativeBridge {
     required String approvalId,
     required bool approved,
   })? _toolApprovalDecisionHandler;
+  static Future<bool> Function({
+    required String taskId,
+    required String sessionId,
+    required String reasonCode,
+  })? _backgroundTaskLeaseInterruptedHandler;
   static void Function(String sessionId)? _navigateToSessionHandler;
   static Future<void> Function(SharedContent content)? _shareIntentHandler;
   static bool _agentCallbackInitialized = false;
@@ -129,6 +135,17 @@ class NativeBridge {
     _ensureAgentCallbackHandler();
   }
 
+  static void setBackgroundTaskLeaseInterruptedHandler(
+    Future<bool> Function({
+      required String taskId,
+      required String sessionId,
+      required String reasonCode,
+    })? handler,
+  ) {
+    _backgroundTaskLeaseInterruptedHandler = handler;
+    _ensureAgentCallbackHandler();
+  }
+
   static void setNavigateToSessionHandler(
     void Function(String sessionId)? handler,
   ) {
@@ -170,6 +187,27 @@ class NativeBridge {
           sessionId: sessionId,
           approvalId: approvalId,
           approved: approved,
+        );
+      } else if (call.method == 'onBackgroundTaskLeaseInterrupted') {
+        final args = call.arguments;
+        if (args is! Map) return false;
+        final taskId = args['taskId'] as String?;
+        final sessionId = args['sessionId'] as String?;
+        final reasonCode = args['reasonCode'] as String?;
+        final handler = _backgroundTaskLeaseInterruptedHandler;
+        if (taskId == null ||
+            taskId.isEmpty ||
+            sessionId == null ||
+            sessionId.isEmpty ||
+            reasonCode == null ||
+            reasonCode.isEmpty ||
+            handler == null) {
+          return false;
+        }
+        return handler(
+          taskId: taskId,
+          sessionId: sessionId,
+          reasonCode: reasonCode,
         );
       } else if (call.method == 'navigateToSession') {
         final args = call.arguments;
@@ -593,6 +631,50 @@ class NativeBridge {
           'previewText': previewText,
           if (toolName != null) 'toolName': toolName,
           'overlayVisible': overlayVisible,
+        }) ??
+        false;
+  }
+
+  /// Starts a native foreground-service lease for an already-authorized Dart
+  /// task. The bridge intentionally carries no preview, payload, target,
+  /// receipt, or execution command.
+  static Future<bool> startBackgroundTaskLease({
+    required String taskId,
+    required String sessionId,
+  }) async {
+    return await _channel.invokeMethod<bool>('startBackgroundTaskLease', {
+          'taskId': taskId,
+          'executionOwnerId': taskId,
+          'sessionId': sessionId,
+          'ownerKind': _backgroundTaskOwnerKind,
+        }) ??
+        false;
+  }
+
+  static Future<bool> updateBackgroundTaskLease({
+    required String taskId,
+    required String sessionId,
+    required String status,
+  }) async {
+    return await _channel.invokeMethod<bool>('updateBackgroundTaskLease', {
+          'taskId': taskId,
+          'executionOwnerId': taskId,
+          'sessionId': sessionId,
+          'status': status,
+          'ownerKind': _backgroundTaskOwnerKind,
+        }) ??
+        false;
+  }
+
+  static Future<bool> stopBackgroundTaskLease({
+    required String taskId,
+    required String sessionId,
+  }) async {
+    return await _channel.invokeMethod<bool>('stopBackgroundTaskLease', {
+          'taskId': taskId,
+          'executionOwnerId': taskId,
+          'sessionId': sessionId,
+          'ownerKind': _backgroundTaskOwnerKind,
         }) ??
         false;
   }

@@ -328,8 +328,7 @@ void main() {
     await fixture.provider.setCurrentSessionRemoteAgentEnabled(true);
 
     final send = fixture.provider.sendMessage('cancel this request');
-    await _waitUntil(
-        () => fixture.provider.agentStatus == AgentStatus.thinking);
+    await fixture.connector.started.future.timeout(const Duration(seconds: 2));
     await fixture.provider.cancelAgent(savePartial: true);
     await send;
 

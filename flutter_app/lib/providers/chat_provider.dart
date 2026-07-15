@@ -10,6 +10,7 @@ import '../models/chat_models.dart';
 import '../models/model_capabilities.dart';
 import '../models/provider_profile.dart';
 import '../models/remote_agent_connector.dart';
+import '../models/structured_result.dart';
 import '../models/workspace_import_receipt.dart';
 import '../services/agent_service.dart';
 import '../services/attachment_budget.dart';
@@ -24,8 +25,10 @@ import '../services/runtime_debug_events.dart';
 import '../services/skill_capability_policy.dart';
 import '../services/session_storage.dart';
 import '../services/startup_restore_guard.dart';
+import '../services/structured_action_registry.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
+import '../services/tools/memory_tools.dart';
 import '../services/tool_call_expansion_state.dart';
 import '../services/preferences_service.dart';
 import '../services/remote_agent_configuration_service.dart';
@@ -480,6 +483,9 @@ class ChatProvider extends ChangeNotifier {
   AgentState? _pendingApprovalState;
   Completer<bool>? _approvalCompleter;
   _ToolApprovalDecisionSource? _approvalDecisionSource;
+  final Map<String, _StructuredActionAttempt> _activeStructuredActions = {};
+  final Map<String, Future<void>> _structuredActionSaveTails = {};
+  final Set<String> _structuredActionCommitSessions = <String>{};
   bool _appInBackground = false;
 
   static const _agentServiceThinkingText = 'AI 正在思考...';
@@ -1843,6 +1849,697 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Human-readable, local-only reason why a fixed structured action cannot be
+  /// started from the current card.  The renderer uses this to disable a card
+  /// before it can allocate an operation that has no durable receipt capacity.
+  String? structuredActionUnavailableReason({
+    required String resultId,
+    required String actionId,
+  }) {
+    final session = currentSession;
+    if (_disposed || session == null) return 'Action is unavailable.';
+    if (isSessionSending(session.id)) {
+      return 'Wait for the current response before starting this action.';
+    }
+    final content = _structuredResultForAction(session, resultId, actionId);
+    if (content == null || content.isInvalid) {
+      return 'Action data is unavailable.';
+    }
+    if (pendingApproval != null) {
+      return 'Finish the current tool approval before starting another action.';
+    }
+    if (session.structuredActionReceipts.length >= 256) {
+      return 'Action history is full. Start a new session before saving more actions.';
+    }
+    final action = content.actionById(actionId);
+    if (action == null ||
+        StructuredActionRegistry.resolve(
+              action,
+              tools: _tools,
+              sessionId: session.id,
+            ) ==
+            null) {
+      return 'This action is unavailable in the current session.';
+    }
+    return null;
+  }
+
+  /// Executes one app-owned structured action.  The UI supplies only stable
+  /// identifiers; the payload is read again from the current persisted card so
+  /// a model result or Flutter callback cannot invoke arbitrary tools.
+  Future<void> executeStructuredAction({
+    required String resultId,
+    required String actionId,
+  }) async {
+    if (_disposed) return;
+    await _ensurePrefs();
+    if (_disposed) return;
+
+    final session = currentSession;
+    if (pendingApproval != null) return;
+    if (session == null ||
+        isSessionSending(session.id) ||
+        _deletingSessionIds.contains(session.id) ||
+        !_storage.isSessionGenerationCurrent(
+          session.id,
+          _storage.sessionGeneration(session.id),
+        )) {
+      return;
+    }
+    final content = _structuredResultForAction(session, resultId, actionId);
+    if (content == null || content.isInvalid) return;
+    final action = content.actionById(actionId);
+    if (action == null) return;
+    final resolution = StructuredActionRegistry.resolve(
+      action,
+      tools: _tools,
+      sessionId: session.id,
+    );
+    if (resolution == null) return;
+    if (session.structuredActionReceipts.length >= 256) {
+      notifyListeners();
+      return;
+    }
+
+    final key = _structuredActionKey(session.id, resultId, actionId);
+    if (_activeStructuredActions.containsKey(key)) return;
+    final attempt = _StructuredActionAttempt(
+      key: key,
+      session: session,
+      storageGeneration: _storage.sessionGeneration(session.id),
+      resultId: resultId,
+      actionId: actionId,
+      resolution: resolution,
+      skillProvenance: content.skillProvenance,
+      operationId: _uuid.v4(),
+      receiptId: _uuid.v4(),
+    );
+    _activeStructuredActions[key] = attempt;
+    try {
+      await _runStructuredAction(attempt);
+    } finally {
+      if (identical(_activeStructuredActions[key], attempt)) {
+        _activeStructuredActions.remove(key);
+      }
+    }
+  }
+
+  StructuredResultContent? _structuredResultForAction(
+    ChatSession session,
+    String resultId,
+    String actionId,
+  ) {
+    for (final message in session.messages) {
+      if (message.role != 'user') continue;
+      for (final content in message.content) {
+        if (content is! StructuredResultContent ||
+            content.isInvalid ||
+            content.document.resultId != resultId ||
+            content.toolUseId == null) {
+          continue;
+        }
+        final matchingResult = message.toolResults.any((toolResult) {
+          final metadata = toolResult.metadata;
+          return !toolResult.isError &&
+              toolResult.toolUseId == content.toolUseId &&
+              metadata['toolName'] == StructuredResultIngress.toolName &&
+              metadata['resultId'] == resultId &&
+              metadata['schemaVersion'] == content.document.schemaVersion;
+        });
+        if (matchingResult && content.actionById(actionId) != null) {
+          return content;
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<void> _runStructuredAction(_StructuredActionAttempt attempt) async {
+    var receipt = _initialStructuredActionReceipt(attempt);
+    if (!await _persistStructuredActionReceipt(attempt, receipt)) return;
+    if (!_isStructuredActionCurrent(attempt)) {
+      await _persistStructuredActionStale(attempt, receipt);
+      return;
+    }
+
+    final request = ToolApprovalRequest(
+      toolName: attempt.resolution.toolName,
+      arguments: Map<String, dynamic>.from(attempt.resolution.input),
+      risk: attempt.resolution.risk,
+      operationId: attempt.operationId,
+    );
+    final hardDeny =
+        _currentStructuredActionToolPolicy(attempt).denyFor(request);
+    if (hardDeny != null) {
+      await _persistStructuredActionTerminal(
+        attempt,
+        receipt,
+        hardDeny: 'denied',
+        skillDeny: 'not_checked',
+        approval: 'not_requested',
+        outcome: 'denied',
+        summary: 'Local memory action was blocked by safety settings.',
+      );
+      return;
+    }
+    receipt = receipt.copyWith(
+      updatedAt: DateTime.now(),
+      hardDeny: 'not_denied',
+    );
+    if (!await _persistStructuredActionReceipt(attempt, receipt)) return;
+
+    final skillDeny = await _skillDenyForStructuredAction(attempt, request);
+    if (skillDeny != null) {
+      await _persistStructuredActionTerminal(
+        attempt,
+        receipt,
+        hardDeny: receipt.hardDeny,
+        skillDeny: 'denied',
+        approval: 'not_requested',
+        outcome: 'denied',
+        summary: 'Local memory action is unavailable for this skill.',
+      );
+      return;
+    }
+    receipt = receipt.copyWith(
+      updatedAt: DateTime.now(),
+      skillDeny:
+          attempt.skillProvenance == null ? 'not_applicable' : 'not_denied',
+    );
+    if (!await _persistStructuredActionReceipt(attempt, receipt)) return;
+    if (!_isStructuredActionCurrent(attempt)) {
+      await _persistStructuredActionStale(attempt, receipt);
+      return;
+    }
+
+    if (_currentStructuredActionToolPolicy(attempt)
+        .requiresApproval(request.risk)) {
+      receipt = receipt.copyWith(
+        updatedAt: DateTime.now(),
+        approval: 'pending',
+        state: ToolAttemptLifecycle.approvalPending.name,
+        safeSummary: 'Waiting for local memory approval.',
+      );
+      if (!await _persistStructuredActionReceipt(attempt, receipt)) return;
+    }
+
+    // Re-check the global policy immediately before its approval decision. A
+    // settings change while the card was open must fail closed, not inherit an
+    // earlier check.
+    final approvalPolicy = _currentStructuredActionToolPolicy(attempt);
+    final currentHardDeny = approvalPolicy.denyFor(request);
+    if (currentHardDeny != null) {
+      await _persistStructuredActionTerminal(
+        attempt,
+        receipt,
+        hardDeny: 'denied',
+        skillDeny: receipt.skillDeny,
+        approval: 'not_requested',
+        outcome: 'denied',
+        summary: 'Local memory action was blocked by safety settings.',
+      );
+      return;
+    }
+    if (!_isStructuredActionCurrent(attempt)) {
+      await _persistStructuredActionStale(attempt, receipt);
+      return;
+    }
+    final approved = await approvalPolicy.approve(request);
+    if (!_isStructuredActionCurrent(attempt)) {
+      await _persistStructuredActionStale(attempt, receipt);
+      return;
+    }
+    if (!approved) {
+      await _persistStructuredActionTerminal(
+        attempt,
+        receipt,
+        hardDeny: 'not_denied',
+        skillDeny: receipt.skillDeny,
+        approval: 'denied',
+        outcome: 'cancelled',
+        summary: 'Local memory action was not approved.',
+      );
+      return;
+    }
+
+    // A user may have spent time at the approval surface. Re-run both
+    // additive authorization boundaries against their current state before
+    // crossing the effect boundary; approval itself never freezes a skill
+    // grant or overrides a newly configured hard deny.
+    final postApprovalHardDeny =
+        _currentStructuredActionToolPolicy(attempt).denyFor(request);
+    if (postApprovalHardDeny != null) {
+      await _persistStructuredActionTerminal(
+        attempt,
+        receipt,
+        hardDeny: 'denied',
+        skillDeny: receipt.skillDeny,
+        approval: 'stale',
+        outcome: 'denied',
+        summary: 'Local memory action was blocked by safety settings.',
+      );
+      return;
+    }
+    final postApprovalSkillDeny =
+        await _skillDenyForStructuredAction(attempt, request);
+    if (postApprovalSkillDeny != null) {
+      await _persistStructuredActionTerminal(
+        attempt,
+        receipt,
+        hardDeny: 'not_denied',
+        skillDeny: 'denied',
+        approval: 'stale',
+        outcome: 'denied',
+        summary: 'Local memory action is unavailable for this skill.',
+      );
+      return;
+    }
+    if (!_isStructuredActionCurrent(attempt)) {
+      await _persistStructuredActionStale(attempt, receipt);
+      return;
+    }
+
+    receipt = receipt.copyWith(
+      updatedAt: DateTime.now(),
+      approval: _structuredApprovalCode(),
+      state: ToolAttemptLifecycle.approvedNotStarted.name,
+      safeSummary: 'Local memory action is approved.',
+    );
+    if (!await _persistStructuredActionReceipt(attempt, receipt)) return;
+    if (!_isStructuredActionCurrent(attempt)) {
+      await _persistStructuredActionStale(attempt, receipt);
+      return;
+    }
+
+    // This write is the effect boundary.  No memory tool call can run unless a
+    // durable `started` receipt already exists for this exact operation ID.
+    receipt = receipt.copyWith(
+      updatedAt: DateTime.now(),
+      state: ToolAttemptLifecycle.started.name,
+      safeSummary: 'Saving local memory.',
+    );
+    if (!await _persistStructuredActionReceipt(attempt, receipt)) return;
+    if (!_isStructuredActionCurrent(attempt)) {
+      await _persistStructuredActionStale(attempt, receipt);
+      return;
+    }
+
+    try {
+      final payload = await _tools.executeToolResult(
+        attempt.resolution.toolName,
+        Map<String, dynamic>.from(attempt.resolution.input),
+        sessionId: attempt.session.id,
+        operationId: attempt.operationId,
+      );
+      if (!MemoryWriteTool.isKnownSuccessfulOutput(payload.forUser)) {
+        await _persistStructuredActionKnownFailure(attempt, receipt);
+        return;
+      }
+      receipt = receipt.copyWith(
+        updatedAt: DateTime.now(),
+        state: ToolAttemptLifecycle.completed.name,
+        outcome: 'success',
+        outcomeKnown: true,
+        safeSummary: 'Saved to local memory.',
+      );
+      if (!await _persistStructuredActionReceipt(
+        attempt,
+        receipt,
+        requireCurrentSession: false,
+      )) {
+        await _persistStructuredActionUnknown(attempt, receipt);
+        return;
+      }
+      final persisted = receipt.copyWith(
+        updatedAt: DateTime.now(),
+        state: ToolAttemptLifecycle.resultPersisted.name,
+      );
+      if (!await _persistStructuredActionReceipt(
+        attempt,
+        persisted,
+        requireCurrentSession: false,
+      )) {
+        await _persistStructuredActionUnknown(attempt, receipt);
+      }
+    } on Object {
+      await _persistStructuredActionUnknown(attempt, receipt);
+    }
+  }
+
+  Future<ToolDenyDecision?> _skillDenyForStructuredAction(
+    _StructuredActionAttempt attempt,
+    ToolApprovalRequest request,
+  ) async {
+    final provenance = attempt.skillProvenance;
+    if (provenance == null) return null;
+    final imageDomain =
+        Uri.tryParse(_prefs.baseUrl ?? 'https://api.openai.com')?.host;
+    final policy = _skillCapabilityPolicyFactory({
+      'web_search': 'html.duckduckgo.com',
+      if (imageDomain != null && imageDomain.isNotEmpty)
+        'generate_image': imageDomain,
+    });
+    try {
+      await policy.restoreGrantedSkill(
+        provenance.skillId,
+        expectedTrustDigest: provenance.trustDigest,
+      );
+      // A skill presentation does not grant a later memory write.  Require
+      // both the ingress declaration and the current action declaration.
+      final presentationDeny = policy.denyFor(ToolApprovalRequest(
+        toolName: StructuredResultIngress.toolName,
+        arguments: const <String, dynamic>{},
+        risk: ToolRisk.safe,
+        operationId: attempt.operationId,
+      ));
+      return presentationDeny ?? policy.denyFor(request);
+    } on SkillCapabilityViolation catch (error) {
+      return ToolDenyDecision(
+        ruleType: 'skill_capability',
+        ruleId: error.ruleId,
+        message: error.message,
+      );
+    } on Object {
+      return const ToolDenyDecision(
+        ruleType: 'skill_capability',
+        ruleId: 'skill_provenance_stale',
+        message: 'Skill consent is missing or stale.',
+      );
+    }
+  }
+
+  ToolPolicy _currentStructuredActionToolPolicy(
+    _StructuredActionAttempt attempt,
+  ) {
+    return ToolPolicy(
+      onApprovalRequired: (approvalRequest) =>
+          _requestStructuredActionApproval(attempt, approvalRequest),
+      deniedToolNames: _prefs.deniedToolNames,
+      bashCommandDenyPatterns: _prefs.bashCommandDenyPatterns,
+    );
+  }
+
+  Future<bool> _requestStructuredActionApproval(
+    _StructuredActionAttempt attempt,
+    ToolApprovalRequest request,
+  ) async {
+    if (!_isStructuredActionCurrent(attempt)) return false;
+    final state = _getOrCreateState(attempt.session.id);
+    final policy = _prefs.toolApprovalPolicy;
+    if (policy == PreferencesService.toolApprovalAuto) return true;
+    if (policy == PreferencesService.toolApprovalSessionFirst &&
+        state.sessionApprovedTools.contains(request.toolName)) {
+      return true;
+    }
+
+    _completePendingApproval(false, notify: false);
+    final completer = Completer<bool>();
+    _approvalCompleter = completer;
+    _approvalDecisionSource = null;
+    _pendingApprovalState = state;
+    pendingApproval = request;
+    notifyListeners();
+    if (_appInBackground) {
+      await _publishPendingToolApprovalNotification();
+    }
+    final approvedByUser = await completer.future;
+    final decisionSource = _approvalDecisionSource;
+    return approvedByUser &&
+        _isStructuredActionCurrent(attempt) &&
+        (decisionSource == _ToolApprovalDecisionSource.notification ||
+            !_appInBackground);
+  }
+
+  String _structuredApprovalCode() => switch (_prefs.toolApprovalPolicy) {
+        PreferencesService.toolApprovalAuto => 'auto_allowed',
+        PreferencesService.toolApprovalSessionFirst => 'approved',
+        _ => 'approved',
+      };
+
+  StructuredActionReceipt _initialStructuredActionReceipt(
+    _StructuredActionAttempt attempt,
+  ) {
+    final now = DateTime.now();
+    return StructuredActionReceipt(
+      schemaVersion: 1,
+      receiptId: attempt.receiptId,
+      operationId: attempt.operationId,
+      sourceKind: 'structured_result',
+      resultId: attempt.resultId,
+      actionId: attempt.actionId,
+      actionKind: attempt.resolution.actionKind,
+      toolName: attempt.resolution.toolName,
+      canonicalInputDigest: structuredActionInputDigestForInput(
+        attempt.resolution.actionKind,
+        Map<String, Object?>.from(attempt.resolution.input),
+      ),
+      createdAt: now,
+      updatedAt: now,
+      hardDeny: 'not_checked',
+      skillDeny: 'not_checked',
+      approval: 'not_requested',
+      state: ToolAttemptLifecycle.proposed.name,
+      outcome: 'pending',
+      outcomeKnown: false,
+      safeSummary: 'Preparing local memory action.',
+    );
+  }
+
+  Future<void> _persistStructuredActionTerminal(
+    _StructuredActionAttempt attempt,
+    StructuredActionReceipt receipt, {
+    required String hardDeny,
+    required String skillDeny,
+    required String approval,
+    required String outcome,
+    required String summary,
+  }) async {
+    final terminal = receipt.copyWith(
+      updatedAt: DateTime.now(),
+      hardDeny: hardDeny,
+      skillDeny: skillDeny,
+      approval: approval,
+      state: ToolAttemptLifecycle.resultPersisted.name,
+      outcome: outcome,
+      outcomeKnown: true,
+      safeSummary: summary,
+    );
+    await _persistStructuredActionReceipt(
+      attempt,
+      terminal,
+      requireCurrentSession: false,
+    );
+  }
+
+  Future<void> _persistStructuredActionKnownFailure(
+    _StructuredActionAttempt attempt,
+    StructuredActionReceipt receipt,
+  ) async {
+    final failed = receipt.copyWith(
+      updatedAt: DateTime.now(),
+      state: ToolAttemptLifecycle.failed.name,
+      outcome: 'failed',
+      outcomeKnown: true,
+      safeSummary: 'Local memory was not saved.',
+    );
+    if (!await _persistStructuredActionReceipt(
+      attempt,
+      failed,
+      requireCurrentSession: false,
+    )) {
+      await _persistStructuredActionUnknown(attempt, receipt);
+      return;
+    }
+    await _persistStructuredActionReceipt(
+      attempt,
+      failed.copyWith(
+        updatedAt: DateTime.now(),
+        state: ToolAttemptLifecycle.resultPersisted.name,
+      ),
+      requireCurrentSession: false,
+    );
+  }
+
+  Future<void> _persistStructuredActionUnknown(
+    _StructuredActionAttempt attempt,
+    StructuredActionReceipt receipt,
+  ) =>
+      _persistStructuredActionReceipt(
+        attempt,
+        receipt.copyWith(
+          updatedAt: DateTime.now(),
+          state: ToolAttemptLifecycle.interruptedUnknown.name,
+          outcome: 'unknown_outcome',
+          outcomeKnown: false,
+          safeSummary:
+              'Local memory result is unknown and will not be retried automatically.',
+        ),
+        requireCurrentSession: false,
+      );
+
+  Future<void> _persistStructuredActionStale(
+    _StructuredActionAttempt attempt,
+    StructuredActionReceipt receipt,
+  ) =>
+      _persistStructuredActionTerminal(
+        attempt,
+        receipt,
+        hardDeny: receipt.hardDeny,
+        skillDeny: receipt.skillDeny,
+        approval:
+            receipt.approval == 'not_requested' ? 'not_requested' : 'stale',
+        outcome: 'cancelled',
+        summary: 'Local memory action is no longer current.',
+      );
+
+  bool _isStructuredActionCurrent(_StructuredActionAttempt attempt) {
+    return _structuredActionWriteIsCurrent(
+      attempt,
+      requireCurrentSession: true,
+    );
+  }
+
+  bool _structuredActionWriteIsCurrent(
+    _StructuredActionAttempt attempt, {
+    required bool requireCurrentSession,
+  }) {
+    return !_disposed &&
+        identical(_activeStructuredActions[attempt.key], attempt) &&
+        !_deletingSessionIds.contains(attempt.session.id) &&
+        !isSessionSending(attempt.session.id) &&
+        (!requireCurrentSession ||
+            identical(currentSession, attempt.session)) &&
+        _storage.isSessionGenerationCurrent(
+          attempt.session.id,
+          attempt.storageGeneration,
+        ) &&
+        _structuredResultForAction(
+              attempt.session,
+              attempt.resultId,
+              attempt.actionId,
+            )?.actionById(attempt.actionId) !=
+            null;
+  }
+
+  SessionCommitPermit? _acquireStructuredActionCommit(
+    _StructuredActionCommitAuthority authority,
+  ) {
+    if (!authority.isValid ||
+        !_structuredActionCommitSessions.add(authority.attempt.session.id)) {
+      return null;
+    }
+    return _StructuredActionCommitPermit(this, authority.attempt.session.id);
+  }
+
+  void _completeStructuredActionCommit(String sessionId) {
+    _structuredActionCommitSessions.remove(sessionId);
+  }
+
+  bool _hasActiveStructuredActionForSession(String sessionId) {
+    return _activeStructuredActions.values
+        .any((attempt) => attempt.session.id == sessionId);
+  }
+
+  Future<bool> _persistStructuredActionReceipt(
+    _StructuredActionAttempt attempt,
+    StructuredActionReceipt receipt, {
+    bool requireCurrentSession = true,
+  }) {
+    return _queueStructuredActionWrite(attempt.session.id, () async {
+      if (!_structuredActionWriteIsCurrent(
+        attempt,
+        requireCurrentSession: requireCurrentSession,
+      )) {
+        return false;
+      }
+      final existingIndex = attempt.session.structuredActionReceipts
+          .indexWhere((item) => item.operationId == receipt.operationId);
+      if (existingIndex < 0 &&
+          attempt.session.structuredActionReceipts.length >= 256) {
+        return false;
+      }
+      if (existingIndex >= 0 &&
+          attempt.session.structuredActionReceipts[existingIndex].receiptId !=
+              receipt.receiptId) {
+        return false;
+      }
+      final nextReceipts = [
+        ...attempt.session.structuredActionReceipts,
+      ];
+      if (existingIndex >= 0) {
+        nextReceipts[existingIndex] = receipt;
+      } else {
+        nextReceipts.add(receipt);
+      }
+      final candidate = attempt.session.copyWith(
+        structuredActionReceipts: nextReceipts,
+        updatedAt: DateTime.now(),
+      );
+      final authority = _StructuredActionCommitAuthority(
+        owner: this,
+        attempt: attempt,
+        requireCurrentSession: requireCurrentSession,
+      );
+      try {
+        await _storage.saveSession(
+          candidate,
+          expectedGeneration: attempt.storageGeneration,
+          commitGuard: authority.commitGuard,
+        );
+      } on Object {
+        return false;
+      }
+      if (!_structuredActionWriteIsCurrent(
+        attempt,
+        requireCurrentSession: requireCurrentSession,
+      )) {
+        return false;
+      }
+      attempt.session.structuredActionReceipts
+        ..clear()
+        ..addAll(nextReceipts);
+      attempt.session.updatedAt = candidate.updatedAt;
+      if (identical(currentSession, attempt.session)) {
+        _syncCurrentSessionReference(attempt.session);
+        if (!_disposed) notifyListeners();
+      }
+      return true;
+    });
+  }
+
+  Future<T> _queueStructuredActionWrite<T>(
+    String sessionId,
+    Future<T> Function() operation,
+  ) {
+    final previous =
+        _structuredActionSaveTails[sessionId] ?? Future<void>.value();
+    final completion = Completer<void>();
+    Future<T> run() async {
+      try {
+        try {
+          await previous;
+        } on Object {
+          // A failed prior receipt save must not poison a fresh user retry.
+        }
+        return await operation();
+      } finally {
+        if (!completion.isCompleted) completion.complete();
+        if (identical(
+            _structuredActionSaveTails[sessionId], completion.future)) {
+          _structuredActionSaveTails.remove(sessionId);
+        }
+      }
+    }
+
+    final result = run();
+    _structuredActionSaveTails[sessionId] = completion.future;
+    return result;
+  }
+
+  String _structuredActionKey(
+          String sessionId, String resultId, String actionId) =>
+      '$sessionId:$resultId:$actionId';
+
   Future<bool> _requestToolApproval(
     AgentState state,
     ToolApprovalRequest request, {
@@ -2035,15 +2732,19 @@ class ChatProvider extends ChangeNotifier {
       unawaited(_hidePendingToolApprovalNotification());
       _resumeActiveAgentStreamAfterForeground();
       if (pendingApproval != null && !_disposed) notifyListeners();
-    } else if (_activeAgentStates.isNotEmpty) {
-      unawaited(NativeBridge.setAgentOverlayVisible(true));
-      for (final state in _activeAgentStates) {
-        unawaited(_updateAgentNativeStatusForState(
-          state,
-          _statusForAgentServiceText(_agentServiceTextForState(state)),
-        ));
+    } else {
+      if (_activeAgentStates.isNotEmpty) {
+        unawaited(NativeBridge.setAgentOverlayVisible(true));
+        for (final state in _activeAgentStates) {
+          unawaited(_updateAgentNativeStatusForState(
+            state,
+            _statusForAgentServiceText(_agentServiceTextForState(state)),
+          ));
+        }
       }
-      unawaited(_publishPendingToolApprovalNotification());
+      if (pendingApproval != null) {
+        unawaited(_publishPendingToolApprovalNotification());
+      }
     }
   }
 
@@ -2363,7 +3064,20 @@ class ChatProvider extends ChangeNotifier {
       if (sessionState != null && session != null) {
         _bindAgentStateToSession(sessionState, session);
       }
-      if (sessionState != null && sessionState.isSending) {
+      final activeSessionId = session?.id;
+      if (sessionState != null &&
+          activeSessionId != null &&
+          (sessionState.isSending ||
+              _hasActiveStructuredActionForSession(activeSessionId) ||
+              _structuredActionCommitSessions.contains(activeSessionId))) {
+        if (_hasActiveStructuredActionForSession(activeSessionId) ||
+            _structuredActionCommitSessions.contains(activeSessionId)) {
+          sessionState.status = AgentStatus.error;
+          sessionState.errorMessage =
+              'A local action is in progress. Wait before sending a message.';
+          notifyListeners();
+          return;
+        }
         if (sessionReplay != null) {
           sessionState.errorMessage = '该会话已有任务正在运行，请稍后重试。';
           notifyListeners();
@@ -5644,7 +6358,120 @@ class ChatProvider extends ChangeNotifier {
         update,
         runToken,
       ),
+      onStructuredResultDelivery: (delivery) =>
+          _persistStructuredResultDelivery(
+        activeSession,
+        state,
+        runToken,
+        delivery,
+      ),
     );
+  }
+
+  /// Atomically owns the result card and matching tool result for an active
+  /// run. AgentService awaits this save before it acknowledges the successful
+  /// presentation tool result, and never writes SessionStorage itself.
+  Future<bool> _persistStructuredResultDelivery(
+    ChatSession session,
+    AgentState state,
+    _AgentRunToken runToken,
+    StructuredResultDelivery delivery,
+  ) async {
+    if (delivery.runAttemptId != runToken.runAttemptId ||
+        delivery.presentations.isEmpty ||
+        delivery.agentMessageCount < 1 ||
+        !_runMayContinue(runToken) ||
+        state.sessionId != session.id ||
+        !_storage.isSessionGenerationCurrent(
+          session.id,
+          runToken.storageGeneration,
+        )) {
+      return false;
+    }
+
+    final existingResultIds = <String>{
+      for (final message in session.messages)
+        for (final content in message.content)
+          if (content
+              case StructuredResultContent(
+                :final document,
+                :final isInvalid,
+              ))
+            if (!isInvalid) document.resultId,
+    };
+    final deliveryResultIds = <String>{};
+    final presentationByToolUseId = <String, StructuredResultPresentation>{};
+    for (final presentation in delivery.presentations) {
+      if (!deliveryResultIds.add(presentation.document.resultId) ||
+          existingResultIds.contains(presentation.document.resultId) ||
+          presentationByToolUseId.containsKey(presentation.toolUseId)) {
+        return false;
+      }
+      presentationByToolUseId[presentation.toolUseId] = presentation;
+    }
+
+    final content = <MessageContent>[];
+    final seenToolUseIds = <String>{};
+    for (final result in delivery.toolResults) {
+      final toolUseId = result['tool_use_id'];
+      if (toolUseId is! String ||
+          toolUseId.isEmpty ||
+          !seenToolUseIds.add(toolUseId)) {
+        return false;
+      }
+      final presentation = presentationByToolUseId[toolUseId];
+      if (presentation != null) {
+        final metadata = result['metadata'];
+        if (metadata is! Map ||
+            metadata['operationId'] != presentation.operationId ||
+            metadata['resultId'] != presentation.document.resultId ||
+            metadata['toolName'] != StructuredResultIngress.toolName ||
+            metadata['schemaVersion'] != presentation.document.schemaVersion) {
+          return false;
+        }
+      }
+      content.add(ToolResultContent.fromToolResultJson(result));
+      if (presentation != null) {
+        content.add(StructuredResultContent(
+          document: presentation.document,
+          skillProvenance: presentation.skillProvenance,
+          toolUseId: presentation.toolUseId,
+        ));
+      }
+    }
+    if (presentationByToolUseId.keys
+        .any((id) => !seenToolUseIds.contains(id))) {
+      return false;
+    }
+
+    final message = ChatMessage.userContent(content);
+    final updatedAt = DateTime.now();
+    final candidate = session.copyWith(
+      messages: [...session.messages, message],
+      updatedAt: updatedAt,
+    );
+    try {
+      await _storage.saveSession(
+        candidate,
+        expectedGeneration: runToken.storageGeneration,
+      );
+    } catch (_) {
+      return false;
+    }
+    if (!_runMayContinue(runToken) ||
+        !_storage.isSessionGenerationCurrent(
+          session.id,
+          runToken.storageGeneration,
+        )) {
+      return false;
+    }
+
+    session.messages.add(message);
+    session.updatedAt = updatedAt;
+    state.initialApiMsgCount = delivery.agentMessageCount;
+    _syncCurrentSessionReference(session);
+    if (!_disposed) notifyListeners();
+    return true;
   }
 
   Future<void> _persistToolAttemptUpdate(
@@ -6469,6 +7296,18 @@ class ChatProvider extends ChangeNotifier {
             metadata: _sanitizeRecoveryMap(payload.metadata),
             isError: isError,
           ));
+        case StructuredResultContent(
+            :final document,
+            :final isInvalid,
+            :final skillProvenance,
+            :final toolUseId,
+          ):
+          sanitized.add(StructuredResultContent(
+            document: document,
+            isInvalid: isInvalid,
+            skillProvenance: skillProvenance,
+            toolUseId: toolUseId,
+          ));
       }
     }
     return sanitized;
@@ -6598,6 +7437,82 @@ class _AgentRunToken {
     required this.storageGeneration,
     required this.skillProvenance,
   });
+}
+
+final class _StructuredActionAttempt {
+  const _StructuredActionAttempt({
+    required this.key,
+    required this.session,
+    required this.storageGeneration,
+    required this.resultId,
+    required this.actionId,
+    required this.resolution,
+    required this.skillProvenance,
+    required this.operationId,
+    required this.receiptId,
+  });
+
+  final String key;
+  final ChatSession session;
+  final int storageGeneration;
+  final String resultId;
+  final String actionId;
+  final StructuredActionResolution resolution;
+  final StructuredResultSkillProvenance? skillProvenance;
+  final String operationId;
+  final String receiptId;
+}
+
+final class _StructuredActionCommitAuthority implements SessionCommitAuthority {
+  _StructuredActionCommitAuthority({
+    required this.owner,
+    required this.attempt,
+    required this.requireCurrentSession,
+  }) : _generation = Object.hash(
+          attempt.operationId,
+          attempt.receiptId,
+          requireCurrentSession,
+        );
+
+  final ChatProvider owner;
+  final _StructuredActionAttempt attempt;
+  final bool requireCurrentSession;
+  final int _generation;
+
+  SessionCommitGuard get commitGuard => SessionCommitGuard(
+        sessionId: attempt.session.id,
+        sessionGeneration: attempt.storageGeneration,
+        authorizationGeneration: generation,
+        authority: this,
+      );
+
+  @override
+  int get generation => _generation;
+
+  @override
+  bool get isValid => owner._structuredActionWriteIsCurrent(
+        attempt,
+        requireCurrentSession: requireCurrentSession,
+      );
+
+  @override
+  SessionCommitPermit? tryAcquireCommit() =>
+      owner._acquireStructuredActionCommit(this);
+}
+
+final class _StructuredActionCommitPermit implements SessionCommitPermit {
+  _StructuredActionCommitPermit(this.owner, this.sessionId);
+
+  final ChatProvider owner;
+  final String sessionId;
+  bool _complete = false;
+
+  @override
+  void complete() {
+    if (_complete) return;
+    _complete = true;
+    owner._completeStructuredActionCommit(sessionId);
+  }
 }
 
 final class _SessionReplayOperation implements SessionCommitAuthority {

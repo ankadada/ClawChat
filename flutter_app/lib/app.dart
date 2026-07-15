@@ -8,6 +8,7 @@ import 'screens/chat_screen.dart';
 import 'screens/chat_sessions_screen.dart';
 import 'screens/remote_agent_configuration_recovery_screen.dart';
 import 'services/app_http.dart';
+import 'services/background_task_center_controller.dart';
 import 'services/preferences_service.dart';
 import 'services/remote_agent_boot.dart';
 import 'services/remote_agent_configuration_service.dart';
@@ -90,6 +91,7 @@ class _ClawChatAppState extends State<ClawChatApp> {
   late final RemoteAgentBootController _remoteAgentBoot;
   late final RemoteAgentRuntimeBinding _remoteAgentRuntime;
   late final ChatProvider _chatProvider;
+  late final BackgroundTaskCenterController _backgroundTaskCenter;
   RemoteAgentConfigurationService? _attachedRemoteConfiguration;
   late final bool _ownsRemoteAgentBoot;
 
@@ -102,6 +104,7 @@ class _ClawChatAppState extends State<ClawChatApp> {
     _chatProvider =
         widget.chatProviderFactoryForTesting?.call(_remoteAgentRuntime) ??
             ChatProvider(remoteAgentRuntimeBinding: _remoteAgentRuntime);
+    _backgroundTaskCenter = BackgroundTaskCenterController.createForApp();
     _remoteAgentBoot = injected ??
         RemoteAgentBootController(
           loader: widget.remoteAgentConfigurationLoader ??
@@ -142,6 +145,7 @@ class _ClawChatAppState extends State<ClawChatApp> {
 
   @override
   void dispose() {
+    _backgroundTaskCenter.dispose();
     _chatProvider.dispose();
     _remoteAgentRuntime.dispose();
     if (_ownsRemoteAgentBoot) _remoteAgentBoot.dispose();
@@ -166,6 +170,9 @@ class _ClawChatAppState extends State<ClawChatApp> {
           value: _remoteAgentRuntime,
         ),
         ChangeNotifierProvider<ChatProvider>.value(value: _chatProvider),
+        ChangeNotifierProvider<BackgroundTaskCenterController>.value(
+          value: _backgroundTaskCenter,
+        ),
       ],
       child: ValueListenableBuilder<ThemeMode>(
         valueListenable: themeNotifier,

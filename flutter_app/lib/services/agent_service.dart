@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:uuid/uuid.dart';
 import '../models/chat_models.dart';
+import '../models/structured_result.dart';
 import 'llm_content_sanitizer.dart';
 import 'llm_service.dart';
 import 'privacy_filter.dart';
@@ -131,6 +132,46 @@ typedef AgentMessagesUpdatedCallback = FutureOr<void> Function(
   List<Map<String, dynamic>> messages,
 );
 
+/// Typed, awaited handoff for structured-result persistence.
+///
+/// The sink is owned by [ChatProvider]. It is the sole writer of the matching
+/// user tool-result message and validated UI-only content; generic tools never
+/// receive a SessionStorage dependency.
+typedef StructuredResultDeliverySink = Future<bool> Function(
+  StructuredResultDelivery delivery,
+);
+
+final class StructuredResultPresentation {
+  const StructuredResultPresentation({
+    required this.toolUseId,
+    required this.operationId,
+    required this.document,
+    this.skillProvenance,
+  });
+
+  final String toolUseId;
+  final String operationId;
+  final StructuredResultDocument document;
+  final StructuredResultSkillProvenance? skillProvenance;
+}
+
+final class StructuredResultDelivery {
+  StructuredResultDelivery({
+    required this.runAttemptId,
+    required this.agentMessageCount,
+    required List<Map<String, dynamic>> toolResults,
+    required List<StructuredResultPresentation> presentations,
+  })  : toolResults = List.unmodifiable(
+          toolResults.map(Map<String, dynamic>.unmodifiable),
+        ),
+        presentations = List.unmodifiable(presentations);
+
+  final String runAttemptId;
+  final int agentMessageCount;
+  final List<Map<String, dynamic>> toolResults;
+  final List<StructuredResultPresentation> presentations;
+}
+
 class AgentService {
   final LlmService _llm;
   final ToolRegistry _tools;
@@ -147,6 +188,7 @@ class AgentService {
   final String? sessionId;
   final String runAttemptId;
   final ToolAttemptObserver? onToolAttemptUpdate;
+  final StructuredResultDeliverySink? onStructuredResultDelivery;
   final Uuid _uuid;
   final ToolArgumentPreflight _toolArgumentPreflight;
   final SkillActivationReference? _historicalSkillActivation;
@@ -173,6 +215,7 @@ class AgentService {
     this.sessionId,
     String? runAttemptId,
     this.onToolAttemptUpdate,
+    this.onStructuredResultDelivery,
     Uuid? uuid,
     ToolArgumentPreflight? toolArgumentPreflight,
     SkillActivationReference? historicalSkillActivation,
@@ -355,6 +398,7 @@ class AgentService {
           response.content.where((b) => b.type == 'tool_use').toList();
       if (toolBlocks.isNotEmpty) hadToolCalls = true;
       final toolResults = <Map<String, dynamic>>[];
+      final deferredStructuredResults = <_ToolResult>[];
 
       final toolInputs = <ContentBlock, Map<String, dynamic>>{};
       final toolAttempts = <ContentBlock, _ToolAttemptContext>{};
@@ -364,7 +408,9 @@ class AgentService {
         if (toolUseId == null || toolName == null) continue;
         final preflightInput = _preflightToolInput(
           toolName,
-          block.rawToolInputJson ?? block.toolInput ?? {},
+          toolName == StructuredResultIngress.toolName
+              ? block.toolInput ?? const <String, dynamic>{}
+              : block.rawToolInputJson ?? block.toolInput ?? {},
         );
         final attempt = _ToolAttemptContext(
           operationId: _uuid.v4(),
@@ -434,12 +480,16 @@ class AgentService {
         if (_cancelled) return;
         for (final r in results) {
           if (r == null) continue;
-          yield AgentToolDone(
-            r.id,
-            r.output,
-            operationId: r.operationId,
-            isError: r.isError,
-          );
+          if (r.structuredResult == null) {
+            yield AgentToolDone(
+              r.id,
+              r.output,
+              operationId: r.operationId,
+              isError: r.isError,
+            );
+          } else {
+            deferredStructuredResults.add(r);
+          }
           toolResults.add(r.toJson());
         }
       } else {
@@ -460,13 +510,77 @@ class AgentService {
             preparedSkillActivation: skillBatchPlan.preparedFor(block),
           );
           if (_cancelled) return;
-          yield AgentToolDone(
-            result.id,
-            result.output,
-            operationId: result.operationId,
-            isError: result.isError,
-          );
+          if (result.structuredResult == null) {
+            yield AgentToolDone(
+              result.id,
+              result.output,
+              operationId: result.operationId,
+              isError: result.isError,
+            );
+          } else {
+            deferredStructuredResults.add(result);
+          }
           toolResults.add(result.toJson());
+        }
+      }
+
+      var structuredDeliveryPersisted = false;
+      if (deferredStructuredResults.isNotEmpty) {
+        final sink = onStructuredResultDelivery;
+        if (sink != null) {
+          try {
+            structuredDeliveryPersisted = await sink(StructuredResultDelivery(
+              runAttemptId: runAttemptId,
+              agentMessageCount: messages.length + 1,
+              toolResults: toolResults,
+              presentations: deferredStructuredResults
+                  .map(
+                    (result) => StructuredResultPresentation(
+                      toolUseId: result.id,
+                      operationId: result.operationId,
+                      document: result.structuredResult!.document,
+                      skillProvenance: result.structuredResultSkillProvenance,
+                    ),
+                  )
+                  .toList(growable: false),
+            ));
+          } catch (_) {
+            structuredDeliveryPersisted = false;
+          }
+        }
+        if (structuredDeliveryPersisted) {
+          for (final result in deferredStructuredResults) {
+            final attempt = toolAttempts.values
+                .where((item) => item.operationId == result.operationId)
+                .firstOrNull;
+            if (attempt != null) {
+              await _reportToolAttempt(
+                attempt,
+                ToolAttemptLifecycle.completed,
+                executionOutcomeKnown: true,
+              );
+            }
+            yield AgentToolDone(
+              result.id,
+              result.output,
+              operationId: result.operationId,
+              isError: false,
+            );
+          }
+        } else {
+          for (final result in deferredStructuredResults) {
+            final index = toolResults.indexWhere((item) =>
+                item['metadata'] is Map &&
+                (item['metadata'] as Map)['operationId'] == result.operationId);
+            final failure = await _structuredResultSinkFailure(result);
+            if (index >= 0) toolResults[index] = failure.toJson();
+            yield AgentToolDone(
+              failure.id,
+              failure.output,
+              operationId: failure.operationId,
+              isError: true,
+            );
+          }
         }
       }
 
@@ -474,8 +588,10 @@ class AgentService {
         'role': 'user',
         'content': toolResults,
       });
-      if (onMessagesUpdated != null) {
+      if (!structuredDeliveryPersisted && onMessagesUpdated != null) {
         await onMessagesUpdated(messages);
+      }
+      if (structuredDeliveryPersisted || onMessagesUpdated != null) {
         for (final result in toolResults) {
           final operationId = result['metadata'] is Map
               ? (result['metadata'] as Map)['operationId']?.toString()
@@ -611,6 +727,20 @@ class AgentService {
       );
     }
 
+    StructuredResultIngress? structuredResult;
+    if (toolName == StructuredResultIngress.toolName) {
+      try {
+        structuredResult = StructuredResultIngress.parseOuter(toolInput);
+      } on StructuredResultParseException {
+        await _reportToolAttempt(
+          attempt,
+          ToolAttemptLifecycle.failed,
+          executionOutcomeKnown: true,
+        );
+        return _invalidStructuredResult(attempt);
+      }
+    }
+
     final request = ToolApprovalRequest(
       toolName: toolName,
       arguments: Map<String, dynamic>.from(toolInput),
@@ -723,6 +853,32 @@ class AgentService {
     );
 
     try {
+      if (structuredResult != null) {
+        final activeSkill = _skillCapabilityPolicy?.activeSkill;
+        return _ToolResult(
+          toolUseId,
+          attempt.operationId,
+          ToolResultPayload(
+            forUser: 'Structured result ready.',
+            forLlm: structuredResult.document.projection,
+            summary: 'Structured result stored.',
+            metadata: {
+              'status': 'ok',
+              'toolName': StructuredResultIngress.toolName,
+              'resultId': structuredResult.document.resultId,
+              'schemaVersion': structuredResult.document.schemaVersion,
+            },
+          ),
+          false,
+          structuredResult: structuredResult,
+          structuredResultSkillProvenance: activeSkill == null
+              ? null
+              : StructuredResultSkillProvenance(
+                  skillId: activeSkill.id,
+                  trustDigest: activeSkill.trustDigest,
+                ),
+        );
+      }
       if (verifiedSkillRead != null) {
         _skillCapabilityPolicy?.activate(verifiedSkillRead);
         final output = _formatVerifiedSkillRead(
@@ -849,6 +1005,50 @@ class AgentService {
       true,
     );
   }
+
+  Future<_ToolResult> _structuredResultSinkFailure(_ToolResult result) async {
+    final attempt = _ToolAttemptContext(
+      operationId: result.operationId,
+      toolUseId: result.id,
+      toolName: StructuredResultIngress.toolName,
+      risk: ToolRisk.safe,
+    );
+    await _reportToolAttempt(
+      attempt,
+      ToolAttemptLifecycle.failed,
+      executionOutcomeKnown: true,
+    );
+    return _ToolResult(
+      result.id,
+      result.operationId,
+      const ToolResultPayload(
+        forUser: 'Structured result rejected: persistence unavailable.',
+        forLlm: 'Structured result rejected: persistence unavailable.',
+        summary: 'Structured result persistence failed.',
+        metadata: {
+          'status': 'error',
+          'reasonCode': 'structured_result_persistence_failed',
+        },
+      ),
+      true,
+    );
+  }
+
+  _ToolResult _invalidStructuredResult(_ToolAttemptContext attempt) =>
+      _ToolResult(
+        attempt.toolUseId,
+        attempt.operationId,
+        const ToolResultPayload(
+          forUser: 'Structured result rejected: invalid_structured_result.',
+          forLlm: 'Structured result rejected: invalid_structured_result.',
+          summary: 'Structured result rejected.',
+          metadata: {
+            'status': 'error',
+            'reasonCode': 'invalid_structured_result',
+          },
+        ),
+        true,
+      );
 
   String _formatVerifiedSkillRead(
     String content,
@@ -1083,6 +1283,19 @@ class AgentService {
     String toolName,
     Object? rawToolInput,
   ) {
+    if (toolName == StructuredResultIngress.toolName) {
+      // This ingress is intentionally excluded from generic coercion, field
+      // renaming, and JSON-closure repair. The provider-decoded outer map must
+      // already be the one-field schema before the inner raw JSON is parsed.
+      try {
+        return {
+          'documentJson':
+              StructuredResultIngress.parseOuter(rawToolInput).documentJson,
+        };
+      } on StructuredResultParseException {
+        return const <String, dynamic>{};
+      }
+    }
     final schema = _tools.inputSchemaFor(toolName, sessionId: sessionId);
     if (schema == null) {
       return rawToolInput is Map
@@ -1286,7 +1499,17 @@ class _ToolResult {
   final String operationId;
   final ToolResultPayload payload;
   final bool isError;
-  _ToolResult(this.id, this.operationId, this.payload, this.isError);
+  final StructuredResultIngress? structuredResult;
+  final StructuredResultSkillProvenance? structuredResultSkillProvenance;
+
+  _ToolResult(
+    this.id,
+    this.operationId,
+    this.payload,
+    this.isError, {
+    this.structuredResult,
+    this.structuredResultSkillProvenance,
+  });
 
   String get output => payload.forUser;
 

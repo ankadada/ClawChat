@@ -146,6 +146,7 @@ void main() {
     await tester.pump();
 
     expect(find.text(AppStrings.localDataRecovery), findsOneWidget);
+    expect(find.text('本地任务中心'), findsOneWidget);
     expect(find.text(AppStrings.privacyMode), findsNothing);
     expect(find.text('开发者模式'), findsNothing);
   });

@@ -33,6 +33,7 @@ import 'setup_wizard_screen.dart';
 import 'run_trace_screen.dart';
 import 'remote_agent_settings_screen.dart';
 import 'local_data_recovery_screen.dart';
+import 'background_task_center_screen.dart';
 import '../l10n/app_strings.dart';
 import '../layout/foldable_layout.dart';
 
@@ -124,6 +125,8 @@ class SettingsScreen extends StatefulWidget {
     SettingsControlInfo(SettingsDestination.voice, '电话与短信', ['拨号', 'SMS']),
     SettingsControlInfo(
         SettingsDestination.dataRecovery, '本地数据恢复', ['会话回收站', '恢复']),
+    SettingsControlInfo(SettingsDestination.dataRecovery, '本地任务中心',
+        ['后台任务', '恢复', '未知结果', '弃置']),
     SettingsControlInfo(
         SettingsDestination.dataRecovery, '导出与导入配置', ['备份', '迁移']),
     SettingsControlInfo(SettingsDestination.dataRecovery, '使用量摘要', ['tokens']),
@@ -1970,6 +1973,19 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                             onTap: () => Navigator.of(context).push(
                               MaterialPageRoute(
                                 builder: (_) => const LocalDataRecoveryScreen(),
+                              ),
+                            ),
+                          ),
+                          ListTile(
+                            title: const Text('本地任务中心'),
+                            subtitle:
+                                const Text('创建、批准并按当前策略执行本机任务；不会自动继续或发送。'),
+                            leading: const Icon(Icons.task_alt_outlined),
+                            trailing: const Icon(Icons.chevron_right),
+                            onTap: () => Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) =>
+                                    const BackgroundTaskCenterScreen(),
                               ),
                             ),
                           ),
