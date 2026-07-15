@@ -1,0 +1,1 @@
+{"caseId":"static.web-search","kind":"static_scan","decision":"reject","reasonCode":"static_shell_instruction","selectedSkillId":null,"ruleIds":["static_shell_instruction","static_network_url"]}

@@ -428,7 +428,9 @@ class AppStrings {
   static const skillUrl = '技能归档地址';
   static const importButton = '导入';
   static const importFailed = '导入失败';
-  static const installPresets = '安装预设技能';
+  static const bundledLegacyPresetsUnavailable = '预设旧版技能不可用';
+  static const bundledLegacyPresetsUnavailableDescription =
+      '以下随应用附带的旧版预设目前不可用，不会安装或请求二次授权。';
   static const archiveSkill = 'Archive (.zip, .tar.gz, .tgz)';
   static const directory = 'Directory';
   static const selectSkillArchive =
@@ -552,10 +554,6 @@ class AppStrings {
   // ── Environment Variables (additional) ─────────────────────────────
   static const noEnvVars = '暂无环境变量';
   static const envVarsAgentRunningNotice = '修改将在下次启动 Agent 时生效';
-
-  // ── Preset skills ──────────────────────────────────────────────────
-  static String presetSkillsInstalled(int count) => '已安装 $count 个预设技能';
-  static const installFailed = '安装失败';
 
   // ── Quick prompts ──────────────────────────────────────────────────
   static const promptTranslate = '翻译这段';

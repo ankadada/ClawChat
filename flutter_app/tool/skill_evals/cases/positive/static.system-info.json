@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"static.system-info","fixtureId":"system-info","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"reject","reasonCode":"static_shell_instruction"}}

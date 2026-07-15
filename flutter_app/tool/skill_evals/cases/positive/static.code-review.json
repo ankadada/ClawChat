@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"static.code-review","fixtureId":"code-review","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"reject","reasonCode":"static_shell_instruction"}}

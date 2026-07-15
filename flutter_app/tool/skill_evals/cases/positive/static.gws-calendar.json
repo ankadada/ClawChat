@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"static.gws-calendar","fixtureId":"gws-calendar","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"reject","reasonCode":"static_shell_instruction"}}

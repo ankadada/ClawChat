@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"trigger.web-search","fixtureId":"web-search","kind":"trigger_metadata","input":{"text":"Search the web","locale":"en-US"},"expected":{"decision":"match","reasonCode":"trigger_metadata_match","selectedSkillId":"web-search"}}

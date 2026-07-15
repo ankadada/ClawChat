@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"structure.web-search","fixtureId":"web-search","kind":"structure","input":{"text":"verify structure"},"expected":{"decision":"match","reasonCode":"structure_valid","selectedSkillId":"web-search"}}

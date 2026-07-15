@@ -559,7 +559,7 @@ void main() {
     final metadata = _metadata(
       kind: 'androidApp',
       targetId: AppConstants.packageName,
-      version: '2.6.0',
+      version: '2.7.0',
       revision: 1,
       artifactBytes: apk,
       artifactUrl: 'https://updates.example/app.apk',
@@ -597,7 +597,7 @@ void main() {
         jsonEncode(_metadata(
           kind: 'androidApp',
           targetId: AppConstants.packageName,
-          version: '2.6.0',
+          version: '2.7.0',
           revision: 1,
           artifactBytes: expected,
           artifactUrl: 'https://updates.example/app.apk',
@@ -625,7 +625,7 @@ void main() {
       jsonEncode(_metadata(
         kind: 'androidApp',
         targetId: AppConstants.packageName,
-        version: '2.6.0',
+        version: '2.7.0',
         revision: 1,
         artifactBytes: bytes,
         artifactUrl: 'https://updates.example/app.apk',
@@ -1026,7 +1026,7 @@ void main() {
     const appPlan = '87654321-4321-4123-8123-123456789abc';
     stageApp.appStates[appPlan] = AppUpdateStagingState(
       targetId: AppConstants.packageName,
-      version: '2.6.0',
+      version: '2.7.0',
       revision: 7,
       sha256: 'c' * 64,
       size: 3,
@@ -1153,7 +1153,7 @@ void main() {
       jsonEncode(_metadata(
         kind: 'androidApp',
         targetId: AppConstants.packageName,
-        version: '2.6.0',
+        version: '2.7.0',
         revision: 9,
         artifactBytes: const [1, 2, 3],
         artifactUrl: 'https://updates.example/app.apk',
@@ -1200,7 +1200,7 @@ void main() {
           jsonEncode(_metadata(
             kind: 'androidApp',
             targetId: AppConstants.packageName,
-            version: '2.6.0',
+            version: '2.7.0',
             revision: 10,
             artifactBytes: apk,
             artifactUrl: 'https://updates.example/app.apk',
@@ -1248,7 +1248,7 @@ void main() {
           jsonEncode(_metadata(
             kind: 'androidApp',
             targetId: AppConstants.packageName,
-            version: '2.6.0',
+            version: '2.7.0',
             revision: 11,
             artifactBytes: apk,
             artifactUrl: 'https://updates.example/app.apk',
@@ -1273,7 +1273,7 @@ void main() {
     );
     expect(ledger.revisions[AppConstants.packageName], isNull);
 
-    installedVersion = '2.6.0';
+    installedVersion = '2.7.0';
     await service.reconcileAtStartup();
     ledger = UpdateLedger.parse(
       (await SharedPreferences.getInstance())
@@ -1482,7 +1482,7 @@ void main() {
           jsonEncode(_metadata(
             kind: 'androidApp',
             targetId: AppConstants.packageName,
-            version: '2.6.0',
+            version: '2.7.0',
             revision: 14,
             artifactBytes: apk,
             artifactUrl: 'https://updates.example/app.apk',
@@ -1539,7 +1539,7 @@ void main() {
       jsonEncode(_metadata(
         kind: 'androidApp',
         targetId: AppConstants.packageName,
-        version: '2.6.0',
+        version: '2.7.0',
         revision: 15,
         artifactBytes: apk,
         artifactUrl: 'https://updates.example/app.apk',

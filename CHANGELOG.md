@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.6.0 — Host-Owned Skill Evals and Safe Import Inspection
+
+### Security and Quality Gates
+
+- **Host-owned Skill Evals** — Binds all nine shipped skill assets to exact SHA-256 inventory entries, a closed repository-owned corpus, strict schemas, deterministic goldens, and positive/negative/near-miss coverage.
+- **Inert device import inspection** — Parses bounded imported bytes without executing archive-provided scripts, tools, models, JavaScript, or network requests; reports only fixed rule IDs and count-only capability summaries.
+- **Strict manifest parsing** — Rejects invalid UTF-8, BOMs, duplicate JSON keys, unknown fields, unsupported manifest versions, invalid integrity metadata, oversized files, unsafe archive paths, and duplicate normalized members before extraction.
+- **Non-authorizing eval invariant** — A passing host eval or import inspection cannot bypass global hard denies, per-skill capability checks, Ask, Auto Allow eligibility, or recovery reauthorization.
+
+### Bundled Preset Safety
+
+- **Nine legacy presets locked** — Existing bundled presets remain unavailable with a fixed user-visible reason until their advertised behavior can be enforced by current runtime policy.
+- **Catalog and runtime closure** — Locked presets cannot install, enable, enter the model index, load by ID/path, update, restore, or roll back; similarly named third-party nested skills remain unaffected.
+- **Accessible status UI** — Locked states and import inspection summaries are covered at 320dp/200% text, book-fold hinge, tabletop posture, and IME layouts.
+
+---
+
 ## v2.3.0 — Multi-Session Parallel AI
 
 ### New Features

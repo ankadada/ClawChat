@@ -90,7 +90,7 @@ void main() {
         jsonEncode(_metadata(
           kind: 'androidApp',
           target: AppConstants.packageName,
-          version: '2.6.0',
+          version: '2.7.0',
           bytes: apk,
           url: 'https://updates.example/app.apk',
         )),

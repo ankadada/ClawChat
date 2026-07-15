@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "testCommand": "flutter test --no-pub",
+  "files": [
+    {
+      "path": "lib/screens/settings_screen.dart",
+      "sha256": "ecc3218533cf1a4553c10cde9c3cbd6fc7fef8cf0523e826c601a8891178671f"
+    },
+    {
+      "path": "lib/services/bundled_legacy_skill_catalog.dart",
+      "sha256": "201d77bc7e97eb218b50073b34e4baf48e3fafeb6ddd82b1ac6110446dff2dfd"
+    },
+    {
+      "path": "lib/services/skill_capability_policy.dart",
+      "sha256": "ec7c4778bda1aeb129860b588ba9416ce425da9955a551c9b9033b7fdb32ac4b"
+    },
+    {
+      "path": "lib/services/skill_import_inspector.dart",
+      "sha256": "6ed6f636ca771da80d255fafc79c56c33f854ad3b6d2214a10b3b691856e942e"
+    },
+    {
+      "path": "lib/services/skill_service.dart",
+      "sha256": "ed234ee7f730f6f37d0e12bef56b2ac7db3237b4de14c2077af90db68dd0591c"
+    },
+    {
+      "path": "lib/services/tools/tool_policy.dart",
+      "sha256": "ac7fbb599784b2abfdcd4214e6caa9d2343ec6e4e40fadba59c76e95baa6e9d4"
+    },
+    {
+      "path": "lib/widgets/skill_consent_dialog.dart",
+      "sha256": "d146f30809afac374c792f4dc911c4979d33273b05d2e28485eca98a58e6ff89"
+    },
+    {
+      "path": "test/screens/settings_bundled_legacy_presets_test.dart",
+      "sha256": "c91bab8af891d3edd34203d6665270418f5ce0610064a39cad80048b20061a92"
+    },
+    {
+      "path": "test/services/bundled_legacy_skill_catalog_test.dart",
+      "sha256": "acaf359c966052c8352c5dab211524d525b7410ebcedb33cf5dfecdaefdaffaf"
+    },
+    {
+      "path": "test/services/skill_capability_policy_test.dart",
+      "sha256": "62411d3a47ae8820cc1bb35c9bd24e190e5f4db6fad75b585d6adbb633ceb3a1"
+    },
+    {
+      "path": "test/services/skill_eval_authorization_invariant_test.dart",
+      "sha256": "62437dc4e4d52bf81d9c5cc6911432b426b5d10f55ec182880130b77dbd5384d"
+    },
+    {
+      "path": "test/services/skill_import_inspector_test.dart",
+      "sha256": "423ca47470da086bc2ac280a5fcc1fee0537b296e2e7513073c0956bff2a3bf0"
+    },
+    {
+      "path": "test/services/skill_service_test.dart",
+      "sha256": "80ad926f0bebbd555db43d54d3a1804b525087bed8a009ce6a11b497837579bd"
+    },
+    {
+      "path": "test/tool/skill_evals/skill_eval_host_gate_test.dart",
+      "sha256": "fee0e6255a1ed0b1c99e2d1d201aee0f0fbf0dea354b6e4cef5bac4fefe7a266"
+    },
+    {
+      "path": "test/widgets/skill_consent_dialog_test.dart",
+      "sha256": "6286960b65a3de5dae2256887760bbb79a07cb68664ae8d9590ca8b9a853916d"
+    },
+    {
+      "path": "tool/skill_evals/lib/skill_eval_host_gate.dart",
+      "sha256": "3f3db269ef1ae872cfb000b23a6900b29b7e801964b69f641a9e20e8e79fbef8"
+    },
+    {
+      "path": "tool/skill_evals/lib/skill_eval_runner.dart",
+      "sha256": "695f61b30c16d1059aaa2acf2ad7144b92010c9362ed8ce9cd69144cfb871104"
+    },
+    {
+      "path": "tool/skill_evals/run_skill_evals.dart",
+      "sha256": "c26ef67377dc119d85b1034e3cb6a8ff2b321801bc380661f178f2ef9405145a"
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"trigger.unrelated","fixtureId":"system-info","kind":"trigger_metadata","input":{"text":"Tell me a joke","locale":"en-US"},"expected":{"decision":"no_match","reasonCode":"trigger_metadata_no_match"}}

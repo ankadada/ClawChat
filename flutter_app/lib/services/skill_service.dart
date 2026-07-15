@@ -14,7 +14,9 @@ import '../models/chat_models.dart';
 import '../models/workspace_import_receipt.dart';
 import 'app_http.dart';
 import 'bounded_file_reader.dart';
+import 'bundled_legacy_skill_catalog.dart';
 import 'native_bridge.dart';
+import 'skill_import_inspector.dart';
 
 typedef SkillArchiveStager = Future<String> Function(
   Uri uri,
@@ -51,6 +53,7 @@ class SkillInfo {
   final String? validationError;
   final ExtensionManifest? manifest;
   final ExtensionCapabilitySnapshot capabilitySnapshot;
+  final String? availabilityReason;
   bool enabled;
 
   SkillInfo({
@@ -68,9 +71,12 @@ class SkillInfo {
     required this.enabled,
     this.validationError,
     this.manifest,
+    this.availabilityReason,
   });
 
-  bool get requiresConsent => valid && !consentCurrent;
+  bool get isUnavailable => availabilityReason != null;
+
+  bool get requiresConsent => valid && !isUnavailable && !consentCurrent;
 }
 
 class PreparedSkillImport {
@@ -89,6 +95,7 @@ class PreparedSkillImport {
   final String trustDigest;
   final SkillTrustGrant? previousGrant;
   final bool installedCandidate;
+  final ImportInspectionResult inspection;
 
   const PreparedSkillImport({
     required this.stagingPath,
@@ -105,6 +112,7 @@ class PreparedSkillImport {
     required this.contentDigest,
     required this.trustDigest,
     required this.previousGrant,
+    required this.inspection,
     this.installedCandidate = false,
   });
 
@@ -334,6 +342,7 @@ class SkillService {
     required String backupPath,
     required String expectedBackupTrustDigest,
   }) async {
+    _rejectUnavailableBundledIdentity(id);
     final target = updateTargetPath(id);
     if (!_validUpdateBackupPath(id, backupPath)) {
       throw StateError('Update backup path is invalid.');
@@ -372,6 +381,7 @@ class SkillService {
     required String failedPath,
     required String expectedTrustDigest,
   }) async {
+    _rejectUnavailableBundledIdentity(id);
     final target = updateTargetPath(id);
     if (!_validUpdateFailedPath(id, failedPath)) {
       throw StateError('Failed update path is invalid.');
@@ -407,6 +417,7 @@ class SkillService {
     required String id,
     required String expectedTrustDigest,
   }) async {
+    _rejectUnavailableBundledIdentity(id);
     final target = updateTargetPath(id);
     final restored = await _installedCandidateAt(target);
     if (restored == null ||
@@ -444,17 +455,6 @@ class SkillService {
     throw StateError('Update recovery cleanup path is invalid.');
   }
 
-  static const presetSkillNames = [
-    'github',
-    'web-search',
-    'code-review',
-    'translator',
-    'file-manager',
-    'system-info',
-    'gws-calendar',
-    'gws-gmail',
-    'gws-drive',
-  ];
   static const _stagingDirectory = '/root/workspace/.skill-import-staging';
   static const _updateBackupDirectory = '/root/workspace/.skill-update-backups';
   static const _updateFailureDirectory =
@@ -513,14 +513,26 @@ class SkillService {
   }
 
   static Future<void> setSkillEnabled(String id, bool enabled) async {
-    await _setSkillEnabled(id, enabled);
+    await _setSkillEnabled(id, enabled, treatIdAsNameAlias: true);
   }
 
   static Future<void> _setSkillEnabled(
     String id,
     bool enabled, {
     Iterable<String> aliases = const [],
+    bool treatIdAsNameAlias = false,
   }) async {
+    if (enabled) {
+      final unavailable = BundledLegacySkillCatalog.entryForIdentity(
+        id: id,
+        name: treatIdAsNameAlias ? id : null,
+      );
+      if (unavailable != null) {
+        throw StateError(
+          'Bundled legacy preset is unavailable: ${unavailable.reason}',
+        );
+      }
+    }
     final prefs = await SharedPreferences.getInstance();
     final disabled = await _loadDisabled();
     if (enabled) {
@@ -558,12 +570,20 @@ class SkillService {
             installedCandidate: true,
           );
           final grant = grants[candidate.id];
-          final consentCurrent = grant != null &&
+          final unavailable = BundledLegacySkillCatalog.entryForInstalledSkill(
+            id: candidate.id,
+            name: candidate.name,
+            legacy: candidate.legacy,
+            installedAssetDirectory: _installedAssetDirectory(path),
+          );
+          final consentCurrent = unavailable == null &&
+              grant != null &&
               grant.manifestDigest == candidate.manifestDigest &&
               grant.contentDigest == candidate.contentDigest &&
               grant.version == candidate.version &&
               grant.legacy == candidate.legacy;
-          final storedEnabled = !disabled.contains(candidate.id) &&
+          final storedEnabled = unavailable == null &&
+              !disabled.contains(candidate.id) &&
               !disabled.contains(candidate.name);
           skills.add(SkillInfo(
             id: candidate.id,
@@ -579,6 +599,7 @@ class SkillService {
             capabilitySnapshot: candidate.capabilitySnapshot,
             enabled: storedEnabled && consentCurrent,
             manifest: candidate.manifest,
+            availabilityReason: unavailable?.reason,
           ));
         } catch (error) {
           final fallbackName = root.split('/').last;
@@ -607,7 +628,20 @@ class SkillService {
 
   static String buildSkillIndex(List<SkillInfo> skills) {
     final enabled = skills
-        .where((skill) => skill.enabled && skill.valid && skill.consentCurrent)
+        .where(
+          (skill) =>
+              skill.enabled &&
+              skill.valid &&
+              skill.consentCurrent &&
+              BundledLegacySkillCatalog.entryForInstalledSkill(
+                    id: skill.id,
+                    name: skill.name,
+                    legacy: skill.legacy,
+                    installedAssetDirectory:
+                        _installedAssetDirectory(skill.path),
+                  ) ==
+                  null,
+        )
         .toList();
     if (enabled.isEmpty) return '';
 
@@ -650,6 +684,16 @@ class SkillService {
       manifestContent: await _readOptionalRootfsText('$root/$manifestFilename'),
       installedCandidate: true,
     );
+    final unavailable = BundledLegacySkillCatalog.entryForInstalledSkill(
+      id: candidate.id,
+      name: candidate.name,
+      legacy: candidate.legacy,
+      installedAssetDirectory: _installedAssetDirectory(normalizedPath),
+    );
+    if (unavailable != null) {
+      throw StateError(
+          'Bundled legacy preset is unavailable: ${unavailable.reason}');
+    }
     final grants = await loadTrustGrants();
     final grant = grants[candidate.id];
     final disabled = await _loadDisabled();
@@ -680,6 +724,13 @@ class SkillService {
   /// the normal use-time grant and digest verification on fresh bytes.
   static Future<VerifiedSkillUse> loadGrantedSkillById(String id) async {
     final normalizedId = _normalizeSkillName(id);
+    final unavailable = BundledLegacySkillCatalog.entryForIdentity(
+      id: normalizedId,
+    );
+    if (unavailable != null) {
+      throw StateError(
+          'Bundled legacy preset is unavailable: ${unavailable.reason}');
+    }
     final output = await NativeBridge.runInProot(
       'find ${_shellQuote(skillsDirectory)} -name "SKILL.md" -type f 2>/dev/null',
     );
@@ -746,15 +797,36 @@ class SkillService {
     required String? manifestContent,
     SkillTrustGrant? previousGrant,
     bool installedCandidate = false,
-  }) {
-    if (skillContent.trim().isEmpty) {
-      throw const FormatException('SKILL.md is empty.');
-    }
-    if (skillContent.length > 1024 * 1024) {
-      throw const FormatException('SKILL.md is too large.');
-    }
+  }) =>
+      _inspectPackageBytes(
+        stagingPath: stagingPath,
+        sourceIdentity: sourceIdentity,
+        skillBytes: utf8.encode(skillContent),
+        manifestBytes:
+            manifestContent == null ? null : utf8.encode(manifestContent),
+        previousGrant: previousGrant,
+        installedCandidate: installedCandidate,
+      );
 
-    if (manifestContent == null) {
+  static PreparedSkillImport _inspectPackageBytes({
+    required String stagingPath,
+    required String sourceIdentity,
+    required List<int> skillBytes,
+    required List<int>? manifestBytes,
+    SkillTrustGrant? previousGrant,
+    bool installedCandidate = false,
+  }) {
+    final inspected = SkillImportInspector.inspect(
+      skillBytes: skillBytes,
+      manifestBytes: manifestBytes,
+    );
+    if (inspected.result.isRejected) {
+      throw SkillImportRejectedException(inspected.result);
+    }
+    final skillContent = inspected.skillContent!;
+    final manifest = inspected.manifest;
+
+    if (manifest == null) {
       final fallbackName = stagingPath.split('/').last;
       final name = _extractYamlField(skillContent, 'name') ?? fallbackName;
       final description = _extractYamlField(skillContent, 'description') ?? '';
@@ -762,8 +834,7 @@ class SkillService {
       final manifestDigest = sha256
           .convert(utf8.encode('legacy-manifest-v1\n$id\n$name\n$description'))
           .toString();
-      final contentDigest =
-          sha256.convert(utf8.encode(skillContent)).toString();
+      final contentDigest = sha256.convert(skillBytes).toString();
       return PreparedSkillImport(
         stagingPath: stagingPath,
         sourceIdentity: sourceIdentity,
@@ -779,20 +850,11 @@ class SkillService {
         contentDigest: contentDigest,
         trustDigest: _packageTrustDigest(manifestDigest, contentDigest),
         previousGrant: previousGrant,
+        inspection: inspected.result,
         installedCandidate: installedCandidate,
       );
     }
-
-    if (manifestContent.length > 256 * 1024) {
-      throw const FormatException('Manifest is too large.');
-    }
-    final manifest = ExtensionManifest.parse(manifestContent);
-    if (manifest.failsIntegrityClosed) {
-      throw FormatException(
-        'Manifest integrity check failed (${manifest.integrityStatus.name}).',
-      );
-    }
-    final contentDigest = sha256.convert(utf8.encode(skillContent)).toString();
+    final contentDigest = sha256.convert(skillBytes).toString();
     return PreparedSkillImport(
       stagingPath: stagingPath,
       sourceIdentity: sourceIdentity,
@@ -808,6 +870,7 @@ class SkillService {
       contentDigest: contentDigest,
       trustDigest: _packageTrustDigest(manifest.grantDigest, contentDigest),
       previousGrant: previousGrant,
+      inspection: inspected.result,
       installedCandidate: installedCandidate,
     );
   }
@@ -967,6 +1030,15 @@ class SkillService {
     if (!skill.valid) {
       throw StateError('Invalid or tampered skill cannot be enabled.');
     }
+    if (BundledLegacySkillCatalog.entryForInstalledSkill(
+          id: skill.id,
+          name: skill.name,
+          legacy: skill.legacy,
+          installedAssetDirectory: _installedAssetDirectory(skill.path),
+        ) !=
+        null) {
+      throw StateError('Bundled legacy preset is unavailable.');
+    }
     final root =
         skill.path.substring(0, skill.path.length - '/SKILL.md'.length);
     final grants = await loadTrustGrants();
@@ -983,11 +1055,29 @@ class SkillService {
   static Future<SkillInstallResult> installPreparedSkill(
     PreparedSkillImport candidate, {
     bool enabled = true,
+    bool inspectionReviewConfirmed = false,
     bool preserveBackup = false,
     String? preservedBackupPath,
     Future<void> Function()? afterBackupMove,
     Future<void> Function()? afterNewMove,
   }) async {
+    if (candidate.inspection.isRejected) {
+      throw StateError('Rejected skill import cannot be installed.');
+    }
+    if (candidate.inspection.needsReview && !inspectionReviewConfirmed) {
+      throw StateError('Skill import inspection requires explicit review.');
+    }
+    if (BundledLegacySkillCatalog.entryForInstalledSkill(
+          id: candidate.id,
+          name: candidate.name,
+          legacy: candidate.legacy,
+          installedAssetDirectory: _installedAssetDirectory(
+            '${candidate.stagingPath}/SKILL.md',
+          ),
+        ) !=
+        null) {
+      throw StateError('Bundled legacy preset is unavailable.');
+    }
     if (candidate.installedCandidate) {
       final root = candidate.stagingPath;
       if (_normalizeInstalledSkillEntrypoint('$root/SKILL.md') == null) {
@@ -1179,6 +1269,7 @@ class SkillService {
     Future<void> Function()? afterTargetMove,
     Future<void> Function()? afterBackupMove,
   }) async {
+    _rejectUnavailableBundledIdentity(id);
     final target = _targetDirForSkillId(id);
     final failed = failedPath ?? updateFailedPath(id, const Uuid().v4());
     if (!_validUpdateBackupPath(id, backupPath)) {
@@ -1280,7 +1371,9 @@ class SkillService {
 
   static Future<int> installPresetSkills() async {
     var installed = 0;
-    for (final name in presetSkillNames) {
+    for (final preset in BundledLegacySkillCatalog.entries) {
+      if (!preset.isInstallable) continue;
+      final name = preset.assetDirectory;
       final targetDir = '$skillsDirectory/$name';
       try {
         final checkOutput = await NativeBridge.runInProot(
@@ -1375,7 +1468,7 @@ class SkillService {
       checkCancelled();
       final grants = await loadTrustGrants();
       checkCancelled();
-      final skillContent = await _readStagedRootfsTextBounded(
+      final skillBytes = await _readStagedRootfsBytesBounded(
         skillPath,
         maxBytes: _maxSkillEntrypointBytes,
         deadline: deadline,
@@ -1383,7 +1476,7 @@ class SkillService {
         required: true,
       );
       checkCancelled();
-      final manifestContent = await _readStagedRootfsTextBounded(
+      final manifestBytes = await _readStagedRootfsBytesBounded(
         '$root/$manifestFilename',
         maxBytes: _maxManifestBytes,
         deadline: deadline,
@@ -1391,18 +1484,18 @@ class SkillService {
         required: false,
       );
       checkCancelled();
-      final provisional = inspectPackage(
+      final provisional = _inspectPackageBytes(
         stagingPath: root,
         sourceIdentity: sourceIdentity,
-        skillContent: skillContent!,
-        manifestContent: manifestContent,
+        skillBytes: skillBytes!,
+        manifestBytes: manifestBytes,
         previousGrant: null,
       );
-      return inspectPackage(
+      return _inspectPackageBytes(
         stagingPath: root,
         sourceIdentity: sourceIdentity,
-        skillContent: skillContent,
-        manifestContent: manifestContent,
+        skillBytes: skillBytes,
+        manifestBytes: manifestBytes,
         previousGrant: grants[provisional.id],
       );
     } finally {
@@ -1531,7 +1624,7 @@ class SkillService {
   static Future<String?> _readOptionalRootfsText(String path) =>
       NativeBridge.readRootfsFile(_bridgeRootfsPath(path));
 
-  static Future<String?> _readStagedRootfsTextBounded(
+  static Future<Uint8List?> _readStagedRootfsBytesBounded(
     String path, {
     required int maxBytes,
     required _SkillImportDeadline? deadline,
@@ -1564,13 +1657,7 @@ class SkillService {
         }
         return null;
       }
-      try {
-        return utf8.decode(bytes, allowMalformed: false);
-      } on FormatException {
-        throw FormatException(
-          'Skill file is not valid UTF-8: ${path.split('/').last}.',
-        );
-      }
+      return bytes;
     } on TimeoutException {
       await NativeBridge.cancelImportOperation(cancellationToken.operationId);
       try {
@@ -2008,6 +2095,24 @@ class SkillService {
     return normalized;
   }
 
+  static String? _installedAssetDirectory(String path) {
+    final normalized = _normalizeInstalledSkillEntrypoint(path);
+    if (normalized == null) return null;
+    final relative = normalized.substring('$skillsDirectory/'.length);
+    final segments = relative.split('/');
+    if (segments.length != 2 || segments.last != 'SKILL.md') return null;
+    return segments.first;
+  }
+
+  static void _rejectUnavailableBundledIdentity(String id) {
+    final unavailable = BundledLegacySkillCatalog.entryForIdentity(id: id);
+    if (unavailable != null) {
+      throw StateError(
+        'Bundled legacy preset is unavailable: ${unavailable.reason}',
+      );
+    }
+  }
+
   static String _normalizeSkillName(String rawName) {
     final name = rawName.trim();
     if (name.isEmpty ||
@@ -2053,31 +2158,46 @@ class SkillService {
     }
   }
 
-  /// Extracts only regular files/directories after validating every archive
-  /// member. This prevents path traversal and link-based writes outside the
-  /// isolated staging directory before consent.
-  static Future<void> _safeExtractArchive(
-    String archive,
-    String destination, {
-    required String format,
-    _SkillImportDeadline? deadline,
-    SkillImportCancellationToken? cancellationToken,
-  }) async {
-    const script = r'''
+  static const _archiveExtractorScript = r'''
 import os, pathlib, stat, sys, tarfile, zipfile
 source, destination, archive_format = sys.argv[1:4]
 max_files = 512
 max_bytes = 20 * 1024 * 1024
 
-def safe_name(name):
-    if not name or name.startswith('/') or '\\' in name or '\x00' in name:
-        return False
+def normalized_name(name):
+    if (not name or len(name.encode('utf-8')) > 4096 or name.startswith('/')
+            or '\\' in name or '\x00' in name):
+        raise ValueError('unsafe archive member')
     path = pathlib.PurePosixPath(name)
     if path.is_absolute() or '..' in path.parts:
-        return False
+        raise ValueError('unsafe archive member')
     if path.parts and path.parts[0].endswith(':'):
-        return False
-    return not any(ord(char) < 32 or ord(char) == 127 for char in name)
+        raise ValueError('unsafe archive member')
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError('unsafe archive member')
+    normalized = path.as_posix().rstrip('/')
+    if not normalized or normalized == '.':
+        raise ValueError('unsafe archive member')
+    return normalized
+
+def validate_layout(entries):
+    seen = set()
+    for name, is_dir, size in entries:
+        if name in seen:
+            raise ValueError('duplicate normalized archive member')
+        seen.add(name)
+    skill_files = [name for name, is_dir, size in entries
+                   if not is_dir and (name == 'SKILL.md' or name.endswith('/SKILL.md'))]
+    if len(skill_files) != 1:
+        raise ValueError('invalid skill layout')
+    skill_root = skill_files[0][:-len('/SKILL.md')] if skill_files[0] != 'SKILL.md' else ''
+    if not skill_root:
+        return
+    for name, is_dir, size in entries:
+        within_root = name == skill_root or name.startswith(skill_root + '/')
+        ancestor_dir = is_dir and skill_root.startswith(name + '/')
+        if not within_root and not ancestor_dir:
+            raise ValueError('entry outside skill layout')
 
 os.makedirs(destination, exist_ok=True)
 if archive_format == 'zip' or (archive_format == 'auto' and zipfile.is_zipfile(source)):
@@ -2086,13 +2206,21 @@ if archive_format == 'zip' or (archive_format == 'auto' and zipfile.is_zipfile(s
         if not members or len(members) > max_files:
             raise ValueError('invalid archive file count')
         total = 0
+        entries = []
         for member in members:
             mode = member.external_attr >> 16
-            if not safe_name(member.filename) or stat.S_ISLNK(mode):
+            if stat.S_ISLNK(mode):
+                raise ValueError('unsafe archive member')
+            name = normalized_name(member.filename)
+            is_dir = member.is_dir()
+            kind = stat.S_IFMT(mode)
+            if kind and not (is_dir or stat.S_ISREG(mode)):
                 raise ValueError('unsafe archive member')
             total += member.file_size
             if total > max_bytes:
                 raise ValueError('archive too large')
+            entries.append((name, is_dir, member.file_size))
+        validate_layout(entries)
         package.extractall(destination)
 else:
     with tarfile.open(source, mode='r:*') as package:
@@ -2100,15 +2228,31 @@ else:
         if not members or len(members) > max_files:
             raise ValueError('invalid archive file count')
         total = 0
+        entries = []
         for member in members:
-            if not safe_name(member.name) or not (member.isfile() or member.isdir()):
+            if not (member.isfile() or member.isdir()):
                 raise ValueError('unsafe archive member')
+            name = normalized_name(member.name)
             total += member.size
             if total > max_bytes:
                 raise ValueError('archive too large')
+            entries.append((name, member.isdir(), member.size))
+        validate_layout(entries)
         package.extractall(destination, members=members)
 print('SKILL_EXTRACT_OK')
 ''';
+
+  /// Extracts only regular files/directories after validating every archive
+  /// member. This prevents path traversal, normalized-name replacement, and
+  /// link-based writes outside the isolated staging directory before consent.
+  static Future<void> _safeExtractArchive(
+    String archive,
+    String destination, {
+    required String format,
+    _SkillImportDeadline? deadline,
+    SkillImportCancellationToken? cancellationToken,
+  }) async {
+    const script = _archiveExtractorScript;
     final command = 'python3 -c ${_shellQuote(script)} ${_shellQuote(archive)} '
         '${_shellQuote(destination)} ${_shellQuote(format)} 2>/dev/null';
     final output = deadline == null
@@ -2125,6 +2269,9 @@ print('SKILL_EXTRACT_OK')
       throw const FormatException('Skill archive is invalid or unsafe.');
     }
   }
+
+  @visibleForTesting
+  static String get archiveExtractorScriptForTesting => _archiveExtractorScript;
 
   @visibleForTesting
   static void setLocalImportReadStreamForTesting(

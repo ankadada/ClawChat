@@ -12,6 +12,7 @@ import '../constants.dart';
 import '../models/mcp_server_config.dart';
 import '../models/update_models.dart';
 import '../services/bounded_file_reader.dart';
+import '../services/bundled_legacy_skill_catalog.dart';
 import '../services/config_export_service.dart';
 import '../services/memory_service.dart';
 import '../services/mcp_service.dart';
@@ -1030,19 +1031,19 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: Text('${skill.name} · v${skill.version}'),
-                  subtitle: Text(
-                    !skill.valid
-                        ? '扩展无效，操作已禁用'
-                        : loading
-                            ? '正在读取本地更新历史…'
-                            : snapshot.hasError
-                                ? '更新历史状态未知'
-                                : state == null
-                                    ? '无本地更新历史或回滚备份'
-                                    : '已更新至 v${state.version} · 可回滚',
-                  ),
+                  subtitle: Text(skill.isUnavailable
+                      ? skill.availabilityReason!
+                      : !skill.valid
+                          ? '扩展无效，操作已禁用'
+                          : loading
+                              ? '正在读取本地更新历史…'
+                              : snapshot.hasError
+                                  ? '更新历史状态未知'
+                                  : state == null
+                                      ? '无本地更新历史或回滚备份'
+                                      : '已更新至 v${state.version} · 可回滚'),
                   value: skill.enabled,
-                  onChanged: skill.valid
+                  onChanged: skill.valid && !skill.isUnavailable
                       ? (value) async {
                           if (value && skill.requiresConsent) {
                             await _requestInstalledSkillConsent(skill);
@@ -1061,19 +1062,20 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                   runSpacing: 8,
                   children: [
                     OutlinedButton(
-                      onPressed: skill.valid
+                      onPressed: skill.valid && !skill.isUnavailable
                           ? () => _showRemoteExtensionUpdate(skill)
                           : null,
                       child: Text(SettingsScreen.extensionActionLabels[0]),
                     ),
                     OutlinedButton(
-                      onPressed: loading || snapshot.hasError
-                          ? null
-                          : () => _showExtensionHistory(skill, state),
+                      onPressed:
+                          skill.isUnavailable || loading || snapshot.hasError
+                              ? null
+                              : () => _showExtensionHistory(skill, state),
                       child: Text(SettingsScreen.extensionActionLabels[1]),
                     ),
                     OutlinedButton(
-                      onPressed: loading || state == null
+                      onPressed: skill.isUnavailable || loading || state == null
                           ? null
                           : () => _rollbackExtension(skill),
                       child: Text(SettingsScreen.extensionActionLabels[2]),
@@ -1616,8 +1618,12 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
-                              _subsectionHeader(
-                                  theme, AppStrings.bashDenyPatterns),
+                              Expanded(
+                                child: _subsectionHeader(
+                                  theme,
+                                  AppStrings.bashDenyPatterns,
+                                ),
+                              ),
                               Padding(
                                 padding: const EdgeInsets.only(right: 8),
                                 child: IconButton(
@@ -1826,10 +1832,14 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                 crossAxisAlignment: WrapCrossAlignment.center,
                                 children: [
                                   TextButton.icon(
-                                    icon: const Icon(Icons.download, size: 18),
-                                    label:
-                                        const Text(AppStrings.installPresets),
-                                    onPressed: _installPresetSkills,
+                                    icon: const Icon(Icons.info_outline,
+                                        size: 18),
+                                    label: const Text(
+                                      AppStrings
+                                          .bundledLegacyPresetsUnavailable,
+                                    ),
+                                    onPressed:
+                                        _showBundledLegacyPresetsUnavailable,
                                   ),
                                   IconButton(
                                     icon: const Icon(Icons.add),
@@ -1877,22 +1887,25 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                   title: Text(
                                     '${skill.name} · ${skill.legacy ? 'Legacy' : 'v${skill.version}'}',
                                   ),
-                                  subtitle: Text(
-                                    [
-                                      if (!skill.valid)
-                                        skill.validationError ??
-                                            'Invalid or tampered manifest',
-                                      if (skill.valid && skill.requiresConsent)
-                                        'Consent required before use',
-                                      if (skill.valid)
-                                        'Risk: ${skill.riskTier}',
-                                      skill.description,
-                                    ].join(' · '),
-                                    maxLines: 3,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
+                                  subtitle: skill.isUnavailable
+                                      ? Text(skill.availabilityReason!)
+                                      : Text(
+                                          [
+                                            if (!skill.valid)
+                                              skill.validationError ??
+                                                  'Invalid or tampered manifest',
+                                            if (skill.valid &&
+                                                skill.requiresConsent)
+                                              'Consent required before use',
+                                            if (skill.valid)
+                                              'Risk: ${skill.riskTier}',
+                                            skill.description,
+                                          ].join(' · '),
+                                          maxLines: 3,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
                                   value: skill.enabled,
-                                  onChanged: skill.valid
+                                  onChanged: skill.valid && !skill.isUnavailable
                                       ? (v) async {
                                           HapticFeedback.lightImpact();
                                           if (!v) {
@@ -2422,57 +2435,35 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
     );
   }
 
-  Future<void> _installPresetSkills() async {
-    final confirmed = await showDialog<bool>(
-          context: context,
-          barrierDismissible: false,
-          builder: (ctx) => AlertDialog(
-            title: const Text('Install bundled legacy skills?'),
-            content: SingleChildScrollView(
-              child: Text(
-                'Source: bundled with ClawChat\n'
-                'Manifest identity: none (legacy)\n'
-                'Risk: unknown / conservative critical\n'
-                'Declared capabilities: none\n'
-                'Declared secret names: none\n\n'
-                '${SkillService.presetSkillNames.join(', ')}\n\n'
-                'These skills will be installed disabled. Each skill requires '
-                'a second explicit legacy consent before it can enter the '
-                'model prompt. Per-call tool approvals still apply.',
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text(AppStrings.cancel),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('Install disabled'),
-              ),
+  Future<void> _showBundledLegacyPresetsUnavailable() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.bundledLegacyPresetsUnavailable),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(AppStrings.bundledLegacyPresetsUnavailableDescription),
+              const SizedBox(height: 12),
+              for (final preset in BundledLegacySkillCatalog.entries) ...[
+                Text(preset.assetDirectory),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Text(preset.reason),
+                ),
+              ],
             ],
           ),
-        ) ??
-        false;
-    if (!confirmed || !mounted) return;
-    setState(() => _loadingSkills = true);
-    try {
-      final count = await SkillService.installPresetSkills();
-      await _loadSkills();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(AppStrings.presetSkillsInstalled(count))),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('${AppStrings.installFailed}: $e')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _loadingSkills = false);
-    }
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(AppStrings.cancel),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _showImportSkillDialog() async {
@@ -2520,7 +2511,10 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         return;
       }
       setState(() => _loadingSkills = true);
-      await SkillService.installPreparedSkill(candidate);
+      await SkillService.installPreparedSkill(
+        candidate,
+        inspectionReviewConfirmed: true,
+      );
       await _loadSkills();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -2727,7 +2721,10 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         return;
       }
       setState(() => _loadingSkills = true);
-      await SkillService.installPreparedSkill(candidate);
+      await SkillService.installPreparedSkill(
+        candidate,
+        inspectionReviewConfirmed: true,
+      );
       await _loadSkills();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -2756,7 +2753,11 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       if (!mounted) return;
       setState(() => _loadingSkills = false);
       if (!await _confirmSkillConsent(candidate)) return;
-      await SkillService.installPreparedSkill(candidate, enabled: true);
+      await SkillService.installPreparedSkill(
+        candidate,
+        enabled: true,
+        inspectionReviewConfirmed: true,
+      );
       await _loadSkills();
     } catch (e) {
       if (!mounted) return;

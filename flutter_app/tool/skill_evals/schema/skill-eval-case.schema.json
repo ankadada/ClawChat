@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClawChat host-owned skill eval case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "fixtureId", "kind", "input", "expected"],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"},
+    "fixtureId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"},
+    "kind": {"enum": ["structure", "static_scan", "trigger_metadata"]},
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text"],
+      "properties": {
+        "text": {"type": "string", "maxLength": 2048},
+        "locale": {"type": "string", "pattern": "^[A-Za-z0-9-]{2,35}$"}
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "reasonCode"],
+      "properties": {
+        "decision": {"enum": ["match", "no_match", "reject"]},
+        "reasonCode": {"type": "string", "pattern": "^[a-z0-9._-]{1,96}$"},
+        "selectedSkillId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"}
+      }
+    }
+  }
+}

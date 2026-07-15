@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"structure.gws-gmail","fixtureId":"gws-gmail","kind":"structure","input":{"text":"verify structure"},"expected":{"decision":"match","reasonCode":"structure_valid","selectedSkillId":"gws-gmail"}}

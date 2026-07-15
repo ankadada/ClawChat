@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"static.translator","fixtureId":"translator","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"no_match","reasonCode":"static_scan_clean"}}

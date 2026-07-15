@@ -26,7 +26,7 @@ void main() {
       'schemaVersion': 1,
       'kind': 'androidApp',
       'targetId': AppConstants.packageName,
-      'version': '2.6.0',
+      'version': '2.7.0',
       'revision': 1,
       'artifactUrl': 'https://updates.example/app.apk',
       'artifactSha256': sha256.convert(artifact).toString(),

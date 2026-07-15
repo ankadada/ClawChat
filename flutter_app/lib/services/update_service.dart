@@ -222,6 +222,7 @@ final class UpdateService {
                 ? ((candidate, backupPath, afterBackupMove, afterNewMove) =>
                     SkillService.installPreparedSkill(
                       candidate,
+                      inspectionReviewConfirmed: true,
                       preserveBackup: true,
                       preservedBackupPath: backupPath,
                       afterBackupMove: () =>
@@ -1670,6 +1671,7 @@ final class UpdateService {
       contentDigest: candidate.contentDigest,
       trustDigest: candidate.trustDigest,
       previousGrant: candidate.previousGrant,
+      inspection: candidate.inspection,
       installedCandidate: candidate.installedCandidate,
     );
   }

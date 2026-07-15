@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"structure.file-manager","fixtureId":"file-manager","kind":"structure","input":{"text":"verify structure"},"expected":{"decision":"match","reasonCode":"structure_valid","selectedSkillId":"file-manager"}}

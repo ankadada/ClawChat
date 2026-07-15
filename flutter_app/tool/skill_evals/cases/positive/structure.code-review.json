@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"structure.code-review","fixtureId":"code-review","kind":"structure","input":{"text":"verify structure"},"expected":{"decision":"match","reasonCode":"structure_valid","selectedSkillId":"code-review"}}

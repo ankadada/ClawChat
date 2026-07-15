@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "assetRoot": "assets/skills",
+  "entries": [
+    {
+      "assetDirectory": "code-review",
+      "skillMarkdownSha256": "3ccad2580a82dc16c8af4ac3242135f90f0f96b3b330408a18b24b355c08f047",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    },
+    {
+      "assetDirectory": "file-manager",
+      "skillMarkdownSha256": "3efa6a61f52c1b453a5ffe81c1f83c0d63516ecd336343abcef948b6b0aa1661",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    },
+    {
+      "assetDirectory": "github",
+      "skillMarkdownSha256": "37f77682a9e6891b1650bc2e9e518c8e58057c6c5215bd350f879796b47ba446",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    },
+    {
+      "assetDirectory": "gws-calendar",
+      "skillMarkdownSha256": "a0954c5aa90cc49f824a75eb89cf7d847753bd455f1e3dad08f125c58277916b",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    },
+    {
+      "assetDirectory": "gws-drive",
+      "skillMarkdownSha256": "53df6b9255ad60e980cb3f66375157758902873ca4bcd76b579c560069eaeb86",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    },
+    {
+      "assetDirectory": "gws-gmail",
+      "skillMarkdownSha256": "57ef6f4af7d62cb0ca05c36b93190357408fb7d217b163e3dceb69a33bcc0979",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    },
+    {
+      "assetDirectory": "system-info",
+      "skillMarkdownSha256": "415b5aa3c04df6d6118f4d73bc7cc6f0e3c55fda1caa39c7495f7ded75504aff",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    },
+    {
+      "assetDirectory": "translator",
+      "skillMarkdownSha256": "9a42a100138d501cd1d6f5f94256117322d036d1052a11c8653c0d2c16c89ac3",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    },
+    {
+      "assetDirectory": "web-search",
+      "skillMarkdownSha256": "9b41cb1fcbffccc439183e840e48ecc013d977e4f2466f8dffdbcd0016243678",
+      "disposition": "disabled",
+      "reason": "Legacy preset requires runtime policy remediation before availability.",
+      "planningStatus": "ready_for_release"
+    }
+  ]
+}
