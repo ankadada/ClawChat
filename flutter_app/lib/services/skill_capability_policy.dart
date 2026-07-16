@@ -114,15 +114,8 @@ class SkillCapabilityPolicy {
         'Historical skill consent is stale; reactivate the skill before tools can run.',
       );
     }
-    if (active == null) {
-      if (request.toolName == LegacySkillCompatibility.xdsToolName) {
-        return _deny(
-          'xds_skill_context_required',
-          'XDS is available only after activating an authorized XDS skill.',
-        );
-      }
-      return null;
-    }
+    if (request.toolName == LegacySkillCompatibility.xdsToolName) return null;
+    if (active == null) return null;
 
     final capabilities = active.capabilities;
     if (!capabilities.tools.contains(request.toolName)) {
@@ -158,7 +151,6 @@ class SkillCapabilityPolicy {
           capabilities,
         ),
       'bash' => _checkBash(request.arguments, capabilities),
-      LegacySkillCompatibility.xdsToolName => _checkXdsAgent(capabilities),
       _ when request.toolName.startsWith('mcp_') => _deny(
           'skill_mcp_unenforceable',
           'MCP tools are unavailable inside a skill capability context in P0.',
@@ -287,26 +279,6 @@ class SkillCapabilityPolicy {
       return _deny(
         'skill_secret_bash_forbidden',
         'Secrets are unavailable to Bash and subprocess tools.',
-      );
-    }
-    return null;
-  }
-
-  ToolDenyDecision? _checkXdsAgent(
-    ExtensionCapabilitySnapshot capabilities,
-  ) {
-    if (!capabilities.networkDomains
-        .contains(LegacySkillCompatibility.xdsDomain)) {
-      return _deny(
-        'skill_network_domain',
-        'Skill did not declare the fixed AI-XDS service domain.',
-      );
-    }
-    if (!capabilities.secretNames
-        .contains(LegacySkillCompatibility.xdsTokenName)) {
-      return _deny(
-        'skill_secret_undeclared',
-        'Skill did not declare the XDS authentication secret.',
       );
     }
     return null;

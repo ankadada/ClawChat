@@ -272,7 +272,13 @@ class AgentService {
       toolDefs = supportsTools
           ? _tools.getToolDefinitions(
               sessionId: sessionId,
-              includeXds: _skillCapabilityPolicy?.activeSkill != null,
+              includeXds: _tools.hasTool(
+                    LegacySkillCompatibility.xdsToolName,
+                  ) &&
+                  envVars[LegacySkillCompatibility.xdsTokenName]
+                          ?.trim()
+                          .isNotEmpty ==
+                      true,
             )
           : <ToolDefinition>[];
       iteration++;

@@ -56,18 +56,17 @@ ToolApprovalRequest _request(
     );
 
 void main() {
-  test('XDS requires an active declared compatibility context', () async {
+  test('XDS is an app-owned typed adapter outside skill capability scopes',
+      () async {
     final policy = SkillCapabilityPolicy();
     final request = _request(
       LegacySkillCompatibility.xdsToolName,
       const {'operation': 'list'},
       risk: ToolRisk.dangerous,
     );
-    expect(policy.denyFor(request)?.ruleId, 'xds_skill_context_required');
+    expect(policy.denyFor(request), isNull);
 
-    policy.activate(
-      _skill(LegacySkillCompatibility.xdsCapabilities),
-    );
+    policy.activate(_skill(_capabilities()));
     expect(policy.denyFor(request), isNull);
     expect(
       policy
@@ -75,16 +74,22 @@ void main() {
           ?.ruleId,
       'skill_tool_undeclared',
     );
+  });
 
-    final missingDomain = SkillCapabilityPolicy()
-      ..activate(_skill(_capabilities(
-        tools: const [LegacySkillCompatibility.xdsToolName],
-        secrets: const [LegacySkillCompatibility.xdsTokenName],
-      )));
-    expect(
-      missingDomain.denyFor(request)?.ruleId,
-      'skill_network_domain',
-    );
+  test('app-owned XDS remains dangerous and requires normal approval',
+      () async {
+    var approvals = 0;
+    final policy = ToolPolicy(onApprovalRequired: (_) {
+      approvals++;
+      return false;
+    });
+    final approved = await policy.approve(_request(
+      LegacySkillCompatibility.xdsToolName,
+      const {'operation': 'list'},
+    ));
+
+    expect(approved, isFalse);
+    expect(approvals, 1);
   });
 
   test(

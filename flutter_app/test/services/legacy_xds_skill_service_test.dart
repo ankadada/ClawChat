@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/services/legacy_skill_compatibility.dart';
 import 'package:clawchat/services/native_bridge.dart';
@@ -9,12 +8,39 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+Map<String, dynamic> _xdsManifest() => {
+      'schemaVersion': 1,
+      'id': 'com.example.xds',
+      'name': 'XDS adapter',
+      'description': 'Typed XDS adapter test manifest.',
+      'model': {
+        'name': 'xds_adapter',
+        'description': 'Use the typed XDS adapter.',
+      },
+      'version': '1.0.0',
+      'source': {'type': 'local'},
+      'integrity': <String, dynamic>{},
+      'author': 'Example',
+      'license': 'MIT',
+      'capabilities': {
+        'tools': [LegacySkillCompatibility.xdsToolName],
+        'commands': <String>[],
+        'networkDomains': [LegacySkillCompatibility.xdsDomain],
+        'filesystem': {'read': <String>[], 'write': <String>[]},
+        'android': {'intents': <String>[], 'permissions': <String>[]},
+        'secrets': [LegacySkillCompatibility.xdsTokenName],
+        'subprocess': {'required': false, 'runtimes': <String>[]},
+        'riskTier': 'critical',
+        'updatePolicy': 'manual',
+      },
+    };
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   const channel = MethodChannel(AppConstants.channelName);
   final messenger =
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-  const root = LegacySkillCompatibility.xdsSkillRoot;
+  const root = '/root/workspace/.agents/skills/xds-skills';
   late String content;
 
   setUp(() async {
@@ -29,8 +55,7 @@ void main() {
     messenger.setMockMethodCallHandler(channel, null);
   });
 
-  test(
-      'published XDS package gets only typed compatibility after fresh consent',
+  test('legacy XDS package can be consented but receives no capabilities',
       () async {
     messenger.setMockMethodCallHandler(channel, (call) async {
       final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
@@ -38,6 +63,9 @@ void main() {
         final command = args['command'] as String;
         if (command.contains("find '/root/workspace/.agents/skills'")) {
           return '$root/SKILL.md';
+        }
+        if (command.contains('echo SKILL_INSTALL_OK')) {
+          return 'SKILL_INSTALL_OK';
         }
         return '';
       }
@@ -54,67 +82,42 @@ void main() {
       return null;
     });
 
-    var skills = await SkillService.scanSkills();
+    final skills = await SkillService.scanSkills();
     expect(skills, hasLength(1));
-    expect(skills.single.id, LegacySkillCompatibility.xdsSkillId);
-    expect(skills.single.version, '0.1.9');
+    expect(skills.single.id, 'legacy.xds-skills');
+    expect(skills.single.version, 'legacy');
     expect(skills.single.availabilityReason, isNull);
+    expect(skills.single.capabilitySnapshot.tools, isEmpty);
     expect(skills.single.enabled, isFalse);
     expect(skills.single.requiresConsent, isTrue);
-    expect(
-      skills.single.capabilitySnapshot.tools,
-      [LegacySkillCompatibility.xdsToolName],
-    );
-    expect(skills.single.capabilitySnapshot.commands, isEmpty);
 
     final candidate =
         await SkillService.prepareConsentForInstalledSkill(skills.single);
-    expect(candidate.legacy, isTrue);
-    expect(candidate.version, '0.1.9');
-    expect(candidate.legacyAvailabilityReason, isNull);
     await SkillService.installPreparedSkill(
       candidate,
       enabled: true,
       inspectionReviewConfirmed: true,
     );
-
-    skills = await SkillService.scanSkills();
-    expect(skills.single.consentCurrent, isTrue);
-    expect(skills.single.enabled, isTrue);
     final verified =
         await SkillService.loadGrantedSkillById('legacy.xds-skills');
-    expect(verified.capabilities.tools, ['xds_agent']);
-    expect(verified.capabilities.commands, isEmpty);
-    expect(verified.skillContent, content);
+    expect(verified.capabilities.tools, isEmpty);
   });
 
-  test('wrong path, name, or bytes remain unavailable', () {
-    final wrongPath = SkillService.inspectPackage(
-      stagingPath: '/root/workspace/.agents/skills/vendor/xds-skills',
+  test('formal manifest can explicitly declare the typed XDS adapter', () {
+    final candidate = SkillService.inspectPackage(
+      stagingPath: '/root/workspace/skills/com.example.xds',
       sourceIdentity: 'Installed locally',
-      skillContent: content,
-      manifestContent: null,
+      skillContent: '---\nname: xds-adapter\n---\nUse XDS.',
+      manifestContent: jsonEncode(_xdsManifest()),
       installedCandidate: true,
     );
-    expect(wrongPath.legacyAvailabilityReason, isNotNull);
 
-    final wrongName = SkillService.inspectPackage(
-      stagingPath: root,
-      sourceIdentity: 'Installed locally',
-      skillContent: content.replaceFirst('name: xds-skills', 'name: other'),
-      manifestContent: null,
-      installedCandidate: true,
-    );
-    expect(wrongName.id, 'legacy.other');
-    expect(wrongName.legacyAvailabilityReason, isNotNull);
-
-    final changed = SkillService.inspectPackage(
-      stagingPath: root,
-      sourceIdentity: 'Installed locally',
-      skillContent: '$content\nchanged',
-      manifestContent: null,
-      installedCandidate: true,
-    );
-    expect(changed.legacyAvailabilityReason, isNotNull);
+    expect(candidate.legacy, isFalse);
+    expect(candidate.capabilitySnapshot.tools,
+        [LegacySkillCompatibility.xdsToolName]);
+    expect(candidate.capabilitySnapshot.networkDomains,
+        [LegacySkillCompatibility.xdsDomain]);
+    expect(candidate.capabilitySnapshot.secretNames,
+        [LegacySkillCompatibility.xdsTokenName]);
   });
 }

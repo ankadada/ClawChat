@@ -322,7 +322,9 @@ void main() {
     );
   });
 
-  test('XDS schema is exposed only after the Agent has an active skill', () {
+  test(
+      'XDS schema is hidden by default and explicitly available to the registry',
+      () {
     final registry = ToolRegistry.withDefaults(prefs: preferences);
     expect(
       registry.getToolDefinitions().any((tool) => tool.name == 'xds_agent'),

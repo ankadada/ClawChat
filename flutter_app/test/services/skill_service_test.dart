@@ -209,7 +209,7 @@ void main() {
     expect(findCalls, callsBeforeIdLookup);
   });
 
-  test('xd-skill CLI root is discovered consented and loaded by stable ID',
+  test('xd-skill CLI legacy root loads after consent with empty capabilities',
       () async {
     SharedPreferences.setMockInitialValues({});
     const root = '/root/workspace/.agents/skills/xds-skills';
@@ -243,6 +243,8 @@ void main() {
     expect(skills.single.id, 'legacy.xds-skills');
     expect(skills.single.isCliManaged, isTrue);
     expect(skills.single.requiresConsent, isTrue);
+    expect(skills.single.availabilityReason, isNull);
+    expect(skills.single.capabilitySnapshot.tools, isEmpty);
     expect(skills.single.enabled, isFalse);
 
     final candidate =
@@ -263,6 +265,7 @@ void main() {
         await SkillService.loadGrantedSkillById('legacy.xds-skills');
     expect(verified.path, '$root/SKILL.md');
     expect(verified.skillContent, content);
+    expect(verified.capabilities.tools, isEmpty);
   });
 
   test('installed entrypoint normalization accepts only the two skill roots',

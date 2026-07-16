@@ -49,8 +49,10 @@ final class XdsAgentTool extends Tool {
 
   @override
   String get description =>
-      'Fixed first-party AI-XDS operations: list, get, files, kb, exec. '
-      'No arbitrary URL or local shell.';
+      'App-owned fixed typed AI-XDS adapter. Use only xds_agent with operation '
+      'list, get, files, kb, or exec; fixed domain and configured token apply '
+      'and normal ToolPolicy approval rules apply. Never call bash, python3, or '
+      'scripts.py, and never use a local shell or arbitrary URL.';
 
   @override
   Map<String, dynamic> get inputSchema => {

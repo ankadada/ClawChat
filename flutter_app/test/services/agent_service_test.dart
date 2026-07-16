@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/models/extension_manifest.dart';
 import 'package:clawchat/services/agent_service.dart';
+import 'package:clawchat/services/legacy_skill_compatibility.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/runtime_debug_events.dart';
 import 'package:clawchat/services/skill_capability_policy.dart';
@@ -1365,6 +1366,160 @@ void main() {
       final error = agentEvents.whereType<AgentError>().single;
       expect(error.message, contains('incomplete tool call JSON'));
     });
+
+    test('exposes the app-owned XDS adapter when its token is configured',
+        () async {
+      final xds = _VisibilityLlmService(_config);
+      final verified = _verifiedSkill(const ExtensionCapabilitySnapshot(
+        tools: [LegacySkillCompatibility.xdsToolName],
+        commands: [],
+        networkDomains: [LegacySkillCompatibility.xdsDomain],
+        filesystemRead: [],
+        filesystemWrite: [],
+        androidIntents: [],
+        androidPermissions: [],
+        secretNames: [LegacySkillCompatibility.xdsTokenName],
+        runtimes: [],
+        subprocessRequired: false,
+        riskTier: 'critical',
+        updatePolicy: 'manual',
+      ));
+      final tools = ToolRegistry()
+        ..register(LoadSkillTool(), risk: ToolRisk.safe)
+        ..register(_RecordingTool(name: LegacySkillCompatibility.xdsToolName),
+            risk: ToolRisk.dangerous);
+      final policy = SkillCapabilityPolicy(loader: (_) async => verified);
+      final service = AgentService(
+        llm: xds,
+        tools: tools,
+        systemPrompt: 'system',
+        envVars: const {
+          LegacySkillCompatibility.xdsTokenName: 'configured-token',
+        },
+        skillCapabilityPolicy: policy,
+        toolPolicy: ToolPolicy(
+          approvalRequiredFor: const {},
+          additionalDenyCheck: policy.denyFor,
+        ),
+      );
+
+      await service.runAgentLoop([]).drain<void>();
+
+      expect(xds.toolsByCall, hasLength(2));
+      expect(xds.toolsByCall.first, contains('xds_agent'));
+      expect(xds.toolsByCall.last, contains('xds_agent'));
+      expect(xds.toolsByCall.last, isNot(contains('bash')));
+      expect(xds.toolsByCall.last, isNot(contains('python3')));
+    });
+
+    test('configured XDS adapter is visible without a loaded skill', () async {
+      final xds = _VisibilityLlmService(_config, loadSkill: false);
+      final tools = ToolRegistry()
+        ..register(LoadSkillTool(), risk: ToolRisk.safe)
+        ..register(
+          _RecordingTool(name: LegacySkillCompatibility.xdsToolName),
+          risk: ToolRisk.dangerous,
+        );
+      final service = AgentService(
+        llm: xds,
+        tools: tools,
+        systemPrompt: 'system',
+        envVars: const {
+          LegacySkillCompatibility.xdsTokenName: 'configured-token',
+        },
+      );
+
+      await service.runAgentLoop([]).drain<void>();
+
+      expect(xds.toolsByCall, hasLength(1));
+      expect(xds.toolsByCall.single, contains('xds_agent'));
+    });
+
+    test('missing XDS token hides the adapter even after skill activation',
+        () async {
+      final xds = _VisibilityLlmService(_config);
+      final verified = _verifiedSkill(const ExtensionCapabilitySnapshot(
+        tools: [LegacySkillCompatibility.xdsToolName],
+        commands: [],
+        networkDomains: [LegacySkillCompatibility.xdsDomain],
+        filesystemRead: [],
+        filesystemWrite: [],
+        androidIntents: [],
+        androidPermissions: [],
+        secretNames: [LegacySkillCompatibility.xdsTokenName],
+        runtimes: [],
+        subprocessRequired: false,
+        riskTier: 'critical',
+        updatePolicy: 'manual',
+      ));
+      final tools = ToolRegistry()
+        ..register(LoadSkillTool(), risk: ToolRisk.safe)
+        ..register(
+          _RecordingTool(name: LegacySkillCompatibility.xdsToolName),
+          risk: ToolRisk.dangerous,
+        );
+      final policy = SkillCapabilityPolicy(loader: (_) async => verified);
+      final service = AgentService(
+        llm: xds,
+        tools: tools,
+        systemPrompt: 'system',
+        skillCapabilityPolicy: policy,
+        toolPolicy: ToolPolicy(
+          approvalRequiredFor: const {},
+          additionalDenyCheck: policy.denyFor,
+        ),
+      );
+
+      await service.runAgentLoop([]).drain<void>();
+
+      expect(xds.toolsByCall, hasLength(2));
+      expect(xds.toolsByCall.first, isNot(contains('xds_agent')));
+      expect(xds.toolsByCall.last, isNot(contains('xds_agent')));
+    });
+
+    test('ordinary active skills do not hide the app-owned XDS adapter',
+        () async {
+      final xds = _VisibilityLlmService(_config);
+      final verified = _verifiedSkill(const ExtensionCapabilitySnapshot(
+        tools: [],
+        commands: [],
+        networkDomains: [],
+        filesystemRead: [],
+        filesystemWrite: [],
+        androidIntents: [],
+        androidPermissions: [],
+        secretNames: [],
+        runtimes: [],
+        subprocessRequired: false,
+        riskTier: 'low',
+        updatePolicy: 'manual',
+      ));
+      final tools = ToolRegistry()
+        ..register(LoadSkillTool(), risk: ToolRisk.safe)
+        ..register(
+          _RecordingTool(name: LegacySkillCompatibility.xdsToolName),
+          risk: ToolRisk.dangerous,
+        );
+      final policy = SkillCapabilityPolicy(loader: (_) async => verified);
+      final service = AgentService(
+        llm: xds,
+        tools: tools,
+        systemPrompt: 'system',
+        envVars: const {
+          LegacySkillCompatibility.xdsTokenName: 'configured-token',
+        },
+        skillCapabilityPolicy: policy,
+        toolPolicy: ToolPolicy(
+          approvalRequiredFor: const {},
+          additionalDenyCheck: policy.denyFor,
+        ),
+      );
+
+      await service.runAgentLoop([]).drain<void>();
+
+      expect(xds.toolsByCall, hasLength(2));
+      expect(xds.toolsByCall.last, contains('xds_agent'));
+    });
   });
 }
 
@@ -1406,6 +1561,42 @@ class _ToolCallLlmService extends LlmService {
             toolUseId: 'call_1',
             toolName: toolName,
             toolInput: arguments,
+          ),
+        ],
+      ));
+      return;
+    }
+    yield StreamDone(const LlmResponse(
+      stopReason: 'end_turn',
+      content: [ContentBlock(type: 'text', text: 'done')],
+    ));
+  }
+}
+
+class _VisibilityLlmService extends LlmService {
+  _VisibilityLlmService(super.config, {this.loadSkill = true});
+
+  final bool loadSkill;
+  final toolsByCall = <List<String>>[];
+  var calls = 0;
+
+  @override
+  Stream<StreamEvent> chatStream({
+    required String system,
+    required List<Map<String, dynamic>> messages,
+    required List<ToolDefinition> tools,
+  }) async* {
+    toolsByCall.add(tools.map((tool) => tool.name).toList());
+    calls++;
+    if (calls == 1 && loadSkill) {
+      yield StreamDone(const LlmResponse(
+        stopReason: 'tool_use',
+        content: [
+          ContentBlock(
+            type: 'tool_use',
+            toolUseId: 'load_xds',
+            toolName: 'load_skill',
+            toolInput: {'id': 'com.example.active'},
           ),
         ],
       ));
