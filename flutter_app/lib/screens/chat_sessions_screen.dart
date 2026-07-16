@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -184,17 +183,14 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           );
           if (!opened) throw StateError('share unavailable');
         case _SessionExportDestination.save:
-          final path = await FilePicker.platform.saveFile(
+          final path = await FilePicker.saveFile(
             dialogTitle: AppStrings.saveConversationExport,
             fileName: 'clawchat-session.md',
             allowedExtensions: const ['md'],
             type: FileType.custom,
+            bytes: Uint8List.fromList(utf8.encode(text)),
           );
           if (path == null) return;
-          final destination = File(path);
-          final temp = File('$path.tmp');
-          await temp.writeAsString(text, flush: true);
-          await temp.rename(destination.path);
       }
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

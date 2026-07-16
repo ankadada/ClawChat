@@ -235,7 +235,12 @@ void main() {
 
     test('skill archive picker accepts zip tar.gz and tgz without MIME filter',
         () async {
-      for (final name in ['skill.zip', 'skill.tar.gz', 'skill.tgz']) {
+      for (final name in [
+        'skill.zip',
+        'skill.tar.gz',
+        'skill.tgz',
+        '中文技能.tar.gz',
+      ]) {
         final archive = await writeFile(name, [1]);
         FileAttachmentService.setPickerForTesting(({
           required type,

@@ -298,16 +298,14 @@ class _LocalDataRecoveryScreenState extends State<LocalDataRecoveryScreen> {
           );
           if (!opened) throw StateError('share unavailable');
         case _ExportDestination.save:
-          final path = await FilePicker.platform.saveFile(
+          final path = await FilePicker.saveFile(
             dialogTitle: AppStrings.saveConversationExport,
             fileName: 'clawchat-sessions-v2.json',
             type: FileType.custom,
             allowedExtensions: const ['json'],
+            bytes: Uint8List.fromList(utf8.encode(artifact)),
           );
           if (path == null) return;
-          final temp = File('$path.tmp');
-          await temp.writeAsString(artifact, flush: true);
-          await temp.rename(path);
       }
       _show(AppStrings.exportDestinationComplete);
     } catch (_) {
@@ -355,7 +353,7 @@ class _LocalDataRecoveryScreenState extends State<LocalDataRecoveryScreen> {
       );
 
   Future<void> _pickAndPreviewImport() async {
-    final picked = await FilePicker.platform.pickFiles(
+    final picked = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: const ['json'],
     );

@@ -3296,7 +3296,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
     final injected = widget.diagnosticsSaveForTesting;
     if (injected != null) return injected(report);
     final date = DateTime.now().toIso8601String().split('T').first;
-    final path = await FilePicker.platform.saveFile(
+    final path = await FilePicker.saveFile(
       dialogTitle: '保存脱敏诊断',
       fileName: 'clawchat-diagnostics-$date.txt',
       type: FileType.custom,
@@ -3450,7 +3450,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       );
       final date = DateTime.now().toIso8601String().split('T').first;
       final bytes = utf8.encode(jsonStr);
-      final path = await FilePicker.platform.saveFile(
+      final path = await FilePicker.saveFile(
         dialogTitle: AppStrings.exportConfig,
         fileName: 'clawchat-config-$date.json',
         type: FileType.custom,
@@ -3580,7 +3580,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
 
   Future<void> _importConfig() async {
     try {
-      final result = await FilePicker.platform.pickFiles(
+      final result = await FilePicker.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['json'],
       );

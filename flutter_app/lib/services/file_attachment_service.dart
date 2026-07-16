@@ -145,7 +145,7 @@ class FileAttachmentService {
   }) async {
     try {
       final result = _pickerForTesting == null
-          ? await FilePicker.platform.pickFiles(
+          ? await FilePicker.pickFiles(
               type: type,
               allowedExtensions: allowedExtensions,
               allowMultiple: allowMultiple,
