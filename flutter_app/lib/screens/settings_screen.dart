@@ -1036,7 +1036,9 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
               children: [
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: Text('${skill.name} · v${skill.version}'),
+                  title: Text(
+                    '${skill.name} · ${skill.legacy ? 'Legacy' : 'v${skill.version}'}',
+                  ),
                   subtitle: Text(skill.isUnavailable
                       ? skill.availabilityReason!
                       : !skill.valid
