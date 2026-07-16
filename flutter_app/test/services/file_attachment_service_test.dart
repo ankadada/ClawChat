@@ -23,6 +23,7 @@ void main() {
     rootfsWrites = [];
     prootCommands = [];
     FileAttachmentService.resetInlineReadStreamForTesting();
+    FileAttachmentService.resetPickerForTesting();
     NativeBridge.resetImportReadStreamForTesting();
     NativeBridge.setImportIdentityProbeForTesting((_) async => 'stable-file');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -50,6 +51,7 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);
     FileAttachmentService.resetInlineReadStreamForTesting();
+    FileAttachmentService.resetPickerForTesting();
     NativeBridge.resetImportReadStreamForTesting();
     if (await tempDir.exists()) {
       await tempDir.delete(recursive: true);
@@ -89,6 +91,104 @@ void main() {
   }
 
   group('FileAttachmentService.prepareForMessage', () {
+    test('picker cancellation is silent and picker errors are bounded',
+        () async {
+      FileAttachmentService.setPickerForTesting(({
+        required type,
+        required allowMultiple,
+        required allowedExtensions,
+      }) async =>
+          null);
+      expect(await FileAttachmentService.pickFiles(), isEmpty);
+
+      FileAttachmentService.setPickerForTesting(({
+        required type,
+        required allowMultiple,
+        required allowedExtensions,
+      }) async {
+        throw PlatformException(code: 'FILE_PICKER_CANCELLED');
+      });
+      expect(await FileAttachmentService.pickFiles(), isEmpty);
+
+      FileAttachmentService.setPickerForTesting(({
+        required type,
+        required allowMultiple,
+        required allowedExtensions,
+      }) async {
+        throw PlatformException(
+          code: 'unknown_path',
+          message: '/sensitive/provider/path',
+        );
+      });
+      await expectLater(
+        FileAttachmentService.pickFiles(),
+        throwsA(
+          isA<FilePickerException>()
+              .having((error) => error.userMessage, 'userMessage',
+                  contains('无法读取所选文件'))
+              .having((error) => error.toString(), 'details',
+                  isNot(contains('sensitive'))),
+        ),
+      );
+    });
+
+    test('null path with bounded bytes is staged in the app cache', () async {
+      final bytes = Uint8List.fromList([1, 2, 3]);
+      FileAttachmentService.setPickerForTesting(({
+        required type,
+        required allowMultiple,
+        required allowedExtensions,
+      }) async =>
+          FilePickerResult([
+            PlatformFile(name: 'photo.png', size: bytes.length, bytes: bytes),
+          ]));
+
+      final files = await FileAttachmentService.pickFiles();
+      expect(files.single.path, isNotNull);
+      expect(await File(files.single.path!).readAsBytes(), bytes);
+      final prepared = await FileAttachmentService.prepareForMessage(
+        files.single,
+      );
+      expect(prepared.content, isA<ImageContent>());
+    });
+
+    test('skill archive picker accepts zip tar.gz and tgz without MIME filter',
+        () async {
+      for (final name in ['skill.zip', 'skill.tar.gz', 'skill.tgz']) {
+        final archive = await writeFile(name, [1]);
+        FileAttachmentService.setPickerForTesting(({
+          required type,
+          required allowMultiple,
+          required allowedExtensions,
+        }) async {
+          expect(type, FileType.any);
+          expect(allowedExtensions, isNull);
+          return FilePickerResult([platformFile(archive, name)]);
+        });
+
+        final selected = await FileAttachmentService.pickSkillArchive();
+        expect(selected?.name, name);
+      }
+
+      final unsupported = await writeFile('skill.gz', [1]);
+      FileAttachmentService.setPickerForTesting(({
+        required type,
+        required allowMultiple,
+        required allowedExtensions,
+      }) async =>
+          FilePickerResult([platformFile(unsupported, 'skill.gz')]));
+      await expectLater(
+        FileAttachmentService.pickSkillArchive(),
+        throwsA(
+          isA<FilePickerException>().having(
+            (error) => error.reason,
+            'reason',
+            'unsupported_archive',
+          ),
+        ),
+      );
+    });
+
     test('image file returns ImageContent', () async {
       final file = await writeFile('photo.png', [1, 2, 3, 4]);
 

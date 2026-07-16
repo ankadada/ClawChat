@@ -8,7 +8,7 @@
     },
     {
       "path": "lib/screens/settings_screen.dart",
-      "sha256": "ec7c7515c3101abe5b01a58d20a26a2e6d9fc48adb780174b4233a9bbeb7d918"
+      "sha256": "48616eb3c8b11a6bea3e5979f6b199411788cb6d2b86744124be2fba05a8f716"
     },
     {
       "path": "lib/services/bundled_legacy_skill_catalog.dart",
@@ -16,7 +16,7 @@
     },
     {
       "path": "lib/services/skill_capability_policy.dart",
-      "sha256": "78eac128e76c21b486002221d2986c564b72b64b178da55b0669522a4e7763cd"
+      "sha256": "4b59d9ccfb2d4655d716187bd9788e9edb24afcf46bf6e4c288be3de9292c501"
     },
     {
       "path": "lib/services/skill_import_inspector.dart",
@@ -24,7 +24,7 @@
     },
     {
       "path": "lib/services/skill_service.dart",
-      "sha256": "b4c2acc0f3537efbd9d7f0bb885cec5ab1cf34b3f42cb7a3746ce1cca79bd4a5"
+      "sha256": "dfd7fd1c8c5a6078edcb8db5834884fd12f56c3b8982eb1422b48a95516c80c9"
     },
     {
       "path": "lib/services/tools/tool_policy.dart",
@@ -36,7 +36,7 @@
     },
     {
       "path": "test/screens/settings_cli_skill_discovery_test.dart",
-      "sha256": "024fa3e227075d2a9fdbbb1d2cd6a3ceb40a47db6e1dc8d98643c4e5a12ebb62"
+      "sha256": "4ae2c29ced14c5ec4f62ef2aa2075818fc42468290226f7c6cc9dc4ecc6a823c"
     },
     {
       "path": "test/screens/settings_bundled_legacy_presets_test.dart",
@@ -48,7 +48,7 @@
     },
     {
       "path": "test/services/skill_capability_policy_test.dart",
-      "sha256": "e7a3014be318b61d0d40b1d2411bb86224e7ab91bf87cb1992735af9ed1e8358"
+      "sha256": "3de91efa732150fb866dc3d49d7637ef9a6b49ed1a02e5d0d96344bc069ed17e"
     },
     {
       "path": "test/services/skill_eval_authorization_invariant_test.dart",
@@ -60,7 +60,7 @@
     },
     {
       "path": "test/services/skill_service_test.dart",
-      "sha256": "ab1aacb8a1362392948c395383689102a840c729bc05e8e5cbe5a12ae421daa3"
+      "sha256": "2e7af4c3a76438e9ecb2330d5689bd27032fd8fdc9a459e5f3a831585b464e8e"
     },
     {
       "path": "test/tool/skill_evals/skill_eval_host_gate_test.dart",

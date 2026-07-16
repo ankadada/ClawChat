@@ -14,6 +14,7 @@ import '../models/update_models.dart';
 import '../services/bounded_file_reader.dart';
 import '../services/bundled_legacy_skill_catalog.dart';
 import '../services/config_export_service.dart';
+import '../services/file_attachment_service.dart';
 import '../services/memory_service.dart';
 import '../services/mcp_service.dart';
 import '../services/native_bridge.dart';
@@ -1042,7 +1043,9 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                           ? '扩展无效，操作已禁用'
                           : skill.isCliManaged
                               ? skill.requiresConsent
-                                  ? '由 xd-skill CLI 管理 · 授权后可启用'
+                                  ? skill.isLegacyCompatibility
+                                      ? '由 xd-skill CLI 管理 · 需要重新授权 XDS 兼容能力'
+                                      : '由 xd-skill CLI 管理 · 授权后可启用'
                                   : skill.enabled
                                       ? '由 xd-skill CLI 管理 · 已启用'
                                       : '由 xd-skill CLI 管理 · 已停用'
@@ -1903,7 +1906,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                           else
                             ..._skills.map((skill) => SwitchListTile(
                                   title: Text(
-                                    '${skill.name} · ${skill.legacy ? 'Legacy' : 'v${skill.version}'}',
+                                    '${skill.name} · ${skill.isLegacyCompatibility ? 'v${skill.version}' : skill.legacy ? 'Legacy' : 'v${skill.version}'}',
                                   ),
                                   subtitle: skill.isUnavailable
                                       ? Text(skill.availabilityReason!)
@@ -2724,21 +2727,21 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
 
     String? path;
     if (mode == 'archive') {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['zip', 'tgz', 'gz'],
-        withData: false,
-        withReadStream: false,
-      );
-      if (result == null || result.files.isEmpty) return;
-      path = result.files.single.path;
-      final lowerPath = path?.toLowerCase() ?? '';
-      if (!lowerPath.endsWith('.zip') &&
-          !lowerPath.endsWith('.tgz') &&
-          !lowerPath.endsWith('.tar.gz')) {
+      PlatformFile? selected;
+      try {
+        selected = await FileAttachmentService.pickSkillArchive();
+        if (selected == null) return;
+        path = await FileAttachmentService.localPathFor(selected);
+      } on FilePickerException catch (error) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text(AppStrings.selectSkillArchive)),
+            SnackBar(
+              content: Text(
+                error.reason == 'unsupported_archive'
+                    ? AppStrings.selectSkillArchive
+                    : error.userMessage,
+              ),
+            ),
           );
         }
         return;
@@ -2872,20 +2875,35 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   }
 
   Future<void> _showLocalExtensionUpdate() async {
-    final metadataPick = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['json'],
-      withData: false,
-    );
-    final metadataPath = metadataPick?.files.single.path;
-    if (metadataPath == null) return;
-    final archivePick = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['zip', 'tgz', 'gz'],
-      withData: false,
-    );
-    final archivePath = archivePick?.files.single.path;
-    if (archivePath == null) return;
+    String metadataPath;
+    String archivePath;
+    try {
+      final metadataFiles = await FileAttachmentService.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['json'],
+      );
+      if (metadataFiles.isEmpty) return;
+      metadataPath = await FileAttachmentService.localPathFor(
+        metadataFiles.single,
+      );
+
+      final archive = await FileAttachmentService.pickSkillArchive();
+      if (archive == null) return;
+      archivePath = await FileAttachmentService.localPathFor(archive);
+    } on FilePickerException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              error.reason == 'unsupported_archive'
+                  ? AppStrings.selectSkillArchive
+                  : error.userMessage,
+            ),
+          ),
+        );
+      }
+      return;
+    }
 
     setState(() => _loadingSkills = true);
     ExtensionUpdatePlan? plan;

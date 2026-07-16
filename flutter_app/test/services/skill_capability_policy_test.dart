@@ -1,5 +1,6 @@
 import 'package:clawchat/models/extension_manifest.dart';
 import 'package:clawchat/services/skill_capability_policy.dart';
+import 'package:clawchat/services/legacy_skill_compatibility.dart';
 import 'package:clawchat/services/skill_service.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -55,6 +56,37 @@ ToolApprovalRequest _request(
     );
 
 void main() {
+  test('XDS requires an active declared compatibility context', () async {
+    final policy = SkillCapabilityPolicy();
+    final request = _request(
+      LegacySkillCompatibility.xdsToolName,
+      const {'operation': 'list'},
+      risk: ToolRisk.dangerous,
+    );
+    expect(policy.denyFor(request)?.ruleId, 'xds_skill_context_required');
+
+    policy.activate(
+      _skill(LegacySkillCompatibility.xdsCapabilities),
+    );
+    expect(policy.denyFor(request), isNull);
+    expect(
+      policy
+          .denyFor(_request('bash', {'command': 'python3 script.py'}))
+          ?.ruleId,
+      'skill_tool_undeclared',
+    );
+
+    final missingDomain = SkillCapabilityPolicy()
+      ..activate(_skill(_capabilities(
+        tools: const [LegacySkillCompatibility.xdsToolName],
+        secrets: const [LegacySkillCompatibility.xdsTokenName],
+      )));
+    expect(
+      missingDomain.denyFor(request)?.ruleId,
+      'skill_network_domain',
+    );
+  });
+
   test(
       'skill bytes cannot bypass verified entrypoint through bash or raw files',
       () async {

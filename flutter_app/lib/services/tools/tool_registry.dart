@@ -14,6 +14,7 @@ import 'read_file_tool.dart';
 import 'tool_result_formatter.dart';
 import 'tool_policy.dart';
 import 'write_file_tool.dart';
+import 'xds_agent_tool.dart';
 import 'web_fetch_tool.dart';
 import 'web_search_tool.dart';
 import 'image_gen_tool.dart';
@@ -148,6 +149,7 @@ class ToolRegistry {
     registry.register(WebSearchTool(), risk: ToolRisk.safe);
     if (prefs != null) {
       registry.register(ImageGenTool(prefs), risk: ToolRisk.safe);
+      registry.register(XdsAgentTool(prefs), risk: ToolRisk.dangerous);
     }
     return registry;
   }
@@ -162,9 +164,16 @@ class ToolRegistry {
     _risks.remove(name);
   }
 
-  List<ToolDefinition> getToolDefinitions({String? sessionId}) {
+  List<ToolDefinition> getToolDefinitions({
+    String? sessionId,
+    bool includeXds = false,
+  }) {
     return _tools.values
-        .where((tool) => _isToolAvailableForSession(tool, sessionId))
+        .where(
+          (tool) =>
+              (includeXds || tool.name != 'xds_agent') &&
+              _isToolAvailableForSession(tool, sessionId),
+        )
         .map((t) => t.toDefinition())
         .toList();
   }

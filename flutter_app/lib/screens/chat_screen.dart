@@ -18,6 +18,7 @@ import '../models/structured_result.dart';
 import '../models/workspace_import_receipt.dart';
 import '../providers/chat_provider.dart';
 import '../services/preferences_service.dart';
+import '../services/attachment_budget.dart';
 import '../services/current_session_search.dart';
 import '../services/file_attachment_service.dart';
 import '../services/memory_service.dart';
@@ -4445,7 +4446,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _pickAndAttach(FileType type) async {
-    final files = await FileAttachmentService.pickFiles(type: type);
+    late final List<PlatformFile> files;
+    try {
+      files = await FileAttachmentService.pickFiles(type: type);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_attachmentErrorMessage(error))),
+        );
+      }
+      return;
+    }
     if (files.isEmpty) return;
 
     for (final file in files) {
@@ -4499,11 +4510,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('${AppStrings.attachFailed}: $e')),
+            SnackBar(content: Text(_attachmentErrorMessage(e))),
           );
         }
       }
     }
+  }
+
+  String _attachmentErrorMessage(Object error) {
+    if (error is FilePickerException) return error.userMessage;
+    if (error is AttachmentBudgetException || error is FormatException) {
+      return error.toString();
+    }
+    return '${AppStrings.attachFailed}，无法读取所选文件，请选择可访问的文件后重试。';
   }
 
   String _appendAttachmentText(String text) {

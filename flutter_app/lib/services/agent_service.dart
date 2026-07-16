@@ -3,6 +3,7 @@ import 'package:uuid/uuid.dart';
 import '../models/chat_models.dart';
 import '../models/structured_result.dart';
 import 'llm_content_sanitizer.dart';
+import 'legacy_skill_compatibility.dart';
 import 'llm_service.dart';
 import 'privacy_filter.dart';
 import 'runtime_debug_events.dart';
@@ -262,14 +263,18 @@ class AgentService {
     _ephemeralEnvVarValues.clear();
     _lastMessages = messages;
     await _restoreHistoricalSkillContext(messages);
-    final toolDefs = supportsTools
-        ? _tools.getToolDefinitions(sessionId: sessionId)
-        : <ToolDefinition>[];
+    var toolDefs = <ToolDefinition>[];
     final effectiveMaxIterations = maxIterations.clamp(1, 99).toInt();
     int iteration = 0;
     var hadToolCalls = false;
 
     while (!_cancelled) {
+      toolDefs = supportsTools
+          ? _tools.getToolDefinitions(
+              sessionId: sessionId,
+              includeXds: _skillCapabilityPolicy?.activeSkill != null,
+            )
+          : <ToolDefinition>[];
       iteration++;
       if (iteration > effectiveMaxIterations) {
         yield AgentError(
@@ -740,7 +745,6 @@ class AgentService {
         return _invalidStructuredResult(attempt);
       }
     }
-
     final request = ToolApprovalRequest(
       toolName: toolName,
       arguments: Map<String, dynamic>.from(toolInput),
@@ -1295,6 +1299,14 @@ class AgentService {
       } on StructuredResultParseException {
         return const <String, dynamic>{};
       }
+    }
+    if (toolName == LegacySkillCompatibility.xdsToolName) {
+      // XDS has a closed operation schema. Preserve the provider-decoded map
+      // exactly so generic field-name/type repair cannot turn an unsupported
+      // request into a valid remote call.
+      return rawToolInput is Map
+          ? Map<String, dynamic>.from(rawToolInput)
+          : const <String, dynamic>{};
     }
     final schema = _tools.inputSchemaFor(toolName, sessionId: sessionId);
     if (schema == null) {

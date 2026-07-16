@@ -213,8 +213,8 @@ void main() {
       () async {
     SharedPreferences.setMockInitialValues({});
     const root = '/root/workspace/.agents/skills/xds-skills';
-    const content =
-        '---\nname: xds-skills\ndescription: XDS tools\n---\nUse XDS.';
+    final content =
+        await File('test/fixtures/xds_skills_0_1_9_SKILL.md').readAsString();
     messenger.setMockMethodCallHandler(channel, (call) async {
       final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
       if (call.method == 'runInProot') {

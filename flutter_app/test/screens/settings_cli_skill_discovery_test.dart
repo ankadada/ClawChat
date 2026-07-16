@@ -58,7 +58,7 @@ void main() {
   });
 
   testWidgets(
-      'CLI-managed skill is visible and consentable but app update actions are disabled',
+      'unmanifested CLI-managed skill is visible but explicitly unavailable',
       (tester) async {
     tester.view.devicePixelRatio = 1;
     tester.view.physicalSize = const Size(400, 760);
@@ -91,7 +91,10 @@ void main() {
     await tester.ensureVisible(title);
     await tester.pumpAndSettle();
     expect(title, findsOneWidget);
-    expect(find.text('由 xd-skill CLI 管理 · 授权后可启用'), findsOneWidget);
+    expect(
+      find.text('需要兼容升级：此 Skill 缺少受支持的权限清单。请通过 xd-skill 更新后重新授权。'),
+      findsOneWidget,
+    );
 
     final tile = find.ancestor(
       of: title,
@@ -99,15 +102,7 @@ void main() {
     );
     expect(tile, findsOneWidget);
     final toggle = find.descendant(of: tile, matching: find.byType(Switch));
-    expect(tester.widget<Switch>(toggle).onChanged, isNotNull);
-
-    await tester.tap(title);
-    await tester.pumpAndSettle();
-    expect(find.text('Legacy skill warning'), findsOneWidget);
-    expect(find.text('Source: Installed by xd-skill CLI'), findsOneWidget);
-    await tester.tap(find.widgetWithText(FilledButton, 'Enable'));
-    await tester.pumpAndSettle();
-    expect(find.text('由 xd-skill CLI 管理 · 已启用'), findsOneWidget);
+    expect(tester.widget<Switch>(toggle).onChanged, isNull);
 
     for (final label in SettingsScreen.extensionActionLabels) {
       final button = find.widgetWithText(OutlinedButton, label);
@@ -151,14 +146,17 @@ void main() {
     await tester.ensureVisible(title);
     await tester.pumpAndSettle();
     expect(title, findsOneWidget);
-    expect(find.textContaining('由 xd-skill CLI 管理'), findsOneWidget);
+    expect(
+      find.textContaining('需要兼容升级：此 Skill 缺少受支持的权限清单'),
+      findsOneWidget,
+    );
     final tile = find.ancestor(
       of: title,
       matching: find.byType(SwitchListTile),
     );
     expect(tile, findsOneWidget);
     final toggle = find.descendant(of: tile, matching: find.byType(Switch));
-    expect(tester.widget<Switch>(toggle).onChanged, isNotNull);
+    expect(tester.widget<Switch>(toggle).onChanged, isNull);
     expect(tester.takeException(), isNull);
   });
 }

@@ -6608,7 +6608,9 @@ class ChatProvider extends ChangeNotifier {
     required ModelCapabilities capabilities,
   }) {
     if (!capabilities.supportsTools) return const [];
-    final definitions = _tools.getToolDefinitions();
+    // XDS is exposed to the Agent only after the exact authorized skill is
+    // restored/activated. Do not charge every ordinary turn for its schema.
+    final definitions = _tools.getToolDefinitions(includeXds: false);
     if (llmConfig.format == ApiFormat.anthropic) {
       return definitions.map((tool) => tool.toAnthropicJson()).toList();
     }

@@ -15,6 +15,7 @@ import '../models/workspace_import_receipt.dart';
 import 'app_http.dart';
 import 'bounded_file_reader.dart';
 import 'bundled_legacy_skill_catalog.dart';
+import 'legacy_skill_compatibility.dart';
 import 'native_bridge.dart';
 import 'skill_import_inspector.dart';
 
@@ -79,6 +80,12 @@ class SkillInfo {
   bool get requiresConsent => valid && !isUnavailable && !consentCurrent;
 
   bool get isCliManaged => SkillService.isCliManagedSkillEntrypoint(path);
+
+  bool get isLegacyCompatibility =>
+      legacy &&
+      version != 'legacy' &&
+      capabilitySnapshot.tools.length == 1 &&
+      capabilitySnapshot.tools.single == LegacySkillCompatibility.xdsToolName;
 }
 
 class PreparedSkillImport {
@@ -118,9 +125,25 @@ class PreparedSkillImport {
     this.installedCandidate = false,
   });
 
-  String get riskTier => legacy
+  String get riskTier => legacy && !hasSupportedLegacyCompatibility
       ? 'unknown / conservative critical'
       : capabilitySnapshot.effectiveRiskTier;
+
+  bool get hasSupportedLegacyCompatibility =>
+      legacy &&
+      LegacySkillCompatibility.isSupported(
+        stagingPath: stagingPath,
+        id: id,
+        name: name,
+        version: version,
+        contentDigest: contentDigest,
+        capabilities: capabilitySnapshot,
+      );
+
+  String? get legacyAvailabilityReason =>
+      legacy && !hasSupportedLegacyCompatibility
+          ? LegacySkillCompatibility.unsupportedReason
+          : null;
 
   CapabilityDiff? get capabilityDiff => previousGrant == null
       ? null
@@ -583,13 +606,15 @@ class SkillService {
             legacy: candidate.legacy,
             installedAssetDirectory: _installedAssetDirectory(path),
           );
-          final consentCurrent = unavailable == null &&
+          final availabilityReason =
+              unavailable?.reason ?? candidate.legacyAvailabilityReason;
+          final consentCurrent = availabilityReason == null &&
               grant != null &&
               grant.manifestDigest == candidate.manifestDigest &&
               grant.contentDigest == candidate.contentDigest &&
               grant.version == candidate.version &&
               grant.legacy == candidate.legacy;
-          final storedEnabled = unavailable == null &&
+          final storedEnabled = availabilityReason == null &&
               !disabled.contains(candidate.id) &&
               !disabled.contains(candidate.name);
           skills.add(SkillInfo(
@@ -606,7 +631,7 @@ class SkillService {
             capabilitySnapshot: candidate.capabilitySnapshot,
             enabled: storedEnabled && consentCurrent,
             manifest: candidate.manifest,
-            availabilityReason: unavailable?.reason,
+            availabilityReason: availabilityReason,
           ));
         } catch (error) {
           final fallbackName = root.split('/').last;
@@ -640,6 +665,7 @@ class SkillService {
               skill.enabled &&
               skill.valid &&
               skill.consentCurrent &&
+              !skill.isUnavailable &&
               BundledLegacySkillCatalog.entryForInstalledSkill(
                     id: skill.id,
                     name: skill.name,
@@ -708,6 +734,10 @@ class SkillService {
     if (unavailable != null) {
       throw StateError(
           'Bundled legacy preset is unavailable: ${unavailable.reason}');
+    }
+    final legacyAvailabilityReason = candidate.legacyAvailabilityReason;
+    if (legacyAvailabilityReason != null) {
+      throw StateError(legacyAvailabilityReason);
     }
     final grants = await loadTrustGrants();
     final grant = grants[candidate.id];
@@ -846,19 +876,29 @@ class SkillService {
       final name = _extractYamlField(skillContent, 'name') ?? fallbackName;
       final description = _extractYamlField(skillContent, 'description') ?? '';
       final id = 'legacy.${_legacyIdPart(name)}';
-      final manifestDigest = sha256
-          .convert(utf8.encode('legacy-manifest-v1\n$id\n$name\n$description'))
-          .toString();
       final contentDigest = sha256.convert(skillBytes).toString();
+      final compatibility = LegacySkillCompatibility.resolve(
+        stagingPath: stagingPath,
+        id: id,
+        name: name,
+        contentDigest: contentDigest,
+      );
+      final manifestDigest = compatibility?.manifestDigest ??
+          sha256
+              .convert(
+                utf8.encode('legacy-manifest-v1\n$id\n$name\n$description'),
+              )
+              .toString();
       return PreparedSkillImport(
         stagingPath: stagingPath,
         sourceIdentity: sourceIdentity,
         id: id,
         name: _boundedLegacyText(name, fallbackName, 120),
         description: _boundedLegacyText(description, '', 1000),
-        version: 'legacy',
+        version: compatibility?.version ?? 'legacy',
         manifest: null,
-        capabilitySnapshot: ExtensionCapabilitySnapshot.legacy(),
+        capabilitySnapshot:
+            compatibility?.capabilities ?? ExtensionCapabilitySnapshot.legacy(),
         integrityStatus: IntegrityStatus.notProvided,
         legacy: true,
         manifestDigest: manifestDigest,
@@ -1057,7 +1097,7 @@ class SkillService {
     final root =
         skill.path.substring(0, skill.path.length - '/SKILL.md'.length);
     final grants = await loadTrustGrants();
-    return inspectPackage(
+    final candidate = inspectPackage(
       stagingPath: root,
       sourceIdentity: isCliManagedSkillEntrypoint(skill.path)
           ? 'Installed by xd-skill CLI'
@@ -1067,6 +1107,11 @@ class SkillService {
       previousGrant: grants[skill.id],
       installedCandidate: true,
     );
+    final legacyAvailabilityReason = candidate.legacyAvailabilityReason;
+    if (legacyAvailabilityReason != null) {
+      throw StateError(legacyAvailabilityReason);
+    }
+    return candidate;
   }
 
   static Future<SkillInstallResult> installPreparedSkill(
@@ -1123,6 +1168,9 @@ class SkillService {
           'Extension ID conflicts with an installed skill at another path.',
         );
       }
+      if (enabled && rechecked.legacyAvailabilityReason != null) {
+        throw StateError(rechecked.legacyAvailabilityReason!);
+      }
       final prefs = await SharedPreferences.getInstance();
       final previousGrants = prefs.getString(_kTrustGrantsKey);
       final previousDisabled = prefs.getString(_kDisabledKey);
@@ -1155,6 +1203,10 @@ class SkillService {
         rechecked.trustDigest != candidate.trustDigest) {
       await discardPreparedImport(candidate);
       throw StateError('Staged skill changed after preview.');
+    }
+    if (enabled && rechecked.legacyAvailabilityReason != null) {
+      await discardPreparedImport(candidate);
+      throw StateError(rechecked.legacyAvailabilityReason!);
     }
 
     final target = _targetDirForSkillId(candidate.id);

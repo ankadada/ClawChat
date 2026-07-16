@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../models/chat_models.dart';
 import '../models/workspace_import_receipt.dart';
@@ -28,11 +30,45 @@ class PreparedAttachment {
   });
 }
 
+/// A picker failure without exposing provider paths, URI contents, or native
+/// exception details to the UI.
+class FilePickerException implements Exception {
+  final String reason;
+
+  const FilePickerException(this.reason);
+
+  String get userMessage {
+    switch (reason) {
+      case 'no_activity':
+        return '文件选择器暂不可用，请返回应用后重试。';
+      case 'unknown_path':
+      case 'path_missing':
+      case 'path_unreadable':
+        return '无法读取所选文件，请换一个文件或重新选择。';
+      case 'oversized':
+        return '所选文件超过应用允许的大小上限。';
+      default:
+        return '无法打开文件选择器，请重试。';
+    }
+  }
+
+  @override
+  String toString() => userMessage;
+}
+
+typedef FilePickerInvoker = Future<FilePickerResult?> Function({
+  required FileType type,
+  required bool allowMultiple,
+  required List<String>? allowedExtensions,
+});
+
 /// Service for picking files from device storage and importing them
 /// into the proot workspace for use by the AI agent.
 class FileAttachmentService {
   static const _attachmentBudget = AttachmentBudget();
   static BoundedFileStreamFactory? _inlineReadStreamForTesting;
+  static FilePickerInvoker? _pickerForTesting;
+  static int _materializedFileCounter = 0;
 
   static const Set<String> _imageExtensions = {
     'jpg',
@@ -102,14 +138,42 @@ class FileAttachmentService {
   static Future<List<PlatformFile>> pickFiles({
     FileType type = FileType.any,
     bool allowMultiple = false,
+    List<String>? allowedExtensions,
   }) async {
-    final result = await FilePicker.platform.pickFiles(
-      type: type,
-      allowMultiple: allowMultiple,
-      withData: false,
-      withReadStream: false,
-    );
-    return result?.files ?? [];
+    try {
+      final result = _pickerForTesting == null
+          ? await FilePicker.platform.pickFiles(
+              type: type,
+              allowedExtensions: allowedExtensions,
+              allowMultiple: allowMultiple,
+              withData: false,
+              withReadStream: false,
+            )
+          : await _pickerForTesting!(
+              type: type,
+              allowMultiple: allowMultiple,
+              allowedExtensions: allowedExtensions,
+            );
+      if (result == null) return const [];
+      return Future.wait(result.files.map(_materializeIfNeeded));
+    } on PlatformException catch (error) {
+      if (_isCancellationCode(error.code)) return const [];
+      throw FilePickerException(error.code);
+    } on MissingPluginException {
+      throw const FilePickerException('missing_plugin');
+    } on FileSystemException {
+      throw const FilePickerException('path_unreadable');
+    } on AttachmentBudgetException {
+      throw const FilePickerException('oversized');
+    }
+  }
+
+  static bool _isCancellationCode(String code) {
+    final normalized = code.trim().toLowerCase();
+    return normalized == 'cancelled' ||
+        normalized == 'canceled' ||
+        normalized == 'user_cancelled' ||
+        normalized == 'file_picker_cancelled';
   }
 
   /// Pick images specifically.
@@ -119,17 +183,26 @@ class FileAttachmentService {
     return pickFiles(type: FileType.image, allowMultiple: allowMultiple);
   }
 
+  /// Android document providers do not consistently map tgz/tar.gz suffixes
+  /// to MIME filters. Pick broadly, then apply the exact host-owned suffix
+  /// allowlist before any archive inspection or extraction.
+  static Future<PlatformFile?> pickSkillArchive() async {
+    final files = await pickFiles(type: FileType.any);
+    if (files.isEmpty) return null;
+    final selected = files.single;
+    if (!isSkillArchiveName(selected.name)) {
+      throw const FilePickerException('unsupported_archive');
+    }
+    return selected;
+  }
+
   /// Prepare a picked file for inclusion in a user message.
   ///
   /// Images are sent as multimodal content blocks. Text files are inlined as
   /// fenced code with filename context. Other binaries are copied into the
   /// workspace and represented by their workspace path.
   static Future<PreparedAttachment> prepareForMessage(PlatformFile file) async {
-    final sourcePath = file.path;
-    if (sourcePath == null) {
-      throw Exception(
-          'File path is null - file may not have been saved to disk');
-    }
+    final sourcePath = await _localPathFor(file);
 
     final safeName = sanitizeFileName(file.name);
     final extension = _extensionFor(safeName);
@@ -209,11 +282,7 @@ class FileAttachmentService {
   static Future<WorkspaceImportReceipt> importToWorkspace(
     PlatformFile file,
   ) async {
-    final sourcePath = file.path;
-    if (sourcePath == null) {
-      throw Exception(
-          'File path is null - file may not have been saved to disk');
-    }
+    final sourcePath = await _localPathFor(file);
 
     final safeName = sanitizeFileName(file.name);
     final sourceFile = File(sourcePath);
@@ -235,6 +304,78 @@ class FileAttachmentService {
   static String sanitizeFileName(String name) {
     final safeName = name.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
     return safeName.isEmpty ? 'attachment' : safeName;
+  }
+
+  static bool isSkillArchiveName(String name) {
+    final lower = name.trim().toLowerCase();
+    return lower.endsWith('.zip') ||
+        lower.endsWith('.tar.gz') ||
+        lower.endsWith('.tgz');
+  }
+
+  /// Resolves a picker result to an app-readable local path. Some platforms
+  /// can provide bounded bytes without a filesystem path; stage those bytes in
+  /// the app cache so the existing native import broker can still verify and
+  /// receipt them. A missing path and missing bytes fail closed.
+  static Future<String> localPathFor(PlatformFile file) => _localPathFor(file);
+
+  static Future<String> _localPathFor(PlatformFile file) async {
+    final path = file.path;
+    final bytes = file.bytes;
+    if (path != null && path.isNotEmpty) {
+      try {
+        final handle = await File(path).open();
+        await handle.close();
+        return path;
+      } catch (_) {
+        if (bytes == null) {
+          throw const FilePickerException('path_unreadable');
+        }
+      }
+    }
+    if (bytes == null) {
+      throw const FilePickerException('path_missing');
+    }
+    _attachmentBudget.checkWorkspaceImportBytes(
+      bytes.length,
+      fileName: sanitizeFileName(file.name),
+    );
+    final cache = await _temporaryDirectory();
+    final directory = Directory('${cache.path}/clawchat-picked-files');
+    await directory.create(recursive: true);
+    final counter = ++_materializedFileCounter;
+    final target = File(
+      '${directory.path}/$counter-${sanitizeFileName(file.name)}',
+    );
+    await target.writeAsBytes(bytes, flush: true);
+    return target.path;
+  }
+
+  static Future<Directory> _temporaryDirectory() async {
+    try {
+      return await getTemporaryDirectory();
+    } on MissingPluginException {
+      // Headless/unit-test embedders may not register path_provider. The
+      // process temp directory remains app-private and is still bounded by
+      // the byte budget above.
+      return Directory.systemTemp;
+    }
+  }
+
+  static Future<PlatformFile> _materializeIfNeeded(PlatformFile file) async {
+    if (file.path != null && file.path!.isNotEmpty) return file;
+    if (file.bytes == null) {
+      throw const FilePickerException('path_missing');
+    }
+    final path = await _localPathFor(file);
+    return PlatformFile(
+      name: file.name,
+      size: file.size,
+      path: path,
+      bytes: file.bytes,
+      identifier: file.identifier,
+      readStream: file.readStream,
+    );
   }
 
   static String _extensionFor(String name) {
@@ -261,5 +402,15 @@ class FileAttachmentService {
   @visibleForTesting
   static void resetInlineReadStreamForTesting() {
     _inlineReadStreamForTesting = null;
+  }
+
+  @visibleForTesting
+  static void setPickerForTesting(FilePickerInvoker picker) {
+    _pickerForTesting = picker;
+  }
+
+  @visibleForTesting
+  static void resetPickerForTesting() {
+    _pickerForTesting = null;
   }
 }
