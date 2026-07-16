@@ -98,6 +98,8 @@ class MainActivity : FlutterActivity() {
     private var mediaPlaybackPath: String? = null
     private var mediaPlaybackOperationId: String? = null
     private var activityResumed = false
+    private val pickedContentCacheDirName = "clawchat_picked_content"
+    private val pickedContentMaxAgeMs = 24L * 60L * 60L * 1000L
 
     private fun safeRunOnUiThread(action: () -> Unit) {
         if (isDestroyed || isFinishing) return
@@ -117,6 +119,83 @@ class MainActivity : FlutterActivity() {
             }
         } catch (_: Exception) {
             // Cache deletion is best effort and must not mask playback state.
+        }
+    }
+
+    private fun cleanupPickedContentCache() {
+        try {
+            val directory = File(cacheDir, pickedContentCacheDirName)
+            val cutoff = System.currentTimeMillis() - pickedContentMaxAgeMs
+            directory.listFiles()?.forEach { file ->
+                if (file.isFile && file.name.startsWith("picked_") &&
+                    file.lastModified() < cutoff) {
+                    file.delete()
+                }
+            }
+        } catch (_: Exception) {
+            // Cache cleanup is best effort and must not block app startup.
+        }
+    }
+
+    private fun deletePickedContentCache(path: String?) {
+        if (path == null) return
+        try {
+            val root = File(cacheDir, pickedContentCacheDirName).canonicalFile
+            val candidate = File(path).canonicalFile
+            if (candidate.path.startsWith(root.path + File.separator) &&
+                candidate.name.startsWith("picked_") && candidate.isFile) {
+                candidate.delete()
+            }
+        } catch (_: Exception) {
+            // Never allow an invalid caller path to escape the cache root.
+        }
+    }
+
+    private fun stagePickedContentUri(
+        rawUri: String,
+        displayName: String,
+        maxBytes: Long,
+    ): String {
+        val uri = Uri.parse(rawUri)
+        if (uri.scheme != "content" || uri.authority.isNullOrBlank() ||
+            rawUri.length > 4096) {
+            throw SecurityException("content URI required")
+        }
+        if (maxBytes <= 0L || maxBytes > 50L * 1024L * 1024L) {
+            throw IllegalArgumentException("invalid content limit")
+        }
+        val safeName = sanitizeSharedFileName(displayName).take(120)
+        val declaredSize = queryOpenableLong(uri, OpenableColumns.SIZE)
+        if (declaredSize != null && declaredSize > maxBytes) {
+            throw IllegalArgumentException("content exceeds bounded limit")
+        }
+        val directory = File(cacheDir, pickedContentCacheDirName).apply {
+            mkdirs()
+        }
+        val destination = File.createTempFile("picked_", "_$safeName", directory)
+        var total = 0L
+        try {
+            val input = contentResolver.openInputStream(uri)
+                ?: throw IllegalArgumentException("content cannot be opened")
+            input.use { source ->
+                destination.outputStream().use { target ->
+                    val buffer = ByteArray(16 * 1024)
+                    while (true) {
+                        val read = source.read(buffer)
+                        if (read < 0) break
+                        if (read == 0) continue
+                        total += read.toLong()
+                        if (total > maxBytes) {
+                            throw IllegalArgumentException("content exceeds bounded limit")
+                        }
+                        target.write(buffer, 0, read)
+                    }
+                }
+            }
+            return destination.absolutePath
+        } catch (error: Throwable) {
+            destination.delete()
+            throw error
         }
     }
 
@@ -170,6 +249,7 @@ class MainActivity : FlutterActivity() {
         bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
         processManager = ProcessManager(filesDir, nativeLibDir, cleanupCoordinator)
         phoneIntentManager = PhoneIntentManager(this) { activityResumed }
+        cleanupPickedContentCache()
 
         if (setupDone.compareAndSet(false, true)) {
             // Reconcile a few bounded journal batches off the UI thread. Each
@@ -197,6 +277,32 @@ class MainActivity : FlutterActivity() {
                 "getProotPath" -> result.success(processManager.getProotPath())
                 "getArch" -> result.success(ArchUtils.getArch())
                 "getFilesDir" -> result.success(filesDir)
+                "stagePickedContentUri" -> {
+                    val uri = call.argument<String>("uri")
+                    val displayName = call.argument<String>("displayName")
+                    val maxBytes = call.argument<Number>("maxBytes")?.toLong()
+                    if (uri == null || displayName == null || maxBytes == null ||
+                        !uri.startsWith("content://") || displayName.isBlank() ||
+                        displayName.length > 256 || maxBytes <= 0L ||
+                        maxBytes > 50L * 1024L * 1024L) {
+                        result.error("INVALID_ARGS", "picked content arguments required", null)
+                    } else {
+                        secureImportExecutor.execute {
+                            try {
+                                val path = stagePickedContentUri(uri, displayName, maxBytes)
+                                safeRunOnUiThread { result.success(path) }
+                            } catch (_: Throwable) {
+                                safeRunOnUiThread {
+                                    result.error("PICKED_CONTENT_ERROR", "unable to stage picked content", null)
+                                }
+                            }
+                        }
+                    }
+                }
+                "discardPickedContentCache" -> {
+                    deletePickedContentCache(call.argument<String>("path"))
+                    result.success(true)
+                }
                 "importHostFileToWorkspace" -> {
                     val path = call.argument<String>("path")
                     val destinationPath = call.argument<String>("destinationPath")

@@ -44,6 +44,7 @@ class FilePickerException implements Exception {
       case 'unknown_path':
       case 'path_missing':
       case 'path_unreadable':
+      case 'content_stage_failed':
         return '无法读取所选文件，请换一个文件或重新选择。';
       case 'oversized':
         return '所选文件超过应用允许的大小上限。';
@@ -69,6 +70,8 @@ class FileAttachmentService {
   static BoundedFileStreamFactory? _inlineReadStreamForTesting;
   static FilePickerInvoker? _pickerForTesting;
   static int _materializedFileCounter = 0;
+  static final Set<String> _nativeStagedPaths = <String>{};
+  static final Set<String> _dartStagedPaths = <String>{};
 
   static const Set<String> _imageExtensions = {
     'jpg',
@@ -203,7 +206,17 @@ class FileAttachmentService {
   /// workspace and represented by their workspace path.
   static Future<PreparedAttachment> prepareForMessage(PlatformFile file) async {
     final sourcePath = await _localPathFor(file);
+    try {
+      return await _prepareForMessageAtPath(file, sourcePath);
+    } finally {
+      await cleanupLocalPath(sourcePath);
+    }
+  }
 
+  static Future<PreparedAttachment> _prepareForMessageAtPath(
+    PlatformFile file,
+    String sourcePath,
+  ) async {
     final safeName = sanitizeFileName(file.name);
     final extension = _extensionFor(safeName);
 
@@ -253,7 +266,7 @@ class FileAttachmentService {
       );
     }
 
-    final receipt = await importToWorkspace(file);
+    final receipt = await _importToWorkspaceAtPath(file, sourcePath);
     final marker = receipt.marker;
     return PreparedAttachment(
       content: TextContent(marker),
@@ -283,7 +296,17 @@ class FileAttachmentService {
     PlatformFile file,
   ) async {
     final sourcePath = await _localPathFor(file);
+    try {
+      return await _importToWorkspaceAtPath(file, sourcePath);
+    } finally {
+      await cleanupLocalPath(sourcePath);
+    }
+  }
 
+  static Future<WorkspaceImportReceipt> _importToWorkspaceAtPath(
+    PlatformFile file,
+    String sourcePath,
+  ) async {
     final safeName = sanitizeFileName(file.name);
     final sourceFile = File(sourcePath);
     final byteLength = await sourceFile.length();
@@ -328,11 +351,19 @@ class FileAttachmentService {
         await handle.close();
         return path;
       } catch (_) {
-        if (bytes == null) {
-          throw const FilePickerException('path_unreadable');
-        }
+        final staged = await _stageContentIdentifier(
+          file,
+          failClosed: bytes == null,
+        );
+        if (staged != null) return staged;
+        if (bytes == null) throw const FilePickerException('path_unreadable');
       }
     }
+    final staged = await _stageContentIdentifier(
+      file,
+      failClosed: bytes == null,
+    );
+    if (staged != null) return staged;
     if (bytes == null) {
       throw const FilePickerException('path_missing');
     }
@@ -348,7 +379,46 @@ class FileAttachmentService {
       '${directory.path}/$counter-${sanitizeFileName(file.name)}',
     );
     await target.writeAsBytes(bytes, flush: true);
+    _dartStagedPaths.add(target.path);
     return target.path;
+  }
+
+  static Future<String?> _stageContentIdentifier(
+    PlatformFile file, {
+    required bool failClosed,
+  }) async {
+    final identifier = file.identifier;
+    if (identifier == null || !identifier.startsWith('content://')) {
+      return null;
+    }
+    try {
+      final path = await NativeBridge.stagePickedContentUri(
+        contentUri: identifier,
+        displayName: sanitizeFileName(file.name),
+      );
+      _nativeStagedPaths.add(path);
+      return path;
+    } catch (_) {
+      if (!failClosed) return null;
+      throw const FilePickerException('content_stage_failed');
+    }
+  }
+
+  /// Removes only cache files created by this service/native URI staging.
+  /// Provider-owned picker cache paths are never deleted here.
+  static Future<void> cleanupLocalPath(String path) async {
+    if (_nativeStagedPaths.remove(path)) {
+      try {
+        await NativeBridge.discardPickedContentCache(path);
+      } catch (_) {}
+      return;
+    }
+    if (_dartStagedPaths.remove(path)) {
+      try {
+        final file = File(path);
+        if (await file.exists()) await file.delete();
+      } catch (_) {}
+    }
   }
 
   static Future<Directory> _temporaryDirectory() async {
@@ -364,7 +434,8 @@ class FileAttachmentService {
 
   static Future<PlatformFile> _materializeIfNeeded(PlatformFile file) async {
     if (file.path != null && file.path!.isNotEmpty) return file;
-    if (file.bytes == null) {
+    if (file.bytes == null &&
+        !(file.identifier?.startsWith('content://') ?? false)) {
       throw const FilePickerException('path_missing');
     }
     final path = await _localPathFor(file);

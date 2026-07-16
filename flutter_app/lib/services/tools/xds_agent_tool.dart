@@ -62,13 +62,57 @@ final class XdsAgentTool extends Tool {
           },
           'skill': {'type': 'string'},
           'path': {'type': 'string'},
-          'project_id': {'type': 'string'},
-          'app_id': {'type': 'string'},
+          // Model responses frequently preserve numeric IDs from the XDS
+          // response JSON. Normalize those bounded integers before building
+          // the request instead of rejecting an otherwise valid workflow.
+          'project_id': {
+            'type': ['string', 'integer'],
+            'pattern': r'^[0-9]{1,20}$',
+            'minimum': 0,
+          },
+          'app_id': {
+            'type': ['string', 'integer'],
+            'pattern': r'^[0-9]{1,20}$',
+            'minimum': 0,
+          },
           'command': {'type': 'string'},
           'user_query': {'type': 'string'},
           'intent': {'type': 'string'},
         },
         'required': ['operation'],
+        'oneOf': [
+          {
+            'properties': {
+              'operation': {
+                'enum': ['list'],
+              },
+            },
+          },
+          {
+            'properties': {
+              'operation': {
+                'enum': ['get', 'files'],
+              },
+            },
+            'required': ['skill'],
+          },
+          {
+            'properties': {
+              'operation': {
+                'enum': ['kb'],
+              },
+            },
+            'required': ['skill', 'project_id'],
+          },
+          {
+            'properties': {
+              'operation': {
+                'enum': ['exec'],
+              },
+            },
+            'required': ['skill', 'command'],
+          },
+        ],
         'additionalProperties': false,
       };
 
@@ -287,22 +331,25 @@ final class _XdsAgentInvocation {
     final skill = operation == 'list'
         ? null
         : _requiredString(input, 'skill', 100, pattern: _skillNamePattern);
-    final appId = _optionalString(input, 'app_id', 20, pattern: _idPattern);
+    final appId = _optionalIdentifier(input, 'app_id', 20);
     return _XdsAgentInvocation(
       operation: operation,
       skill: skill,
       path: _optionalRelativePath(input, 'path'),
       projectId: operation == 'kb'
-          ? _requiredString(input, 'project_id', 20, pattern: _idPattern)
+          ? _requiredIdentifier(input, 'project_id', 20)
           : null,
       appId: appId,
       command:
           operation == 'exec' ? _requiredString(input, 'command', 4096) : null,
       userQuery: operation == 'exec'
-          ? _requiredString(input, 'user_query', 4000)
+          ? _optionalString(input, 'user_query', 4000) ??
+              'User-requested XDS skill operation.'
           : null,
-      intent:
-          operation == 'exec' ? _requiredString(input, 'intent', 1000) : null,
+      intent: operation == 'exec'
+          ? _optionalString(input, 'intent', 1000) ??
+              'Execute the requested XDS skill command.'
+          : null,
     );
   }
 
@@ -403,6 +450,33 @@ final class _XdsAgentInvocation {
   }) {
     if (!input.containsKey(key)) return null;
     return _requiredString(input, key, max, pattern: pattern);
+  }
+
+  static String _requiredIdentifier(
+    Map<String, dynamic> input,
+    String key,
+    int max,
+  ) {
+    if (!input.containsKey(key)) throw FormatException('missing $key');
+    final value = input[key];
+    final normalized = value is int ? value.toString() : value;
+    if (normalized is! String ||
+        normalized.isEmpty ||
+        normalized.length > max ||
+        _hasForbiddenControl(normalized) ||
+        !_idPattern.hasMatch(normalized)) {
+      throw FormatException('invalid $key');
+    }
+    return normalized;
+  }
+
+  static String? _optionalIdentifier(
+    Map<String, dynamic> input,
+    String key,
+    int max,
+  ) {
+    if (!input.containsKey(key)) return null;
+    return _requiredIdentifier(input, key, max);
   }
 
   static String? _optionalRelativePath(

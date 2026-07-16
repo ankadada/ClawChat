@@ -2788,6 +2788,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         );
       }
     } finally {
+      await FileAttachmentService.cleanupLocalPath(path);
       if (mounted) setState(() => _loadingSkills = false);
     }
   }
@@ -2875,8 +2876,8 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   }
 
   Future<void> _showLocalExtensionUpdate() async {
-    String metadataPath;
-    String archivePath;
+    var metadataPath = '';
+    var archivePath = '';
     try {
       final metadataFiles = await FileAttachmentService.pickFiles(
         type: FileType.custom,
@@ -2888,9 +2889,14 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       );
 
       final archive = await FileAttachmentService.pickSkillArchive();
-      if (archive == null) return;
+      if (archive == null) {
+        await FileAttachmentService.cleanupLocalPath(metadataPath);
+        return;
+      }
       archivePath = await FileAttachmentService.localPathFor(archive);
     } on FilePickerException catch (error) {
+      await FileAttachmentService.cleanupLocalPath(metadataPath);
+      await FileAttachmentService.cleanupLocalPath(archivePath);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -2904,6 +2910,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       }
       return;
     }
+    if (metadataPath.isEmpty || archivePath.isEmpty) return;
 
     setState(() => _loadingSkills = true);
     ExtensionUpdatePlan? plan;
@@ -2964,6 +2971,8 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       if (plan != null) await _updates.discardExtensionPlan(plan);
       _showUpdateError(error);
     } finally {
+      await FileAttachmentService.cleanupLocalPath(metadataPath);
+      await FileAttachmentService.cleanupLocalPath(archivePath);
       if (mounted) setState(() => _loadingSkills = false);
     }
   }

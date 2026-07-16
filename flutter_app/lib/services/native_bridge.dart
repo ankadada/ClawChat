@@ -45,6 +45,14 @@ typedef ApkInstallerHandoff = Future<bool> Function(
   String sha256,
 );
 
+typedef PickedContentUriStager = Future<String> Function(
+  String contentUri,
+  String displayName,
+  int maxBytes,
+);
+
+typedef PickedContentCacheDisposer = Future<void> Function(String path);
+
 class NativeBridge {
   static const _backgroundTaskOwnerKind = 'backgroundTask';
   static const _channel = MethodChannel(AppConstants.channelName);
@@ -76,6 +84,8 @@ class NativeBridge {
   static PendingWorkspaceImportLister? _pendingWorkspaceImportListerForTesting;
   static UpdateSignatureVerifier? _updateSignatureVerifierForTesting;
   static ApkInstallerHandoff? _apkInstallerHandoffForTesting;
+  static PickedContentUriStager? _pickedContentUriStagerForTesting;
+  static PickedContentCacheDisposer? _pickedContentCacheDisposerForTesting;
   static final Set<String> _testWorkspaceImportOperations = {};
 
   static void setShareIntentHandler(
@@ -229,6 +239,51 @@ class NativeBridge {
 
   static Future<String> getFilesDir() async {
     return (await _channel.invokeMethod<String>('getFilesDir'))!;
+  }
+
+  /// Copies an Android SAF content URI to an app-private bounded cache file.
+  /// The URI itself and file bytes never cross the Dart/native bridge together.
+  static Future<String> stagePickedContentUri({
+    required String contentUri,
+    required String displayName,
+    int maxBytes = AttachmentBudget.maxWorkspaceImportBytes,
+  }) async {
+    if (!contentUri.startsWith('content://') || contentUri.length > 4096) {
+      throw const FormatException('Picked content URI is invalid.');
+    }
+    if (displayName.trim().isEmpty || displayName.length > 256) {
+      throw const FormatException('Picked content name is invalid.');
+    }
+    if (maxBytes <= 0 || maxBytes > AttachmentBudget.maxWorkspaceImportBytes) {
+      throw ArgumentError.value(maxBytes, 'maxBytes');
+    }
+    final stager = _pickedContentUriStagerForTesting;
+    final path = stager != null
+        ? await stager(contentUri, displayName, maxBytes)
+        : await _channel.invokeMethod<String>('stagePickedContentUri', {
+            'uri': contentUri,
+            'displayName': displayName,
+            'maxBytes': maxBytes,
+          });
+    if (path == null ||
+        path.isEmpty ||
+        !path.startsWith('/') ||
+        (stager == null && !path.contains('/clawchat_picked_content/'))) {
+      throw const FileSystemException('Picked content staging failed.');
+    }
+    return path;
+  }
+
+  static Future<void> discardPickedContentCache(String path) async {
+    if (!path.startsWith('/')) return;
+    final disposer = _pickedContentCacheDisposerForTesting;
+    if (disposer != null) {
+      await disposer(path);
+      return;
+    }
+    await _channel.invokeMethod<bool>('discardPickedContentCache', {
+      'path': path,
+    });
   }
 
   static Future<String> getNativeLibDir() async {
@@ -1180,6 +1235,8 @@ class NativeBridge {
     _rootfsBoundedReadBrokerForTesting = null;
     _workspaceImportLifecycleBrokerForTesting = null;
     _pendingWorkspaceImportListerForTesting = null;
+    _pickedContentUriStagerForTesting = null;
+    _pickedContentCacheDisposerForTesting = null;
     _testWorkspaceImportOperations.clear();
   }
 
@@ -1223,5 +1280,14 @@ class NativeBridge {
     RootfsBoundedReadBroker broker,
   ) {
     _rootfsBoundedReadBrokerForTesting = broker;
+  }
+
+  @visibleForTesting
+  static void setPickedContentStagersForTesting({
+    PickedContentUriStager? stager,
+    PickedContentCacheDisposer? disposer,
+  }) {
+    _pickedContentUriStagerForTesting = stager;
+    _pickedContentCacheDisposerForTesting = disposer;
   }
 }

@@ -8,7 +8,7 @@
     },
     {
       "path": "lib/screens/settings_screen.dart",
-      "sha256": "48616eb3c8b11a6bea3e5979f6b199411788cb6d2b86744124be2fba05a8f716"
+      "sha256": "65d24719087f6e2c96b8d217839ccdbf535baedd5fd67e272cc72d5e53da6aa2"
     },
     {
       "path": "lib/services/bundled_legacy_skill_catalog.dart",

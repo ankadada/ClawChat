@@ -4462,7 +4462,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     for (final file in files) {
       try {
         if (FileAttachmentService.requiresSensitiveTextConfirmation(file)) {
-          if (!mounted) return;
+          if (!mounted) {
+            await FileAttachmentService.cleanupLocalPath(file.path ?? '');
+            return;
+          }
           final warning = FileAttachmentService.sensitiveTextWarning(file) ??
               '该文件可能包含密钥或凭据。确认后才会把全文注入提示词。';
           final confirmed = await showDialog<bool>(
@@ -4482,7 +4485,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ],
             ),
           );
-          if (confirmed != true) continue;
+          if (confirmed != true) {
+            await FileAttachmentService.cleanupLocalPath(file.path ?? '');
+            continue;
+          }
         }
         final prepared = await FileAttachmentService.prepareForMessage(file);
         if (!mounted) {

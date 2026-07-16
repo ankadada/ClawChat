@@ -131,6 +131,130 @@ void main() {
     expect(output, contains('"output":"ok"'));
   });
 
+  test('maps every fixed operation and normalizes numeric project IDs',
+      () async {
+    final requests = <http.BaseRequest>[];
+    final tool = XdsAgentTool(
+      preferences,
+      requestSender: (incoming) async {
+        requests.add(incoming);
+        return _jsonResponse(incoming, {'ok': true});
+      },
+    );
+
+    await tool.execute(const {'operation': 'list', 'app_id': 10005388});
+    await tool.execute(const {
+      'operation': 'get',
+      'skill': 'tapdb-data-analysis',
+    });
+    await tool.execute(const {
+      'operation': 'files',
+      'skill': 'tapdb-data-analysis',
+      'path': 'references/sql_schema_guide.md',
+    });
+    await tool.execute(const {
+      'operation': 'kb',
+      'skill': 'tapdb-data-analysis',
+      'project_id': 10005388,
+      'path': 'ssrpg 5/gacha_recruitment.md',
+    });
+    await tool.execute(const {
+      'operation': 'exec',
+      'skill': 'xds-user-auth',
+      'command': 'list',
+    });
+
+    expect(requests, hasLength(5));
+    expect(requests[0].url.toString(),
+        'https://ai-xds.tapdb.net/open-skills?app_id=10005388');
+    expect(requests[1].url.toString(),
+        'https://ai-xds.tapdb.net/open-skills/tapdb-data-analysis');
+    expect(requests[2].url.toString(),
+        'https://ai-xds.tapdb.net/open-skills/tapdb-data-analysis/files/references/sql_schema_guide.md');
+    expect(requests[3].url.toString(),
+        'https://ai-xds.tapdb.net/open-skills/tapdb-data-analysis/kb/10005388/ssrpg%205/gacha_recruitment.md');
+
+    final execBody = jsonDecode((requests[4] as http.Request).body) as Map;
+    expect(execBody['skill'], 'xds-user-auth');
+    expect(execBody['command'], 'list');
+    expect(execBody['user_query'], 'User-requested XDS skill operation.');
+    expect(execBody['intent'], 'Execute the requested XDS skill command.');
+  });
+
+  test('supports the published project-selection and DAU command forms',
+      () async {
+    final bodies = <Map>[];
+    final tool = XdsAgentTool(
+      preferences,
+      requestSender: (incoming) async {
+        bodies.add(jsonDecode((incoming as http.Request).body) as Map);
+        return _jsonResponse(incoming, {'ok': true});
+      },
+    );
+
+    await tool.execute(const {
+      'operation': 'exec',
+      'skill': 'xds-user-auth',
+      'command': 'list',
+    });
+    await tool.execute(const {
+      'operation': 'exec',
+      'skill': 'xds-user-auth',
+      'command': 'use 17',
+    });
+    await tool.execute(const {
+      'operation': 'exec',
+      'skill': 'tapdb-data-analysis',
+      'command': 'list_projects --search 铃兰',
+      'app_id': 10005388,
+    });
+    await tool.execute(const {
+      'operation': 'exec',
+      'skill': 'tapdb-data-analysis',
+      'command':
+          'active -p 10005388 -s 2026-04-15 -e 2026-04-21 --quota dau -g time',
+      'app_id': 10005388,
+    });
+
+    expect(bodies, hasLength(4));
+    expect(bodies[0]['command'], 'list');
+    expect(bodies[1]['command'], 'use 17');
+    expect(bodies[2]['command'], startsWith('list_projects'));
+    expect(bodies[2]['app_id'], '10005388');
+    expect(bodies[3]['command'], startsWith('active -p 10005388'));
+    expect(bodies[3]['app_id'], '10005388');
+    for (final body in bodies) {
+      expect(body['user_query'], isNotEmpty);
+      expect(body['intent'], isNotEmpty);
+    }
+  });
+
+  test('HTTP and malformed JSON failures are fixed and redact response data',
+      () async {
+    var response = 0;
+    final tool = XdsAgentTool(
+      preferences,
+      requestSender: (incoming) async {
+        response++;
+        return http.StreamedResponse(
+          Stream<List<int>>.value(utf8.encode(response == 1
+              ? '{"error":"token-not-for-output"}'
+              : '{"token":"token-not-for-output"')),
+          response == 1 ? 403 : 200,
+          request: incoming,
+        );
+      },
+    );
+
+    final httpFailure = await tool.execute(const {'operation': 'list'});
+    final jsonFailure = await tool.execute(const {'operation': 'list'});
+
+    expect(httpFailure, 'XDS request failed (HTTP 403).');
+    expect(jsonFailure, 'XDS response rejected: invalid bounded JSON.');
+    expect(httpFailure, isNot(contains('token-not-for-output')));
+    expect(jsonFailure, isNot(contains('token-not-for-output')));
+  });
+
   test('rejects unknown fields, traversal, and missing token before dispatch',
       () async {
     var calls = 0;
@@ -167,6 +291,18 @@ void main() {
     final schema = registry.inputSchemaFor('xds_agent');
     expect(schema?['additionalProperties'], isFalse);
     expect(schema?['properties'], containsPair('operation', isNotNull));
+    final operationVariants = schema?['oneOf'] as List;
+    expect(
+      operationVariants,
+      contains(predicate<Map>((variant) {
+        final properties = variant['properties'] as Map;
+        final operation = properties['operation'] as Map;
+        return (operation['enum'] as List).contains('exec') &&
+            (variant['required'] as List)
+                .toSet()
+                .containsAll(['skill', 'command']);
+      })),
+    );
 
     final tool = XdsAgentTool(
       preferences,

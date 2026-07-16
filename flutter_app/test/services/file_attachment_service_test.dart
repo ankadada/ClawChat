@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/models/chat_models.dart';
+import 'package:clawchat/services/attachment_budget.dart';
 import 'package:clawchat/services/file_attachment_service.dart';
 import 'package:clawchat/services/native_bridge.dart';
 import 'package:file_picker/file_picker.dart';
@@ -150,6 +151,86 @@ void main() {
         files.single,
       );
       expect(prepared.content, isA<ImageContent>());
+    });
+
+    test('content URI identifier stages through native bridge and is cleaned',
+        () async {
+      final staged = await writeFile('native-picked.png', [1, 2, 3]);
+      String? requestedUri;
+      String? requestedName;
+      String? disposedPath;
+      NativeBridge.setPickedContentStagersForTesting(
+        stager: (uri, name, maxBytes) async {
+          requestedUri = uri;
+          requestedName = name;
+          expect(maxBytes, AttachmentBudget.maxWorkspaceImportBytes);
+          return staged.path;
+        },
+        disposer: (path) async => disposedPath = path,
+      );
+
+      final prepared = await FileAttachmentService.prepareForMessage(
+        PlatformFile(
+          name: 'photo.png',
+          size: 3,
+          identifier: 'content://downloads/documents/1',
+        ),
+      );
+
+      expect(prepared.content, isA<ImageContent>());
+      expect(requestedUri, 'content://downloads/documents/1');
+      expect(requestedName, 'photo.png');
+      expect(disposedPath, staged.path);
+    });
+
+    test(
+        'content provider failure falls back to bounded bytes and rejects file URI',
+        () async {
+      NativeBridge.setPickedContentStagersForTesting(
+        stager: (uri, name, maxBytes) async {
+          throw const FileSystemException('provider unavailable');
+        },
+      );
+      final bytes = Uint8List.fromList([4, 5, 6]);
+      final prepared = await FileAttachmentService.prepareForMessage(
+        PlatformFile(
+          name: 'fallback.png',
+          size: bytes.length,
+          bytes: bytes,
+          identifier: 'content://provider/document/2',
+        ),
+      );
+      expect(prepared.content, isA<ImageContent>());
+      await expectLater(
+        NativeBridge.stagePickedContentUri(
+          contentUri: 'file:///private/secret',
+          displayName: 'fallback.png',
+        ),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('native content staging wrapper sends identifier and bound only',
+        () async {
+      Map<Object?, Object?>? request;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'stagePickedContentUri') {
+          request = Map<Object?, Object?>.from(call.arguments as Map);
+          return '/data/data/com.anka.clawbot/cache/clawchat_picked_content/picked_1';
+        }
+        return null;
+      });
+
+      final path = await NativeBridge.stagePickedContentUri(
+        contentUri: 'content://downloads/documents/99',
+        displayName: 'archive.zip',
+      );
+
+      expect(path, startsWith('/data/data/'));
+      expect(request?['uri'], 'content://downloads/documents/99');
+      expect(request?['displayName'], 'archive.zip');
+      expect(request?['maxBytes'], AttachmentBudget.maxWorkspaceImportBytes);
     });
 
     test('skill archive picker accepts zip tar.gz and tgz without MIME filter',
