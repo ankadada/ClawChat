@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.16.0 — Android P0：工作区点击区域、键盘布局与发布质量
+
+- **宽横屏工作区 chip 的整块点击区域** — 聊天顶栏的工作区控件从标题区移入 actions 槽：标题是 AppBar 的 header 语义节点，会把子控件的标签吸收进标题，而可点击的只是 24dp 高的药丸本体，不是整块可见区域。现在它是独立控件，拥有自己的 semantics 节点（label + button + tap 指向同一动作）与 48dp 命中盒（宽度贴合药丸、上限 160dp，不会伸到旁边按钮下面）；宽横屏、320dp 与 200% 字体下，可见区域内的任意位置（含四角）与读屏激活都会进入工作区页。
+- **工作区命名页取消按钮** — AppBar leading 宽度随字体缩放增长（`max(56, 2×label + 24)`），取消按钮填满整个 slot（最小 48×56），标签不再被固定 56dp 挤压到自身点击盒之外；窄屏、200% 字体与 IME 打开时点击角点仍能关闭页面。
+- **横屏 + IME 的输入区不再溢出** — 800×360 + 键盘时聊天 body 只有约 104dp，输入区两行 48dp 内容会溢出（RenderFlex overflow 17px）。现在输入区可滚动内容高度按“body 高度 − 消息列表最小 96dp − 输入区垂直内边距”封顶、底部锚定滚动，并在矮窗口下隐藏纯信息性的执行上下文行；文本输入行始终可见，键盘关闭后信息行恢复。
+- **测试** — 新增 `test/screens/workspace_hit_target_test.dart`（6 个 widget 测试）：宽横屏 chip 七点采样 + 语义动作导航、320dp/200% 紧凑 chip、IME 打开时 chip 与输入行、命名页取消按钮整个 slot 与角点点击、320dp/200% + 键盘下的取消与字段布局。既有 `chat_screen_render_window_test.dart`、`workspaces_screen_test.dart` 保持通过。
+- **版本与门禁** — pubspec `2.16.0+16`、`lib/constants.dart` 2.16.0、CHANGELOG 顶部 v2.16.0 三者一致（build number 递增）；`flutter analyze` 0 issue，`flutter test --no-pub` 全绿，`./gradlew :app:testDebugUnitTest` 全绿，`dart run tool/skill_evals/run_skill_evals.dart` PASS。
+
+### Residual in 2.16.0
+
+- 本版仍为 Android 侧载交付；真机矩阵（多机型 × 320dp/200% / 横屏 + IME / 折叠姿态）需按 `docs/android-roadmap.md` §3 在至少两台真机上执行，未跑项必须标记 NOT RUN。
+- 矮窗口（键盘打开且 body 高度 < 200dp）下执行上下文行隐藏，键盘关闭后自动恢复；这是版面取舍，不是功能删除。
+- 本版不做端侧大模型（见 `docs/android-roadmap.md` §1.3），也不涉及 v2.17 的 run journal / 架构拆分。
+- 既有非阻断项：仓库中已跟踪的 Android 构建日志、生成文件仍建议在后续清理提交中处理。
+
 ## v2.15.0 — Local automation, memory visibility, workflow templates
 
 - **计划执行（本地计划）** — 已批准的本地任务可以排下一次时间：一次性或每 15–1440 分钟，支持暂停 / 继续 / 删除、下次运行提示、失败次数与重试上限、最多 20 条执行历史。计划存储在 `clawchat_scheduled_tasks_v1`，只保存 `taskId` 与调度元数据（任务内容仍留在加密的后台任务存储）。**没有执行 API**：到期后计划只进入“等待确认”，实际运行仍走任务中心的人工确认与既有审批策略；一次性计划跑完即结束，需要新的时间才会再跑，间隔计划按计划时间推进而不补跑错过的次数。新建计划必须勾选“到期后需要我再次确认才会执行”。入口：任务中心 → 计划执行。

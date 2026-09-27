@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -322,6 +323,14 @@ class _WorkspaceNamePageState extends State<_WorkspaceNamePage> {
 
   @override
   Widget build(BuildContext context) {
+    // The app bar slot grows with the label: a fixed 56dp leading clipped the
+    // cancel label at large text scales, so the painted text no longer matched
+    // the tappable box. The button fills the whole slot, which keeps a real
+    // 48dp+ target on narrow phones and makes the visible label part of it.
+    final cancelWidth = math.max(
+      56.0,
+      MediaQuery.textScalerOf(context).scale(14) * 2 + 24,
+    );
     return Scaffold(
       // The editor keeps the full body height: the field lives at the very
       // top, so the IME only ever covers the empty space below it. Letting
@@ -329,10 +338,21 @@ class _WorkspaceNamePageState extends State<_WorkspaceNamePage> {
       // the field with ~10dp of visible height.
       resizeToAvoidBottomInset: false,
       appBar: AppBar(
+        leadingWidth: cancelWidth,
         leading: TextButton(
           key: const ValueKey('workspace-name-cancel'),
+          style: TextButton.styleFrom(
+            minimumSize: Size(cancelWidth, kToolbarHeight),
+            padding: EdgeInsets.zero,
+            tapTargetSize: MaterialTapTargetSize.padded,
+          ),
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text(AppStrings.cancel),
+          child: const Text(
+            AppStrings.cancel,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+          ),
         ),
         title: Text(
           widget.title,

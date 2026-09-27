@@ -105,6 +105,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   static const int _initialRenderMessageWindow = 180;
   static const int _loadOlderMessageIncrement = 120;
 
+  /// Composer height kept when a short landscape window with the IME open
+  /// cannot fit the full composer and the message list at once. The composer
+  /// scrolls internally below this bound instead of overflowing the body.
+  static const double _minimumComposerHeight = 72;
+
+  /// Vertical padding of the composer container (`_buildInputArea`): the cap
+  /// below is computed for the scrollable content, not the painted container.
+  static const double _composerVerticalPadding = 24;
+
+  /// Sliver of message list kept above the composer while the composer is
+  /// clamped on a short window.
+  static const double _minimumMessageListHeight = 96;
+
+  /// Body height below which the composer drops its informational rows (the
+  /// execution-context chip) so the text field stays visible above the IME on
+  /// a short landscape window.
+  static const double _compactComposerBodyHeight = 200;
+
   final _inputController = TextEditingController();
   final _sessionSearchController = TextEditingController();
   final _pastedBlocks = PastedTextBlocks();
@@ -2385,47 +2403,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         title: Consumer<ChatProvider>(
           builder: (_, provider, __) {
             final session = provider.currentSession;
-            final workspace = provider.workspaceForSession(
-              session?.workspaceId,
-            );
-            return LayoutBuilder(
-              builder: (context, constraints) {
-                // Never a second line: the toolbar keeps its height at 320dp
-                // and 200 percent text. The name shows when it fits; below
-                // that an icon-only chip keeps the current workspace visible
-                // (its semantics label and tooltip still name it) while the
-                // title stays readable.
-                final showName = constraints.maxWidth >= 260;
-                final showChip = constraints.maxWidth >= 56;
-                return Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        session?.title ?? AppStrings.appName,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    if (showChip) ...[
-                      const SizedBox(width: 8),
-                      ConstrainedBox(
-                        constraints: BoxConstraints(
-                          maxWidth: showName ? constraints.maxWidth * 0.45 : 40,
-                        ),
-                        child: _ChatWorkspaceChip(
-                          key: const ValueKey('chat-workspace-chip'),
-                          name: workspace.name,
-                          compact: !showName,
-                          onTap: () => Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => const WorkspacesScreen(),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ],
-                );
-              },
+            return Text(
+              session?.title ?? AppStrings.appName,
+              overflow: TextOverflow.ellipsis,
             );
           },
         ),
@@ -2440,6 +2420,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ),
               ),
         actions: [
+          // The workspace control sits in the actions slot, next to the title.
+          // The app bar's title is a header semantics node that absorbs the
+          // labels of its descendants; a control placed there was announced as
+          // part of the title and only part of its visual area was the target.
+          // As an action it keeps its own node whose label and tap action cover
+          // the same 48dp box in wide landscape and at 320dp alike.
+          const _ChatWorkspaceChipAction(),
           IconButton(
             icon: const Icon(Icons.search),
             tooltip: AppStrings.searchCurrentConversation,
@@ -2457,7 +2444,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ],
         // The workspace is the scope every file action and new session uses,
-        // so it stays visible under the title instead of only inside menus.
+        // so its chip stays visible next to the title instead of only inside
+        // menus.
       ),
       body: LayoutBuilder(
         builder: (context, chatConstraints) {
@@ -2814,7 +2802,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   ),
                 )
               else
-                _buildInputArea(theme, readingWidth),
+                // The composer keeps at least a sliver of the message list
+                // above it. On a short landscape window with the IME open the
+                // body is only ~100dp high; the inner content cap makes the
+                // composer's secondary rows scroll instead of overflowing the
+                // body and pushing the text field under the keyboard. The cap
+                // is applied inside the composer (not as an outer box) so the
+                // composer still sizes to its content on a tall window.
+                _buildInputArea(
+                  theme,
+                  readingWidth,
+                  compact:
+                      chatConstraints.maxHeight < _compactComposerBodyHeight,
+                  maxContentHeight: math.max(
+                    _minimumComposerHeight - _composerVerticalPadding,
+                    chatConstraints.maxHeight -
+                        _minimumMessageListHeight -
+                        _composerVerticalPadding,
+                  ),
+                ),
             ],
           );
         },
@@ -6053,7 +6059,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     };
   }
 
-  Widget _buildInputArea(ThemeData theme, double readingWidth) {
+  Widget _buildInputArea(
+    ThemeData theme,
+    double readingWidth, {
+    bool compact = false,
+    double maxContentHeight = double.infinity,
+  }) {
     return Consumer<ChatProvider>(
       builder: (_, provider, __) {
         final isRunning = provider.agentStatus != AgentStatus.idle &&
@@ -6068,6 +6079,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         final maxInputHeight = imeVisible
             ? math.min(240.0, math.max(148.0, usableHeight * 0.52))
             : double.infinity;
+        // Never taller than the body can give while keeping a sliver of the
+        // message list: the content scrolls (bottom-anchored) below this.
+        final effectiveMaxInputHeight =
+            math.min(maxInputHeight, maxContentHeight);
 
         return Container(
           padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
@@ -6083,9 +6098,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               child: ConstrainedBox(
                 constraints: BoxConstraints(
                   maxWidth: readingWidth,
-                  maxHeight: maxInputHeight,
+                  maxHeight: effectiveMaxInputHeight,
                 ),
                 child: SingleChildScrollView(
+                  // Bottom-anchored: when the composer content is capped on a
+                  // short window the input row stays visible and the
+                  // informational rows above it scroll instead of pushing the
+                  // field under the keyboard.
+                  reverse: true,
                   physics: imeVisible
                       ? const ClampingScrollPhysics()
                       : const NeverScrollableScrollPhysics(),
@@ -6097,7 +6117,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         blocks: _pastedBlocks,
                         onRemove: _removePastedBlock,
                       ),
-                      _buildExecutionContextChip(theme, provider),
+                      // The execution-context chip is informational; on a short
+                      // window the input row wins the available height.
+                      if (!compact) _buildExecutionContextChip(theme, provider),
                       _buildBackgroundTasksBar(theme, provider),
                       _buildMessageQueueBar(theme, provider, isRunning),
                       _buildVoiceState(theme),
@@ -6618,6 +6640,32 @@ class _ChatCommandAction {
 /// One line only: it must never grow the toolbar (the 320dp and 200 percent
 /// text layouts depend on that height), and it doubles as the entry to the
 /// workspace screen.
+class _ChatWorkspaceChipAction extends StatelessWidget {
+  const _ChatWorkspaceChipAction();
+
+  @override
+  Widget build(BuildContext context) {
+    final provider = context.watch<ChatProvider>();
+    final session = provider.currentSession;
+    final workspace = provider.workspaceForSession(session?.workspaceId);
+    // The icon-only chip is for the narrowest toolbars (320dp, large text);
+    // below ~404dp window width the named chip would leave the title less room
+    // than it needs, so the name moves to the tooltip and semantics label.
+    final compact = MediaQuery.sizeOf(context).width < 404;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 160),
+      child: _ChatWorkspaceChip(
+        key: const ValueKey('chat-workspace-chip'),
+        name: workspace.name,
+        compact: compact,
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => const WorkspacesScreen()),
+        ),
+      ),
+    );
+  }
+}
+
 class _ChatWorkspaceChip extends StatelessWidget {
   const _ChatWorkspaceChip({
     super.key,
@@ -6637,43 +6685,68 @@ class _ChatWorkspaceChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final label = '当前工作区：$name';
-    return Tooltip(
-      message: label,
-      child: Semantics(
-        label: label,
-        button: true,
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(999),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            child: compact
-                ? Icon(
-                    Icons.workspaces_outline,
-                    size: 16,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  )
-                : Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.workspaces_outline,
-                        size: 14,
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                      const SizedBox(width: 4),
-                      Flexible(
-                        child: Text(
-                          name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: theme.textTheme.labelSmall?.copyWith(
-                            color: theme.colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
+    // A 24dp pill is below the 48dp touch-target minimum. The whole control is
+    // a 48dp box (the pill stays centered inside it), and the semantics node -
+    // the outermost widget, so it is the node found for the key - carries the
+    // same label and tap action, so a touch anywhere on the visible control
+    // area and a screen-reader activation both open the workspaces page.
+    // Wide landscape toolbars keep the same behaviour as the compact 320dp
+    // one. Outside the app bar title on purpose: the title is a header
+    // semantics node that would absorb this control's label.
+    return Semantics(
+      label: label,
+      button: true,
+      onTap: onTap,
+      child: Tooltip(
+        message: label,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(999),
+            // Height fills the 48dp target; width hugs the pill (never more
+            // than the action cap) so the invisible target does not extend
+            // under the neighbouring toolbar buttons.
+            child: ExcludeSemantics(
+              child: SizedBox(
+                height: 48,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: compact
+                          ? Icon(
+                              Icons.workspaces_outline,
+                              size: 16,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            )
+                          : Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.workspaces_outline,
+                                  size: 14,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                                const SizedBox(width: 4),
+                                Flexible(
+                                  child: Text(
+                                    name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.labelSmall?.copyWith(
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
         ),
       ),
