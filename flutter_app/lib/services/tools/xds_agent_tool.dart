@@ -13,6 +13,7 @@ import '../preferences_service.dart';
 import '../strict_json_decoder.dart';
 import 'tool_registry.dart';
 import 'tool_result_formatter.dart';
+import 'untrusted_data_policy.dart';
 
 typedef XdsAgentRequestSender = Future<http.StreamedResponse> Function(
   http.BaseRequest request,
@@ -135,6 +136,7 @@ final class XdsAgentTool extends Tool {
     String? sessionId,
     required String operationId,
     required ToolCancellationSignal cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) async {
     final result = await _execute(
       input,

@@ -22,10 +22,13 @@ import java.util.zip.GZIPInputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 
-class BootstrapManager(
+internal class BootstrapManager(
     private val context: Context,
     private val filesDir: String,
-    private val nativeLibDir: String
+    private val nativeLibDir: String,
+    private val rootfsBytesReader: RootfsBytesReader = RootfsBytesReader { rootPath, relativePath, operationId, maxBytes ->
+        SecureImportNative.readRootfsBytesBounded(rootPath, relativePath, operationId, maxBytes)
+    }
 ) {
     data class StagedReadLocation(
         val rootPath: String,
@@ -552,28 +555,11 @@ class BootstrapManager(
         }
     }
 
-    private fun normalizeVirtualPath(path: String): String {
-        if (path.indexOf('\u0000') >= 0 || path.contains('\\')) {
-            throw SecurityException("Invalid rootfs path")
-        }
-        val segments = mutableListOf<String>()
-        for (segment in path.split('/')) {
-            if (segment.isEmpty() || segment == ".") continue
-            if (segment == "..") throw SecurityException("Path traversal detected")
-            segments.add(segment)
-        }
-        return if (segments.isEmpty()) "/" else "/" + segments.joinToString("/")
-    }
-
-    private fun isInsideScope(path: String, scope: String): Boolean {
-        return scope == "/" || path == scope || path.startsWith("$scope/")
-    }
-
     private fun scopedHostPath(path: String, allowedRoots: List<String>): Path {
         if (allowedRoots.isEmpty()) throw SecurityException("No filesystem scope granted")
-        val virtualPath = normalizeVirtualPath(path)
-        val scopes = allowedRoots.map { normalizeVirtualPath(it) }
-        if (scopes.none { isInsideScope(virtualPath, it) }) {
+        val virtualPath = normalizeRootfsVirtualPath(path)
+        val scopes = allowedRoots.map { normalizeRootfsVirtualPath(it) }
+        if (scopes.none { isRootfsPathInsideScope(virtualPath, it) }) {
             throw SecurityException("Path is outside the granted filesystem scope")
         }
         val root = Paths.get(rootfsDir).toAbsolutePath().normalize()
@@ -683,6 +669,40 @@ class BootstrapManager(
         return StagedReadLocation(root.toString(), relative)
     }
 
+    /**
+     * Lists one directory inside the granted scope for the file browser.
+     *
+     * The scope rules, symlink rejection and entry caps live in
+     * [RootfsDirectoryLister] so they are unit-tested on the JVM; this only
+     * wires the app's rootfs directory into them.
+     */
+    fun listRootfsDirectory(
+        path: String,
+        allowedRoots: List<String> = listOf("/"),
+        maxEntries: Int = RootfsDirectoryLister.DEFAULT_MAX_ENTRIES
+    ): Map<String, Any> {
+        val listing = RootfsDirectoryLister.list(
+            rootfsDir,
+            path,
+            allowedRoots,
+            maxEntries
+        )
+        val rows = listing.entries.map { entry ->
+            mapOf<String, Any>(
+                "name" to entry.name,
+                "path" to entry.path,
+                "isDirectory" to entry.isDirectory,
+                "isSymbolicLink" to entry.isSymbolicLink,
+                "sizeBytes" to entry.sizeBytes,
+                "modifiedEpochMs" to entry.modifiedEpochMs
+            )
+        }
+        return mapOf(
+            "entries" to rows,
+            "truncated" to listing.truncated
+        )
+    }
+
     /** Read without following any symlink in the granted root or target path. */
     fun readRootfsFile(path: String, allowedRoots: List<String> = listOf("/")): String? {
         val target = scopedHostPath(path, allowedRoots)
@@ -690,15 +710,9 @@ class BootstrapManager(
         if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) return null
         if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) return null
         rejectHardLinkedFile(target)
-        val options = setOf<OpenOption>(
-            StandardOpenOption.READ,
-            LinkOption.NOFOLLOW_LINKS
-        )
-        return Files.newByteChannel(target, options).use { channel ->
-            java.nio.channels.Channels.newInputStream(channel)
-                .bufferedReader(Charsets.UTF_8)
-                .use { it.readText() }
-        }
+        // Bounded read: never buffer the whole file. Stops at 100000 characters
+        // or 400000 UTF-8 bytes and appends the existing truncation marker.
+        return RootfsBoundedTextReader.readNoFollow(target)
     }
 
     /** Create/write without following any symlink in the granted path. */
@@ -707,8 +721,100 @@ class BootstrapManager(
         content: String,
         allowedRoots: List<String> = listOf("/"),
         createNew: Boolean = false
-    ) {
-        writeRootfsBytes(path, content.toByteArray(Charsets.UTF_8), allowedRoots, createNew)
+    ): Boolean {
+        // Descriptor-relative create: the parent is walked with O_NOFOLLOW and
+        // the file is opened through that fd with CREATE_NEW + NOFOLLOW, so a
+        // swapped parent cannot redirect the write and an existing name is never
+        // overwritten when createNew is set.
+        val location = resolveRootfsReadLocation(rootfsDir, path, allowedRoots)
+        return try {
+            SecureImportNative.writeRootfsFileBounded(
+                location.rootHostPath,
+                location.relativePath,
+                content,
+                createNew
+            )
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Creates a directory inside the granted scope.
+     *
+     * The path is resolved through the same scoped API as the other rootfs
+     * operations, and the broker creates every missing level descriptor-relative
+     * (mkdirat + O_NOFOLLOW + directory identity per level), so a symlinked or
+     * swapped component can never redirect the creation. A directory that
+     * already exists is a success; anything that is not a real directory makes
+     * this return false (fail closed).
+     */
+    fun createRootfsDirectory(
+        path: String,
+        allowedRoots: List<String> = listOf("/")
+    ): Boolean {
+        val location = resolveRootfsReadLocation(rootfsDir, path, allowedRoots)
+        return try {
+            SecureImportNative.createRootfsDirectoryBounded(
+                location.rootHostPath,
+                location.relativePath
+            )
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * Read a rootfs file as bytes, bounded by [maxBytes] and the granted scope.
+     *
+     * Used for tool-result images: a missing, non-regular, symlinked,
+     * hard-linked, special, or oversized file returns null so the caller keeps
+     * the text form instead.
+     *
+     * The read is descriptor-relative end to end: the JNI broker walks every
+     * component with `O_NOFOLLOW` relative to a verified parent descriptor,
+     * opens the final file with `O_NOFOLLOW | O_NONBLOCK`, verifies regular
+     * type and link count with `fstat` on that descriptor, and re-checks the
+     * identity after the bounded read. No path is re-resolved after the check,
+     * so a concurrent writer cannot swap a parent directory symlink, a FIFO, or
+     * a larger file into the read.
+     */
+    fun readRootfsFileBytes(
+        path: String,
+        allowedRoots: List<String> = listOf("/"),
+        maxBytes: Long = MAX_ROOTFS_BYTES_READ,
+        onRejected: ((String) -> Unit)? = null
+    ): ByteArray? = readScopedRootfsBytes(
+        rootfsDir = rootfsDir,
+        path = path,
+        allowedRoots = allowedRoots,
+        maxBytes = maxBytes,
+        operationId = newRootfsReadOperationId(),
+        reader = rootfsBytesReader,
+        onRejected = onRejected,
+    )
+
+    /**
+     * Delete a rootfs file without following any symlink in the granted path.
+     *
+     * Used once to remove the pre-2.9.0 memory trust-flag file from the
+     * model-writable rootfs after it has been migrated to app-private storage.
+     */
+    fun deleteRootfsFile(path: String, allowedRoots: List<String> = listOf("/")): Boolean {
+        // Descriptor-relative unlink: the parent directory is walked with
+        // O_NOFOLLOW and the leaf is removed through that fd, so a swapped
+        // parent can never redirect the delete. A file that is already gone
+        // counts as success.
+        val location = resolveRootfsReadLocation(rootfsDir, path, allowedRoots)
+        return try {
+            SecureImportNative.deleteRootfsFileBounded(
+                location.rootHostPath,
+                location.relativePath
+            )
+        } catch (_: Throwable) {
+            // A missing or unloadable broker must fail closed.
+            false
+        }
     }
 
     fun writeRootfsBytes(

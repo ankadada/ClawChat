@@ -1,8 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- dataExtractionRules for Android 12+ -->
+<!--
+  dataExtractionRules for Android 12+.
+
+  Both cloud backup and device transfer use the same scope as
+  `backup_rules.xml`: chat history plus the allowlisted settings mirror are
+  kept; `FlutterSharedPreferences.xml` (possible legacy plaintext credentials)
+  and the encrypted credential stores are excluded.
+-->
 <data-extraction-rules>
     <cloud-backup>
         <include domain="sharedpref" path="." />
+        <include domain="file" path="app_flutter/clawchat_sessions" />
+        <include domain="file" path="app_flutter/clawchat_settings_backup.json" />
+
         <exclude domain="sharedpref" path="FlutterSharedPreferences.xml" />
         <exclude domain="sharedpref" path="FlutterSecureStorage.xml" />
         <exclude domain="sharedpref" path="FlutterSecureKeyStore.xml" />
@@ -10,6 +20,9 @@
     </cloud-backup>
     <device-transfer>
         <include domain="sharedpref" path="." />
+        <include domain="file" path="app_flutter/clawchat_sessions" />
+        <include domain="file" path="app_flutter/clawchat_settings_backup.json" />
+
         <exclude domain="sharedpref" path="FlutterSharedPreferences.xml" />
         <exclude domain="sharedpref" path="FlutterSecureStorage.xml" />
         <exclude domain="sharedpref" path="FlutterSecureKeyStore.xml" />

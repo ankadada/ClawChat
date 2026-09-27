@@ -9,6 +9,7 @@ import '../constants.dart';
 import '../models/workspace_import_receipt.dart';
 import 'attachment_budget.dart';
 import 'bounded_file_reader.dart';
+import 'mcp_stdio_session_latch.dart';
 import 'shared_content.dart';
 
 typedef HostFileImportBroker = Future<Map<String, dynamic>> Function(
@@ -53,6 +54,60 @@ typedef PickedContentUriStager = Future<String> Function(
 
 typedef PickedContentCacheDisposer = Future<void> Function(String path);
 
+/// Test seam for the I5 MCP proot bridge. Production uses the native channel;
+/// tests replace it to exercise lifecycle and failure paths on the host.
+abstract class McpStdioBridgeBroker {
+  Future<Map<String, dynamic>> start({
+    required String runId,
+    required String serverId,
+    required String command,
+    required List<String> args,
+    required Map<String, String> environment,
+    required int timeoutSeconds,
+  });
+
+  Future<void> writeLine({
+    required String runId,
+    required String serverId,
+    required String line,
+  });
+
+  Future<void> closeStdin({
+    required String runId,
+    required String serverId,
+  });
+
+  Future<void> stopServer({
+    required String runId,
+    required String serverId,
+  });
+
+  /// Ends the run's children. [sessionTokens] limits the stop to the starts the
+  /// caller owns, so a delayed stop cannot reach a same-key replacement.
+  Future<void> stopRun(String runId, {Set<String>? sessionTokens});
+}
+
+class _McpStdioSessionHandlers {
+  final String runId;
+  final String serverId;
+
+  /// Identifies the one native start this session belongs to. Events that carry
+  /// another token are from a previous child of the same key and are dropped.
+  final String sessionToken;
+  final void Function(String line) onStdoutLine;
+  final void Function(String line) onStderrLine;
+  final void Function(int exitCode) onExit;
+
+  const _McpStdioSessionHandlers({
+    required this.runId,
+    required this.serverId,
+    required this.sessionToken,
+    required this.onStdoutLine,
+    required this.onStderrLine,
+    required this.onExit,
+  });
+}
+
 class NativeBridge {
   static const _backgroundTaskOwnerKind = 'backgroundTask';
   static const _channel = MethodChannel(AppConstants.channelName);
@@ -75,6 +130,9 @@ class NativeBridge {
   static Future<void> Function(SharedContent content)? _shareIntentHandler;
   static bool _agentCallbackInitialized = false;
   static bool _nativeCallbackInitialized = false;
+  static final Map<String, _McpStdioSessionHandlers> _mcpStdioSessions = {};
+  static final McpStdioSessionLatch _mcpStdioLatch = McpStdioSessionLatch();
+  static McpStdioBridgeBroker? _mcpStdioBridgeBrokerForTesting;
   static Stream<List<int>> Function(String path)? _importReadStreamForTesting;
   static BoundedFileIdentityProbe? _importIdentityProbeForTesting;
   static HostFileImportBroker? _hostFileImportBrokerForTesting;
@@ -166,7 +224,7 @@ class NativeBridge {
         if (sessionId != null && sessionId.isNotEmpty) {
           _navigateToSessionHandler?.call(sessionId);
         }
-      });
+      }).catchError((_) => null);
     }
   }
 
@@ -219,6 +277,10 @@ class NativeBridge {
           sessionId: sessionId,
           reasonCode: reasonCode,
         );
+      } else if (call.method == 'onMcpStdioEvent') {
+        final args = call.arguments;
+        if (args is! Map) return false;
+        _dispatchMcpStdioEvent(Map<String, dynamic>.from(args));
       } else if (call.method == 'navigateToSession') {
         final args = call.arguments;
         final sessionId = args is Map ? args['sessionId'] as String? : null;
@@ -231,6 +293,246 @@ class NativeBridge {
 
   static Future<String> getProotPath() async {
     return (await _channel.invokeMethod<String>('getProotPath'))!;
+  }
+
+  // ── I5 run-scoped MCP stdio bridge ───────────────────────────────
+
+  /// Starts one proot MCP child for [runId]. The native side owns the process
+  /// and reports a structured failure instead of an empty tool list.
+  ///
+  /// [timeoutSeconds] is the startup/initialize readiness budget: the child is
+  /// stopped only if it produced no output at all inside it. Once it answered,
+  /// it runs for as long as its run needs it.
+  ///
+  /// The result carries the session token of this start, which every event,
+  /// write, and stop for the child must present.
+  static Future<Map<String, dynamic>> startMcpStdioProcess({
+    required String runId,
+    required String serverId,
+    required String command,
+    required List<String> args,
+    required Map<String, String> environment,
+    int timeoutSeconds = 30,
+  }) async {
+    final broker = _mcpStdioBridgeBrokerForTesting;
+    if (broker != null) {
+      return broker.start(
+        runId: runId,
+        serverId: serverId,
+        command: command,
+        args: args,
+        environment: environment,
+        timeoutSeconds: timeoutSeconds,
+      );
+    }
+    final result = await _channel.invokeMethod<Map>('startMcpStdioProcess', {
+      'runId': runId,
+      'serverId': serverId,
+      'command': command,
+      'args': args,
+      'environment': Map<String, String>.from(environment),
+      'timeoutSeconds': timeoutSeconds,
+    });
+    return result == null ? const {} : Map<String, dynamic>.from(result);
+  }
+
+  /// Writes one JSON-RPC frame to a run-scoped MCP child. Returns false when
+  /// the native bridge rejected the frame (oversized, unknown child, or a
+  /// failed write) so the caller can settle its pending request immediately.
+  static Future<bool> writeMcpStdioLine({
+    required String runId,
+    required String serverId,
+    required String line,
+    String? sessionToken,
+  }) async {
+    final broker = _mcpStdioBridgeBrokerForTesting;
+    if (broker != null) {
+      await broker.writeLine(runId: runId, serverId: serverId, line: line);
+      return true;
+    }
+    final written = await _channel.invokeMethod<bool>('writeMcpStdioLine', {
+      'runId': runId,
+      'serverId': serverId,
+      'line': line,
+      // A stale token is refused natively: it must not reach the child that
+      // replaced the one this caller was started for.
+      if (sessionToken != null) 'sessionToken': sessionToken,
+    });
+    return written ?? false;
+  }
+
+  static Future<void> closeMcpStdioStdin({
+    required String runId,
+    required String serverId,
+    String? sessionToken,
+  }) async {
+    final broker = _mcpStdioBridgeBrokerForTesting;
+    if (broker != null) {
+      return broker.closeStdin(runId: runId, serverId: serverId);
+    }
+    await _channel.invokeMethod<bool>('closeMcpStdioStdin', {
+      'runId': runId,
+      'serverId': serverId,
+      if (sessionToken != null) 'sessionToken': sessionToken,
+    });
+  }
+
+  static Future<void> stopMcpServer({
+    required String runId,
+    required String serverId,
+    String? sessionToken,
+  }) async {
+    final broker = _mcpStdioBridgeBrokerForTesting;
+    if (broker != null) {
+      return broker.stopServer(runId: runId, serverId: serverId);
+    }
+    await _channel.invokeMethod<bool>('stopMcpServer', {
+      'runId': runId,
+      'serverId': serverId,
+      if (sessionToken != null) 'sessionToken': sessionToken,
+    });
+  }
+
+  /// Ends every MCP child owned by [runId]. Called when the run completes, is
+  /// cancelled, or the foreground-service lease drops.
+  static Future<void> stopMcpRun(
+    String runId, {
+    Set<String>? sessionTokens,
+  }) async {
+    final broker = _mcpStdioBridgeBrokerForTesting;
+    if (broker != null) {
+      return broker.stopRun(runId, sessionTokens: sessionTokens);
+    }
+    await _channel.invokeMethod<bool>('stopMcpRun', {
+      'runId': runId,
+      // A stale stop must not kill the child that replaced the same key, so the
+      // native side only stops the starts this caller still owns.
+      if (sessionTokens != null) 'sessionTokens': sessionTokens.toList(),
+    });
+  }
+
+  /// Routes one native stdio event to the live session handler.
+  ///
+  /// A child can emit everything (including its exit) before Dart has bound a
+  /// session for it. Those events are latched for a start that was announced
+  /// with [expectMcpStdioSession] and replayed when the session binds, so a
+  /// child that dies immediately still settles its caller.
+  static void _dispatchMcpStdioEvent(Map<String, dynamic> event) {
+    final runId = event['runId']?.toString();
+    final serverId = event['serverId']?.toString();
+    if (runId == null || serverId == null) return;
+    _mcpStdioLatch.deliver(
+      _mcpStdioSessionKey(runId, serverId),
+      sessionToken: event['sessionToken']?.toString(),
+      event: event,
+    );
+  }
+
+  static String _mcpStdioSessionKey(String runId, String serverId) =>
+      '$runId\u0000$serverId';
+
+  static void _deliverMcpStdioEvent(
+    _McpStdioSessionHandlers session,
+    Map<String, dynamic> event,
+  ) {
+    final stream = event['stream']?.toString();
+    final kind = event['event']?.toString() ?? 'line';
+    if (kind == 'exit') {
+      final code =
+          event['exitCode'] is num ? (event['exitCode'] as num).toInt() : -1;
+      session.onExit(code);
+      return;
+    }
+    if (kind == 'error') {
+      // Native bounded the message; never treat it as an MCP stdout frame.
+      final message = event['message']?.toString() ?? '';
+      if (message.isNotEmpty) session.onStderrLine(message);
+      return;
+    }
+    final line = event['line']?.toString() ?? '';
+    if (stream == 'stderr') {
+      session.onStderrLine(line);
+    } else {
+      session.onStdoutLine(line);
+    }
+  }
+
+  /// Declares that a session for [runId]/[serverId] is being started, so events
+  /// that arrive before [registerMcpStdioSession] are latched instead of lost.
+  static void expectMcpStdioSession({
+    required String runId,
+    required String serverId,
+  }) {
+    _mcpStdioLatch.expect(_mcpStdioSessionKey(runId, serverId));
+  }
+
+  /// The start behind [runId]/[serverId] failed: no session will bind.
+  static void cancelMcpStdioSessionExpectation({
+    required String runId,
+    required String serverId,
+  }) {
+    _mcpStdioLatch.cancelExpectation(_mcpStdioSessionKey(runId, serverId));
+  }
+
+  static void registerMcpStdioSession({
+    required String runId,
+    required String serverId,
+    required String sessionToken,
+    required void Function(String line) onStdoutLine,
+    required void Function(String line) onStderrLine,
+    required void Function(int exitCode) onExit,
+  }) {
+    _ensureAgentCallbackHandler();
+    final key = _mcpStdioSessionKey(runId, serverId);
+    final session = _McpStdioSessionHandlers(
+      runId: runId,
+      serverId: serverId,
+      sessionToken: sessionToken,
+      onStdoutLine: onStdoutLine,
+      onStderrLine: onStderrLine,
+      onExit: onExit,
+    );
+    _mcpStdioSessions[key] = session;
+    // Binding replays what this child already emitted, in arrival order, so an
+    // immediate exit (or an immediate initialize answer) is never lost; events
+    // from an earlier child of the same key are dropped instead.
+    _mcpStdioLatch.bind(
+      key,
+      sessionToken: sessionToken,
+      handler: (event) => _deliverMcpStdioEvent(session, event),
+    );
+  }
+
+  static void unregisterMcpStdioSession({
+    required String runId,
+    required String serverId,
+  }) {
+    final key = _mcpStdioSessionKey(runId, serverId);
+    _mcpStdioSessions.remove(key);
+    _mcpStdioLatch.forget(key);
+  }
+
+  @visibleForTesting
+  static void setMcpStdioBridgeBrokerForTesting(
+    McpStdioBridgeBroker? broker,
+  ) {
+    _mcpStdioBridgeBrokerForTesting = broker;
+  }
+
+  @visibleForTesting
+  static void deliverMcpStdioEventForTesting(Map<String, dynamic> event) {
+    _dispatchMcpStdioEvent(event);
+  }
+
+  @visibleForTesting
+  static int get mcpStdioSessionCountForTesting => _mcpStdioSessions.length;
+
+  @visibleForTesting
+  static void resetMcpStdioLatchForTesting() {
+    for (final key in _mcpStdioSessions.keys.toList()) {
+      _mcpStdioLatch.forget(key);
+    }
+    _mcpStdioSessions.clear();
   }
 
   static Future<String> getArch() async {
@@ -740,6 +1042,7 @@ class NativeBridge {
     required String approvalId,
     required String toolName,
     required String risk,
+    String? detail,
   }) async {
     return await _channel.invokeMethod<bool>('showToolApprovalNotification', {
           'sessionId': sessionId,
@@ -747,6 +1050,7 @@ class NativeBridge {
           'approvalId': approvalId,
           'toolName': toolName,
           'risk': risk,
+          if (detail != null && detail.isNotEmpty) 'detail': detail,
         }) ??
         false;
   }
@@ -765,6 +1069,18 @@ class NativeBridge {
   static Future<bool> hasAgentOverlayPermission() async {
     return await _channel.invokeMethod<bool>('hasAgentOverlayPermission') ??
         false;
+  }
+
+  /// Opens the OS App details screen for this package so the user can grant a
+  /// denied runtime permission. Returns false (never throws) when no handler
+  /// exists, so the call site can fall back to the text path.
+  static Future<bool> openAppDetailsSettings() async {
+    try {
+      return await _channel.invokeMethod<bool>('openAppDetailsSettings') ??
+          false;
+    } catch (_) {
+      return false;
+    }
   }
 
   static Future<bool> requestAgentOverlayPermissionIfNeeded() async {
@@ -854,6 +1170,37 @@ class NativeBridge {
     });
   }
 
+  /// Read a file inside the rootfs as raw bytes, bounded by [maxBytes].
+  ///
+  /// Used for tool-result images. A missing, symlinked, non-regular, or
+  /// oversized file returns null so the caller keeps the text form.
+  static Future<Uint8List?> readRootfsFileBytes(
+    String path, {
+    Iterable<String>? allowedRoots,
+    int maxBytes = 2 * 1024 * 1024,
+  }) async {
+    return await _channel.invokeMethod<Uint8List>('readRootfsFileBytes', {
+      'path': path,
+      if (allowedRoots != null) 'allowedRoots': allowedRoots.toList(),
+      'maxBytes': maxBytes,
+    });
+  }
+
+  /// Lists one directory inside the granted scope. Throws when the native side
+  /// rejects the path (outside the scope, symlinked component, not a directory).
+  static Future<Map<String, dynamic>> listRootfsDirectory({
+    required String path,
+    Iterable<String>? allowedRoots,
+    int maxEntries = 200,
+  }) async {
+    final listing = await _channel.invokeMethod<Map>('listRootfsDirectory', {
+      'path': path,
+      if (allowedRoots != null) 'allowedRoots': allowedRoots.toList(),
+      'maxEntries': maxEntries,
+    });
+    return listing == null ? const {} : Map<String, dynamic>.from(listing);
+  }
+
   static Future<bool> writeRootfsFile(
     String path,
     String content, {
@@ -865,6 +1212,35 @@ class NativeBridge {
       'content': content,
       if (allowedRoots != null) 'allowedRoots': allowedRoots.toList(),
       'createNew': createNew,
+    }))!;
+  }
+
+  /// Creates a directory (every missing level) inside the granted scope.
+  ///
+  /// The native broker resolves the same scoped root as the other rootfs
+  /// operations and creates each level descriptor-relative with mkdirat +
+  /// O_NOFOLLOW and a directory-identity check, so a linked or swapped
+  /// component fails closed. An existing directory counts as success; false
+  /// means the path is unsafe or a component is not a real directory.
+  static Future<bool> createRootfsDirectory(
+    String path, {
+    Iterable<String>? allowedRoots,
+  }) async {
+    return (await _channel.invokeMethod<bool>('createRootfsDirectory', {
+      'path': path,
+      if (allowedRoots != null) 'allowedRoots': allowedRoots.toList(),
+    }))!;
+  }
+
+  /// Delete one file inside the granted scope. The parent is walked with
+  /// memory trust-flag file after migrating it to app-private storage.
+  static Future<bool> deleteRootfsFile(
+    String path, {
+    Iterable<String>? allowedRoots,
+  }) async {
+    return (await _channel.invokeMethod<bool>('deleteRootfsFile', {
+      'path': path,
+      if (allowedRoots != null) 'allowedRoots': allowedRoots.toList(),
     }))!;
   }
 
@@ -910,8 +1286,14 @@ class NativeBridge {
   }
 
   static Future<bool> cancelSpeechRecognition() async {
-    return await _channel.invokeMethod<bool>('cancelSpeechRecognition') ??
-        false;
+    try {
+      return await _channel.invokeMethod<bool>('cancelSpeechRecognition') ??
+          false;
+    } on PlatformException {
+      // A destroyed activity/engine already cancelled the native capture; a
+      // best-effort cancel must not surface as an unhandled async error.
+      return false;
+    }
   }
 
   static Future<bool> shareText({

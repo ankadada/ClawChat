@@ -63,10 +63,10 @@ void main() {
         result.countFor(
           SkillEvalReasonCode.releaseBlockerRuntimeEvidenceMissing,
         ),
-        9,
+        6,
       );
       expect(result.inventoryErrorCount, greaterThan(0));
-      expect(result.releaseBlockerCount, 9);
+      expect(result.releaseBlockerCount, 6);
       expect(result.exitCode, 1);
     });
 
@@ -197,7 +197,7 @@ void main() {
       );
       _copyFile(
         File(
-            '${corpusDirectory.path}/cases/positive/structure.code-review.json'),
+            '${corpusDirectory.path}/cases/positive/structure.file-manager.json'),
         duplicate,
       );
       var result = _run(assetsDirectory, inventoryFile, corpusDirectory);
@@ -221,9 +221,9 @@ void main() {
       expect(result.countFor(SkillEvalReasonCode.caseUnknownFixture), 1);
 
       duplicate.deleteSync();
-      File('${corpusDirectory.path}/cases/positive/static.code-review.json')
+      File('${corpusDirectory.path}/cases/positive/static.file-manager.json')
           .deleteSync();
-      File('${corpusDirectory.path}/goldens/static.code-review.json')
+      File('${corpusDirectory.path}/goldens/static.file-manager.json')
           .deleteSync();
       result = _run(assetsDirectory, inventoryFile, corpusDirectory);
       expect(result.countFor(SkillEvalReasonCode.fixtureCoverageMissing), 1);
@@ -309,9 +309,9 @@ void main() {
         'detects fixture substitution, static scanner changes, and golden tamper',
         () {
       final fixture = File(
-        '${corpusDirectory.path}/fixtures/skills/translator/SKILL.md',
+        '${corpusDirectory.path}/fixtures/skills/web-search/SKILL.md',
       );
-      fixture.writeAsStringSync('# Translator\nRun curl safely.');
+      fixture.writeAsStringSync('# Web Search\nRun curl safely.');
       var result = _run(assetsDirectory, inventoryFile, corpusDirectory);
       expect(result.countFor(SkillEvalReasonCode.fixtureAssetMismatch), 1);
       expect(result.countFor(SkillEvalReasonCode.staticScanMismatch), 1);
@@ -319,7 +319,7 @@ void main() {
 
       _copyFile(
         File(
-            '${_flutterProjectRoot().path}/tool/skill_evals/fixtures/skills/translator/SKILL.md'),
+            '${_flutterProjectRoot().path}/tool/skill_evals/fixtures/skills/web-search/SKILL.md'),
         fixture,
       );
       final golden = File(
@@ -354,10 +354,10 @@ void main() {
       final entries = inventory['entries'] as List<dynamic>;
       final entry = entries.firstWhere((value) =>
           (value as Map<String, dynamic>)['assetDirectory'] ==
-          'code-review') as Map<String, dynamic>;
+          'file-manager') as Map<String, dynamic>;
       final manifest = _emptyEnabledManifest();
       final manifestSource = jsonEncode(manifest);
-      File('${assetsDirectory.path}/code-review/skill.json')
+      File('${assetsDirectory.path}/file-manager/skill.json')
           .writeAsStringSync(manifestSource);
       entry
         ..remove('reason')
@@ -389,18 +389,18 @@ filesystem: []
 ---
 # clean''';
       final manifest = jsonEncode(_emptyEnabledManifest());
-      File('${assetsDirectory.path}/code-review/SKILL.md')
+      File('${assetsDirectory.path}/file-manager/SKILL.md')
           .writeAsStringSync(skill);
-      File('${assetsDirectory.path}/code-review/skill.json')
+      File('${assetsDirectory.path}/file-manager/skill.json')
           .writeAsStringSync(manifest);
-      File('${corpusDirectory.path}/fixtures/skills/code-review/SKILL.md')
+      File('${corpusDirectory.path}/fixtures/skills/file-manager/SKILL.md')
           .writeAsStringSync(skill);
       final inventory =
           jsonDecode(inventoryFile.readAsStringSync()) as Map<String, dynamic>;
       final entry = (inventory['entries'] as List<dynamic>).firstWhere(
           (value) =>
               (value as Map<String, dynamic>)['assetDirectory'] ==
-              'code-review') as Map<String, dynamic>;
+              'file-manager') as Map<String, dynamic>;
       entry
         ..remove('reason')
         ..['disposition'] = 'manifest_v1_enabled'
@@ -408,12 +408,12 @@ filesystem: []
         ..['skillMarkdownSha256'] = _sha256(skill)
         ..['skillJsonSha256'] = _sha256(manifest);
       inventoryFile.writeAsStringSync(jsonEncode(inventory));
-      File('${corpusDirectory.path}/cases/positive/static.code-review.json')
+      File('${corpusDirectory.path}/cases/positive/static.file-manager.json')
           .writeAsStringSync(
-              '{"schemaVersion":1,"id":"static.code-review","fixtureId":"code-review","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"no_match","reasonCode":"static_scan_clean"}}');
-      File('${corpusDirectory.path}/goldens/static.code-review.json')
+              '{"schemaVersion":1,"id":"static.file-manager","fixtureId":"file-manager","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"no_match","reasonCode":"static_scan_clean"}}');
+      File('${corpusDirectory.path}/goldens/static.file-manager.json')
           .writeAsStringSync(
-              '{"caseId":"static.code-review","kind":"static_scan","decision":"no_match","reasonCode":"static_scan_clean","selectedSkillId":null,"ruleIds":[]}');
+              '{"caseId":"static.file-manager","kind":"static_scan","decision":"no_match","reasonCode":"static_scan_clean","selectedSkillId":null,"ruleIds":[]}');
 
       final result = _run(assetsDirectory, inventoryFile, corpusDirectory);
 
@@ -421,7 +421,7 @@ filesystem: []
       expect(
           result.countFor(SkillEvalReasonCode.enabledClaimToolUndeclared), 0);
       expect(result.countFor(SkillEvalReasonCode.enabledClaimUnenforceable), 0);
-      expect(result.releaseBlockerCount, 9);
+      expect(result.releaseBlockerCount, 6);
     });
 
     test('block-form tools cannot be ignored by an empty manifest', () {
@@ -432,7 +432,7 @@ tools:
   - evil_tool
 ---
 # clean''';
-      _configureCleanEnabledCodeReview(
+      _configureCleanEnabledFileManager(
         assetsDirectory: assetsDirectory,
         corpusDirectory: corpusDirectory,
         inventoryFile: inventoryFile,
@@ -460,7 +460,7 @@ secrets:
   - API_KEY
 ---
 # clean''';
-      _configureCleanEnabledCodeReview(
+      _configureCleanEnabledFileManager(
         assetsDirectory: assetsDirectory,
         corpusDirectory: corpusDirectory,
         inventoryFile: inventoryFile,
@@ -572,7 +572,7 @@ tools: []
       ((manifest['capabilities'] as Map<String, dynamic>)['tools']
               as List<String>)
           .add('read_file');
-      _configureCleanEnabledCodeReview(
+      _configureCleanEnabledFileManager(
         assetsDirectory: assetsDirectory,
         corpusDirectory: corpusDirectory,
         inventoryFile: inventoryFile,
@@ -611,7 +611,7 @@ filesystem: []
         ((manifest['capabilities'] as Map<String, dynamic>)['tools']
                 as List<String>)
             .add(tool);
-        _configureCleanEnabledCodeReview(
+        _configureCleanEnabledFileManager(
           assetsDirectory: assetsDirectory,
           corpusDirectory: corpusDirectory,
           inventoryFile: inventoryFile,
@@ -647,7 +647,7 @@ filesystem: []
 ---
 # clean
 $body''';
-        _configureCleanEnabledCodeReview(
+        _configureCleanEnabledFileManager(
           assetsDirectory: assetsDirectory,
           corpusDirectory: corpusDirectory,
           inventoryFile: inventoryFile,
@@ -729,7 +729,7 @@ String _basename(String path) => path.substring(path.lastIndexOf('/') + 1);
 
 String _sha256(String value) => sha256.convert(utf8.encode(value)).toString();
 
-void _configureCleanEnabledCodeReview({
+void _configureCleanEnabledFileManager({
   required Directory assetsDirectory,
   required Directory corpusDirectory,
   required File inventoryFile,
@@ -737,15 +737,15 @@ void _configureCleanEnabledCodeReview({
   Map<String, dynamic>? manifest,
 }) {
   final manifestSource = jsonEncode(manifest ?? _emptyEnabledManifest());
-  File('${assetsDirectory.path}/code-review/SKILL.md').writeAsStringSync(skill);
-  File('${assetsDirectory.path}/code-review/skill.json')
+  File('${assetsDirectory.path}/file-manager/SKILL.md').writeAsStringSync(skill);
+  File('${assetsDirectory.path}/file-manager/skill.json')
       .writeAsStringSync(manifestSource);
-  File('${corpusDirectory.path}/fixtures/skills/code-review/SKILL.md')
+  File('${corpusDirectory.path}/fixtures/skills/file-manager/SKILL.md')
       .writeAsStringSync(skill);
   final inventory =
       jsonDecode(inventoryFile.readAsStringSync()) as Map<String, dynamic>;
   final entry = (inventory['entries'] as List<dynamic>).firstWhere((value) =>
-          (value as Map<String, dynamic>)['assetDirectory'] == 'code-review')
+          (value as Map<String, dynamic>)['assetDirectory'] == 'file-manager')
       as Map<String, dynamic>;
   entry
     ..remove('reason')
@@ -754,16 +754,16 @@ void _configureCleanEnabledCodeReview({
     ..['skillMarkdownSha256'] = _sha256(skill)
     ..['skillJsonSha256'] = _sha256(manifestSource);
   inventoryFile.writeAsStringSync(jsonEncode(inventory));
-  File('${corpusDirectory.path}/cases/positive/static.code-review.json')
+  File('${corpusDirectory.path}/cases/positive/static.file-manager.json')
       .writeAsStringSync(
-          '{"schemaVersion":1,"id":"static.code-review","fixtureId":"code-review","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"no_match","reasonCode":"static_scan_clean"}}');
-  File('${corpusDirectory.path}/goldens/static.code-review.json').writeAsStringSync(
-      '{"caseId":"static.code-review","kind":"static_scan","decision":"no_match","reasonCode":"static_scan_clean","selectedSkillId":null,"ruleIds":[]}');
+          '{"schemaVersion":1,"id":"static.file-manager","fixtureId":"file-manager","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"no_match","reasonCode":"static_scan_clean"}}');
+  File('${corpusDirectory.path}/goldens/static.file-manager.json').writeAsStringSync(
+      '{"caseId":"static.file-manager","kind":"static_scan","decision":"no_match","reasonCode":"static_scan_clean","selectedSkillId":null,"ruleIds":[]}');
 }
 
 Map<String, dynamic> _emptyEnabledManifest() => {
       'schemaVersion': 1,
-      'id': 'com.example.code-review',
+      'id': 'com.example.file-manager',
       'name': 'Code review',
       'description': 'Temporary host test manifest.',
       'model': {'name': 'code_review', 'description': 'Host test.'},

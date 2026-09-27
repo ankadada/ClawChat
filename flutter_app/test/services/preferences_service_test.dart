@@ -168,7 +168,7 @@ void main() {
       'secret-project',
     ]);
 
-    secondService.importAllSettings({
+    await secondService.importAllSettings({
       'deniedToolNames': ['write_file', ' bash ', ''],
       'bashCommandDenyPatterns': ['curl .*token', ''],
     });
@@ -332,7 +332,7 @@ void main() {
     final service = PreferencesService();
     await service.init();
 
-    service.importAllSettings({
+    await service.importAllSettings({
       'contextLength': 200000,
       'contextTokenBudget': 32768,
     });
@@ -346,7 +346,7 @@ void main() {
     final service = PreferencesService();
     await service.init();
 
-    service.importAllSettings({
+    await service.importAllSettings({
       'contextTokenBudget': 100000,
     });
 

@@ -12,7 +12,7 @@ import '../../../tool/skill_evals/lib/skill_eval_runner.dart';
 
 void main() {
   group('SkillEvalRunner real bundled assets', () {
-    test('covers all nine real assets and closes verified runtime evidence',
+    test('covers all real bundled assets and closes verified runtime evidence',
         () {
       final flutterRoot = _flutterProjectRoot();
       final result = const HostSkillEvalRunner().run(

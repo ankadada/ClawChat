@@ -20,6 +20,27 @@ subprojects {
     }
 }
 
+// The app module compiles against android-36, but two pinned plugins hardcode an
+// older compileSdk (flutter_tts 3.8.5 -> 31, speech_to_text 6.6.0 -> 33). Their
+// resolved Flutter-embedding dependencies require compileSdk 34+, so AGP's
+// checkReleaseAarMetadata fails those library modules even though the app module
+// is fine. Raise compileSdk only, and only on Android library subprojects; the
+// app module, minSdk, targetSdk and the pinned packages stay untouched.
+//
+// This block must stay above the evaluationDependsOn(":app") block below:
+// that block evaluates the subprojects during root configuration, and
+// afterEvaluate on an already-evaluated project is rejected.
+subprojects { subproject ->
+    subproject.afterEvaluate {
+        if (subproject.plugins.hasPlugin("com.android.library")) {
+            subproject.extensions.getByName("android").compileSdk = 36
+            logger.lifecycle(
+                "ClawChat: compileSdk 36 forced on Android library subproject ${subproject.path}"
+            )
+        }
+    }
+}
+
 subprojects {
     project.evaluationDependsOn(":app")
 }

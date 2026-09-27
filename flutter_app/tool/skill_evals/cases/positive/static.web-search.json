@@ -1,1 +1,1 @@
-{"schemaVersion":1,"id":"static.web-search","fixtureId":"web-search","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"reject","reasonCode":"static_shell_instruction"}}
+{"schemaVersion":1,"id":"static.web-search","fixtureId":"web-search","kind":"static_scan","input":{"text":"scan instructions"},"expected":{"decision":"no_match","reasonCode":"static_scan_clean"}}

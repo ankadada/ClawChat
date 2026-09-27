@@ -1,11 +1,16 @@
 ---
 name: file-manager
-description: 文件管理 — 搜索、重命名、分析目录结构、文件操作
+description: 文件管理 — 管理 workspace 内的文件，以及通过 Android SAF 导入/导出工作区文件
 tools: [bash, read_file, write_file]
 ---
 
 ## Use This Skill When
-用户需要管理文件：搜索、重命名、移动、统计、分析目录
+用户需要管理 workspace 内文件：搜索、重命名、移动、统计、分析目录
+
+## Scope
+这只覆盖两处存储，不管整机存储：
+- **Workspace**：`/root/workspace` 内的文件
+- **SAF 导入/导出**：用户通过 Android 系统文件选择器选中的文件/目录，导入后落在 workspace
 
 ## Execution Workflow
 
@@ -21,17 +26,12 @@ find /root/workspace -name "*.{ext}" -type f
 du -sh /root/workspace/*/ | sort -rh | head -20
 ```
 
-**批量重命名:**
-```bash
-for f in /root/workspace/*.{old_ext}; do mv "$f" "${f%.old_ext}.new_ext"; done
-```
-
 **文件统计:**
 ```bash
 find /root/workspace -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -20
 ```
 
 ## Hard Rules
-- 操作前先确认文件列表，避免误操作
-- 删除操作需要用户二次确认
-- 始终在 /root/workspace 内操作
+- 只在 `/root/workspace` 内操作；不访问整机存储，也不声称能读手机里的全部文件
+- 需要工作区之外的文件时，提示用户先用 SAF 选择器导入
+- 操作前先确认文件列表；删除操作需要用户二次确认

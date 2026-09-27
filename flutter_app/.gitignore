@@ -8,6 +8,7 @@ build/
 # Android
 android/.gradle/
 android/app/build/
+android/app/.cxx/
 android/local.properties
 android/key.properties
 *.jks

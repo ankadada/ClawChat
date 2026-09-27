@@ -7,14 +7,47 @@ import 'package:flutter/foundation.dart';
 import '../constants.dart';
 import '../models/mcp_server_config.dart';
 import 'llm_content_sanitizer.dart';
+import 'mcp_stdio_line_transformer.dart';
 
 abstract class McpStdioProcess {
   Stream<String> get stdoutLines;
   Stream<String> get stderrLines;
   Future<int> get exitCode;
-  void writeLine(String line);
+
+  /// Writes one JSON-RPC frame. Completes only after the frame reached the
+  /// child, and completes with an error when the write failed.
+  Future<void> writeLine(String line);
+
   Future<void> closeStdin();
   bool kill();
+}
+
+/// Shared MCP stdio bounds. The native reader/writer mirrors these values;
+/// keep both sides in sync when changing one.
+class McpStdioLimits {
+  const McpStdioLimits._();
+
+  /// One stdout/stderr line may not exceed this many UTF-8 bytes.
+  ///
+  /// Matching the Android reader (ProcessManager.MCP_MAX_LINE_BYTES): an
+  /// over-limit line fails the stream instead of being buffered whole.
+  static const int maxLineBytes = 1024 * 1024;
+
+  /// One stdin frame may not exceed this many UTF-8 bytes.
+  ///
+  /// The frame is the payload plus its newline terminator, which is the same
+  /// unit the native writer measures (ProcessManager.MCP_MAX_STDIN_LINE_BYTES).
+  static const int maxStdinLineBytes = 1024 * 1024;
+}
+
+/// A stdin frame could not be delivered to the MCP child.
+class McpStdinWriteException implements Exception {
+  final String message;
+
+  const McpStdinWriteException(this.message);
+
+  @override
+  String toString() => 'MCP stdin write failed: $message';
 }
 
 typedef McpProcessStarter = Future<McpStdioProcess> Function(
@@ -26,20 +59,36 @@ class DartMcpStdioProcess implements McpStdioProcess {
 
   DartMcpStdioProcess(this._process);
 
+  /// Bounded before it is split: a child that never terminates a line must not
+  /// be able to grow this process's memory. Android runs the same cap natively
+  /// on the same pipes (see ProcessManager.readMcpStream).
   @override
-  Stream<String> get stdoutLines =>
-      _process.stdout.transform(utf8.decoder).transform(const LineSplitter());
+  Stream<String> get stdoutLines => _process.stdout.transform(
+        const BoundedUtf8LineTransformer(
+          maxLineBytes: McpStdioLimits.maxLineBytes,
+          streamName: 'stdout',
+        ),
+      );
 
   @override
-  Stream<String> get stderrLines =>
-      _process.stderr.transform(utf8.decoder).transform(const LineSplitter());
+  Stream<String> get stderrLines => _process.stderr.transform(
+        const BoundedUtf8LineTransformer(
+          maxLineBytes: McpStdioLimits.maxLineBytes,
+          streamName: 'stderr',
+        ),
+      );
 
   @override
   Future<int> get exitCode => _process.exitCode;
 
   @override
-  void writeLine(String line) {
-    _process.stdin.writeln(line);
+  Future<void> writeLine(String line) async {
+    try {
+      _process.stdin.write('$line\n');
+      await _process.stdin.flush();
+    } catch (error) {
+      throw McpStdinWriteException('$error');
+    }
   }
 
   @override
@@ -96,6 +145,10 @@ class McpStdioClient {
   final _pending = <Object, Completer<Object?>>{};
   final _stderrTail = StringBuffer();
   Future<void>? _connectFuture;
+
+  /// Serializes stdin frames for this client, exactly like the native writer
+  /// serializes them per child. Two call sites must never interleave a frame.
+  Future<void> _writeChain = Future<void>.value();
   var _nextId = 1;
   var _connectAttempt = 0;
   var _disposed = false;
@@ -165,17 +218,30 @@ class McpStdioClient {
     _stdoutSub = process.stdoutLines.listen(
       _handleStdoutLine,
       onError: (Object error) {
-        _completeAllPendingError('stdout error: $error');
+        // A stale child's stream must not tear the live connection down.
+        if (!identical(_process, process)) return;
+        _handleStreamFailure('stdout', error);
       },
       cancelOnError: false,
     );
     _stderrSub = process.stderrLines.listen(
       _handleStderrLine,
+      onError: (Object error) {
+        if (!identical(_process, process)) return;
+        _handleStreamFailure('stderr', error);
+      },
       cancelOnError: false,
     );
     unawaited(process.exitCode.then((code) {
       if (_disposed) return;
+      // A stale child (a failed attempt already replaced by a new one) must not
+      // reset the live connection's state.
+      if (!identical(_process, process)) return;
+      // A run-scoped MCP child dies with its run. Pending requests settle now,
+      // and the next call starts a fresh child instead of writing into a
+      // process that is gone.
       _completeAllPendingError('process exited with code $code');
+      _dropChild();
     }));
 
     await _request('initialize', {
@@ -186,7 +252,7 @@ class McpStdioClient {
         'version': AppConstants.version,
       },
     });
-    _sendNotification('notifications/initialized', const {});
+    await _sendNotification('notifications/initialized', const {});
     _initialized = true;
   }
 
@@ -269,13 +335,29 @@ class McpStdioClient {
     if (_disposed) throw StateError('MCP client disposed');
     final id = _nextId++;
     final completer = Completer<Object?>();
+    // The frame is written before this future is awaited. A child that dies in
+    // that window (or a write failure that settles every pending request) would
+    // otherwise complete the future with an error that no listener has seen
+    // yet, which the zone reports as an unhandled async error.
+    unawaited(completer.future.then((_) {}, onError: (Object _) {}));
     _pending[id] = completer;
-    _writeJson({
-      'jsonrpc': '2.0',
-      'id': id,
-      'method': method,
-      'params': params,
-    });
+    try {
+      await _writeJson({
+        'jsonrpc': '2.0',
+        'id': id,
+        'method': method,
+        'params': params,
+      });
+    } catch (error) {
+      // A frame that never reached the child can never be answered, so this
+      // request must fail now instead of waiting for the request timeout.
+      _pending.remove(id);
+      final failure = error is McpStdinWriteException
+          ? error
+          : McpStdinWriteException('$error');
+      _failPendingAfterWriteFailure(failure);
+      throw failure;
+    }
     try {
       return await completer.future.timeout(requestTimeout);
     } on TimeoutException {
@@ -284,19 +366,78 @@ class McpStdioClient {
     }
   }
 
-  void _sendNotification(String method, Map<String, dynamic> params) {
+  Future<void> _sendNotification(
+    String method,
+    Map<String, dynamic> params,
+  ) async {
     if (_disposed) return;
-    _writeJson({
-      'jsonrpc': '2.0',
-      'method': method,
-      'params': params,
-    });
+    try {
+      await _writeJson({
+        'jsonrpc': '2.0',
+        'method': method,
+        'params': params,
+      });
+    } catch (error) {
+      _failPendingAfterWriteFailure(
+        error is McpStdinWriteException
+            ? error
+            : McpStdinWriteException('$error'),
+      );
+      rethrow;
+    }
   }
 
-  void _writeJson(Map<String, dynamic> message) {
+  Future<void> _writeJson(Map<String, dynamic> message) {
     final process = _process;
     if (process == null) throw StateError('MCP process not started');
-    process.writeLine(jsonEncode(message));
+    final encoded = jsonEncode(message);
+    // The cap covers the frame as it goes on the wire: payload plus newline.
+    if (utf8.encode(encoded).length + 1 > McpStdioLimits.maxStdinLineBytes) {
+      throw const McpStdinWriteException(
+        'frame exceeds ${McpStdioLimits.maxStdinLineBytes} UTF-8 bytes',
+      );
+    }
+    // One frame at a time: concurrent requests must not interleave bytes on the
+    // child's stdin. A failed frame is reported to its caller and the chain
+    // stays usable, so one failure cannot corrupt a later frame.
+    final next = _writeChain.then((_) => process.writeLine(encoded));
+    _writeChain = next.then((_) {}, onError: (Object _) {});
+    return next;
+  }
+
+  /// A bounded stdio stream failed: an over-limit line, a decode error, or a
+  /// broken pipe. The child cannot be trusted to answer again, so every pending
+  /// request settles now and the child is stopped instead of leaving callers on
+  /// the request timeout.
+  void _handleStreamFailure(String stream, Object error) {
+    final sanitized = const LlmContentSanitizer().sanitizeText('$error').text;
+    _completeAllPendingError('$stream stream failed: $sanitized');
+    _dropChild();
+  }
+
+  /// Settles every pending request when a stdin frame cannot be delivered and
+  /// tears the broken child down, so the next call starts a fresh one.
+  void _failPendingAfterWriteFailure(Object error) {
+    final sanitized = const LlmContentSanitizer().sanitizeText('$error').text;
+    _completeAllPendingError(sanitized);
+    _dropChild();
+  }
+
+  /// Forgets the live child, stops listening to it, and kills it. The next call
+  /// reconnects through [connect].
+  void _dropChild() {
+    _initialized = false;
+    _connectFuture = null;
+    final process = _process;
+    _process = null;
+    final stdoutSub = _stdoutSub;
+    final stderrSub = _stderrSub;
+    _stdoutSub = null;
+    _stderrSub = null;
+    unawaited(stdoutSub?.cancel() ?? Future<void>.value());
+    unawaited(stderrSub?.cancel() ?? Future<void>.value());
+    _writeChain = Future<void>.value();
+    process?.kill();
   }
 
   void _handleStdoutLine(String line) {

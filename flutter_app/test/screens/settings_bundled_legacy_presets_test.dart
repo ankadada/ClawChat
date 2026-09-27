@@ -93,13 +93,21 @@ void main() {
     expect(tester.takeException(), isNull);
 
     await tester.ensureVisible(
-      find.text(AppStrings.bundledLegacyPresetsUnavailable),
+      find.text(AppStrings.bundledSkillPresetsInfo),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text(AppStrings.bundledLegacyPresetsUnavailable));
+    await tester.tap(find.text(AppStrings.bundledSkillPresetsInfo));
     await tester.pumpAndSettle();
     expect(
-      find.text(AppStrings.bundledLegacyPresetsUnavailableDescription),
+      find.text(AppStrings.bundledSkillPresetsDescription),
+      findsOneWidget,
+    );
+    expect(
+      find.text(AppStrings.bundledGooglePresetsCopy),
+      findsOneWidget,
+    );
+    expect(
+      find.text(AppStrings.bundledExampleSkillsCopy),
       findsOneWidget,
     );
     expect(find.text('Install disabled'), findsNothing);

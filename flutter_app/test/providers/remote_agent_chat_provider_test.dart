@@ -48,7 +48,11 @@ void main() {
     messenger.setMockMethodCallHandler(secureChannel, null);
     messenger.setMockMethodCallHandler(nativeChannel, null);
     PreferencesService.resetForTesting();
-    if (await tempDir.exists()) await tempDir.delete(recursive: true);
+    // Providers are disposed by the test's addTearDown callbacks, which run
+    // before this hook. A cancelled remote send can still commit its terminal
+    // session write on a later microtask, so the directory is removed through a
+    // bounded retry instead of failing the test with "Directory not empty".
+    await _deleteTempDir(tempDir);
   });
 
   test('per-session opt-in maps local history and commits terminal only',
@@ -793,6 +797,28 @@ void main() {
   });
 }
 
+/// Removes the per-test directory through a bounded retry.
+///
+/// A cancelled remote send can still commit its terminal session write on a
+/// microtask that lands while the recursive walk is already deleting parent
+/// directories, which surfaces as a spurious `Directory not empty`
+/// [FileSystemException]. Retrying the delete closes that race without
+/// weakening any assertion; the last attempt still surfaces a real leak.
+Future<void> _deleteTempDir(Directory directory) async {
+  for (var attempt = 0; attempt < 20; attempt++) {
+    if (!await directory.exists()) return;
+    try {
+      await directory.delete(recursive: true);
+      return;
+    } on FileSystemException {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+  }
+  if (await directory.exists()) {
+    await directory.delete(recursive: true);
+  }
+}
+
 Future<_Fixture> _fixture({
   _ConnectorMode mode = _ConnectorMode.complete,
   SessionStorage? storage,
@@ -827,7 +853,9 @@ Future<_Fixture> _fixture({
     remoteAgentRuntimeBinding: runtime,
     beforeRemoteConnectorSendForTesting: beforeRemoteConnectorSendForTesting,
   );
-  await Future<void>.delayed(const Duration(milliseconds: 100));
+  // Deterministic startup barrier: the async init settled before the
+  // fixture is handed to the test, so nothing fires after disposal.
+  await provider.initialized;
   return _Fixture(
     provider,
     connector,
@@ -876,7 +904,9 @@ Future<_Fixture> _fixtureForConfiguration(
     storage: sessionStorage,
     remoteAgentRuntimeBinding: runtime,
   );
-  await Future<void>.delayed(const Duration(milliseconds: 100));
+  // Deterministic startup barrier: the async init settled before the
+  // fixture is handed to the test, so nothing fires after disposal.
+  await provider.initialized;
   return _Fixture(
     provider,
     connector,

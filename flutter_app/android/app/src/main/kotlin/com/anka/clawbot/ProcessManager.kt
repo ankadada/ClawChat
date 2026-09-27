@@ -3,9 +3,12 @@ package com.anka.clawbot
 import android.os.Build
 import android.os.Environment
 import android.util.Log
+import java.io.BufferedInputStream
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStreamReader
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -15,6 +18,24 @@ import java.util.concurrent.TimeUnit
  *   - Install mode (buildInstallCommand): matches proot-distro's run_proot_cmd()
  *   - Gateway mode (buildGatewayCommand): matches proot-distro's command_login()
  */
+/**
+ * One MCP start's launch script.
+ *
+ * [identity] is the native device:inode of the start directory this launch
+ * created. Cleanup passes it back to the broker, which refuses to delete a
+ * directory that no longer has that identity: a substituted node is left alone
+ * instead of being removed through.
+ */
+internal data class McpLaunchScript(
+    val homeDir: String,
+    val runSegment: String,
+    val serverSegment: String,
+    val startName: String,
+    val identity: String,
+    val hostPath: File,
+    val guestPath: String,
+)
+
 internal class ProcessManager(
     private val filesDir: String,
     private val nativeLibDir: String,
@@ -34,6 +55,74 @@ internal class ProcessManager(
         const val FAKE_KERNEL_RELEASE = "6.17.0-PRoot-Distro"
         const val FAKE_KERNEL_VERSION =
             "#1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000"
+        private const val TAG = "ClawChat"
+        /** Hard limit on one MCP stdio line, in UTF-8 bytes. */
+        const val MCP_MAX_LINE_BYTES = 1024 * 1024
+        /**
+         * Hard limit on one MCP stdin frame, in UTF-8 bytes. The frame is the
+         * payload plus its newline terminator, and this is the same bound the
+         * Dart side applies before calling writeMcpStdioLine.
+         */
+        const val MCP_MAX_STDIN_LINE_BYTES = 1024 * 1024
+        /**
+         * How long a child whose stdout already closed may keep running before
+         * it is treated as wedged and stopped.
+         */
+        private const val MCP_STDOUT_EOF_GRACE_MS = 2000L
+        /**
+         * Launch-script directories older than this are leftovers from a crash
+         * or a kill and are swept on the next start or teardown.
+         */
+        internal const val MCP_LAUNCH_SCRIPT_STALE_MS = 60L * 60L * 1000L
+        /** Hard limit on MCP stdio lines per second, per stream. */
+        const val MCP_MAX_LINES_PER_SECOND = 200
+
+        /**
+         * Removes launch-script directories under [homeDir] that no live child
+         * owns: leftovers from a crash, a kill, or a process that died before
+         * its reap ran.
+         *
+         * A live child's directory is never touched, and neither is a directory
+         * still inside the grace window, so a start that is in flight keeps its
+         * script. Shared by the app (start and engine teardown) and by the agent
+         * service (its own teardown), so both paths clean the same tree.
+         */
+        internal fun sweepStaleMcpLaunchScriptsIn(
+            homeDir: File,
+            maxAgeMs: Long = MCP_LAUNCH_SCRIPT_STALE_MS,
+        ): Int = try {
+            SecureImportNative.sweepMcpLaunchDirectories(
+                homeDir.absolutePath,
+                maxAgeMs,
+                McpStdioRegistry.liveLaunchIdentities().toTypedArray(),
+            )
+        } catch (_: Throwable) {
+            // No native broker, or a tree we refuse to touch: nothing is swept
+            // here and the next start retries.
+            0
+        }
+
+        /**
+         * Removes one start's directory through the native broker, which only
+         * deletes the directory whose identity matches the one that start
+         * created and never follows a symlink inside it.
+         */
+        internal fun deleteMcpLaunchScript(script: McpLaunchScript) {
+            try {
+                SecureImportNative.deleteMcpLaunchDirectory(
+                    script.homeDir,
+                    script.runSegment,
+                    script.serverSegment,
+                    script.startName,
+                    script.identity,
+                )
+            } catch (_: Throwable) {
+                // Best effort: the sweep collects what is left later.
+            }
+        }
+
+        private const val MCP_READ_CHUNK_BYTES = 8 * 1024
+        private const val NANOS_PER_SECOND = 1_000_000_000L
         private val SCOPED_ENVIRONMENT_KEYS = setOf(
             "LARKSUITE_CLI_APP_ID",
             "LARKSUITE_CLI_APP_SECRET",
@@ -677,6 +766,536 @@ internal class ProcessManager(
     fun finishOperation(operationId: String) {
         if (!activeOperations.containsKey(operationId)) {
             cancelledOperations.remove(operationId)
+        }
+    }
+
+    // ================================================================
+    // I5 — run-scoped MCP stdio bridge
+    //
+    // Starts one guest MCP server per (runId, serverId) with a writable stdin
+    // and separate stdout/stderr pipes, and registers it so a run end, a
+    // cancellation, or a foreground-service teardown can kill it. There is no
+    // MCP supervisor.
+    //
+    // Environment is an allowlist, never inheritance: the guest gets only the
+    // fixed baseline (HOME, PATH, LANG, TMPDIR) plus keys the user typed for
+    // this server. Values are written to an app-private launch script instead of
+    // the process argument vector so they are not visible in `/proc/*/cmdline`.
+    // ================================================================
+
+    private val mcpEnvKey = Regex("^[A-Za-z_][A-Za-z0-9_]*$")
+
+    private fun safeMcpSegment(value: String): String =
+        value.replace(Regex("[^A-Za-z0-9._-]"), "_").take(120).ifEmpty { "default" }
+
+    private fun shellSingleQuote(value: String): String =
+        "'" + value.replace("'", "'\\''") + "'"
+
+    /**
+     * Launches one start: creates its directory and writes its script through
+     * the fd-relative native broker.
+     *
+     * The app home is bind-mounted writable into the guest, so every level of
+     * this tree is attacker-reachable. The native call opens each component with
+     * O_NOFOLLOW relative to its verified parent, checks the opened directory's
+     * identity, and writes the script with CREATE_NEW; a symlinked or swapped
+     * component makes it fail closed instead of being followed. The identity it
+     * returns is what the cleanup paths later have to match.
+     */
+    internal fun writeMcpLaunchScript(
+        runId: String,
+        serverId: String,
+        environment: Map<String, String>,
+        startName: String,
+    ): McpLaunchScript {
+        val home = File(homeDir).absolutePath
+        val runSegment = safeMcpSegment(runId)
+        val serverSegment = safeMcpSegment(serverId)
+        val body = buildMcpLaunchScriptBody(environment)
+        val created = try {
+            SecureImportNative.createMcpLaunchScript(
+                home,
+                runSegment,
+                serverSegment,
+                startName,
+                body,
+            )
+        } catch (error: Throwable) {
+            // A missing native broker must fail closed, never fall back to a
+            // pathname write inside a guest-writable tree.
+            null
+        }
+        if (created == null || created.size < 2 ||
+            created[0].isNullOrEmpty() || created[1].isNullOrEmpty()
+        ) {
+            throw IllegalStateException("MCP launch directory unavailable")
+        }
+        val relative = ".mcp/$runSegment/$serverSegment/$startName"
+        return McpLaunchScript(
+            homeDir = home,
+            runSegment = runSegment,
+            serverSegment = serverSegment,
+            startName = startName,
+            identity = created[1],
+            hostPath = File(created[0]),
+            guestPath = "/root/home/$relative/launch.sh",
+        )
+    }
+
+    /** The allowlisted environment exactly as the guest shell reads it. */
+    private fun buildMcpLaunchScriptBody(environment: Map<String, String>): String {
+        val body = StringBuilder("#!/bin/sh\n")
+        for ((key, value) in environment) {
+            if (!mcpEnvKey.matches(key)) continue
+            body.append("export ").append(key).append('=')
+                .append(shellSingleQuote(value.replace("\u0000", ""))).append('\n')
+        }
+        body.append("exec \"$@\"\n")
+        return body.toString()
+    }
+
+    /** Launch-script housekeeping for this manager's home directory. */
+    internal fun sweepStaleMcpLaunchScripts(
+        maxAgeMs: Long = MCP_LAUNCH_SCRIPT_STALE_MS,
+    ): Int = sweepStaleMcpLaunchScriptsIn(File(homeDir), maxAgeMs)
+
+    /** proot invocation for a run-scoped MCP child, cwd under the workspace. */
+    private fun buildMcpStdioCommand(
+        guestScriptPath: String,
+        command: String,
+        args: List<String>,
+    ): List<String> {
+        val flags = commonProotFlags(mountStorage = false).toMutableList()
+        val cwdIndex = flags.indexOf("--cwd=/root")
+        if (cwdIndex >= 0) flags[cwdIndex] = "--cwd=/root/workspace"
+        val arch = ArchUtils.getArch()
+        val machine = if (arch == "arm") "armv7l" else arch
+        val kernelRelease = "\\Linux\\localhost\\$FAKE_KERNEL_RELEASE" +
+            "\\$FAKE_KERNEL_VERSION\\$machine\\localdomain\\-1\\"
+        flags.add(1, "--root-id")
+        flags.add(2, "--kernel-release=$kernelRelease")
+        flags.addAll(
+            listOf(
+                "/usr/bin/env", "-i",
+                "HOME=/root",
+                "LANG=C.UTF-8",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "TMPDIR=/tmp",
+                "/bin/sh", guestScriptPath,
+                command,
+            )
+        )
+        flags.addAll(args)
+        return flags
+    }
+
+    private fun mcpProcessBuilder(
+        command: List<String>,
+        environment: Map<String, String>,
+    ): ProcessBuilder = ProcessBuilder(command).apply {
+        this.environment().clear()
+        this.environment().putAll(environment)
+        // stdout must stay pure JSON-RPC; stderr is read on its own pipe.
+    }
+
+    /**
+     * Starts one run-scoped MCP child.
+     *
+     * [readinessTimeoutSeconds] bounds only the startup/initialize window: a
+     * child that has produced no output at all inside it is stopped, while a
+     * child that answered is left alone for as long as its run needs it.
+     */
+    internal fun startMcpStdio(
+        runId: String,
+        serverId: String,
+        command: String,
+        args: List<String>,
+        environment: Map<String, String>,
+        readinessTimeoutSeconds: Long,
+        emit: (Map<String, Any>) -> Unit,
+    ): Map<String, Any> {
+        if (runId.isBlank() || serverId.isBlank() || command.isBlank()) {
+            return mapOf(
+                "ok" to false,
+                "reasonCode" to "invalid_request",
+                "message" to "runId, serverId and command are required",
+            )
+        }
+        if (!environment.keys.all { mcpEnvKey.matches(it) }) {
+            return mapOf(
+                "ok" to false,
+                "reasonCode" to "invalid_env",
+                "message" to "MCP environment contains an invalid key",
+            )
+        }
+        if (McpStdioRegistry.get(runId, serverId) != null) {
+            return mapOf(
+                "ok" to false,
+                "reasonCode" to "already_running",
+                "message" to "this MCP server already runs for the run",
+            )
+        }
+        // Capture the lifecycle this start belongs to before spawning anything:
+        // a teardown that lands while the process is coming up bumps the epoch
+        // and this child is refused instead of outliving the run.
+        val epoch = McpStdioRegistry.currentEpoch()
+        val sessionToken = UUID.randomUUID().toString()
+        // Each start owns a fresh directory whose identity the cleanup paths
+        // have to match before they may delete anything.
+        val startName = UUID.randomUUID().toString().replace("-", "")
+        // Leftovers from a crashed start never outlive the next one.
+        sweepStaleMcpLaunchScripts()
+        val script: McpLaunchScript
+        val guestScriptPath: String
+        try {
+            script = writeMcpLaunchScript(runId, serverId, environment, startName)
+            guestScriptPath = script.guestPath
+        } catch (error: Exception) {
+            return mapOf(
+                "ok" to false,
+                "reasonCode" to "launch_script_failed",
+                "message" to (error.message ?: "launch script failed"),
+            )
+        }
+        // A torn-down engine or activity must never turn an MCP event into a
+        // crash on a reader, watcher, or teardown thread.
+        val safeEmit: (Map<String, Any>) -> Unit = { event ->
+            try {
+                emit(event)
+            } catch (_: Throwable) {
+                // Dart is gone; the run is over either way.
+            }
+        }
+        val commandLine = buildMcpStdioCommand(guestScriptPath, command, args)
+        val process = try {
+            processStarter(mcpProcessBuilder(commandLine, prootEnv()))
+        } catch (error: Exception) {
+            deleteMcpLaunchScript(script)
+            return mapOf(
+                "ok" to false,
+                "reasonCode" to "proot_start_failed",
+                "message" to (error.message ?: "proot start failed"),
+            )
+        }
+        val child = McpStdioRegistry.Child(
+            runId = runId,
+            serverId = serverId,
+            process = process,
+            script = script,
+            sessionToken = sessionToken,
+            epoch = epoch,
+            emit = safeEmit,
+        )
+        when (McpStdioRegistry.register(child)) {
+            McpRegisterResult.REGISTERED -> Unit
+            McpRegisterResult.ALREADY_RUNNING -> {
+                process.destroyForcibly()
+                deleteMcpLaunchScript(script)
+                return mapOf(
+                    "ok" to false,
+                    "reasonCode" to "already_running",
+                    "message" to "this MCP server already runs for the run",
+                )
+            }
+            McpRegisterResult.TEARDOWN -> {
+                // The service or engine was torn down while this child was
+                // starting: it must not survive that teardown.
+                process.destroyForcibly()
+                deleteMcpLaunchScript(script)
+                return mapOf(
+                    "ok" to false,
+                    "reasonCode" to "lifecycle_closed",
+                    "message" to "MCP children are stopped for this lifecycle",
+                )
+            }
+        }
+        startMcpReaders(child, safeEmit)
+        scheduleMcpReadinessTimeout(child, readinessTimeoutSeconds)
+        return mapOf("ok" to true, "sessionToken" to sessionToken)
+    }
+
+    /**
+     * The only path that reports a natural exit: it waits on the process itself
+     * rather than inferring the exit from a closed pipe. A stdout EOF is not an
+     * exit (the child may still be draining stderr or hanging on to a dead
+     * protocol), so the terminal event belongs to this watcher.
+     */
+    internal fun startMcpExitWatcher(child: McpStdioRegistry.Child) {
+        Thread {
+            val exitCode = try {
+                child.process.waitFor()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                -1
+            }
+            if (child.terminateOnce(null, exitCode)) {
+                child.script?.let { deleteMcpLaunchScript(it) }
+            }
+        }.apply { isDaemon = true; name = "mcp-exit-${child.serverId}" }.start()
+    }
+
+    private fun startMcpReaders(
+        child: McpStdioRegistry.Child,
+        emit: (Map<String, Any>) -> Unit,
+    ) {
+        startMcpExitWatcher(child)
+        val stdoutThread = Thread {
+            readMcpStream(child, child.process.inputStream, "stdout", emit)
+            reapAfterStdoutClosed(child)
+        }.apply { isDaemon = true; name = "mcp-stdout-${child.serverId}" }
+        val stderrThread = Thread {
+            readMcpStream(child, child.process.errorStream, "stderr", emit)
+        }.apply { isDaemon = true; name = "mcp-stderr-${child.serverId}" }
+        stdoutThread.start()
+        stderrThread.start()
+    }
+
+    /**
+     * A closed stdout means this child can never answer another request again,
+     * but it does not prove the process is gone. Give it a bounded grace period
+     * to exit on its own, then stop it, so the request waiting on it always
+     * settles instead of hanging until the Dart-side request timeout.
+     */
+    internal fun reapAfterStdoutClosed(child: McpStdioRegistry.Child) {
+        if (child.finished) return
+        val exited = try {
+            child.process.waitFor(MCP_STDOUT_EOF_GRACE_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (exited || child.finished) return
+        // Token-scoped: a successor that reused this key must not be stopped
+        // because its predecessor's stdout closed late.
+        McpStdioRegistry.stopServerIfTokenMatches(
+            child.runId,
+            child.serverId,
+            child.sessionToken,
+            "stdout_closed_without_exit",
+        )
+    }
+
+    /**
+     * Reads one MCP stdio stream with a hard line-size cap and a bounded line
+     * rate. A line that exceeds [MCP_MAX_LINE_BYTES] or a stream that exceeds
+     * [MCP_MAX_LINES_PER_SECOND] destroys the child, emits exactly one bounded
+     * error, and drops the offending bytes, so a hostile or broken guest can
+     * neither exhaust host memory nor flood the transcript.
+     */
+    internal fun readMcpStream(
+        child: McpStdioRegistry.Child,
+        stream: java.io.InputStream,
+        name: String,
+        emit: (Map<String, Any>) -> Unit,
+    ) {
+        val input = if (stream is BufferedInputStream) {
+            stream
+        } else {
+            BufferedInputStream(stream)
+        }
+        val pending = ByteArrayOutputStream()
+        var windowStartNanos = System.nanoTime()
+        var windowLines = 0
+
+        fun terminate(reasonCode: String, message: String) {
+            emit(
+                mapOf(
+                    "event" to "error",
+                    "runId" to child.runId,
+                    "serverId" to child.serverId,
+                    "sessionToken" to child.sessionToken,
+                    "stream" to name,
+                    "reasonCode" to reasonCode,
+                    "message" to message,
+                )
+            )
+            // The kill path publishes the single terminal event for the child
+            // (Child.terminateOnce), so a guard failure can never leave Dart
+            // waiting on a child that is already being torn down. The token
+            // keeps a late guard from a replaced child off its successor.
+            McpStdioRegistry.stopServerIfTokenMatches(
+                child.runId,
+                child.serverId,
+                child.sessionToken,
+                reasonCode,
+            )
+        }
+
+        fun dispatchLine(bytes: ByteArray): Boolean {
+            // Any output proves the child is alive: it survived its readiness
+            // window and must never be killed for being slow afterwards.
+            child.markReady()
+            var length = bytes.size
+            if (length > 0 && bytes[length - 1] == '\r'.code.toByte()) length--
+            val now = System.nanoTime()
+            if (now - windowStartNanos >= NANOS_PER_SECOND) {
+                windowStartNanos = now
+                windowLines = 0
+            }
+            windowLines++
+            if (windowLines > MCP_MAX_LINES_PER_SECOND) {
+                terminate(
+                    "rate_limit_exceeded",
+                    "MCP $name exceeded $MCP_MAX_LINES_PER_SECOND lines per second",
+                )
+                return false
+            }
+            emit(
+                mapOf(
+                    "event" to "line",
+                    "runId" to child.runId,
+                    "serverId" to child.serverId,
+                    "sessionToken" to child.sessionToken,
+                    "stream" to name,
+                    "line" to String(bytes, 0, length, Charsets.UTF_8),
+                )
+            )
+            return true
+        }
+
+        try {
+            val chunk = ByteArray(MCP_READ_CHUNK_BYTES)
+            while (true) {
+                if (child.finished) return
+                val read = input.read(chunk)
+                if (read == -1) break
+                var start = 0
+                var index = 0
+                while (index < read) {
+                    if (chunk[index] == '\n'.code.toByte()) {
+                        pending.write(chunk, start, index - start)
+                        if (pending.size() > MCP_MAX_LINE_BYTES) {
+                            terminate(
+                                "line_too_long",
+                                "MCP $name line exceeded $MCP_MAX_LINE_BYTES bytes",
+                            )
+                            return
+                        }
+                        val line = pending.toByteArray()
+                        pending.reset()
+                        if (!dispatchLine(line)) return
+                        start = index + 1
+                    }
+                    index++
+                }
+                if (start < read) pending.write(chunk, start, read - start)
+                if (pending.size() > MCP_MAX_LINE_BYTES) {
+                    terminate(
+                        "line_too_long",
+                        "MCP $name line exceeded $MCP_MAX_LINE_BYTES bytes",
+                    )
+                    return
+                }
+            }
+            if (pending.size() > 0 && !child.finished) {
+                // A final line without a trailing newline behaves as readLine().
+                dispatchLine(pending.toByteArray())
+            }
+        } catch (_: Exception) {
+            // The pipe closes on kill; the exit event carries the outcome.
+        }
+    }
+
+    /**
+     * Bounds only the startup/initialize readiness window.
+     *
+     * A child that has produced no output inside [readinessSeconds] never came
+     * up (the client sends initialize as soon as the start returns), so it is
+     * stopped and its caller settles. A child that answered is left running: a
+     * long tool call, a slow model turn, or a server idle between calls is never
+     * killed for taking time.
+     */
+    internal fun scheduleMcpReadinessTimeout(
+        child: McpStdioRegistry.Child,
+        readinessSeconds: Long,
+    ) {
+
+        if (readinessSeconds <= 0) return
+        val timer = Thread {
+            try {
+                Thread.sleep(TimeUnit.SECONDS.toMillis(readinessSeconds))
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            if (child.finished || child.ready) return@Thread
+            logWarning("MCP child was not ready in time: ${child.serverId}")
+            // The kill path publishes the terminal event (reason=readiness
+            // timeout) even when the child refuses to die.
+            McpStdioRegistry.stopServerIfTokenMatches(
+                child.runId,
+                child.serverId,
+                child.sessionToken,
+                "readiness_timeout",
+            )
+        }.apply { isDaemon = true; name = "mcp-readiness-${child.serverId}" }
+        timer.start()
+    }
+
+    /**
+     * android.util.Log is a throwing stub in plain JVM unit tests, so a log
+     * line must never be able to take a timer or a reaper thread down.
+     */
+    private fun logWarning(message: String) {
+        try {
+            Log.w(TAG, message)
+        } catch (_: Throwable) {
+            // Logging is best effort here.
+        }
+    }
+
+    internal fun writeMcpStdio(
+        runId: String,
+        serverId: String,
+        line: String,
+        sessionToken: String? = null,
+    ): Boolean {
+        // A stale token belongs to a previous child of this key: its frames must
+        // never reach the child that replaced it.
+        val child = McpStdioRegistry.getIfTokenMatches(runId, serverId, sessionToken)
+            ?: return false
+        if (child.finished) return false
+        // The cap covers the whole frame: payload plus its newline terminator.
+        // A UTF-16 char is at most 3 UTF-8 bytes in the BMP, so the char count
+        // is a cheap first bound that rejects an oversized frame before any
+        // copy is allocated.
+        if (line.length + 1 > MCP_MAX_STDIN_LINE_BYTES) return false
+        val bytes = (line + "\n").toByteArray(Charsets.UTF_8)
+        if (bytes.size > MCP_MAX_STDIN_LINE_BYTES) return false
+        return try {
+            // One frame at a time per child: concurrent writers would interleave
+            // bytes and produce invalid JSON-RPC.
+            var wrote = false
+            synchronized(child.stdinLock) {
+                if (!child.finished) {
+                    child.process.outputStream.write(bytes)
+                    child.process.outputStream.flush()
+                    wrote = true
+                }
+            }
+            wrote
+        } catch (_: Exception) {
+            // The caller reports the failure to Dart, which settles the pending
+            // request and tears the client down.
+            false
+        }
+    }
+
+    internal fun closeMcpStdin(
+        runId: String,
+        serverId: String,
+        sessionToken: String? = null,
+    ): Boolean {
+        val child = McpStdioRegistry.getIfTokenMatches(runId, serverId, sessionToken)
+            ?: return false
+        return try {
+            // Closing stdin takes the same lock as a frame write, so a close
+            // can never land in the middle of a half-written frame.
+            synchronized(child.stdinLock) {
+                child.process.outputStream.close()
+            }
+            true
+        } catch (_: Exception) {
+            false
         }
     }
 

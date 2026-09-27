@@ -2,21 +2,18 @@ import 'package:clawchat/services/bundled_legacy_skill_catalog.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('has the exact nine legacy stable IDs and unique asset identities', () {
+  test('ships six bundled presets with unique asset identities', () {
     const entries = BundledLegacySkillCatalog.entries;
 
-    expect(entries, hasLength(9));
+    expect(entries, hasLength(6));
     expect(
       entries.map((entry) => entry.legacyStableId).toList(),
       const [
-        'legacy.code-review',
         'legacy.file-manager',
-        'legacy.github',
         'legacy.gws-calendar',
         'legacy.gws-drive',
         'legacy.gws-gmail',
         'legacy.system-info',
-        'legacy.translator',
         'legacy.web-search',
       ],
     );
@@ -30,9 +27,11 @@ void main() {
     );
   });
 
-  test('all current entries are bounded, unavailable, and reasoned', () {
+  test('shipped presets are bounded, installable, reasoned, and consent-gated',
+      () {
     for (final entry in BundledLegacySkillCatalog.entries) {
-      expect(entry.isInstallable, isFalse);
+      expect(entry.isInstallable, isTrue);
+      expect(entry.isBlocked, isFalse);
       expect(entry.reason, isNotEmpty);
       expect(
         entry.reason.length,
@@ -42,7 +41,33 @@ void main() {
     }
   });
 
-  test('reserves stable IDs and legacy name aliases without prefix matching',
+  test('the three Google presets carry the Google API token copy', () {
+    for (final directory
+        in BundledLegacySkillCatalog.googleApiPresetDirectories) {
+      final entry = BundledLegacySkillCatalog.entryForIdentity(name: directory);
+      expect(entry, isNull, reason: '$directory is consent-gated, not blocked');
+      final shipped = BundledLegacySkillCatalog.entries
+          .firstWhere((item) => item.assetDirectory == directory);
+      expect(shipped.reason, contains('GOOGLE_ACCESS_TOKEN'));
+      expect(shipped.reason, contains('No in-app OAuth'));
+    }
+  });
+
+  test('left-over presets stay blocked and are not installable', () {
+    const removed = BundledLegacySkillCatalog.removedEntries;
+    expect(removed, hasLength(3));
+    for (final entry in removed) {
+      expect(entry.isInstallable, isFalse);
+      expect(entry.isBlocked, isTrue);
+      expect(entry.inventoryDisposition, 'removed');
+      expect(
+        entry.reason.length,
+        lessThanOrEqualTo(BundledLegacySkillCatalog.maxUserVisibleReasonLength),
+      );
+    }
+  });
+
+  test('reserves removed stable IDs and legacy name aliases without prefixing',
       () {
     expect(
       BundledLegacySkillCatalog.entryForInstalledSkill(
@@ -77,5 +102,16 @@ void main() {
       )?.legacyStableId,
       'legacy.github',
     );
+    for (final entry in BundledLegacySkillCatalog.entries) {
+      expect(
+        BundledLegacySkillCatalog.entryForInstalledSkill(
+          id: entry.legacyStableId,
+          name: entry.assetDirectory,
+          legacy: true,
+        ),
+        isNull,
+        reason: 'shipped preset ${entry.assetDirectory} is consent-gated',
+      );
+    }
   });
 }

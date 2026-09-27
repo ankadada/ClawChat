@@ -1,5 +1,6 @@
 package com.anka.clawbot
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -110,5 +111,77 @@ class ToolApprovalNotificationStateTest {
         assertFalse(state.beginDecision("session-b", "operation-a", 1))
         assertFalse(state.beginDecision("session-a", "operation-b", 1))
         assertTrue(state.beginDecision("session-a", "operation-a", 1))
+    }
+
+    @Test
+    fun bigTextPrefersTheApprovalPreviewWhileADetailIsPending() {
+        val preview = "web_fetch (moderate) 等待你的明确批准：https://evil.example/x"
+
+        // A pending approval with a URL keeps the approval preview, even when
+        // a later status update changed the session preview.
+        assertEquals(
+            preview,
+            ApprovalNotificationText.bigText(
+                "https://evil.example/x",
+                preview,
+                "tooling · 正在读取日历"
+            )
+        )
+
+        // Without a detail the session preview is used, falling back to the
+        // approval preview when the session preview is blank.
+        assertEquals(
+            "session body",
+            ApprovalNotificationText.bigText(null, preview, "session body")
+        )
+        assertEquals(
+            preview,
+            ApprovalNotificationText.bigText(null, preview, "")
+        )
+    }
+
+    @Test
+    fun lockScreenCopyNeverContainsTheApprovalDetailOrArguments() {
+        val detail = "https://evil.example/x?phone=+15551234567&cmd=rm%20-rf%20/root"
+        val state = ToolApprovalNotificationState(
+            sessionId = "session-a",
+            approvalId = "approval-a",
+            toolName = "bash",
+            risk = "high",
+            detail = detail
+        )
+
+        val copy = ApprovalNotificationText.publicCopy(state)
+        val leaked = listOf(
+            detail,
+            "https://",
+            "evil.example",
+            "+15551234567",
+            "rm -rf",
+            "rm%20-rf",
+            "/root",
+            "bash",
+            "high"
+        )
+        for (fragment in leaked) {
+            assertFalse("public title leaked $fragment", copy.title.contains(fragment))
+            assertFalse("public text leaked $fragment", copy.text.contains(fragment))
+        }
+        assertTrue(copy.title.contains("工具审批"))
+        assertTrue(copy.text.contains("工具审批"))
+
+        // The in-flight variant stays generic too.
+        val inFlight = ToolApprovalNotificationState(
+            sessionId = "session-a",
+            approvalId = "approval-a",
+            toolName = "bash",
+            risk = "high",
+            detail = detail
+        )
+        assertTrue(inFlight.beginDecision("session-a", "approval-a", 1L))
+        val inFlightCopy = ApprovalNotificationText.publicCopy(inFlight)
+        assertFalse(inFlightCopy.title.contains(detail))
+        assertFalse(inFlightCopy.text.contains(detail))
+        assertFalse(inFlightCopy.text.contains("bash"))
     }
 }

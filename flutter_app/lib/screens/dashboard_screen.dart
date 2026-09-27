@@ -7,7 +7,10 @@ import 'package:provider/provider.dart';
 import '../constants.dart';
 import '../layout/foldable_layout.dart';
 import '../models/background_task.dart';
+import '../models/chat_models.dart';
+import '../models/tool_command_lifecycle.dart';
 import '../providers/chat_provider.dart';
+import '../services/machine_health_probe.dart';
 import '../services/native_bridge.dart';
 import '../services/skill_service.dart';
 import '../services/update_service.dart';
@@ -27,6 +30,9 @@ final class SystemHealthSnapshot {
     required this.updatesKnown,
     required this.extensionCount,
     required this.extensionsKnown,
+    this.diskUsage = const MachineDiskUsage.unknown(),
+    this.dnsStatus = MachineDnsStatus.unknown,
+    this.lastCommand = MachineLastCommand.none,
   });
 
   final SystemHealthKind runtime;
@@ -35,6 +41,15 @@ final class SystemHealthSnapshot {
   final bool updatesKnown;
   final int extensionCount;
   final bool extensionsKnown;
+
+  /// Disk used by the rootfs and its workspace. Unknown stays unknown.
+  final MachineDiskUsage diskUsage;
+
+  /// Guest `/etc/resolv.conf` status.
+  final MachineDnsStatus dnsStatus;
+
+  /// Last bash command: running / exited / unknown (plus none on a fresh run).
+  final MachineLastCommand lastCommand;
 }
 
 class DashboardScreen extends StatefulWidget {
@@ -57,6 +72,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Future<SystemHealthSnapshot> _load() async {
+    // `context.read` (listen: false) is safe in initState and lets the machine
+    // tiles report the last command without a second provider dependency.
+    final provider = context.read<ChatProvider>();
     SystemHealthKind runtime = SystemHealthKind.unknown;
     var runtimeDetail = '无法读取嵌入式运行时状态';
     try {
@@ -92,6 +110,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
     } catch (_) {
       extensionsKnown = false;
     }
+
+    // Machine-side checks are read-only and never start a proot command.
+    var diskUsage = const MachineDiskUsage.unknown();
+    var dnsStatus = MachineDnsStatus.unknown;
+    var lastCommand = MachineLastCommand.none;
+    try {
+      final probe = MachineHealthProbe();
+      diskUsage = await probe.diskUsage();
+      dnsStatus = await probe.dnsStatus();
+    } catch (_) {
+      diskUsage = const MachineDiskUsage.unknown();
+      dnsStatus = MachineDnsStatus.unknown;
+    }
+    try {
+      lastCommand = _lastCommandFor(provider);
+    } catch (_) {
+      lastCommand = MachineLastCommand.none;
+    }
     return SystemHealthSnapshot(
       runtime: runtime,
       runtimeDetail: runtimeDetail,
@@ -99,6 +135,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
       updatesKnown: updatesKnown,
       extensionCount: extensionCount,
       extensionsKnown: extensionsKnown,
+      diskUsage: diskUsage,
+      dnsStatus: dnsStatus,
+      lastCommand: lastCommand,
+    );
+  }
+
+  MachineLastCommand _lastCommandFor(ChatProvider provider) {
+    final interruptedRun = provider.currentInterruptedAgentRun;
+    final interruptedUnknown = interruptedRun != null &&
+        interruptedRun.toolAttempts.any(
+          (attempt) =>
+              attempt.toolName == bashToolName &&
+              attempt.lifecycle == ToolAttemptLifecycle.interruptedUnknown,
+        );
+    return classifyLastCommand(
+      messages: provider.currentSession?.messages,
+      runningNow: provider.agentStatus == AgentStatus.tooling,
+      interruptedUnknown: interruptedUnknown,
     );
   }
 
@@ -198,6 +252,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final localStorageKind = provider.safeMode
         ? SystemHealthKind.actionNeeded
         : SystemHealthKind.ready;
+    final lastCommand = provider.currentSession == null
+        ? status.lastCommand
+        : _lastCommandFor(provider);
+    final disk = status.diskUsage;
     final update = status.updateState;
     final updateDetail = !status.updatesKnown
         ? '更新状态未知'
@@ -288,6 +346,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
             MaterialPageRoute(builder: (_) => const AgentRunCenterScreen()),
           ),
         ),
+        _healthTile(
+          title: '磁盘占用',
+          detail: _diskDetail(disk),
+          kind: _diskKind(disk),
+          action: '重试检查',
+          onAction: _retry,
+        ),
+        _healthTile(
+          title: 'DNS 解析',
+          detail: _dnsDetail(status.dnsStatus),
+          kind: _dnsKind(status.dnsStatus),
+          action: '重试检查',
+          onAction: _retry,
+        ),
+        _healthTile(
+          title: '最近命令',
+          detail: lastCommand.detail,
+          kind: _lastCommandKind(lastCommand),
+          action: '重试检查',
+          onAction: _retry,
+        ),
         const Padding(
           padding: EdgeInsets.all(12),
           child: Text(
@@ -298,6 +377,52 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ],
     );
   }
+
+  String _diskDetail(MachineDiskUsage disk) {
+    if (!disk.known) return '无法读取 rootfs 与工作区占用';
+    final used = formatHealthBytes(disk.usedBytes ?? 0);
+    final workspace = disk.workspaceBytes == null
+        ? null
+        : formatHealthBytes(disk.workspaceBytes!);
+    final free =
+        disk.freeBytes == null ? null : formatHealthBytes(disk.freeBytes!);
+    final parts = <String>[
+      'rootfs 与工作区共 $used',
+      if (workspace != null) '工作区 $workspace',
+      if (free != null) '可用 $free',
+    ];
+    return parts.join('；');
+  }
+
+  SystemHealthKind _diskKind(MachineDiskUsage disk) {
+    if (!disk.known) return SystemHealthKind.unknown;
+    final free = disk.freeBytes;
+    if (free == null) return SystemHealthKind.ready;
+    return free < MachineHealthProbe.lowFreeSpaceBytes
+        ? SystemHealthKind.actionNeeded
+        : SystemHealthKind.ready;
+  }
+
+  String _dnsDetail(MachineDnsStatus status) => switch (status) {
+        MachineDnsStatus.ready => 'resolv.conf 已配置可用的名称服务器',
+        MachineDnsStatus.missing => '缺少可用的 resolv.conf；网络命令可能无法解析域名',
+        MachineDnsStatus.unknown => '无法读取 DNS 配置状态',
+      };
+
+  SystemHealthKind _dnsKind(MachineDnsStatus status) => switch (status) {
+        MachineDnsStatus.ready => SystemHealthKind.ready,
+        MachineDnsStatus.missing => SystemHealthKind.actionNeeded,
+        MachineDnsStatus.unknown => SystemHealthKind.unknown,
+      };
+
+  SystemHealthKind _lastCommandKind(MachineLastCommand command) =>
+      switch (command) {
+        MachineLastCommand.unknown => SystemHealthKind.actionNeeded,
+        MachineLastCommand.none ||
+        MachineLastCommand.running ||
+        MachineLastCommand.exited =>
+          SystemHealthKind.ready,
+      };
 
   String _backgroundTaskDetail(BuildContext context) {
     final tasks = context.watch<BackgroundTaskCenterController?>()?.tasks ??

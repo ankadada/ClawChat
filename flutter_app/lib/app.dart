@@ -1,8 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'layout/foldable_layout.dart';
 import 'providers/chat_provider.dart';
+import 'widgets/app_hardware_shortcuts.dart';
 import 'screens/splash_screen.dart';
 import 'screens/chat_screen.dart';
 import 'screens/chat_sessions_screen.dart';
@@ -10,6 +13,7 @@ import 'screens/remote_agent_configuration_recovery_screen.dart';
 import 'services/app_http.dart';
 import 'services/background_task_center_controller.dart';
 import 'services/preferences_service.dart';
+import 'services/settings_backup_mirror.dart';
 import 'services/remote_agent_boot.dart';
 import 'services/remote_agent_configuration_service.dart';
 import 'services/remote_agent_connector.dart';
@@ -87,17 +91,20 @@ class ClawChatApp extends StatefulWidget {
   State<ClawChatApp> createState() => _ClawChatAppState();
 }
 
-class _ClawChatAppState extends State<ClawChatApp> {
+class _ClawChatAppState extends State<ClawChatApp>
+    with WidgetsBindingObserver {
   late final RemoteAgentBootController _remoteAgentBoot;
   late final RemoteAgentRuntimeBinding _remoteAgentRuntime;
   late final ChatProvider _chatProvider;
   late final BackgroundTaskCenterController _backgroundTaskCenter;
+  final SettingsBackupMirror _settingsBackupMirror = SettingsBackupMirror();
   RemoteAgentConfigurationService? _attachedRemoteConfiguration;
   late final bool _ownsRemoteAgentBoot;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     final injected = widget.bootControllerForTesting;
     _ownsRemoteAgentBoot = injected == null;
     _remoteAgentRuntime = RemoteAgentRuntimeBinding();
@@ -145,11 +152,22 @@ class _ClawChatAppState extends State<ClawChatApp> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _backgroundTaskCenter.dispose();
     _chatProvider.dispose();
     _remoteAgentRuntime.dispose();
     if (_ownsRemoteAgentBoot) _remoteAgentBoot.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Android Auto Backup runs while the app is idle, so the allowlisted
+    // settings mirror must be current before the process leaves the foreground.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(_settingsBackupMirror.save().catchError((_) {}));
+    }
   }
 
   @override
@@ -195,7 +213,18 @@ class _ClawChatAppState extends State<ClawChatApp> {
                     scale,
                   ),
                 ),
-                child: child!,
+                // Hardware shortcuts live at the shell so they work on every
+                // route. Ctrl/Cmd+N creates a new chat and Ctrl/Cmd+F opens
+                // the session search; both stand down while another editable
+                // field has focus.
+                child: AppHardwareShortcuts(
+                  onNewChat: () => unawaited(
+                    context.read<ChatProvider>().createSession(),
+                  ),
+                  onFocusSessionSearch: () =>
+                      AppShortcutTargets.openSessionSearch?.call(),
+                  child: child!,
+                ),
               );
             },
             home: AnimatedBuilder(

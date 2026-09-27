@@ -1296,14 +1296,11 @@ String _basename(String path) {
 }
 
 const _trustedTriggers = <String, String>{
-  'code-review': 'review this code change',
   'file-manager': 'manage local project files',
-  'github': 'open a github issue',
   'gws-calendar': 'check my calendar',
   'gws-drive': 'find a file in drive',
   'gws-gmail': 'search my gmail',
   'system-info': 'show system information',
-  'translator': 'translate this text',
   'web-search': 'search the web',
 };
 

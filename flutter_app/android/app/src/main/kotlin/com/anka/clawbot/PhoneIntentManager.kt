@@ -11,12 +11,14 @@ import android.net.Uri
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
+import android.provider.Telephony
 import android.os.Build
 import android.telephony.SmsManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.Calendar
 import java.util.TimeZone
 
 class PhoneIntentManager(
@@ -38,6 +40,8 @@ class PhoneIntentManager(
                 "insertCalendarEvent" -> insertCalendarEvent(params)
                 "listCalendarEvents" -> listCalendarEvents(params)
                 "listContacts" -> listContacts(params)
+                "listSms" -> listSms(params)
+                "getSms" -> getSms(params)
                 "callPhone" -> callPhone(params)
                 "sendSms" -> sendSms(params)
                 else -> error("Unknown action: $action")
@@ -162,8 +166,12 @@ class PhoneIntentManager(
 
     private fun ensurePermission(perm: String): Boolean {
         if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) return true
-        activity.runOnUiThread {
-            ActivityCompat.requestPermissions(activity, arrayOf(perm), PERMISSION_REQUEST)
+        // Ask once per permission per activity lifetime. Re-prompting on every
+        // tool call would loop the system dialog and is never useful.
+        if (permissionRequests.shouldRequest(perm)) {
+            activity.runOnUiThread {
+                ActivityCompat.requestPermissions(activity, arrayOf(perm), PERMISSION_REQUEST)
+            }
         }
         return false
     }
@@ -214,9 +222,9 @@ class PhoneIntentManager(
         if (!ensurePermission(Manifest.permission.READ_CALENDAR)) {
             return mapOf("ok" to false, "error" to "permission_required", "permission" to "READ_CALENDAR")
         }
-        val start = (p["startMillis"] as? Number)?.toLong() ?: System.currentTimeMillis()
+        val start = (p["startMillis"] as? Number)?.toLong() ?: startOfTodayMillis()
         val end = (p["endMillis"] as? Number)?.toLong() ?: (start + 7L * 24 * 3600_000L)
-        val limit = (p["limit"] as? Number)?.toInt() ?: 50
+        val limit = ((p["limit"] as? Number)?.toInt() ?: 20).coerceIn(1, 50)
         val cursor = activity.contentResolver.query(
             CalendarContract.Events.CONTENT_URI,
             arrayOf(
@@ -226,6 +234,7 @@ class PhoneIntentManager(
                 CalendarContract.Events.DTEND,
                 CalendarContract.Events.EVENT_LOCATION,
                 CalendarContract.Events.DESCRIPTION,
+                CalendarContract.Events.ALL_DAY,
             ),
             "${CalendarContract.Events.DTSTART} >= ? AND ${CalendarContract.Events.DTSTART} <= ?",
             arrayOf(start.toString(), end.toString()),
@@ -241,10 +250,121 @@ class PhoneIntentManager(
                     "endMillis" to it.getLong(3),
                     "location" to it.getString(4),
                     "description" to it.getString(5),
+                    "allDay" to (it.getInt(6) == 1),
                 ))
             }
         }
         return mapOf("ok" to true, "events" to events)
+    }
+
+    private fun startOfTodayMillis(): Long {
+        val calendar = Calendar.getInstance()
+        calendar.set(Calendar.HOUR_OF_DAY, 0)
+        calendar.set(Calendar.MINUTE, 0)
+        calendar.set(Calendar.SECOND, 0)
+        calendar.set(Calendar.MILLISECOND, 0)
+        return calendar.timeInMillis
+    }
+
+    private fun listSms(p: Map<String, Any?>): Map<String, Any?> {
+        if (!ensurePermission(Manifest.permission.READ_SMS)) {
+            return mapOf("ok" to false, "error" to "permission_required", "permission" to "READ_SMS")
+        }
+        val box = (p["box"] as? String)?.lowercase() ?: "inbox"
+        val uri = when (box) {
+            "sent" -> Telephony.Sms.Sent.CONTENT_URI
+            "all" -> Telephony.Sms.CONTENT_URI
+            else -> Telephony.Sms.Inbox.CONTENT_URI
+        }
+        val clauses = mutableListOf<String>()
+        val args = mutableListOf<String>()
+        (p["threadId"] as? Number)?.toLong()?.let {
+            clauses.add("${Telephony.Sms.THREAD_ID} = ?"); args.add(it.toString())
+        }
+        (p["address"] as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            clauses.add("${Telephony.Sms.ADDRESS} = ?"); args.add(it)
+        }
+        (p["query"] as? String)?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            clauses.add("${Telephony.Sms.BODY} LIKE ?"); args.add("%$it%")
+        }
+        (p["startMillis"] as? Number)?.toLong()?.let {
+            clauses.add("${Telephony.Sms.DATE} >= ?"); args.add(it.toString())
+        }
+        (p["endMillis"] as? Number)?.toLong()?.let {
+            clauses.add("${Telephony.Sms.DATE} <= ?"); args.add(it.toString())
+        }
+        val limit = ((p["limit"] as? Number)?.toInt() ?: 20).coerceIn(1, 50)
+        val cursor = activity.contentResolver.query(
+            uri,
+            arrayOf(
+                Telephony.Sms._ID,
+                Telephony.Sms.THREAD_ID,
+                Telephony.Sms.ADDRESS,
+                Telephony.Sms.DATE,
+                Telephony.Sms.BODY,
+            ),
+            clauses.takeIf { it.isNotEmpty() }?.joinToString(" AND "),
+            args.takeIf { it.isNotEmpty() }?.toTypedArray(),
+            "${Telephony.Sms.DATE} DESC"
+        ) ?: return mapOf("ok" to false, "error" to "query_failed")
+        val messages = mutableListOf<Map<String, Any?>>()
+        cursor.use {
+            while (it.moveToNext() && messages.size < limit) {
+                val body = it.getString(4) ?: ""
+                messages.add(mapOf(
+                    "id" to it.getLong(0),
+                    "threadId" to it.getLong(1),
+                    "address" to it.getString(2),
+                    "dateMillis" to it.getLong(3),
+                    "box" to box,
+                    "snippet" to body.take(280),
+                ))
+            }
+        }
+        return mapOf("ok" to true, "messages" to messages)
+    }
+
+    private fun getSms(p: Map<String, Any?>): Map<String, Any?> {
+        if (!ensurePermission(Manifest.permission.READ_SMS)) {
+            return mapOf("ok" to false, "error" to "permission_required", "permission" to "READ_SMS")
+        }
+        val id = (p["id"] as? Number)?.toLong()
+            ?: return mapOf("ok" to false, "error" to "invalid_args", "message" to "id required")
+        val cursor = activity.contentResolver.query(
+            Telephony.Sms.CONTENT_URI,
+            arrayOf(
+                Telephony.Sms._ID,
+                Telephony.Sms.THREAD_ID,
+                Telephony.Sms.ADDRESS,
+                Telephony.Sms.DATE,
+                Telephony.Sms.BODY,
+                Telephony.Sms.TYPE,
+            ),
+            "${Telephony.Sms._ID} = ?",
+            arrayOf(id.toString()),
+            null
+        ) ?: return mapOf("ok" to false, "error" to "query_failed")
+        cursor.use {
+            if (!it.moveToFirst()) return mapOf("ok" to false, "error" to "not_found")
+            val body = it.getString(4) ?: ""
+            val box = when (it.getInt(5)) {
+                1 -> "inbox"
+                2 -> "sent"
+                else -> "all"
+            }
+            return mapOf(
+                "ok" to true,
+                "message" to mapOf(
+                    "id" to it.getLong(0),
+                    "threadId" to it.getLong(1),
+                    "address" to it.getString(2),
+                    "dateMillis" to it.getLong(3),
+                    "box" to box,
+                    "snippet" to body.take(280),
+                    "body" to body.take(4000),
+                ),
+            )
+        }
     }
 
     private fun listContacts(p: Map<String, Any?>): Map<String, Any?> {
@@ -252,7 +372,7 @@ class PhoneIntentManager(
             return mapOf("ok" to false, "error" to "permission_required", "permission" to "READ_CONTACTS")
         }
         val query = (p["query"] as? String)?.takeIf { it.isNotBlank() }
-        val limit = (p["limit"] as? Number)?.toInt() ?: 50
+        val limit = (((p["limit"] as? Number)?.toInt() ?: 50)).coerceIn(1, 50)
         val selection: String?
         val selectionArgs: Array<String>?
         if (query != null) {
@@ -371,4 +491,6 @@ class PhoneIntentManager(
     companion object {
         const val PERMISSION_REQUEST = 2001
     }
+
+    private val permissionRequests = PermissionRequestGuard()
 }

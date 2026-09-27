@@ -2,6 +2,7 @@ import '../models/background_task.dart';
 import 'background_task_coordinator.dart';
 import 'skill_capability_policy.dart';
 import 'tools/tool_policy.dart';
+import 'tools/untrusted_data_policy.dart';
 
 final class BackgroundTaskPolicyBinding {
   const BackgroundTaskPolicyBinding({
@@ -82,16 +83,41 @@ final class SharedBackgroundTaskPolicyAdapter implements BackgroundTaskPolicy {
     required BackgroundTaskPolicySettings settings,
     required BackgroundTaskApprovalGateway approvals,
     SkillCapabilityPolicy Function()? skillPolicyFactory,
+    BackgroundUntrustedTranscriptLoader? untrustedTranscriptLoader,
   })  : _bindings = bindings,
         _settings = settings,
         _approvals = approvals,
-        _skillPolicyFactory = skillPolicyFactory ?? SkillCapabilityPolicy.new;
+        _skillPolicyFactory = skillPolicyFactory ?? SkillCapabilityPolicy.new,
+        _untrustedTranscriptLoader = untrustedTranscriptLoader;
 
   final BackgroundTaskPolicyBindingResolver _bindings;
   final BackgroundTaskPolicySettings _settings;
   final BackgroundTaskApprovalGateway _approvals;
   final SkillCapabilityPolicy Function() _skillPolicyFactory;
   final Set<String> _sessionApprovedTools = <String>{};
+
+  /// Loads the untrusted tool results already stored in the chat sessions.
+  ///
+  /// The background executor runs app-owned bindings, but a share payload can
+  /// still carry a value that arrived from an untrusted tool result in a chat
+  /// session. A missing loader is a misconfiguration and fails closed; it must
+  /// never be treated as an empty (therefore permissive) taint set.
+  final BackgroundUntrustedTranscriptLoader? _untrustedTranscriptLoader;
+
+  Future<RunTaintSet> _transcriptTaint() async {
+    final loader = _untrustedTranscriptLoader;
+    if (loader == null) {
+      throw StateError('untrusted transcript loader is not configured');
+    }
+    final taint = RunTaintSet();
+    for (final entry in await loader()) {
+      taint.addPayload(
+        entry.text,
+        source: entry.source ?? resultSourceForTool(entry.toolName),
+      );
+    }
+    return taint;
+  }
 
   @override
   Future<BackgroundTaskPolicyDecision> hardAndSkillPreflight({
@@ -103,7 +129,15 @@ final class SharedBackgroundTaskPolicyAdapter implements BackgroundTaskPolicy {
       return const BackgroundTaskPolicyDecision.deny(
           'task_policy_binding_invalid');
     }
-    final toolPolicy = await _toolPolicy();
+    RunTaintSet taint;
+    try {
+      taint = await _transcriptTaint();
+    } on Object {
+      // A missing or unreadable transcript cannot authorize a share.
+      return const BackgroundTaskPolicyDecision.deny(
+          'task_untrusted_transcript_unavailable');
+    }
+    final toolPolicy = await _toolPolicy(taint);
     final hardDeny = toolPolicy.denyFor(bound.request);
     if (hardDeny != null) {
       return const BackgroundTaskPolicyDecision.deny('task_hard_deny');
@@ -205,11 +239,12 @@ final class SharedBackgroundTaskPolicyAdapter implements BackgroundTaskPolicy {
     }
   }
 
-  Future<ToolPolicy> _toolPolicy() async {
+  Future<ToolPolicy> _toolPolicy(RunTaintSet taint) async {
     final settings = await _settings.read();
     return ToolPolicy(
       deniedToolNames: settings.deniedToolNames,
       bashCommandDenyPatterns: settings.bashCommandDenyPatterns,
+      additionalDenyCheck: UntrustedDataPolicy(taint).denyFor,
       onApprovalRequired: (request) async {
         final pending = _approvalBindings[request.operationId];
         if (pending == null || pending.bound.request != request) return false;
@@ -240,7 +275,11 @@ final class SharedBackgroundTaskPolicyAdapter implements BackgroundTaskPolicy {
     _approvalBindings[operationId] =
         _PendingBackgroundTaskApproval(task, bound);
     try {
-      return await (await _toolPolicy()).approve(bound.request);
+      final taint = await _transcriptTaint();
+      return await (await _toolPolicy(taint)).approve(bound.request);
+    } on Object {
+      // A missing or unreadable transcript fails the approval closed.
+      return false;
     } finally {
       _approvalBindings.remove(operationId);
     }

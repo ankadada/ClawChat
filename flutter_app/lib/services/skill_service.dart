@@ -530,6 +530,23 @@ class SkillService {
     await _setSkillEnabled(id, enabled, treatIdAsNameAlias: true);
   }
 
+  /// The stored enable switch for one skill, without scanning the guest.
+  ///
+  /// The scan is the primary source (it also checks the current grant); this
+  /// reads only the disabled list, so a device whose guest scan is unavailable
+  /// can still report the switch the user flipped.
+  static Future<bool> isSkillStoredEnabled(
+    String id, {
+    Iterable<String> aliases = const [],
+  }) async {
+    final disabled = await _loadDisabled();
+    if (disabled.contains(id)) return false;
+    for (final alias in aliases) {
+      if (disabled.contains(alias)) return false;
+    }
+    return true;
+  }
+
   static Future<void> _setSkillEnabled(
     String id,
     bool enabled, {
@@ -636,7 +653,8 @@ class SkillService {
         }
       }
       return skills;
-    } catch (_) {
+    } catch (error) {
+      _logSkillScanFailure(error);
       return [];
     }
   }
@@ -2157,12 +2175,34 @@ class SkillService {
   }
 
   static String _findInstalledSkillEntrypointsCommand() {
-    return installedSkillsDirectories
+    final searches = installedSkillsDirectories
         .map(
           (root) =>
               'find ${_shellQuote(root)} -name "SKILL.md" -type f 2>/dev/null',
         )
         .join('; ');
+    // A scan directory that does not exist yet (for example the CLI directory
+    // before xd-skill is installed) makes find exit non-zero, which the proot
+    // wrapper reports as a command failure even though the other directories
+    // were read. The scan only consumes stdout, so a best-effort exit keeps a
+    // missing directory from hiding installed skills; a shell that cannot run
+    // at all still fails the call.
+    return '$searches; true';
+
+  }
+
+  /// The exact discovery command, for tests that pin its device behaviour.
+  @visibleForTesting
+  static String get installedSkillsCommandForTesting =>
+      _findInstalledSkillEntrypointsCommand();
+
+  /// Safe classification for the device log: which kind of failure stopped the
+  /// scan. Never includes command output, file contents or credentials.
+  static void _logSkillScanFailure(Object error) {
+    final summary = error is PlatformException
+        ? 'platform ${error.code}'
+        : error.runtimeType.toString();
+    debugPrint('[clawchat.skill] scan failed: $summary');
   }
 
   static String _installedSourceIdentity(String path) =>

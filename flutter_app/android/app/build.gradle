@@ -54,7 +54,12 @@ def releaseSigningProblem = {
 android {
     namespace = "com.anka.clawbot"
     compileSdk = 36
-    ndkVersion = flutter.ndkVersion
+    // Pinned, verified NDK. `flutter.ndkVersion` follows the Flutter SDK and
+    // drifts on upgrade; the current plugin matrix (file_picker, flutter_pty,
+    // flutter_secure_storage, speech_to_text, webview_flutter, ...) asks for
+    // 27.0.12077973, the highest version seen at build time. NDK releases are
+    // backward compatible, so a lower plugin request still builds with it.
+    ndkVersion = "27.0.12077973"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8

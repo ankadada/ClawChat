@@ -5,6 +5,7 @@ import '../native_bridge.dart';
 import '../preferences_service.dart';
 import 'tool_registry.dart';
 import 'tool_result_formatter.dart';
+import 'untrusted_data_policy.dart';
 
 class PhoneIntentTool extends Tool {
   final PreferencesService _prefs;
@@ -114,6 +115,7 @@ class PhoneIntentTool extends Tool {
   Future<ToolResultPayload> executeResult(
     Map<String, dynamic> input, {
     String? sessionId,
+    RunTaintSet? runTaintSet,
   }) async {
     final output = await executeWithContext(input, sessionId: sessionId);
     return ToolResultFormatter.format(

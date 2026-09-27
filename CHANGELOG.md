@@ -1,5 +1,106 @@
 # Changelog
 
+## v2.15.0 — Local automation, memory visibility, workflow templates
+
+- **计划执行（本地计划）** — 已批准的本地任务可以排下一次时间：一次性或每 15–1440 分钟，支持暂停 / 继续 / 删除、下次运行提示、失败次数与重试上限、最多 20 条执行历史。计划存储在 `clawchat_scheduled_tasks_v1`，只保存 `taskId` 与调度元数据（任务内容仍留在加密的后台任务存储）。**没有执行 API**：到期后计划只进入“等待确认”，实际运行仍走任务中心的人工确认与既有审批策略；一次性计划跑完即结束，需要新的时间才会再跑，间隔计划按计划时间推进而不补跑错过的次数。新建计划必须勾选“到期后需要我再次确认才会执行”。入口：任务中心 → 计划执行。
+- **记忆可见性** — 记忆管理为每条事实标明 `用户确认（可信）` 或 `来自 <source>`，删除按钮改用 `forgetFact(text)`，使事实与其信任记录一起移除。新增“本轮记忆”（聊天命令面板）：显示**最近一次回复实际注入**的记忆快照与来源，因为是运行快照，事后改开关不会改写当时用了什么。每个会话可单独开关记忆（与全局值一致时清除覆盖、回到跟随全局，旧设置语义不变），全局开关、覆盖值与最终生效值分别显示。会话覆盖从 guest 可写的 `root/.clawchat_memory_sessions.json` 迁到加密应用私有存储（`clawchat.memory_session_modes.v1`，sha256 信封）：旧文件不再被读取、只被检测并退休，被 agent shell 改写的 `enabled` 不再生效；存储损坏（非 Map / schema 错误 / 校验和不符 / 读不到）按 **disabled 优先**，用户再次设置开关即重写合格式存储。信任标志存储同样收紧：合法 JSON 但顶层不是 Map、键或值类型不对、未知来源名都标记为整份加载失败，所有事实按不可信处理且不被静默修复。不可信事实仍进入 Untrusted memories 段落与运行期 taint 集合。
+- **工作流模板** — 技能与扩展新增“工作流模板”：内置 2 个本地模板（每日工作总结：workspace 读写 + memory 读取；日程提醒草稿：手机日历读取 + workspace 写入）。安装前预览所需权限、是否联网、会接触的隐私数据、风险说明，以及安装会写入的 capability 清单；校验拒绝未知能力、超过 16 KiB 的正文，以及正文包含 `http(s)://` / `curl` / `wget` 的模板。模板正文在应用内编译（无 URL 字段、无远程下载），安装写入 `workspace/skills/<id>/SKILL.md` 与受控的 `skill.json`（声明 tools / filesystem / android / networkDomains / riskTier，并带 sha256 自校验摘要），上一份包文件保留为 `.rollback`。清单是唯一能力来源：`scanSkills` 按带清单技能读取且能力快照与预览一致，清单被改动即判无效；启用必须通过既有已安装技能同意流程记录 grant（否则 `setEnabled` 返回 `template_consent_required`），正文或清单变化后需重新同意；运行期未声明的工具被 `skill_tool_undeclared` 拒绝，文件读写仍是显式 `skill_filesystem_unenforceable` 拒绝，可按包回滚且回滚后保持禁用。
+
+### Residual in 2.15.0
+
+- 计划不会在应用未运行、被杀或重启后自动恢复执行，也没有系统闹钟 / WorkManager 触发；`due()` 只是本地查询，重启后仍需用户在任务中心确认。
+- 模板只有“上一份包（正文 + 清单）”这一级回滚，没有版本仓库或签名。
+- 从旧版本升级时，如果 guest 可写的 `root/.clawchat_memory_sessions.json` 仍存在，本次启动按 disabled 优先且不导入其内容；文件被退休后下一次启动回到全局设置，用户重新设置会话开关即可。
+- 本路线没有原生 Android 代码改动，也是唯一没有设备验证的部分。
+
+## v2.14.0 — Multi-destination backup
+
+- **A backup run can write one config package to several local folders** — 数据管理 adds 多目标备份 beside the existing single-file 导出配置. The run stages the existing export package locally, writes it to each folder chosen through the existing file picker, shows per-destination progress, and can be cancelled; each destination is recorded success or failure, secrets stay redacted unless the user confirms the existing plaintext option, and the staged local package is deleted only after every selected destination succeeds (a failed or cancelled run leaves it for a retry). Restore still uses the existing import preview.
+- **Provider routing and bounded summary** — a selected model group now resolves only members whose provider profile has a usable credential (an API key, or an explicitly configured keyless local / self-hosted base URL) and fails with the existing missing-key message when none remain, instead of silently falling through to an unrelated profile. Manual context summary is bounded to 30 seconds and 2 model calls, reports started / summarizing / done / failed, and a cancel or timeout keeps the previous summary.
+- **Long pastes become chips, hardware shortcuts live at the shell** — a paste over 800 characters or 20 lines into the composer becomes a `[Pasted#N]` chip, so the composer stays short; tapping the chip shows the full text and offers removal, and sending expands every token back to the full text in order so the model receives it intact. Ctrl/Cmd+N creates a new chat and Ctrl/Cmd+F opens the current-conversation search, wired at the app shell so they work on every route; neither key is taken while another editable text field has focus, while the composer keeps Ctrl/Cmd+N.
+- **Chat reading width and reply actions** — on a wide (dual-pane) chat pane the message list, composer, and agent status now share one 860dp reading column and stay centered, while phone width keeps its previous rule. The message action sheet gains 复制全文 and 复制纯文本 (plain text drops the markdown markers), and a user message gains 从此处删除, which removes that message and every later message after a confirmation and refuses while the session is sending. A tool result that carries an image (a data URL or an image path) is shown in the tool card. A model stream that ends before its completion event (a dropped connection, for example) keeps the text already produced and marks the turn interrupted instead of discarding the partial assistant message.
+- **Second-review hardening** — every agent notification (session status, tool approval, completion, background-task lease, group summary, auto-approved tool) is `VISIBILITY_PRIVATE` with a generic `publicVersion`, and the multi-task summary no longer repeats session titles; the MCP stdio write path rejects an oversized UTF-8 frame, serializes every frame per child, and settles pending requests immediately when a write fails; the exported share Intent bounds `EXTRA_TEXT` (64 KB), `EXTRA_SUBJECT` (1 KB), and the stream-URI list (64) natively, with a second Dart cap; a platform call that can no longer reach Dart fails with `ACTIVITY_DESTROYED` / `PLATFORM_CALL_CANCELLED` instead of leaving the future pending; Android backup now keeps chat history and non-secret settings while still excluding the encrypted credential store; the build pins NDK 27.0.12077973 (the highest version requested by the plugin matrix).
+- **Third-review hardening** — `readRootfsFileBytes` now reads through the JNI broker's descriptor-relative walk (`openat` with `O_NOFOLLOW` on every component, `O_NONBLOCK` on the final file, `fstat` type and link-count verification, identity re-check after the bounded read), so a concurrent writer cannot swap a parent-directory symlink, a FIFO or device node, or a larger file into the read; `FlutterSharedPreferences.xml` is excluded from Android backup again, so a legacy plaintext `api_key` / `env_vars` from an upgraded install can never enter a backup or device transfer, while non-secret settings travel in an allowlisted `clawchat_settings_backup.json` snapshot; and `cache/shared_intents` now has a total byte and file-count quota that prunes the oldest shared images before each write and rejects a write that cannot fit.
+- **Fourth-review hardening** — the share cache writes into a random `.part` file first: a failed or interrupted provider read deletes the temp file and never evicts a cached image, and the final name is only published by an atomic rename after the quota plan is accepted. Share URIs are deduplicated before the 64-item cap, so a sender that repeats one URI cannot starve a genuinely new attachment. The settings mirror now also carries non-secret provider profile identity metadata (id, name, model, sampling parameters — never the API key or base URL), and the restore runs profile placeholders first so restored model groups and the active selection survive on a new device. `importAllSettings` is now a `Future<void>` that awaits every preferences, model-group and profile write, and the fresh-restore marker is written only after all of them succeed, so an interrupted restore is retried on the next launch instead of being silently consumed.
+
+### Residual in 2.14.0
+
+- Legacy memory import cannot grant user trust; MCP stdio lines are capped in both directions and stdin writes are serialized per child; every agent notification is lock-screen private; `read_file` is bounded natively and `readRootfsFileBytes` reads descriptor-relative; Android backup excludes `FlutterSharedPreferences.xml` and restores settings from an allowlisted mirror; the share-image cache has a total quota; AGP is 8.13.2 and the NDK is pinned to 27.0.12077973.
+- Tool-result image blocks land in this same version (2.14.0); they were not exercised on a device here.
+- SAF device verification and the on-device MCP stdio smoke are **NOT RUN** and stay deferred to a later physical-device pass. No device pass is claimed for 2.14.0.
+- The I7 runtime split is not part of this release.
+
+## v2.10.0 — Linux Runtime Health
+
+### Linux runtime
+- **System Health covers the machine, not just the container** — the health destination now reports the disk used by the rootfs and its `/root/workspace`, the guest `resolv.conf` DNS status, and the last command state (running / exited / unknown). Every check is read-only local state: it starts no proot process, mounts no shared storage, and adds no telemetry or health score. Low free space, a missing nameserver, and an unknown last command ask the user to act; a failed check stays **unknown**, never ready.
+- **Command lifecycle in chat** — a bash attempt shows `started`, `running`, `completed`, `cancelled`, or `interrupted-unknown`. The `running` signal comes from the live tooling status, `cancelled` from the existing cancellation result, and `interrupted-unknown` from the interrupted run marker. After the app is killed mid-command the card states that the command did not finish; there is no silent retry.
+- **Workspace boundary** — agent bash still does not bind `/storage` or `/sdcard`. A Dart regression test pins the `mountStorage: false` argument and the absence of any storage-mount input, and a JVM test pins the native flag builder (`buildInstallCommand(..., mountStorage = false)`) against a default `/storage` bind. `MANAGE_EXTERNAL_STORAGE` is retained for user-initiated flows only; it never becomes an agent-bash bind.
+- **No new durable process** — this lane adds no daemon, MCP supervisor, or additional foreground-service owner. It tracks user-started commands tied to an agent run or one-shot terminal/bash.
+
+## v2.9.0 — Phone Senses
+
+### Phone data and actions
+- **Split phone tools** — `phone_read` (calendar, SMS, contacts), `phone_act` (alarm, share, navigation, calendar UI), and `phone_send` (call, SMS). `phone_intent` stays registered but hidden as a one-version compatibility alias.
+- **SMS read** — `listSms` / `getSms` with `READ_SMS` requested at first use. Bounded snippets (280 chars) and bodies (4000 chars), default limit 20 / max 50, no `RECEIVE_SMS`, no broadcast watcher, no body logging.
+- **Tighter calendar and contacts reads** — calendar default window is start of today → +7 days, with a title/location/description query, default limit 20 / max 50, `allDay`, local ISO times, and a redacted `description` (URLs, emails, `tel:`). Contacts accept a query, or a limit capped at 10, so the address book is never dumped.
+- **Outbound stays default-off** — `phone_send` returns `disabled_by_user` until the matching setting is on; SMS still confirms per send and fails closed when the app is not resumed.
+
+### Untrusted tool data
+- **Run-scoped taint** — `phone_read` results and `web_fetch` / `web_search` bodies are tagged `trust: untrusted` on the transcript entry and feed a run-scoped taint set. A tainted destination is hard-denied for `phone_send`, the local-handoff `phone_act` actions, `bash` network exfil, and the hidden `phone_intent` alias.
+- **Complete `bash` network matcher** — beyond `curl` / `wget` / `nc`, a tainted destination is hard-denied for `busybox wget`, `python3` / `python` using `urllib` / `http.client` / `requests`, `git` `clone` / `fetch` / `push` / `ls-remote`, the `node` / `nodejs` / `bun` deny class below, and any unknown binary whose arguments carry a tainted URL or host. This is not a default-deny outbound firewall.
+- **Match bar** — the deny also fires on URLs, hosts, `tel:` numbers, and emails extracted from the untrusted payload, so an SMS that says `go to evil.example` blocks `curl https://evil.example` and `openWeb` even though the tool argument is not a raw substring of the SMS.
+- **Memory laundering is closed** — a `memory_write` of a value that arrived from untrusted tool data is stored as untrusted; a later `memory_get` re-seeds the run taint set with the original source, so a subsequent `curl` / `phone_send` of that value is hard-denied. The trust flags live in **encrypted app storage** (`flutter_secure_storage`, key `clawchat.memory_untrusted.v1`), not a file the guest shell can rewrite; the pre-2.9.0 rootfs file and the interim plain file are imported once (merged) and deleted. An absent or unreadable trust entry with stored facts, and any fact with no recorded provenance, fails closed as untrusted. Untrusted facts are also listed under a separate **Untrusted memories** prompt heading, and the run taint set is seeded from them at run start even when the session replays no tool result. The flag clears when the user deletes the fact in Settings (or the exact stored text is confirmed through `MemoryService.confirmMemoryText`, which is not a model-facing tool); an ordinary user-typed write stays trusted. If the trust store cannot be read, every stored fact is treated as untrusted.
+- **History replay is enforced** — at the start of a run the taint set is seeded from prior transcript tool results whose `trust` is `untrusted`, so a phone number read in one turn still hard-denies `phone_send` in the next. Only the **triggering** user message clears a value; an older typed URL does not.
+- **Background share is checked** — before a `share_text_v1` task runs, its text is compared with untrusted tool-result values already in the session transcript; a match denies the task. An unreadable transcript fails closed.
+- **Web→web follow is Ask** — following a link found in fetched content shows the approval card with the exact URL, in-app and in the background notification (which carries the URL as `detail`), even when Auto Allow is on. Web taint is only cleared for the exact URL the user confirmed.
+- **Sequential tools only** — parallel tool execution is rejected before any tool starts, so a sibling call cannot race the taint set.
+- **Behavior change** — following a link found in a fetched page used to be silent; it now requires Ask.
+- **One canonicalization layer** — before every bash / phone / web match the argument is canonicalized: percent-decoding, one base64 layer (an argument fed to `base64 -d` / `--decode`, or a single argument that decodes to a URL, host, email, or phone), and empty-string quote-splitting (`""` / `''`). Nested encodings stay out.
+- **Redirect hops are checked** — `web_fetch` keeps `followRedirects = false` and checks every `Location` hop against the run taint set, hard-denying before that hop is requested. A web→web chain that is not otherwise tainted still uses the existing Ask path.
+- **`node` / `nodejs` / `bun`** — a named deny class like python: denied with a tainted URL or host, and an eval flag (`-e`, `--eval`, `-p`, `--print`) denied outright when any tainted value is in the command. `node` is **not** installed in the Alpine baseline.
+- **Same-run file copies** — a `write_file` whose content matches the run taint set marks the normalized `/root/workspace` path; a later `read_file` of that path returns `trust: untrusted` with its original source and re-seeds the same run taint set; bash that reads that path while carrying a tainted destination is hard-denied. The path set is in-memory for the run only: a new run does not inherit file taint and nothing survives a restart.
+
+### Permission recovery
+- **One-tap Fix** — a `phone_read` result that returns `permission_required` shows a **打开权限设置** button in the chat tool card that opens the OS App details screen (`ACTION_APPLICATION_DETAILS_SETTINGS`). If the native open fails the text instruction remains and the run continues.
+- **No prompt loop** — each runtime permission is requested at most once per activity lifetime; later calls return the stable `permission_required` code with the exact Settings path.
+
+### Product boundary
+- **PRODUCT.md** — thesis, the two runtimes, non-goals, privacy, and a written owner scenario for every manifest permission.
+- **Settings** — “手机集成” is now “手机数据与动作”, with separate 读取 and 外发 rows. The existing `allow_phone_call` / `allow_sms` keys are preserved on upgrade.
+- **Default system prompt** — describes the Alpine-hosted machine and the phone tools; it states that phone read works only after the runtime permission is granted.
+- `READ_SMS` is added. `RECEIVE_BOOT_COMPLETED` is retained for the persisted cleanup job.
+
+### Compatibility
+- Includes the v2.6–v2.8 gates. Transcripts written before 2.9.0 have no `trust` field and read back as trusted. Memory entries written before 2.9.0 have no untrusted flag and read back as trusted.
+
+### Known residual (not closed by 2.9.0)
+- DNS rebinding, IP-literal versus hostname, and homograph / punycode domains are not detected: the matcher compares strings, not resolved addresses.
+- There is no default-deny outbound firewall; an unknown binary with no tainted URL or host is allowed.
+- Nested encodings, non-empty shell concatenation, shortlink services whose hop is never fetched, and `perl` / `eval` indirection are not covered.
+
+## v2.13.0 — Background Honesty
+
+- **The island is developer tooling** — Dynamic Island / floating status is behind Developer Mode and **off by default**. A normal install and the first agent run never prompt for `SYSTEM_ALERT_WINDOW`; the overlay permission is requested only after Developer Mode is on and the user enables the 灵动岛 / 悬浮状态 toggle. Turning Developer Mode off turns the island off and hides any existing overlay. The island code is kept, not deleted.
+- **Notification copy describes the machine** — status lines read as a machine doing work (机器正在思考 / 机器正在执行工具 / 机器仍在运行), and the completion summary is 机器任务完成. Notification-only is the core path; the island is an add-on.
+- **Stop cancels only that session** — the notification Stop action still cancels the single session that raised it, leaving parallel sessions running. Existing durable receipts and `unknown_outcome` behavior are unchanged; there is no automatic resume after process death or reboot, and `RECEIVE_BOOT_COMPLETED` is not used to start an agent run.
+
+## v2.12.0 — MCP in proot
+
+- **Run-scoped stdio MCP bridge** — Android now starts stdio MCP servers inside Alpine through a proot bridge instead of refusing them. A child starts for the agent run that needs its tools and is killed when that run ends, is cancelled, or the foreground-service lease drops. There is no durable MCP supervisor and no restart after process death.
+- **Allowlisted environment, never inheritance** — the guest environment is only the fixed `HOME` / `PATH` / `LANG` / `TMPDIR` baseline plus the keys the user typed on that `McpServerConfig.env`. `GOOGLE_ACCESS_TOKEN` and other app secrets are never copied in. The values are written to an app-private launch script rather than the process argument vector. Docs and settings now state that MCP env is not the place for Gmail/Drive tokens.
+- **A failed start is visible** — when proot is not ready, the child crashes, or a start times out, settings and the tool result show the reason instead of an empty tool list. The Alpine readiness answer is surfaced in the MCP settings section.
+- **MCP results are untrusted** — every MCP tool result is tagged `trust: untrusted` with source `mcp` and enters the existing deny engine, so an MCP result cannot drive `phone_send`, the local-handoff `phone_act` sinks, or a tainted `curl` / web destination without the user typing or confirming the value.
+- **Device smoke not run** — the on-device smoke (pinned stdio server starting for one run, listing a tool, executing it, child gone at run end) is **not run** in this lane and is not claimed as a device pass.
+
+## v2.11.0 — Skills disposition
+
+- **Fate table applied** — every bundled preset now has one explicit fate. `gws-calendar`, `gws-gmail`, `gws-drive`, `web-search`, `file-manager`, and `system-info` ship and are installed **disabled**; the existing legacy skill consent is the only unlock.
+- **Google presets are Google API, not phone data** — settings and each preset state that Gmail / Drive / Calendar call Google APIs, there is **no in-app OAuth**, and the user must supply `GOOGLE_ACCESS_TOKEN` in environment variables. Asking about the phone calendar uses `phone_read` and does not require the token or `gws-calendar`.
+- **`web-search` points at the host tool** — the preset now calls the built-in `web_search` / `web_fetch` tools instead of ad-hoc shell fetching.
+- **`file-manager` and `system-info` rewritten** — `file-manager` describes workspace + Android SAF (not whole-device storage); `system-info` describes machine health in the Alpine/proot runtime (not `uname` presented as phone state).
+- **`github`, `translator`, `code-review` leave the app bundle** — they move to `docs/skill-examples/` as examples. Left-over installed copies of the old preset IDs stay blocked, and `code-review` is not installed by default. A skill markdown still cannot grant `phone_send` or bypass Ask.
+
 ## v2.8.0 — Safe Background Tasks
 
 ### Durable local tasks

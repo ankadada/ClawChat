@@ -2,6 +2,7 @@ import 'package:uuid/uuid.dart';
 
 import 'structured_result.dart';
 import 'workspace_import_receipt.dart';
+import '../services/tool_result_images.dart';
 
 class ContextSummary {
   final int version;
@@ -599,6 +600,9 @@ class ChatSession {
   String? folder; // null = ungrouped
   String? modelGroupId; // null = use active provider profile
   String? remoteAgentConnectorId; // explicit per-session external opt-in
+  /// Workspace this session is attached to. Null keeps the pre-workspace
+  /// behaviour: the session follows whichever workspace is active.
+  String? workspaceId;
   ContextSummary? contextSummary;
   AgentRunRecoveryMarker? inFlightAgentRun;
   final List<WorkspaceImportReceipt> pendingWorkspaceImports;
@@ -617,6 +621,7 @@ class ChatSession {
     this.folder,
     this.modelGroupId,
     this.remoteAgentConnectorId,
+    this.workspaceId,
     this.contextSummary,
     this.inFlightAgentRun,
     List<WorkspaceImportReceipt>? pendingWorkspaceImports,
@@ -661,6 +666,7 @@ class ChatSession {
         if (modelGroupId != null) 'modelGroupId': modelGroupId,
         if (remoteAgentConnectorId != null)
           'remoteAgentConnectorId': remoteAgentConnectorId,
+        if (workspaceId != null) 'workspaceId': workspaceId,
         if (contextSummary != null) 'contextSummary': contextSummary!.toJson(),
         if (inFlightAgentRun != null)
           'inFlightAgentRun': inFlightAgentRun!.toJson(),
@@ -702,6 +708,7 @@ class ChatSession {
       modelGroupId: json['modelGroupId'] as String?,
       remoteAgentConnectorId:
           _sanitizeOptionalId(json['remoteAgentConnectorId']),
+      workspaceId: _sanitizeOptionalId(json['workspaceId']),
       contextSummary: rawSummary is Map
           ? ContextSummary.fromJson(Map<String, dynamic>.from(rawSummary))
           : null,
@@ -1435,10 +1442,24 @@ class ToolUseContent extends MessageContent {
       };
 }
 
+/// Trust label persisted on a tool-result transcript entry.
+///
+/// Old transcripts have no field and read back as [trusted]. The label is
+/// written on every new tool-result entry so a later replay slice can refuse
+/// to trust replayed text without re-deriving the source tool.
+abstract final class ToolResultTrust {
+  static const String trusted = 'trusted';
+  static const String untrusted = 'untrusted';
+
+  static String normalize(Object? value) =>
+      value == untrusted ? untrusted : trusted;
+}
+
 class ToolResultContent extends MessageContent {
   final String toolUseId;
   final ToolResultPayload payload;
   final bool isError;
+  final String trust;
 
   ToolResultContent({
     required this.toolUseId,
@@ -1448,6 +1469,7 @@ class ToolResultContent extends MessageContent {
     Map<String, dynamic>? metadata,
     ToolResultPayload? payload,
     this.isError = false,
+    this.trust = ToolResultTrust.trusted,
   }) : payload = payload ??
             ToolResultPayload(
               forUser: output ?? '',
@@ -1468,6 +1490,7 @@ class ToolResultContent extends MessageContent {
       summary: json['summary']?.toString(),
       metadata: ToolResultPayload.metadataFromJson(json['metadata']),
       isError: json['is_error'] as bool? ?? false,
+      trust: ToolResultTrust.normalize(json['trust']),
     );
   }
 
@@ -1477,13 +1500,29 @@ class ToolResultContent extends MessageContent {
   String? get summary => payload.summary;
   Map<String, dynamic> get metadata => payload.metadata;
 
+  /// Image blocks this result carries: the ones the agent loop resolved from
+  /// workspace paths (metadata) plus any inline data URL still in the text.
+  List<Map<String, dynamic>> get imageBlocks => ToolResultImageResolver
+      .imageBlocksFor(llmOutput, metadata);
+
   @override
-  Map<String, dynamic> toApiJson() => {
-        'type': 'tool_result',
-        'tool_use_id': toolUseId,
-        'content': llmOutput,
-        if (isError) 'is_error': true,
-      };
+  Map<String, dynamic> toApiJson() {
+    final images = imageBlocks;
+    // A result with an image is sent as a content list: the text plus the
+    // image block(s), so the model receives the image itself instead of a
+    // base64 blob or a path string.
+    return {
+      'type': 'tool_result',
+      'tool_use_id': toolUseId,
+      'content': images.isEmpty
+          ? llmOutput
+          : <Map<String, dynamic>>[
+              {'type': 'text', 'text': llmOutput},
+              ...images,
+            ],
+      if (isError) 'is_error': true,
+    };
+  }
 
   @override
   Map<String, dynamic> toJson() => {
@@ -1494,6 +1533,7 @@ class ToolResultContent extends MessageContent {
         if (payload.summary != null) 'summary': payload.summary,
         if (payload.metadata.isNotEmpty) 'metadata': payload.metadata,
         'is_error': isError,
+        'trust': trust,
       };
 }
 

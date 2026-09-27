@@ -6,10 +6,11 @@ import '../../models/chat_models.dart';
 import '../app_http.dart';
 import 'tool_registry.dart';
 import 'tool_result_formatter.dart';
+import 'untrusted_data_policy.dart';
 
 class WebFetchTool extends Tool {
   WebFetchTool({
-    AppWebFetchClient? client,
+    AppWebFetchSendClient? client,
     Future<void> Function(Uri uri)? validateUrl,
     bool upgradeInsecureUrls = true,
     @visibleForTesting Duration operationTimeout = _timeout,
@@ -20,7 +21,7 @@ class WebFetchTool extends Tool {
         _operationTimeout = operationTimeout,
         _resolverLimiter = resolverLimiter ?? AppResolverLimiter.shared;
 
-  final AppWebFetchClient? _client;
+  final AppWebFetchSendClient? _client;
   final Future<void> Function(Uri uri) _validateUrl;
   final bool _upgradeInsecureUrls;
   final Duration _operationTimeout;
@@ -103,7 +104,7 @@ class WebFetchTool extends Tool {
     'x-api-key',
   };
 
-  AppWebFetchClient get _pinnedClient =>
+  AppWebFetchSendClient get _pinnedClient =>
       _client ?? AppHttpClientRegistry.instance.webFetchClient;
 
   static bool _isPublicIp(InternetAddress addr) {
@@ -144,6 +145,7 @@ class WebFetchTool extends Tool {
       input,
       allowedDomains: null,
       cancellationSignal: null,
+      runTaintSet: null,
     );
   }
 
@@ -151,11 +153,13 @@ class WebFetchTool extends Tool {
     Map<String, dynamic> input, {
     required Set<String> allowedDomains,
     ToolCancellationSignal? cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) {
     return _execute(
       input,
       allowedDomains: allowedDomains,
       cancellationSignal: cancellationSignal,
+      runTaintSet: runTaintSet,
     );
   }
 
@@ -165,11 +169,13 @@ class WebFetchTool extends Tool {
     String? sessionId,
     required String operationId,
     required ToolCancellationSignal cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) async {
     final output = await _execute(
       input,
       allowedDomains: null,
       cancellationSignal: cancellationSignal,
+      runTaintSet: runTaintSet,
     );
     return ToolResultFormatter.format(
       toolName: name,
@@ -183,6 +189,7 @@ class WebFetchTool extends Tool {
     Map<String, dynamic> input, {
     required Set<String>? allowedDomains,
     required ToolCancellationSignal? cancellationSignal,
+    required RunTaintSet? runTaintSet,
   }) async {
     cancellationSignal?.throwIfCancellationRequested();
     var url = input['url'] as String;
@@ -219,6 +226,7 @@ class WebFetchTool extends Tool {
         allowedDomains,
         cancellationSignal,
         operation,
+        runTaintSet,
       );
 
       final result = StringBuffer();
@@ -252,7 +260,7 @@ class WebFetchTool extends Tool {
   }
 
   Future<http.Response> _sendWithRedirects(
-    AppWebFetchClient client,
+    AppWebFetchSendClient client,
     Uri initialUri,
     String initialMethod,
     Map<String, String> headers,
@@ -260,6 +268,7 @@ class WebFetchTool extends Tool {
     Set<String>? allowedDomains,
     ToolCancellationSignal? cancellationSignal,
     _WebFetchOperation operation,
+    RunTaintSet? runTaintSet,
   ) async {
     var currentUri = initialUri;
     var currentMethod = initialMethod.toUpperCase() == 'POST' ? 'POST' : 'GET';
@@ -343,6 +352,14 @@ class WebFetchTool extends Tool {
         );
       }
       _ensureDomainAllowed(nextUri, allowedDomains);
+      // A redirect hop that names a value from untrusted tool data is a
+      // hard-deny, checked against this run's taint set before any request to
+      // that hop is made.
+      if (runTaintSet?.matchIn(nextUri.toString()) != null) {
+        throw const _WebFetchPolicyException(
+          'Redirect target matches untrusted tool data.',
+        );
+      }
 
       final crossesOrigin =
           _normalizedOrigin(currentUri) != _normalizedOrigin(nextUri);

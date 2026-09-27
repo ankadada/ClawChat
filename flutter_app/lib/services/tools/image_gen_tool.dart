@@ -7,6 +7,7 @@ import 'tool_result_formatter.dart';
 import '../app_http.dart';
 import '../api_validator.dart';
 import '../preferences_service.dart';
+import 'untrusted_data_policy.dart';
 
 class ImageGenTool extends Tool {
   final PreferencesService _prefs;
@@ -53,6 +54,7 @@ class ImageGenTool extends Tool {
     String? sessionId,
     required String operationId,
     required ToolCancellationSignal cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) async {
     final output = await _execute(
       input,

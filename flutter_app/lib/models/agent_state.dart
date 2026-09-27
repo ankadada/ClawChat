@@ -62,7 +62,6 @@ class AgentState {
   final List<QueuedMessage> messageQueue = [];
   bool wasCancelled = false;
   List<String>? pendingAlternatives;
-  bool agentOverlayPermissionRequestStarted = false;
   bool fallbackGuardedOutputObserved = false;
   bool fallbackTextEmitted = false;
   bool fallbackToolStarted = false;

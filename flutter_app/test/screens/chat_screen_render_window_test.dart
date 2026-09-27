@@ -9,11 +9,13 @@ import 'package:clawchat/l10n/app_strings.dart';
 import 'package:clawchat/models/chat_models.dart';
 import 'package:clawchat/models/provider_profile.dart';
 import 'package:clawchat/models/remote_agent_connector.dart';
+import 'package:clawchat/models/workspace.dart';
 import 'package:clawchat/models/structured_result.dart';
 import 'package:clawchat/providers/chat_provider.dart';
 import 'package:clawchat/screens/chat_screen.dart';
 import 'package:clawchat/services/llm_service.dart';
 import 'package:clawchat/services/mcp_rich_surface_protocol.dart';
+import 'package:clawchat/services/memory_service.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:clawchat/services/remote_agent_configuration_service.dart';
 import 'package:clawchat/services/remote_agent_connector.dart';
@@ -190,6 +192,203 @@ void main() {
     }
 
     expect(find.text(AppStrings.settings), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('a failed session-memory save keeps the mode and says so',
+      (tester) async {
+    final session = ChatSession(
+      id: 'memory_save_session',
+      title: 'Memory Save Session',
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    MemoryService.resetForTesting();
+    final store = _FailingSessionModeWriteStore();
+    MemoryService.setSessionModeStoreForTesting(store);
+    addTearDown(MemoryService.resetForTesting);
+
+    await _pumpChatScreen(tester, provider);
+    await _tapRightmostMoreAction(tester);
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.text(AppStrings.sessionMemory),
+      96,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.ensureVisible(find.text(AppStrings.sessionMemory).last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(AppStrings.sessionMemory).last);
+    await tester.pumpAndSettle();
+
+    // Turn the session override on; the write fails, so the mode and the
+    // feedback must both stay truthful.
+    await tester.tap(find.text(AppStrings.sessionMemoryOn));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(AppStrings.save));
+    await tester.pumpAndSettle();
+
+    expect(find.text('保存失败，设置未改变'), findsOneWidget);
+    expect(
+      await MemoryService.getSessionMemoryMode(session.id),
+      SessionMemoryMode.followGlobal,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('the app bar names the session workspace, not the active one',
+      (tester) async {
+    final docs = await provider.createWorkspace(name: 'Docs');
+    await provider.setActiveWorkspace(WorkspaceMetadata.defaultWorkspaceId);
+    final session = ChatSession(
+      id: 'workspace_chip_session',
+      title: 'Workspace Chip Session',
+      workspaceId: docs.id,
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreen(tester, provider);
+    await tester.pumpAndSettle();
+
+    final chip = find.byKey(const ValueKey('chat-workspace-chip'));
+    expect(chip, findsOneWidget);
+    expect(
+        find.descendant(of: chip, matching: find.text('Docs')), findsOneWidget);
+
+    // Switching the active workspace never migrates an existing session: the
+    // chip keeps showing the workspace this conversation belongs to.
+    await provider.setActiveWorkspace(WorkspaceMetadata.defaultWorkspaceId);
+    await tester.pump();
+    expect(
+        find.descendant(of: chip, matching: find.text('Docs')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('without a session the chip names the active workspace',
+      (tester) async {
+    await provider.createWorkspace(name: 'Docs');
+
+    await _pumpChatScreen(tester, provider);
+    await tester.pumpAndSettle();
+
+    final chip = find.byKey(const ValueKey('chat-workspace-chip'));
+    expect(chip, findsOneWidget);
+    expect(
+        find.descendant(of: chip, matching: find.text('Docs')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('320dp keeps a compact workspace indicator without overflow',
+      (tester) async {
+    final docs = await provider.createWorkspace(name: 'Docs');
+    final session = ChatSession(
+      id: 'workspace_chip_narrow',
+      title: 'Narrow Workspace Chip Session',
+      workspaceId: docs.id,
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(320, 720),
+      textScale: 2,
+    );
+    await tester.pumpAndSettle();
+
+    // Whatever the width, the toolbar keeps its height and the title stays.
+    expect(find.text('Narrow Workspace Chip Session'), findsOneWidget);
+    // The indicator stays visible; at this width it is icon-only and names the
+    // workspace through its semantics label and tooltip.
+    final chip = find.byKey(const ValueKey('chat-workspace-chip'));
+    expect(chip, findsOneWidget);
+    final semantics = tester.ensureSemantics();
+    expect(
+      tester.getSemantics(chip).label,
+      contains('Docs'),
+    );
+    semantics.dispose();
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('347dp keeps the compact indicator and a readable title',
+      (tester) async {
+    final docs = await provider.createWorkspace(name: 'Docs');
+    final session = ChatSession(
+      id: 'workspace_chip_347',
+      title: 'Narrow Session Title',
+      workspaceId: docs.id,
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(347, 720),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Narrow Session Title'), findsOneWidget);
+    final chip = find.byKey(const ValueKey('chat-workspace-chip'));
+    expect(chip, findsOneWidget);
+    final semantics = tester.ensureSemantics();
+    expect(tester.getSemantics(chip).label, contains('Docs'));
+    semantics.dispose();
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('landscape keeps the named workspace chip next to the title',
+      (tester) async {
+    final docs = await provider.createWorkspace(name: 'Docs');
+    final session = ChatSession(
+      id: 'workspace_chip_landscape',
+      title: 'Landscape Session',
+      workspaceId: docs.id,
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(800, 360),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Landscape Session'), findsOneWidget);
+    final chip = find.byKey(const ValueKey('chat-workspace-chip'));
+    expect(chip, findsOneWidget);
+    expect(
+        find.descendant(of: chip, matching: find.text('Docs')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+      'the empty chat names the workspace that scopes new sessions at 200 percent text',
+      (tester) async {
+    final session = ChatSession(
+      id: 'workspace_indicator_session',
+      title: 'Workspace Indicator Session',
+    );
+    await storage.saveSession(session);
+    await provider.selectSession(session.id);
+
+    await _pumpChatScreenWithMedia(
+      tester,
+      provider,
+      size: const Size(320, 720),
+      textScale: 2,
+    );
+    await tester.pumpAndSettle();
+
+    // The session scope is named before the first message is sent.
+    expect(find.text('当前工作区'), findsOneWidget);
+    expect(find.text('工作区'), findsWidgets);
     expect(tester.takeException(), isNull);
   });
 
@@ -1695,4 +1894,18 @@ class _ImmediateLlmService extends LlmService {
       content: [ContentBlock(type: 'text', text: 'model recovered')],
     ));
   }
+}
+
+/// A session-mode store whose writes always fail, for the save-failure path.
+class _FailingSessionModeWriteStore implements MemorySessionModeStore {
+  @override
+  Future<String?> read() async => null;
+
+  @override
+  Future<void> write(String content) async {
+    throw StateError('storage unavailable');
+  }
+
+  @override
+  Future<void> deleteLegacy() async {}
 }

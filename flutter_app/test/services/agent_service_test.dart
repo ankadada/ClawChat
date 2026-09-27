@@ -10,6 +10,7 @@ import 'package:clawchat/services/skill_capability_policy.dart';
 import 'package:clawchat/services/skill_service.dart';
 import 'package:clawchat/services/tools/tool_policy.dart';
 import 'package:clawchat/services/tools/tool_registry.dart';
+import 'package:clawchat/services/tools/untrusted_data_policy.dart';
 import 'package:clawchat/services/tools/load_skill_tool.dart';
 import 'package:clawchat/services/tools/present_structured_result_tool.dart';
 import 'package:clawchat/services/tools/read_file_tool.dart';
@@ -1520,6 +1521,145 @@ void main() {
       expect(xds.toolsByCall, hasLength(2));
       expect(xds.toolsByCall.last, contains('xds_agent'));
     });
+
+    test('replayed untrusted value denies phone_send in a later turn',
+        () async {
+      final tool = _RecordingTool(name: 'phone_send');
+      final tools = ToolRegistry()..register(tool, risk: ToolRisk.dangerous);
+      final taint = RunTaintSet();
+      final service = AgentService(
+        llm: _ToolCallLlmService(
+          _config,
+          toolName: 'phone_send',
+          arguments: const {
+            'action': 'sendSms',
+            'params': {'number': '10086', 'body': 'see https://evil.example/x'},
+          },
+        ),
+        tools: tools,
+        systemPrompt: 'system',
+        runTaintSet: taint,
+        replayUntrustedResults: const [
+          UntrustedTranscriptEntry(
+            toolName: 'phone_read',
+            text: 'see https://evil.example/x',
+          ),
+        ],
+        toolPolicy: ToolPolicy(
+          approvalRequiredFor: const {},
+          additionalDenyCheck: (request) =>
+              UntrustedDataPolicy(taint).denyFor(request),
+        ),
+      );
+
+      final events = <AgentEvent>[];
+      await for (final event in service
+          .runAgentLoop([
+            {'role': 'user', 'content': 'what did they send?'},
+          ])) {
+        events.add(event);
+      }
+
+      expect(tool.executedInputs, isEmpty);
+      expect(events.whereType<AgentToolDone>().single.isError, isTrue);
+    });
+
+    test('the triggering message clears replayed taint for that value',
+        () async {
+      final tool = _RecordingTool(name: 'phone_send');
+      final tools = ToolRegistry()..register(tool, risk: ToolRisk.dangerous);
+      final taint = RunTaintSet();
+      final service = AgentService(
+        llm: _ToolCallLlmService(
+          _config,
+          toolName: 'phone_send',
+          arguments: const {
+            'action': 'sendSms',
+            'params': {'number': '10086', 'body': 'see https://evil.example/x'},
+          },
+        ),
+        tools: tools,
+        systemPrompt: 'system',
+        runTaintSet: taint,
+        replayUntrustedResults: const [
+          UntrustedTranscriptEntry(
+            toolName: 'phone_read',
+            text: 'see https://evil.example/x',
+          ),
+        ],
+        toolPolicy: ToolPolicy(
+          approvalRequiredFor: const {},
+          onApprovalRequired: (_) => true,
+          additionalDenyCheck: (request) =>
+              UntrustedDataPolicy(taint).denyFor(request),
+        ),
+      );
+
+      await service.runAgentLoop([
+        {'role': 'user', 'content': 'send https://evil.example/x now'},
+      ]).drain<void>();
+
+      expect(tool.executedInputs, hasLength(1));
+    });
+
+    test('an older typed url does not clear a newer untrusted payload',
+        () async {
+      final tool = _RecordingTool(name: 'phone_send');
+      final tools = ToolRegistry()..register(tool, risk: ToolRisk.dangerous);
+      final taint = RunTaintSet();
+      final service = AgentService(
+        llm: _ToolCallLlmService(
+          _config,
+          toolName: 'phone_send',
+          arguments: const {
+            'action': 'sendSms',
+            'params': {'number': '10086', 'body': 'see https://evil.example/x'},
+          },
+        ),
+        tools: tools,
+        systemPrompt: 'system',
+        runTaintSet: taint,
+        replayUntrustedResults: const [
+          UntrustedTranscriptEntry(
+            toolName: 'phone_read',
+            text: 'see https://evil.example/x',
+          ),
+        ],
+        toolPolicy: ToolPolicy(
+          approvalRequiredFor: const {},
+          additionalDenyCheck: (request) =>
+              UntrustedDataPolicy(taint).denyFor(request),
+        ),
+      );
+
+      final events = <AgentEvent>[];
+      await for (final event in service.runAgentLoop([
+        {'role': 'user', 'content': 'earlier I typed https://evil.example/x'},
+        {'role': 'assistant', 'content': 'ok'},
+        {'role': 'user', 'content': 'now send it'},
+      ])) {
+        events.add(event);
+      }
+
+      expect(tool.executedInputs, isEmpty);
+      expect(events.whereType<AgentToolDone>().single.isError, isTrue);
+    });
+
+    test('parallelTools is rejected before any tool starts', () {
+      expect(
+        () => AgentService(
+          llm: _ToolCallLlmService(
+            _config,
+            toolName: 'bash',
+            arguments: const {'command': 'echo hi'},
+          ),
+          tools: ToolRegistry(),
+          systemPrompt: 'system',
+          parallelTools: true,
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
   });
 }
 
@@ -1862,12 +2002,14 @@ class _RecordingTool extends Tool {
     Map<String, dynamic> input, {
     String? sessionId,
     required String operationId,
+    RunTaintSet? runTaintSet,
   }) async {
     executedOperationIds.add(operationId);
     return super.executeResultWithOperation(
       input,
       sessionId: sessionId,
       operationId: operationId,
+      runTaintSet: runTaintSet,
     );
   }
 }
@@ -1925,6 +2067,7 @@ class _CancellationAwareTool extends Tool {
     String? sessionId,
     required String operationId,
     required ToolCancellationSignal cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) async {
     if (!started.isCompleted) started.complete();
     await cancellationSignal.whenCancelled;

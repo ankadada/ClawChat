@@ -31,9 +31,14 @@ class SessionPreview {
   final String? preview;
   final String? modelOverride;
 
+  /// The workspace the session belongs to, or null for sessions written
+  /// before workspaces existed (they resolve to the active workspace).
+  final String? workspaceId;
+
   const SessionPreview({
     this.preview,
     this.modelOverride,
+    this.workspaceId,
   });
 }
 
@@ -446,6 +451,7 @@ class SessionStorage {
     return SessionPreview(
       preview: preview,
       modelOverride: map['modelOverride'] as String?,
+      workspaceId: map['workspaceId'] as String?,
     );
   }
 

@@ -8,6 +8,7 @@ import '../models/background_task.dart';
 import '../services/background_task_center_controller.dart';
 import '../services/background_task_definitions.dart';
 import '../services/background_task_policy_adapter.dart';
+import 'scheduled_tasks_screen.dart';
 
 /// A local-only maintenance surface for durable task records.
 ///
@@ -83,6 +84,18 @@ class _BackgroundTaskCenterScreenState
             appBar: AppBar(
               title: const Text('本地任务中心'),
               actions: [
+                IconButton(
+                  tooltip: '计划执行',
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => ScheduledTasksScreen(
+                        availableTasks: controller.tasks,
+                        onOpenTaskCenter: () => Navigator.of(context).pop(),
+                      ),
+                    ),
+                  ),
+                  icon: const Icon(Icons.schedule_outlined),
+                ),
                 IconButton(
                   tooltip: '刷新本地任务',
                   onPressed: controller.refresh,

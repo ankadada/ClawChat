@@ -1,6 +1,35 @@
+import 'dart:convert';
+
 import 'package:file_picker/file_picker.dart';
 
 import 'file_attachment_service.dart';
+
+/// Bounds applied to content that arrives from a native share Intent.
+///
+/// The native entry point already truncates, so this is the second line of
+/// defence for a payload that a future caller (or a different platform
+/// channel) hands over without the native cap.
+class SharedContentLimits {
+  const SharedContentLimits._();
+
+  static const int maxTextBytes = 64 * 1024;
+  static const int maxSubjectBytes = 1024;
+  static const int maxImages = 9;
+  static const int maxErrors = 32;
+
+  /// Drops the bytes beyond [maxBytes] without splitting a code point.
+  static String truncateUtf8(String value, int maxBytes) {
+    if (maxBytes <= 0) return '';
+    final bytes = utf8.encode(value);
+    if (bytes.length <= maxBytes) return value;
+    var end = maxBytes;
+    while (end > 0 && (bytes[end] & 0xC0) == 0x80) {
+      end--;
+    }
+    if (end == 0) return '';
+    return utf8.decode(bytes.sublist(0, end));
+  }
+}
 
 class SharedImage {
   final String path;
@@ -56,18 +85,31 @@ class SharedContent {
     if (json == null) return const SharedContent();
     final rawImages = json['images'];
     final rawErrors = json['errors'];
+    final rawSubject = json['subject']?.toString();
     return SharedContent(
-      text: json['text']?.toString() ?? '',
-      subject: json['subject']?.toString(),
+      text: SharedContentLimits.truncateUtf8(
+        json['text']?.toString() ?? '',
+        SharedContentLimits.maxTextBytes,
+      ),
+      subject: rawSubject == null
+          ? null
+          : SharedContentLimits.truncateUtf8(
+              rawSubject,
+              SharedContentLimits.maxSubjectBytes,
+            ),
       images: rawImages is Iterable
           ? rawImages
               .whereType<Map>()
               .map(SharedImage.fromNative)
               .where((image) => image.path.trim().isNotEmpty)
+              .take(SharedContentLimits.maxImages)
               .toList(growable: false)
           : const [],
       errors: rawErrors is Iterable
-          ? rawErrors.map((error) => error.toString()).toList(growable: false)
+          ? rawErrors
+              .map((error) => error.toString())
+              .take(SharedContentLimits.maxErrors)
+              .toList(growable: false)
           : const [],
     );
   }

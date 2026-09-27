@@ -23,10 +23,15 @@ class ChatSessionsScreen extends StatefulWidget {
   final bool embedded;
   final Future<List<SessionSearchResult>> Function(String query)?
       sessionSearcher;
+
+  /// Injectable preview/session storage for tests; rows default to the
+  /// shared instance production has always used.
+  final SessionStorage? sessionStorage;
   const ChatSessionsScreen({
     super.key,
     this.embedded = false,
     this.sessionSearcher,
+    this.sessionStorage,
   });
 
   @override
@@ -697,6 +702,7 @@ class _ChatSessionsScreenState extends State<ChatSessionsScreen> {
           ),
           subtitle: _SessionMeta(
             session: session,
+            storage: widget.sessionStorage,
             timeLabel: _formatTime(session.updatedAt),
             matchPreview: searchResult?.matchPreview,
             selectedForeground: selectedForeground,
@@ -1153,12 +1159,14 @@ class _DateHeaderDelegate extends SliverPersistentHeaderDelegate {
 
 class _SessionMeta extends StatefulWidget {
   final SessionSummary session;
+  final SessionStorage? storage;
   final String timeLabel;
   final String? matchPreview;
   final Color? selectedForeground;
 
   const _SessionMeta({
     required this.session,
+    this.storage,
     required this.timeLabel,
     this.matchPreview,
     this.selectedForeground,
@@ -1169,15 +1177,25 @@ class _SessionMeta extends StatefulWidget {
 }
 
 class _SessionMetaState extends State<_SessionMeta> {
-  static final SessionStorage _storage = SessionStorage();
+  static final SessionStorage _fallbackStorage = SessionStorage();
+
+  SessionStorage get _storage => widget.storage ?? _fallbackStorage;
 
   String? _preview;
   String? _model;
+  String? _workspaceName;
+  bool _previewFailed = false;
+
+  /// Per-load tokens: a completion from an older session, an older
+  /// workspace revision or a superseded retry never writes state.
+  int _previewGeneration = 0;
+  int _workspaceGeneration = 0;
+  int? _resolvedWorkspaceRevision;
 
   @override
   void initState() {
     super.initState();
-    _loadMeta();
+    _reload();
   }
 
   @override
@@ -1187,20 +1205,68 @@ class _SessionMetaState extends State<_SessionMeta> {
         oldWidget.session.updatedAt != widget.session.updatedAt) {
       _preview = null;
       _model = null;
-      _loadMeta();
+      _workspaceName = null;
+      _previewFailed = false;
+      _reload();
     }
   }
 
-  Future<void> _loadMeta() async {
-    final sessionId = widget.session.id;
-    await _storage.init();
-    final meta = await _storage.getSessionPreview(sessionId);
-    if (!mounted || widget.session.id != sessionId) return;
+  void _reload() {
+    unawaited(_loadWorkspace(++_workspaceGeneration));
+    unawaited(_loadPreview(++_previewGeneration));
+  }
 
+  /// The workspace badge follows the provider storage: a session that is
+  /// missing or unreadable keeps no badge (it never claims the active
+  /// workspace), while a session that is found without a workspace id
+  /// (written before workspaces existed) resolves to the active one.
+  Future<void> _loadWorkspace(int generation) async {
+    final sessionId = widget.session.id;
+    final provider = context.read<ChatProvider>();
+    _resolvedWorkspaceRevision = provider.workspaceRevision;
+    String? name;
+    try {
+      final workspace = await provider.workspaceForStoredSession(sessionId);
+      name = workspace?.name;
+    } catch (_) {
+      name = null;
+    }
+    if (!mounted ||
+        generation != _workspaceGeneration ||
+        widget.session.id != sessionId) {
+      return;
+    }
+    setState(() => _workspaceName = name);
+  }
+
+  /// Preview text and model are optional: a failing read keeps the row and
+  /// shows a retry badge instead of an error dialog or a broken tile.
+  Future<void> _loadPreview(int generation) async {
+    final sessionId = widget.session.id;
+    SessionPreview? meta;
+    var failed = false;
+    try {
+      await _storage.init();
+      meta = await _storage.getSessionPreview(sessionId);
+    } catch (_) {
+      failed = true;
+    }
+    if (!mounted ||
+        generation != _previewGeneration ||
+        widget.session.id != sessionId) {
+      return;
+    }
     setState(() {
+      if (failed) {
+        _preview = null;
+        _model = null;
+        _previewFailed = true;
+        return;
+      }
       final preview = meta?.preview;
       _preview = preview == null ? null : _compactPreview(preview);
       _model = meta?.modelOverride;
+      _previewFailed = false;
     });
   }
 
@@ -1212,6 +1278,12 @@ class _SessionMetaState extends State<_SessionMeta> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final provider = context.watch<ChatProvider>();
+    if (_resolvedWorkspaceRevision != provider.workspaceRevision) {
+      // Renaming, switching or deleting a workspace changes what this row
+      // must show, so re-resolve outside this build.
+      unawaited(_loadWorkspace(++_workspaceGeneration));
+    }
     final folder = widget.session.folder;
     final preview = widget.matchPreview ?? _preview;
     final isSearchMatch = widget.matchPreview != null;
@@ -1256,8 +1328,21 @@ class _SessionMetaState extends State<_SessionMeta> {
               _metaBadge(context, widget.timeLabel),
               if (folder != null && folder.isNotEmpty)
                 _metaBadge(context, folder, icon: Icons.folder_outlined),
+              if (_workspaceName != null && _workspaceName!.isNotEmpty)
+                _metaBadge(
+                  context,
+                  _workspaceName!,
+                  icon: Icons.workspaces_outline,
+                ),
               if (_model != null && _model!.isNotEmpty)
                 _metaBadge(context, _model!, icon: Icons.smart_toy_outlined),
+              if (_previewFailed)
+                _metaBadge(
+                  context,
+                  AppStrings.previewUnavailable,
+                  icon: Icons.error_outline,
+                  onTap: () => unawaited(_loadPreview(++_previewGeneration)),
+                ),
             ],
           ),
         ],
@@ -1265,9 +1350,14 @@ class _SessionMetaState extends State<_SessionMeta> {
     );
   }
 
-  Widget _metaBadge(BuildContext context, String label, {IconData? icon}) {
+  Widget _metaBadge(
+    BuildContext context,
+    String label, {
+    IconData? icon,
+    VoidCallback? onTap,
+  }) {
     final theme = Theme.of(context);
-    return Container(
+    final badge = Container(
       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerHighest.withAlpha(170),
@@ -1293,6 +1383,12 @@ class _SessionMetaState extends State<_SessionMeta> {
           ),
         ],
       ),
+    );
+    if (onTap == null) return badge;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(999),
+      child: badge,
     );
   }
 }

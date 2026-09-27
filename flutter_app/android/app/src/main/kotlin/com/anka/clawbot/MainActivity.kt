@@ -98,6 +98,8 @@ class MainActivity : FlutterActivity() {
     private var mediaPlaybackPath: String? = null
     private var mediaPlaybackOperationId: String? = null
     private var activityResumed = false
+    private val pendingPlatformCalls = PendingPlatformCallRegistry()
+    private val sharedIntentCacheLock = Any()
     private val pickedContentCacheDirName = "clawchat_picked_content"
     private val pickedContentMaxAgeMs = 24L * 60L * 60L * 1000L
 
@@ -232,6 +234,9 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // A fresh engine means a fresh MCP lifecycle: starts are acceptable
+        // again after a previous engine or service teardown.
+        McpStdioRegistry.openEpoch()
 
         val filesDir = applicationContext.filesDir.absolutePath
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
@@ -272,7 +277,10 @@ class MainActivity : FlutterActivity() {
             SHARE_CALLBACK_CHANNEL
         )
 
-        mainChannel.setMethodCallHandler { call, result ->
+        mainChannel.setMethodCallHandler { call, rawResult ->
+            // Every result is tracked so a torn-down activity/engine can fail
+            // it instead of leaving the Dart future pending forever.
+            val result = pendingPlatformCalls.track(rawResult)
             when (call.method) {
                 "getProotPath" -> result.success(processManager.getProotPath())
                 "getArch" -> result.success(ArchUtils.getArch())
@@ -913,6 +921,11 @@ class MainActivity : FlutterActivity() {
                 "isTerminalServiceRunning" -> result.success(TerminalSessionService.isRunning)
                 "startAgentService" -> {
                     try {
+                        // A run is being established: reopen the MCP register
+                        // gate before this run starts children. Dart issues this
+                        // call before the run's first MCP start, so the handler
+                        // order on this channel is the ordering guarantee.
+                        McpStdioRegistry.openEpoch()
                         AgentTaskService.start(
                             applicationContext,
                             call.argument<String>("sessionId") ?: "default",
@@ -1014,6 +1027,7 @@ class MainActivity : FlutterActivity() {
                     val approvalId = call.argument<String>("approvalId")
                     val toolName = call.argument<String>("toolName")
                     val risk = call.argument<String>("risk")
+                    val detail = call.argument<String>("detail")
                     if (sessionId.isNullOrBlank() || approvalId.isNullOrBlank() ||
                         toolName.isNullOrBlank() || risk.isNullOrBlank()) {
                         result.error("INVALID_ARGS", "approval metadata required", null)
@@ -1024,7 +1038,8 @@ class MainActivity : FlutterActivity() {
                             sessionTitle ?: "ClawChat",
                             approvalId,
                             toolName,
-                            risk
+                            risk,
+                            detail
                         )
                         result.success(shown)
                     }
@@ -1078,6 +1093,118 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     } catch (e: Exception) {
                         result.error("OVERLAY_ERROR", e.message, null)
+                    }
+                }
+                "startMcpStdioProcess" -> {
+                    val runId = call.argument<String>("runId")
+                    val serverId = call.argument<String>("serverId")
+                    val command = call.argument<String>("command")
+                    val args = (call.argument<List<*>>("args") ?: emptyList<Any>())
+                        .map { it.toString() }
+                    val environment =
+                        (call.argument<Map<*, *>>("environment") ?: emptyMap<Any, Any>())
+                            .entries
+                            .associate { it.key.toString() to it.value.toString() }
+                    val timeoutSeconds = call.argument<Int>("timeoutSeconds")?.toLong() ?: 30L
+                    if (runId.isNullOrBlank() || serverId.isNullOrBlank() || command.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "runId, serverId and command required", null)
+                    } else {
+                        val messenger = flutterEngine.dartExecutor.binaryMessenger
+                        Thread {
+                            val outcome = processManager.startMcpStdio(
+                                runId,
+                                serverId,
+                                command,
+                                args,
+                                environment,
+                                timeoutSeconds,
+                            ) { event ->
+                                runOnUiThread {
+                                    MethodChannel(messenger, AGENT_CALLBACK_CHANNEL)
+                                        .invokeMethod("onMcpStdioEvent", event)
+                                }
+                            }
+                            safeRunOnUiThread { result.success(outcome) }
+                        }.apply { isDaemon = true }.start()
+                    }
+                }
+                "writeMcpStdioLine" -> {
+                    val runId = call.argument<String>("runId")
+                    val serverId = call.argument<String>("serverId")
+                    val line = call.argument<String>("line")
+                    val sessionToken = call.argument<String>("sessionToken")
+                    if (runId.isNullOrBlank() || serverId.isNullOrBlank() || line == null) {
+                        result.error("INVALID_ARGS", "runId, serverId and line required", null)
+                    } else {
+                        Thread {
+                            val ok = processManager.writeMcpStdio(
+                                runId,
+                                serverId,
+                                line,
+                                sessionToken
+                            )
+                            if (!ok) {
+                                Log.w(
+                                    "ClawChat",
+                                    "MCP stdin frame was rejected or the write failed"
+                                )
+                            }
+                            safeRunOnUiThread { result.success(ok) }
+                        }.apply { isDaemon = true }.start()
+                    }
+                }
+                "closeMcpStdioStdin" -> {
+                    val runId = call.argument<String>("runId")
+                    val serverId = call.argument<String>("serverId")
+                    val sessionToken = call.argument<String>("sessionToken")
+                    if (runId.isNullOrBlank() || serverId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "runId and serverId required", null)
+                    } else {
+                        Thread {
+                            val ok = processManager.closeMcpStdin(
+                                runId,
+                                serverId,
+                                sessionToken
+                            )
+                            safeRunOnUiThread { result.success(ok) }
+                        }.apply { isDaemon = true }.start()
+                    }
+                }
+                "stopMcpServer" -> {
+                    val runId = call.argument<String>("runId")
+                    val serverId = call.argument<String>("serverId")
+                    val sessionToken = call.argument<String>("sessionToken")
+                    if (runId.isNullOrBlank() || serverId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "runId and serverId required", null)
+                    } else {
+                        Thread {
+                            // A stale token must not take down the child that
+                            // replaced the one it was started for.
+                            McpStdioRegistry.stopServerIfTokenMatches(
+                                runId,
+                                serverId,
+                                sessionToken,
+                            )
+                            safeRunOnUiThread { result.success(true) }
+                        }.apply { isDaemon = true }.start()
+                    }
+                }
+                "stopMcpRun" -> {
+                    val runId = call.argument<String>("runId")
+                    val sessionTokens = call.argument<List<*>>("sessionTokens")
+                        ?.mapNotNull { it?.toString() }
+                        ?.toSet()
+                    if (runId.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "runId required", null)
+                    } else {
+                        Thread {
+                            // Dart sends the starts it owns: a delayed stop from
+                            // an earlier child must not kill the child that
+                            // replaced it under the same key, and a stop with no
+                            // token list stays the run-wide sweep.
+                            McpStdioRegistry.stopRun(runId, null, sessionTokens)
+                            safeRunOnUiThread { result.success(true) }
+                        }.apply { isDaemon = true }.start()
                     }
                 }
                 "requestBatteryOptimization" -> {
@@ -1255,6 +1382,77 @@ class MainActivity : FlutterActivity() {
                         result.error("INVALID_ARGS", "path required", null)
                     }
                 }
+                "listRootfsDirectory" -> {
+                    val path = call.argument<String>("path")
+                    val allowedRoots = call.argument<List<String>>("allowedRoots") ?: listOf("/")
+                    val maxEntries = call.argument<Number>("maxEntries")?.toInt()
+                        ?: RootfsDirectoryLister.DEFAULT_MAX_ENTRIES
+                    if (path.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "path required", null)
+                    } else {
+                        Thread {
+                            try {
+                                val listing = bootstrapManager.listRootfsDirectory(
+                                    path,
+                                    allowedRoots,
+                                    maxEntries
+                                )
+                                safeRunOnUiThread { result.success(listing) }
+                            } catch (e: Exception) {
+                                safeRunOnUiThread {
+                                    result.error("ROOTFS_LIST_ERROR", e.message, null)
+                                }
+                            }
+                        }.apply { isDaemon = true }.start()
+                    }
+                }
+                "readRootfsFileBytes" -> {
+                    val path = call.argument<String>("path")
+                    val allowedRoots = call.argument<List<String>>("allowedRoots") ?: listOf("/")
+                    val requestedMax = call.argument<Number>("maxBytes")?.toLong()
+                    val maxBytes = (requestedMax ?: MAX_TOOL_RESULT_IMAGE_BYTES)
+                        .coerceAtMost(MAX_TOOL_RESULT_IMAGE_BYTES)
+                    if (path != null && maxBytes > 0L) {
+                        Thread {
+                            try {
+                                val bytes = bootstrapManager.readRootfsFileBytes(
+                                    path,
+                                    allowedRoots,
+                                    maxBytes
+                                ) { reason ->
+                                    // Classification only: which broker check
+                                    // refused the read. No file contents and no
+                                    // credentials are ever logged.
+                                    Log.w(
+                                        "ClawChatRootfsRead",
+                                        "read refused: $reason"
+                                    )
+                                }
+                                safeRunOnUiThread { result.success(bytes) }
+                            } catch (e: Exception) {
+                                safeRunOnUiThread { result.error("ROOTFS_READ_ERROR", e.message, null) }
+                            }
+                        }.start()
+                    } else {
+                        result.error("INVALID_ARGS", "path required", null)
+                    }
+                }
+                "deleteRootfsFile" -> {
+                    val path = call.argument<String>("path")
+                    val allowedRoots = call.argument<List<String>>("allowedRoots") ?: listOf("/")
+                    if (path != null) {
+                        Thread {
+                            try {
+                                val deleted = bootstrapManager.deleteRootfsFile(path, allowedRoots)
+                                safeRunOnUiThread { result.success(deleted) }
+                            } catch (e: Exception) {
+                                safeRunOnUiThread { result.error("ROOTFS_DELETE_ERROR", e.message, null) }
+                            }
+                        }.start()
+                    } else {
+                        result.error("INVALID_ARGS", "path required", null)
+                    }
+                }
                 "writeRootfsFile" -> {
                     val path = call.argument<String>("path")
                     val content = call.argument<String>("content")
@@ -1263,14 +1461,47 @@ class MainActivity : FlutterActivity() {
                     if (path != null && content != null) {
                         Thread {
                             try {
-                                bootstrapManager.writeRootfsFile(path, content, allowedRoots, createNew)
-                                safeRunOnUiThread { result.success(true) }
+                                // The broker's answer decides: with createNew a
+                                // name that already exists is a refusal, and the
+                                // caller retries with a fresh name instead of
+                                // silently overwriting an earlier share.
+                                val written = bootstrapManager.writeRootfsFile(
+                                    path,
+                                    content,
+                                    allowedRoots,
+                                    createNew
+                                )
+                                safeRunOnUiThread { result.success(written) }
                             } catch (e: Exception) {
                                 safeRunOnUiThread { result.error("ROOTFS_WRITE_ERROR", e.message, null) }
                             }
                         }.start()
                     } else {
                         result.error("INVALID_ARGS", "path and content required", null)
+                    }
+                }
+                "createRootfsDirectory" -> {
+                    val path = call.argument<String>("path")
+                    val allowedRoots = call.argument<List<String>>("allowedRoots") ?: listOf("/")
+                    if (path != null) {
+                        Thread {
+                            try {
+                                // Descriptor-relative mkdir-p inside the granted
+                                // scope: the broker refuses linked components, so
+                                // a swapped directory cannot redirect creation.
+                                val created = bootstrapManager.createRootfsDirectory(
+                                    path,
+                                    allowedRoots
+                                )
+                                safeRunOnUiThread { result.success(created) }
+                            } catch (e: Exception) {
+                                safeRunOnUiThread {
+                                    result.error("ROOTFS_MKDIR_ERROR", e.message, null)
+                                }
+                            }
+                        }.apply { isDaemon = true }.start()
+                    } else {
+                        result.error("INVALID_ARGS", "path required", null)
                     }
                 }
                 "writeRootfsBytes" -> {
@@ -1300,7 +1531,7 @@ class MainActivity : FlutterActivity() {
                         result.error("INVALID_ARGS", "action required", null)
                     } else if (action in setOf("callPhone", "sendSms") && !allowed) {
                         result.error("DISABLED", "Action $action is disabled by user setting", null)
-                    } else if (action in setOf("listCalendarEvents", "listContacts", "insertCalendarEvent", "sendSms")) {
+                    } else if (action in setOf("listCalendarEvents", "listContacts", "insertCalendarEvent", "sendSms", "listSms", "getSms")) {
                         // Content provider queries run off the main thread
                         Thread {
                             try {
@@ -1322,6 +1553,20 @@ class MainActivity : FlutterActivity() {
                     result.success(
                         ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
                     )
+                }
+                "openAppDetailsSettings" -> {
+                    // One-tap permission fix from a chat tool result. Never
+                    // throws: a missing handler just leaves the text path.
+                    try {
+                        val intent = Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:$packageName")
+                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(intent)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
                 }
                 "requestAudioPermission" -> {
                     try {
@@ -1694,6 +1939,16 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        // A result that can no longer reach Dart must be failed, not dropped,
+        // and no later call may wait on an engine that is already gone.
+        pendingPlatformCalls.close(
+            "PLATFORM_CALL_CANCELLED",
+            "Flutter engine was detached before the platform call completed",
+        )
+        // No Dart side is left to own an MCP child: stop what is running and
+        // refuse starts until a new engine opens the next epoch.
+        McpStdioRegistry.closeEpoch("engine_detached")
+        processManager.sweepStaleMcpLaunchScripts()
         detachAgentCallbackChannel(flutterEngine)
         super.cleanUpFlutterEngine(flutterEngine)
     }
@@ -1770,17 +2025,42 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun parseShareIntent(intent: Intent): Map<String, Any?> {
-        val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim().orEmpty()
-        val subject = intent.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()?.trim()
+        val rawText =
+            intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        val rawSubject =
+            intent.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()?.trim()
+        val textTruncation =
+            SharedIntentLimits.truncateUtf8(rawText, SharedIntentLimits.MAX_TEXT_BYTES)
+        val subjectTruncation = rawSubject?.let {
+            SharedIntentLimits.truncateUtf8(it, SharedIntentLimits.MAX_SUBJECT_BYTES)
+        }
+        val text = textTruncation.text
+        val subject = subjectTruncation?.text
         val images = mutableListOf<Map<String, Any?>>()
         val errors = mutableListOf<String>()
-        val seenUris = mutableSetOf<String>()
+        if (textTruncation.droppedBytes > 0) {
+            errors.add(
+                "Shared text was truncated to ${SharedIntentLimits.MAX_TEXT_BYTES} bytes"
+            )
+        }
+        if (subjectTruncation != null && subjectTruncation.droppedBytes > 0) {
+            errors.add(
+                "Shared subject was truncated to ${SharedIntentLimits.MAX_SUBJECT_BYTES} bytes"
+            )
+        }
         var imageCandidates = 0
         var skippedImageCount = 0
 
-        for (uri in sharedStreamUris(intent)) {
-            if (!seenUris.add(uri.toString())) continue
-            val mimeType = contentResolver.getType(uri) ?: intent.type.orEmpty()
+        val streamUris = sharedStreamUris(intent)
+        if (streamUris.droppedCount > 0) {
+            errors.add(
+                "Shared link limit is ${SharedIntentLimits.MAX_STREAM_URIS}; " +
+                    "skipped ${streamUris.droppedCount} extra item(s)"
+            )
+        }
+
+        for (uri in streamUris.items) {
+            val mimeType = sharedStreamMimeType(uri, intent.type.orEmpty())
             if (!mimeType.startsWith("image/")) {
                 errors.add("Unsupported shared file type: ${mimeType.ifBlank { "unknown" }}")
                 continue
@@ -1794,7 +2074,13 @@ class MainActivity : FlutterActivity() {
             try {
                 images.add(copySharedImageToCache(uri, imageIndex, mimeType))
             } catch (e: Exception) {
-                errors.add(e.message ?: "Unable to import shared image")
+                // Fail closed with an actionable reason: a file:// share has
+                // no read grant, and this app never reads an arbitrary path.
+                errors.add(
+                    SharedIntentLimits.unreadableSharedStreamMessage(
+                        fileScheme = uri.scheme == "file"
+                    )
+                )
             }
         }
         if (skippedImageCount > 0) {
@@ -1811,20 +2097,45 @@ class MainActivity : FlutterActivity() {
         )
     }
 
+    /**
+     * MIME type for one shared stream: the provider's answer first, then the
+     * type the sending app declared. A file:// URI has no ContentResolver type
+     * at all, so when the sender also omits Intent.type the file name is
+     * consulted; a name that is not a known image keeps the previous
+     * fail-closed unsupported-type behaviour.
+     */
+    private fun sharedStreamMimeType(uri: Uri, declaredType: String): String {
+        val providerType = contentResolver.getType(uri)
+        if (!providerType.isNullOrBlank()) return providerType
+        if (declaredType.isNotBlank()) return declaredType
+        if (uri.scheme == "file") {
+            SharedIntentLimits.imageMimeTypeForName(uri.lastPathSegment.orEmpty())
+                ?.let { return it }
+        }
+        return ""
+    }
+
     @Suppress("DEPRECATION")
-    private fun sharedStreamUris(intent: Intent): List<Uri> {
-        val uris = mutableListOf<Uri>()
+    private fun sharedStreamUris(intent: Intent): SharedIntentLimits.BoundedItems<Uri> {
         val single = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
-        if (single != null) uris.add(single)
         val multiple = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
-        if (multiple != null) uris.addAll(multiple)
         val clipData = intent.clipData
-        if (clipData != null) {
-            for (i in 0 until clipData.itemCount) {
-                clipData.getItemAt(i).uri?.let { uris.add(it) }
+        val candidates = sequence {
+            yield(single)
+            if (multiple != null) yieldAll(multiple)
+            if (clipData != null) {
+                for (i in 0 until clipData.itemCount) {
+                    yield(clipData.getItemAt(i).uri)
+                }
             }
         }
-        return uris
+        // Deduplicate before the cap: a sender that repeats one URI cannot
+        // exhaust the budget and starve a genuinely new attachment.
+        return SharedIntentLimits.collectDistinct(
+            limit = SharedIntentLimits.MAX_STREAM_URIS,
+            keyOf = { it.toString() },
+            values = candidates
+        )
     }
 
     private fun copySharedImageToCache(
@@ -1843,32 +2154,44 @@ class MainActivity : FlutterActivity() {
             ?: "shared-image-$index${extensionForMime(mimeType)}"
         val safeName = sanitizeSharedFileName(displayName)
         val dir = File(cacheDir, SHARED_INTENT_CACHE_DIR).apply { mkdirs() }
-        val dest = File(dir, "${System.currentTimeMillis()}-$index-$safeName")
-        var total = 0L
+        val finalName = "${System.currentTimeMillis()}-$index-" +
+            "${UUID.randomUUID().toString().take(8)}-$safeName"
 
-        val input = contentResolver.openInputStream(uri)
-            ?: throw IllegalArgumentException("Unable to open shared image")
-        input.use { source ->
-            dest.outputStream().use { target ->
-                val buffer = ByteArray(16 * 1024)
-                while (true) {
-                    val read = source.read(buffer)
-                    if (read < 0) break
-                    total += read.toLong()
-                    if (total > MAX_SHARED_IMAGE_BYTES) {
-                        target.close()
-                        dest.delete()
-                        throw IllegalArgumentException("Shared image is too large")
+        // Copy, quota check, eviction, and publish share one lock: two Intents
+        // arriving back to back must not both pass the budget check and write.
+        // The writer copies into a random temp file first, so a failed or
+        // interrupted provider read leaves neither a partial entry nor an
+        // already-evicted victim behind.
+        val published = synchronized(sharedIntentCacheLock) {
+            SharedIntentCacheWriter.store(
+                directory = dir,
+                finalName = finalName,
+                maxSingleFileBytes = MAX_SHARED_IMAGE_BYTES
+            ) { temp ->
+                val input = contentResolver.openInputStream(uri)
+                    ?: throw IllegalArgumentException("Unable to open shared image")
+                input.use { source ->
+                    temp.outputStream().use { target ->
+                        val buffer = ByteArray(16 * 1024)
+                        var total = 0L
+                        while (true) {
+                            val read = source.read(buffer)
+                            if (read < 0) break
+                            total += read.toLong()
+                            if (total > MAX_SHARED_IMAGE_BYTES) {
+                                throw IllegalArgumentException("Shared image is too large")
+                            }
+                            target.write(buffer, 0, read)
+                        }
                     }
-                    target.write(buffer, 0, read)
                 }
             }
         }
 
         return mapOf(
-            "path" to dest.absolutePath,
+            "path" to published.absolutePath,
             "name" to safeName,
-            "size" to total,
+            "size" to published.length(),
             "mimeType" to mimeType
         )
     }
@@ -2022,6 +2345,14 @@ class MainActivity : FlutterActivity() {
             .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                buildPublicNotification(
+                    this,
+                    CHANNEL_ID,
+                    NotificationPrivacy.toolAutoApproved()
+                )
+            )
             .build()
 
         val manager = getSystemService(NotificationManager::class.java)
@@ -2067,6 +2398,14 @@ class MainActivity : FlutterActivity() {
             .setAutoCancel(true)
             .setPriority(Notification.PRIORITY_HIGH)
             .setDefaults(Notification.DEFAULT_ALL)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                buildPublicNotification(
+                    this,
+                    AGENT_COMPLETE_CHANNEL_ID,
+                    NotificationPrivacy.completion()
+                )
+            )
             .build()
 
         val manager = getSystemService(NotificationManager::class.java)
@@ -2145,6 +2484,15 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        // No Dart caller is left waiting: every in-flight platform call fails
+        // with a definite cancellation error, and the registry latches so a
+        // straggler handler cannot start a new wait on a dead activity.
+        pendingPlatformCalls.close(
+            "ACTIVITY_DESTROYED",
+            "Activity was destroyed before the platform call completed",
+        )
+        McpStdioRegistry.closeEpoch("activity_destroyed")
+        processManager.sweepStaleMcpLaunchScripts()
         for (engine in agentCallbackOwners.keys.toList()) {
             detachAgentCallbackChannel(engine)
         }
@@ -2184,6 +2532,9 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         const val CHANNEL_ID = "clawchat_main"
+
+        /** Tool-result images above this size stay text. */
+        const val MAX_TOOL_RESULT_IMAGE_BYTES = 2L * 1024L * 1024L
         const val AGENT_CALLBACK_CHANNEL = "com.anka.clawbot/native/agent_callbacks"
         const val SHARE_CALLBACK_CHANNEL = "com.anka.clawbot/native/share_callbacks"
         const val AGENT_COMPLETE_CHANNEL_ID = "clawchat_agent_complete_v2"

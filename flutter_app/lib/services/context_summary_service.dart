@@ -17,6 +17,10 @@ class ContextSummaryRequest {
   final TokenEstimator estimator;
   final int? maxInputTokens;
 
+  /// Hard upper bound on model calls for this summary. Manual rebuilds pass 2;
+  /// other callers keep the single-call default.
+  final int maxModelCalls;
+
   const ContextSummaryRequest({
     required this.messages,
     required this.llmConfig,
@@ -27,7 +31,25 @@ class ContextSummaryRequest {
     required this.estimator,
     this.maxInputTokens,
     this.existingSummary,
+    this.maxModelCalls = 1,
   });
+}
+
+/// Thrown when a summary generation used its whole model-call budget without
+/// producing a usable summary text.
+class ContextSummaryModelCallLimitExceededException implements Exception {
+  final int modelCalls;
+  final int limit;
+
+  const ContextSummaryModelCallLimitExceededException({
+    required this.modelCalls,
+    required this.limit,
+  });
+
+  @override
+  String toString() =>
+      'Context summary produced no usable output after $modelCalls of $limit '
+      'allowed model calls.';
 }
 
 class ContextSummaryService {
@@ -59,34 +81,46 @@ class ContextSummaryService {
     final llm = _llmFactory(config);
     try {
       final prompt = _buildSummaryUserPromptWithinBudget(request);
-      final response = await llm.chat(
-        system: _summarySystemPrompt,
-        messages: [
-          {
-            'role': 'user',
-            'content': prompt,
-          },
-        ],
-        tools: const [],
-      );
-      final text = response.content
-          .where((block) => block.type == 'text')
-          .map((block) => block.text ?? '')
-          .join('\n')
-          .trim();
-      if (text.isEmpty) {
-        throw StateError('Context summary response was empty.');
+      // Bounded retry: a transient empty or unfittable response may be retried,
+      // but never past the request's hard model-call cap.
+      final maxModelCalls =
+          request.maxModelCalls < 1 ? 1 : request.maxModelCalls;
+      var modelCalls = 0;
+      while (true) {
+        modelCalls++;
+        final response = await llm.chat(
+          system: _summarySystemPrompt,
+          messages: [
+            {
+              'role': 'user',
+              'content': prompt,
+            },
+          ],
+          tools: const [],
+        );
+        final text = response.content
+            .where((block) => block.type == 'text')
+            .map((block) => block.text ?? '')
+            .join('\n')
+            .trim();
+        if (text.isNotEmpty) {
+          final sanitizedText = _sanitizeText(text);
+          final fittedText = _fitSummaryTextToBudget(
+            sanitizedText,
+            request.estimator,
+            request.summaryBudget,
+          );
+          if (fittedText != null) {
+            return _buildSummary(request, fittedText);
+          }
+        }
+        if (modelCalls >= maxModelCalls) {
+          throw ContextSummaryModelCallLimitExceededException(
+            modelCalls: modelCalls,
+            limit: maxModelCalls,
+          );
+        }
       }
-      final sanitizedText = _sanitizeText(text);
-      final fittedText = _fitSummaryTextToBudget(
-        sanitizedText,
-        request.estimator,
-        request.summaryBudget,
-      );
-      if (fittedText == null) {
-        return extractiveFallback(request);
-      }
-      return _buildSummary(request, fittedText);
     } finally {
       llm.dispose();
     }

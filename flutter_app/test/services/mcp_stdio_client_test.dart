@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:clawchat/models/mcp_server_config.dart';
 import 'package:clawchat/services/mcp_service.dart';
 import 'package:clawchat/services/mcp_stdio_client.dart';
+import 'package:clawchat/services/mcp_stdio_line_transformer.dart';
 import 'package:clawchat/services/preferences_service.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -123,6 +125,221 @@ void main() {
       expect(starts, 2);
       await client.dispose();
     });
+
+    test('rejects an oversized stdin frame before it reaches the child',
+        () async {
+      final process = _FakeMcpProcess();
+      final client = McpStdioClient(
+        config: const McpServerConfig(
+          id: 'server-1',
+          displayName: 'Fake',
+          enabled: true,
+          command: 'fake',
+        ),
+        processStarter: (_) async => process,
+        requestTimeout: const Duration(seconds: 1),
+      );
+
+      unawaited(_processRequest(process, 'initialize', const {}));
+      await client.connect();
+      final writesAfterConnect = process.writes.length;
+
+      await expectLater(
+        client.callTool('echo', {
+          'text': 'x' * (McpStdioLimits.maxStdinLineBytes + 1),
+        }),
+        throwsA(isA<McpStdinWriteException>()),
+      );
+      expect(process.writes, hasLength(writesAfterConnect));
+      await client.dispose();
+    });
+
+    test('an over-limit stdout line settles pending and stops the child',
+        () async {
+      final process = _FakeMcpProcess();
+      final client = McpStdioClient(
+        config: const McpServerConfig(
+          id: 'server-1',
+          displayName: 'Fake',
+          enabled: true,
+          command: 'fake',
+        ),
+        processStarter: (_) async => process,
+        requestTimeout: const Duration(seconds: 30),
+      );
+
+      final pendingConnect = client.connect();
+      await process.nextRequest('initialize');
+      final started = DateTime.now();
+      // What BoundedUtf8LineTransformer reports when a child never terminates a
+      // line: the client must stop the child now, not wait out the timeout.
+      process.stdoutError(
+        const McpLineTooLongException('stdout', McpStdioLimits.maxLineBytes),
+      );
+
+      await expectLater(pendingConnect, throwsA(isA<StateError>()));
+      expect(DateTime.now().difference(started).inSeconds, lessThan(5));
+      expect(process.killed, isTrue);
+      await client.dispose();
+    });
+
+    test('a stderr stream failure also stops the child', () async {
+      final process = _FakeMcpProcess();
+      final client = McpStdioClient(
+        config: const McpServerConfig(
+          id: 'server-1',
+          displayName: 'Fake',
+          enabled: true,
+          command: 'fake',
+        ),
+        processStarter: (_) async => process,
+        requestTimeout: const Duration(seconds: 30),
+      );
+
+      final pendingConnect = client.connect();
+      await process.nextRequest('initialize');
+      process.stderrError(
+        const McpLineTooLongException('stderr', McpStdioLimits.maxLineBytes),
+      );
+
+      await expectLater(pendingConnect, throwsA(isA<StateError>()));
+      expect(process.killed, isTrue);
+      await client.dispose();
+    });
+
+    test('concurrent requests never interleave their stdin frames', () async {
+      final process = _FakeMcpProcess()
+        ..writeDelay = const Duration(milliseconds: 10);
+      final client = McpStdioClient(
+        config: const McpServerConfig(
+          id: 'server-1',
+          displayName: 'Fake',
+          enabled: true,
+          command: 'fake',
+        ),
+        processStarter: (_) async => process,
+        requestTimeout: const Duration(milliseconds: 30),
+      );
+
+      unawaited(_processRequest(process, 'initialize', const {}));
+      await client.connect();
+      final results = await Future.wait<Object?>([
+        client.callTool('echo', {'a': 1}).then<Object?>(
+          (value) => value,
+          onError: (Object error) => error,
+        ),
+        client.callTool('echo', {'b': 2}).then<Object?>(
+          (value) => value,
+          onError: (Object error) => error,
+        ),
+      ]);
+
+      expect(results.whereType<Object>(), hasLength(2));
+      expect(process.maxConcurrentWrites, 1);
+      expect(
+        process.writes.map((line) => jsonDecode(line)['method']),
+        ['initialize', 'notifications/initialized', 'tools/call', 'tools/call'],
+      );
+      await client.dispose();
+    });
+
+    test('the stdin cap is the whole frame including its newline', () async {
+      final process = _FakeMcpProcess();
+      final client = McpStdioClient(
+        config: const McpServerConfig(
+          id: 'server-1',
+          displayName: 'Fake',
+          enabled: true,
+          command: 'fake',
+        ),
+        processStarter: (_) async => process,
+        requestTimeout: const Duration(milliseconds: 50),
+      );
+
+      unawaited(_processRequest(process, 'initialize', const {}));
+      await client.connect();
+      const cap = McpStdioLimits.maxStdinLineBytes;
+
+      // The fake never answers a tool call: what matters here is which frames
+      // reached it, so the answer (a timeout) is returned instead of thrown.
+      Future<Object?> send(String note) async {
+        try {
+          await client.callTool('echo', {'note': note});
+          return null;
+        } catch (error) {
+          return error;
+        }
+      }
+
+      expect(await send('x'), isA<TimeoutException>());
+      final base = utf8.encode(process.writes.last).length;
+      final padding = cap - 1 - base;
+      expect(padding, greaterThan(0));
+
+      // Payload + newline == cap: the largest frame that still fits.
+      expect(await send('x' * (padding + 1)), isA<TimeoutException>());
+      expect(utf8.encode(process.writes.last).length, cap - 1);
+      final writesAtCap = process.writes.length;
+
+      // One byte more is over the cap, not "exactly at" it.
+      expect(
+        await send('x' * (padding + 2)),
+        isA<McpStdinWriteException>(),
+      );
+      expect(process.writes, hasLength(writesAtCap));
+      await client.dispose();
+    });
+
+    test('a real desktop child with a long unterminated line is bounded',
+        () async {
+      if (Platform.isWindows) return;
+      final process = await Process.start('sh', [
+        '-c',
+        'head -c 2097152 /dev/zero | tr "\\0" a',
+      ]);
+      final dartProcess = DartMcpStdioProcess(process);
+      Object? failure;
+
+      try {
+        await dartProcess.stdoutLines.toList();
+      } catch (error) {
+        failure = error;
+      } finally {
+        process.kill();
+      }
+
+      expect(failure, isA<McpLineTooLongException>());
+    });
+
+    test('stdin write failure settles the pending request immediately',
+        () async {
+      final process = _FakeMcpProcess();
+      final client = McpStdioClient(
+        config: const McpServerConfig(
+          id: 'server-1',
+          displayName: 'Fake',
+          enabled: true,
+          command: 'fake',
+        ),
+        processStarter: (_) async => process,
+        requestTimeout: const Duration(seconds: 30),
+      );
+
+      unawaited(_processRequest(process, 'initialize', const {}));
+      await client.connect();
+      process.writeFailure = const McpStdinWriteException('child closed stdin');
+      final started = DateTime.now();
+
+      await expectLater(
+        client.callTool('echo', const {}),
+        throwsA(isA<McpStdinWriteException>()),
+      );
+      // The failure must settle the request instead of waiting for the 30s
+      // request timeout.
+      expect(DateTime.now().difference(started).inSeconds, lessThan(5));
+      expect(process.killed, isTrue);
+      await client.dispose();
+    });
   });
 
   group('McpService', () {
@@ -186,7 +403,8 @@ void main() {
         connectTimeout: const Duration(milliseconds: 50),
       );
 
-      final firstTools = await service.loadTools();
+      final runId = service.beginRun(sessionId: 's1');
+      final firstTools = await service.loadTools(runId: runId);
       expect(firstTools, isEmpty);
       expect(first.killed, isTrue);
 
@@ -200,7 +418,7 @@ void main() {
           },
         ],
       }));
-      final secondTools = await service.loadTools();
+      final secondTools = await service.loadTools(runId: runId);
 
       expect(starts, 2);
       expect(secondTools, hasLength(1));
@@ -268,6 +486,10 @@ class _FakeMcpProcess implements McpStdioProcess {
   final _writeController = StreamController<Map<String, dynamic>>.broadcast();
   var killed = false;
   var closeCount = 0;
+  Duration writeDelay = Duration.zero;
+  McpStdinWriteException? writeFailure;
+  int _activeWrites = 0;
+  int maxConcurrentWrites = 0;
 
   @override
   Stream<String> get stdoutLines => _stdout.stream;
@@ -279,9 +501,22 @@ class _FakeMcpProcess implements McpStdioProcess {
   Future<int> get exitCode => _exitCode.future;
 
   @override
-  void writeLine(String line) {
-    writes.add(line);
-    _writeController.add(jsonDecode(line) as Map<String, dynamic>);
+  Future<void> writeLine(String line) async {
+    _activeWrites++;
+    if (_activeWrites > maxConcurrentWrites) {
+      maxConcurrentWrites = _activeWrites;
+    }
+    try {
+      if (writeDelay > Duration.zero) {
+        await Future<void>.delayed(writeDelay);
+      }
+      final failure = writeFailure;
+      if (failure != null) throw failure;
+      writes.add(line);
+      _writeController.add(jsonDecode(line) as Map<String, dynamic>);
+    } finally {
+      _activeWrites--;
+    }
   }
 
   Future<Map<String, dynamic>> nextRequest(String method) {
@@ -293,6 +528,15 @@ class _FakeMcpProcess implements McpStdioProcess {
   void stdoutLine(String line) => _stdout.add(line);
 
   void stderrLine(String line) => _stderr.add(line);
+
+  /// Fails the stdout stream the way the bounded transformer does.
+  void stdoutError(Object error) {
+    _stdout.addError(error);
+  }
+
+  void stderrError(Object error) {
+    _stderr.addError(error);
+  }
 
   @override
   Future<void> closeStdin() async {

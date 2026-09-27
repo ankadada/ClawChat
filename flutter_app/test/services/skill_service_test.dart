@@ -268,6 +268,47 @@ void main() {
     expect(verified.capabilities.tools, isEmpty);
   });
 
+  test('a missing CLI skills directory does not hide installed skills',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    const root = '/root/workspace/skills/daily-work-summary';
+    const skillContent = '---\nname: daily-work-summary\n---\nbody';
+    final manifest = jsonEncode(_manifest(id: 'daily-work-summary'));
+
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+      if (call.method == 'runInProot') {
+        final command = args['command'] as String;
+        // Device behaviour: /root/workspace/.agents/skills does not exist yet,
+        // so a find over it exits non-zero and the wrapper reports the other
+        // directory's output as the failure. Only a command that neutralizes
+        // that status may succeed; everything else keeps the old failure.
+        if (command.contains("find '/root/workspace/.agents/skills'") &&
+            !command.trimRight().endsWith('; true')) {
+          throw PlatformException(
+            code: 'PROOT_ERROR',
+            message: 'Command failed (exit code 1): $root/SKILL.md',
+          );
+        }
+        return '$root/SKILL.md';
+      }
+      if (call.method == 'readRootfsFile' ||
+          call.method == 'readRootfsFileBounded') {
+        final path = args['path'] as String;
+        if (path.endsWith('/SKILL.md')) return _bridgeText(call, skillContent);
+        if (path.endsWith('/skill.json')) return _bridgeText(call, manifest);
+      }
+      return null;
+    });
+
+    final skills = await SkillService.scanSkills();
+
+    expect(skills, hasLength(1));
+    expect(skills.single.id, 'daily-work-summary');
+    expect(skills.single.valid, isTrue);
+    expect(skills.single.enabled, isFalse);
+  });
+
   test('installed entrypoint normalization accepts only the two skill roots',
       () {
     expect(
@@ -515,8 +556,7 @@ void main() {
     expect(bridgeCalls, 0);
   });
 
-  test(
-      'all-disabled preset installation performs no bridge or preference mutation',
+  test('already-installed presets are skipped without preference mutation',
       () async {
     const disabledBefore = '["unrelated"]';
     const grantsBefore = '{"unrelated":{"sentinel":true}}';
@@ -526,7 +566,13 @@ void main() {
     });
     var bridgeCalls = 0;
     messenger.setMockMethodCallHandler(channel, (call) async {
-      if (call.method == 'runInProot' || call.method == 'writeRootfsFile') {
+      if (call.method == 'runInProot') {
+        bridgeCalls += 1;
+        final command = (call.arguments as Map?)?['command'] as String? ?? '';
+        if (command.startsWith('test -f')) return 'EXISTS';
+        return '';
+      }
+      if (call.method == 'writeRootfsFile') {
         bridgeCalls += 1;
       }
       return null;
@@ -535,7 +581,7 @@ void main() {
     expect(await SkillService.installPresetSkills(), 0);
 
     final prefs = await SharedPreferences.getInstance();
-    expect(bridgeCalls, 0);
+    expect(bridgeCalls, BundledLegacySkillCatalog.entries.length);
     expect(prefs.getString('disabled_skills'), disabledBefore);
     expect(prefs.getString('skill_trust_grants_v1'), grantsBefore);
   });

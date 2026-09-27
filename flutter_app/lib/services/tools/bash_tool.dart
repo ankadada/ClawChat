@@ -8,6 +8,7 @@ import '../native_bridge.dart';
 import '../preferences_service.dart';
 import 'tool_result_formatter.dart';
 import 'tool_registry.dart';
+import 'untrusted_data_policy.dart';
 
 enum LarkCliCredentialScopeFailure {
   storeUnavailable,
@@ -177,6 +178,7 @@ class BashTool extends Tool {
     String? sessionId,
     required String operationId,
     required ToolCancellationSignal cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) async {
     final output = await _execute(
       input,

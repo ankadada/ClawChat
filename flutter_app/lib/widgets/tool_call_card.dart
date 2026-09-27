@@ -1,11 +1,20 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../app.dart';
 import '../models/chat_models.dart';
+import '../models/tool_command_lifecycle.dart';
+import '../providers/chat_provider.dart';
+import '../services/native_bridge.dart';
 import '../services/tool_call_expansion_state.dart';
+import '../services/tool_result_images.dart';
 import 'code_block.dart';
 import '../l10n/app_strings.dart';
+
+export '../services/tool_result_images.dart'
+    show ToolResultImage, ToolResultImageKind, extractToolResultImages;
 
 class ToolCallCard extends StatefulWidget {
   final ToolUseContent toolUse;
@@ -25,6 +34,25 @@ class ToolCallCard extends StatefulWidget {
 
 class _ToolCallCardState extends State<ToolCallCard> {
   bool get _expanded => ToolCallExpansionState.isExpanded(widget.toolUse.id);
+
+  /// True when this result is a denied runtime permission, so the card can
+  /// offer a one-tap path to the OS App details screen.
+  bool get _needsPermissionFix {
+    final output = widget.toolOutput;
+    if (output == null || output.isEmpty) return false;
+    try {
+      final decoded = jsonDecode(output);
+      return decoded is Map && decoded['error'] == 'permission_required';
+    } catch (_) {
+      return output.contains('"error":"permission_required"') ||
+          output.contains('"error": "permission_required"');
+    }
+  }
+
+  Future<void> _openAppPermissionSettings() async {
+    // Never throws: a missing handler leaves the text path in place.
+    await NativeBridge.openAppDetailsSettings();
+  }
 
   void _toggleExpanded() {
     setState(() {
@@ -78,6 +106,8 @@ class _ToolCallCardState extends State<ToolCallCard> {
         : isPending
             ? AppColors.statusAmber
             : AppColors.statusGreen;
+    final commandLifecycle =
+        widget.toolUse.name == bashToolName ? _commandLifecycle(context) : null;
 
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 4),
@@ -135,6 +165,17 @@ class _ToolCallCardState extends State<ToolCallCard> {
                                 overflow: TextOverflow.ellipsis,
                               ),
                             ),
+                            if (commandLifecycle != null) ...[
+                              const SizedBox(width: 6),
+                              _CommandLifecycleChip(
+                                lifecycle: commandLifecycle,
+                                toolUseId: widget.toolUse.id,
+                                color: _commandLifecycleColor(
+                                  commandLifecycle,
+                                  theme,
+                                ),
+                              ),
+                            ],
                             if (isExecuting)
                               const SizedBox(
                                 width: 14,
@@ -171,6 +212,18 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       ),
                     ),
                   ),
+                  if (_needsPermissionFix)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.tonalIcon(
+                          onPressed: _openAppPermissionSettings,
+                          icon: const Icon(Icons.settings_outlined, size: 18),
+                          label: const Text(AppStrings.openPermissionSettings),
+                        ),
+                      ),
+                    ),
                   AnimatedCrossFade(
                     duration: const Duration(milliseconds: 260),
                     firstCurve: Curves.easeOutCubic,
@@ -183,7 +236,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                       width: double.infinity,
                       height: 0,
                     ),
-                    secondChild: _buildExpandedContent(theme),
+                    secondChild: _buildExpandedContent(theme, commandLifecycle),
                   ),
                 ],
               ),
@@ -194,13 +247,72 @@ class _ToolCallCardState extends State<ToolCallCard> {
     );
   }
 
-  Widget _buildExpandedContent(ThemeData theme) {
+  /// Classify this bash attempt from the transcript and the live run state.
+  ///
+  /// The provider is optional: outside a chat shell the card falls back to
+  /// `started`/`completed`/`cancelled` without a live run signal.
+  ToolCommandLifecycle _commandLifecycle(BuildContext context) {
+    final signals =
+        context.select<ChatProvider?, ({bool running, bool interrupted})>(
+      (provider) {
+        if (provider == null) {
+          return (running: false, interrupted: false);
+        }
+        final marker = provider.currentInterruptedAgentRun;
+        final interrupted = marker != null &&
+            marker.toolAttempts.any(
+              (attempt) =>
+                  attempt.toolName == bashToolName &&
+                  attempt.lifecycle == ToolAttemptLifecycle.interruptedUnknown,
+            );
+        return (
+          running: provider.agentStatus == AgentStatus.tooling,
+          interrupted: interrupted,
+        );
+      },
+    );
+    return classifyBashToolAttempt(
+      hasResult: widget.toolOutput != null,
+      runningNow: signals.running,
+      interruptedUnknown: signals.interrupted,
+      resultOutput: widget.toolOutput,
+    );
+  }
+
+  Color _commandLifecycleColor(
+    ToolCommandLifecycle lifecycle,
+    ThemeData theme,
+  ) =>
+      switch (lifecycle) {
+        ToolCommandLifecycle.running ||
+        ToolCommandLifecycle.started =>
+          AppColors.statusAmber,
+        ToolCommandLifecycle.completed => AppColors.statusGreen,
+        ToolCommandLifecycle.cancelled => theme.colorScheme.onSurfaceVariant,
+        ToolCommandLifecycle.interruptedUnknown => theme.colorScheme.error,
+      };
+
+  Widget _buildExpandedContent(
+    ThemeData theme,
+    ToolCommandLifecycle? commandLifecycle,
+  ) {
     final output = widget.toolOutput;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Divider(height: 1),
+        if (commandLifecycle != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Text(
+              commandLifecycle.detail,
+              key: ValueKey('tool-lifecycle-detail-${widget.toolUse.id}'),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
         Padding(
           padding: const EdgeInsets.all(12),
           child: Column(
@@ -230,6 +342,7 @@ class _ToolCallCardState extends State<ToolCallCard> {
                   language: 'text',
                   maxLines: 20,
                 ),
+                ..._buildResultImages(theme, output),
                 if (widget.toolUse.name == 'web_search' &&
                     output.trim().isNotEmpty) ...[
                   _buildSearchSources(theme, output),
@@ -240,6 +353,29 @@ class _ToolCallCardState extends State<ToolCallCard> {
         ),
       ],
     );
+  }
+
+  /// Tool result images: a data URL or an image path in the result is rendered
+  /// in the card instead of staying a raw string.
+  List<Widget> _buildResultImages(ThemeData theme, String output) {
+    final images = extractToolResultImages(output);
+    if (images.isEmpty) return const [];
+    return [
+      const SizedBox(height: 12),
+      Text(
+        AppStrings.resultImages,
+        style: theme.textTheme.labelSmall?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      const SizedBox(height: 6),
+      for (final image in images)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: _ToolResultImage(theme: theme, image: image),
+        ),
+    ];
   }
 
   Widget _buildSearchSources(ThemeData theme, String output) {
@@ -349,6 +485,127 @@ class SearchSource {
     required this.uri,
     required this.label,
   });
+}
+
+class _ToolResultImage extends StatelessWidget {
+  final ThemeData theme;
+  final ToolResultImage image;
+
+  const _ToolResultImage({required this.theme, required this.image});
+
+  @override
+  Widget build(BuildContext context) {
+    switch (image.kind) {
+      case ToolResultImageKind.data:
+        final bytes = _decodeDataUrl(image.value);
+        if (bytes == null) return const SizedBox.shrink();
+        return _frame(
+          Image.memory(
+            bytes,
+            fit: BoxFit.contain,
+            gaplessPlayback: true,
+            errorBuilder: (_, __, ___) => _unavailable(),
+          ),
+        );
+      case ToolResultImageKind.network:
+        return _frame(
+          Image.network(
+            image.value,
+            fit: BoxFit.contain,
+            errorBuilder: (_, __, ___) => _unavailable(),
+          ),
+        );
+      case ToolResultImageKind.path:
+        return FutureBuilder<Uint8List?>(
+          future: ToolResultImageResolver.readWorkspaceBytes(image.value),
+          builder: (context, snapshot) {
+            final bytes = snapshot.data;
+            final mediaType =
+                bytes == null ? null : ToolResultImageResolver.detectMediaType(bytes);
+            if (bytes != null && mediaType != null) {
+              return _frame(
+                Image.memory(
+                  bytes,
+                  fit: BoxFit.contain,
+                  gaplessPlayback: true,
+                  errorBuilder: (_, __, ___) => _unavailable(),
+                ),
+              );
+            }
+            return _label(image.value);
+          },
+        );
+    }
+  }
+
+  Widget _label(String value) => Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            Icons.image_outlined,
+            size: 16,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              value,
+              style: theme.textTheme.bodySmall?.copyWith(
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+        ],
+      );
+
+  Widget _frame(Widget child) => ClipRRect(
+        borderRadius: BorderRadius.circular(AppRadii.s),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 240, maxWidth: 320),
+          child: child,
+        ),
+      );
+
+  Widget _unavailable() => Text(
+        AppStrings.resultImageUnavailable,
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      );
+
+  Uint8List? _decodeDataUrl(String dataUrl) {
+    final comma = dataUrl.indexOf(',');
+    if (comma < 0 || comma == dataUrl.length - 1) return null;
+    try {
+      return base64Decode(dataUrl.substring(comma + 1));
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+class _CommandLifecycleChip extends StatelessWidget {
+  const _CommandLifecycleChip({
+    required this.lifecycle,
+    required this.toolUseId,
+    required this.color,
+  });
+
+  final ToolCommandLifecycle lifecycle;
+  final String toolUseId;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      lifecycle.label,
+      key: ValueKey('tool-lifecycle-$toolUseId'),
+      style: Theme.of(context).textTheme.labelSmall?.copyWith(
+            color: color,
+            fontWeight: FontWeight.w600,
+          ),
+    );
+  }
 }
 
 class _PulsingToolBorder extends StatefulWidget {

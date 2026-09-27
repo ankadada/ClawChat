@@ -220,6 +220,28 @@ bool is_safe_component(const std::string& value, size_t max_bytes = 255U) {
     return true;
 }
 
+// Rootfs names are created by the guest (the model, a shell command, an image
+// tool), so any UTF-8 name must stay readable. A component is still rejected
+// when it is not exactly one path segment: empty, ".", "..", longer than
+// NAME_MAX bytes, or containing a separator.
+bool is_safe_rootfs_component(const std::string& value) {
+    if (value.empty() || value.size() > 255U || value == "." || value == "..") {
+        return false;
+    }
+    for (const unsigned char c : value) {
+        if (c == 0U || c == '/') return false;
+    }
+    return true;
+}
+
+using ComponentValidator = bool (*)(const std::string&);
+
+// `is_safe_component` has a default argument, so it cannot decay to a plain
+// function pointer; this wrapper has the single-parameter signature.
+bool validate_generated_component(const std::string& value) {
+    return is_safe_component(value);
+}
+
 bool cancelled(const std::string& operation_id) {
     std::lock_guard<std::mutex> lock(g_cancel_mutex);
     return g_cancelled.find(operation_id) != g_cancelled.end();
@@ -335,7 +357,8 @@ void verify_held_directory(
 
 std::optional<RelativeFile> open_relative_regular(
     int root_fd,
-    const std::string& relative_path
+    const std::string& relative_path,
+    ComponentValidator validate = validate_generated_component
 ) {
     if (relative_path.empty() || relative_path.size() > 1024U ||
         relative_path.front() == '/') {
@@ -350,7 +373,7 @@ std::optional<RelativeFile> open_relative_regular(
         const std::string component = final
             ? relative_path.substr(offset)
             : relative_path.substr(offset, slash - offset);
-        if (!is_safe_component(component)) {
+        if (!validate(component)) {
             throw std::runtime_error("unsafe relative component");
         }
         if (!final) {
@@ -390,7 +413,9 @@ std::optional<RelativeFile> open_relative_regular(
         result.file.reset(openat(
             result.parent.get(),
             result.name.c_str(),
-            O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+            // O_NONBLOCK keeps a swapped-in FIFO or device node from blocking
+            // the open; the fstat snapshot below then rejects it as non-regular.
+            O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
         ));
         if (!result.file.valid() ||
             fstat(result.file.get(), &result.descriptor_before) != 0 ||
@@ -1763,8 +1788,102 @@ Java_com_anka_clawbot_SecureImportNative_readFileBounded(
         return output;
     } catch (const std::bad_alloc&) {
         throw_java(env, "java/lang/OutOfMemoryError", "bounded read allocation failed");
-    } catch (const std::exception&) {
-        throw_java(env, "java/lang/SecurityException", "bounded read failed");
+    } catch (const std::exception& error) {
+        // The classification matters on a device: it is the only safe signal
+        // about which check refused the read (no path contents, no secrets).
+        const std::string reason = std::string("bounded read rejected: ") +
+            error.what();
+        throw_java(env, "java/lang/SecurityException", reason.c_str());
+    }
+    return nullptr;
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_anka_clawbot_SecureImportNative_readRootfsBytesBounded(
+    JNIEnv* env,
+    jobject,
+    jstring root_path_value,
+    jstring relative_path_value,
+    jstring operation_id_value,
+    jlong max_bytes_value
+) {
+    try {
+        const std::string root_path = Utf8Chars(env, root_path_value).str();
+        const std::string relative_path = Utf8Chars(env, relative_path_value).str();
+        const std::string operation_id = Utf8Chars(env, operation_id_value).str();
+        if (!is_hex_operation(operation_id) || max_bytes_value <= 0 ||
+            max_bytes_value > 2LL * 1024LL * 1024LL) {
+            throw std::invalid_argument("invalid bounded read arguments");
+        }
+        [[maybe_unused]] OperationLease operation(operation_id);
+        require_not_cancelled(operation_id);
+        struct stat root_initial {};
+        ScopedFd root = open_verified_directory(root_path, &root_initial);
+        // Descriptor-relative walk: every intermediate component is opened with
+        // O_DIRECTORY | O_NOFOLLOW relative to its parent, so a swapped parent
+        // symlink can never redirect the read. The final open uses O_NOFOLLOW
+        // and is re-verified against the descriptor snapshot.
+        auto source_value = open_relative_regular(
+            root.get(),
+            relative_path,
+            is_safe_rootfs_component
+        );
+        if (!source_value.has_value()) return nullptr;
+        RelativeFile source = std::move(source_value.value());
+        if (source.descriptor_before.st_size < 0 ||
+            source.descriptor_before.st_size > max_bytes_value) {
+            throw std::runtime_error("bounded read size rejected before allocation");
+        }
+        std::vector<uint8_t> bytes;
+        bytes.reserve(static_cast<size_t>(source.descriptor_before.st_size));
+        std::array<uint8_t, kChunkSize> buffer {};
+        while (true) {
+            require_not_cancelled(operation_id);
+            const ssize_t count = read(source.file.get(), buffer.data(), buffer.size());
+            if (count < 0) throw std::runtime_error("bounded read failed");
+            if (count == 0) break;
+            if (bytes.size() + static_cast<size_t>(count) >
+                static_cast<size_t>(max_bytes_value)) {
+                throw std::runtime_error("bounded read actual size exceeded");
+            }
+            bytes.insert(bytes.end(), buffer.begin(), buffer.begin() + count);
+        }
+        struct stat descriptor_after {};
+        struct stat path_after {};
+        struct stat parent_after {};
+        if (fstat(source.file.get(), &descriptor_after) != 0 ||
+            fstatat(
+                source.parent.get(),
+                source.name.c_str(),
+                &path_after,
+                AT_SYMLINK_NOFOLLOW
+            ) != 0 || fstat(source.parent.get(), &parent_after) != 0 ||
+            !same_directory_identity(source.parent_before, parent_after) ||
+            !same_full_snapshot(source.descriptor_before, descriptor_after) ||
+            !same_full_snapshot(descriptor_after, path_after) ||
+            bytes.size() != static_cast<size_t>(source.descriptor_before.st_size)) {
+            throw std::runtime_error("bounded read changed during operation");
+        }
+        verify_held_directory(root.get(), root_path, root_initial);
+        jbyteArray output = env->NewByteArray(static_cast<jsize>(bytes.size()));
+        if (output == nullptr) throw std::bad_alloc();
+        if (!bytes.empty()) {
+            env->SetByteArrayRegion(
+                output,
+                0,
+                static_cast<jsize>(bytes.size()),
+                reinterpret_cast<const jbyte*>(bytes.data())
+            );
+        }
+        return output;
+    } catch (const std::bad_alloc&) {
+        throw_java(env, "java/lang/OutOfMemoryError", "bounded read allocation failed");
+    } catch (const std::exception& error) {
+        // The classification matters on a device: it is the only safe signal
+        // about which check refused the read (no path contents, no secrets).
+        const std::string reason = std::string("bounded read rejected: ") +
+            error.what();
+        throw_java(env, "java/lang/SecurityException", reason.c_str());
     }
     return nullptr;
 }

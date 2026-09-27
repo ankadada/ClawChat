@@ -2,6 +2,9 @@ import 'dart:convert';
 
 import '../memory_service.dart';
 import 'tool_registry.dart';
+import '../../models/chat_models.dart';
+import 'untrusted_data_policy.dart';
+import 'tool_result_formatter.dart';
 
 class MemoryGetTool extends Tool {
   @override
@@ -27,11 +30,44 @@ class MemoryGetTool extends Tool {
     Map<String, dynamic> input, {
     String? sessionId,
   }) async {
+    await MemoryService.ensureSessionModesLoaded();
     if (!MemoryService.isEnabledForSessionSync(sessionId)) {
       return jsonEncode({'ok': false, 'error': 'memory_disabled'});
     }
     final memories = await MemoryService.getMemories();
-    return jsonEncode({'ok': true, 'memories': memories});
+    final untrusted =
+        await MemoryService.untrustedMemoriesForSession(sessionId);
+    return jsonEncode({
+      'ok': true,
+      'memories': memories,
+      // Facts written from untrusted tool data stay untrusted; the agent loop
+      // re-seeds the run taint set from these instead of laundering them.
+      if (untrusted.isNotEmpty)
+        'untrustedMemories': [
+          for (final entry in untrusted) entry['text'],
+        ],
+    });
+  }
+
+  @override
+  Future<ToolResultPayload> executeResult(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    RunTaintSet? runTaintSet,
+  }) async {
+    final payload = await super.executeResult(
+      input,
+      sessionId: sessionId,
+      runTaintSet: runTaintSet,
+    );
+    final untrusted =
+        await MemoryService.untrustedMemoriesForSession(sessionId);
+    if (untrusted.isEmpty) return payload;
+    return payload.copyWith(metadata: {
+      ...payload.metadata,
+      'toolName': name,
+      'untrustedValues': untrusted,
+    });
   }
 }
 
@@ -103,10 +139,36 @@ class MemoryWriteTool extends Tool {
   }
 
   @override
+  Future<ToolResultPayload> executeResult(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    RunTaintSet? runTaintSet,
+  }) async {
+    final output = await _write(
+      input,
+      sessionId: sessionId,
+      runTaintSet: runTaintSet,
+    );
+    return ToolResultFormatter.format(
+      toolName: name,
+      input: input,
+      output: output,
+    );
+  }
+
+  @override
   Future<String> executeWithContext(
     Map<String, dynamic> input, {
     String? sessionId,
+  }) =>
+      _write(input, sessionId: sessionId, runTaintSet: null);
+
+  Future<String> _write(
+    Map<String, dynamic> input, {
+    String? sessionId,
+    RunTaintSet? runTaintSet,
   }) async {
+    await MemoryService.ensureSessionModesLoaded();
     if (!MemoryService.isEnabledForSessionSync(sessionId)) {
       await MemoryService.auditMemoryToolRejected(
         name,
@@ -121,6 +183,8 @@ class MemoryWriteTool extends Tool {
       fact,
       source: 'agent_tool',
       sessionId: sessionId,
+      // The calling run's taint set decides whether this fact stays untrusted.
+      runTaintSet: runTaintSet,
     );
     return jsonEncode({
       // A duplicate means this exact local memory is already durable; it is a
@@ -167,6 +231,7 @@ class MemoryDeleteTool extends Tool {
     Map<String, dynamic> input, {
     String? sessionId,
   }) async {
+    await MemoryService.ensureSessionModesLoaded();
     if (!MemoryService.isEnabledForSessionSync(sessionId)) {
       await MemoryService.auditMemoryToolRejected(
         name,

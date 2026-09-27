@@ -8,7 +8,7 @@
   <img src="assets/ic_launcher.png" alt="ClawChat" width="128"/>
 </p>
 
-> **ClawChat** — Android 上的 AI Agent 聊天应用。内置 Alpine Linux 环境，支持工具调用、技能扩展、多模型切换。
+> **ClawChat** — Android 上的口袋个人 Agent：内置 Alpine Linux 工作区，可通过 Android API 读取日历 / 短信 / 联系人、执行闹钟与分享等手机动作，支持工具调用、技能扩展、多模型切换。
 
 ---
 
@@ -23,13 +23,21 @@
 - **消息操作** — 长按 / ⋯ 按钮支持复制、复制 Markdown、分享、分支、引用；菜单支持重新生成、多模型对比、切换模型、系统提示词
 
 ### 工具调用
-- **Bash** — 在 Alpine Linux 环境中执行命令，默认工作目录为 `/root/workspace`，但命令可访问整个 Alpine rootfs
-- **Read File** — 读取工作区文件
-- **Write File** — 写入工作区文件
-- **Web Fetch** — 抓取网页内容（SSRF 防护）
+- **Bash** — 在 Alpine Linux 环境中执行命令，默认工作目录为 `/root/workspace`
+- **Read / Write File** — 读写工作区文件
+- **Web Fetch / Web Search** — 抓取网页与网页搜索（SSRF 防护）
+- **手机数据（phone_read）** — 读取日历、短信与联系人。首次使用对应数据时请求系统权限；返回受时间窗口和条数上限约束，日历描述中的链接、邮箱与 `tel:` 会被脱敏；短信不常驻后台监听
+- **手机动作（phone_act）** — 闹钟、打开网页、分享、导航、拨号面板、写邮件、相机、日历界面；直接写入日历仍需确认
+- **外发（phone_send，默认关闭）** — 打电话与发短信需在“手机数据与动作 → 外发”中单独开启；读取权限永不隐含发送权限
+- **不可信数据防护** — 来自短信 / 日历 / 联系人 / 网页的内容被标记为不可信，不能单独驱动外发、跳转其他应用或把数据发到网络
 
-### 技能系统
-- **9 个预设技能** — GitHub、Google Calendar/Gmail/Drive、代码审查、翻译、网页搜索、文件管理、系统信息
+### 本地自动化
+- **计划执行** — 为已批准的本地任务排下次执行时间（一次性或 15–1440 分钟间隔），支持暂停 / 继续 / 删除与执行历史、失败重试信息。计划只记录时间和任务引用，到期后仍需在任务中心手动确认才会执行，不会自动发送或调用模型。入口：任务中心右上角或 设置 → 数据管理 → 计划执行
+- **记忆可见性** — 记忆管理逐条显示来源与信任状态（用户确认 / 来自 web、phone、mcp），可单条删除；聊天命令面板的“本轮记忆”显示最近一次回复实际注入的记忆快照；每个会话可单独开关记忆（与全局一致时回退为“跟随全局”），会话覆盖保存在加密应用私有存储、损坏时按关闭处理。不可信来源与 taint 规则不变，信任记录不可读时整体 fail-closed
+- **工作流模板** — 内置 2 个本地模板（每日工作总结、日程提醒草稿），安装前预览所需权限、是否联网、会接触的隐私数据，以及安装会写入的 capability 清单；安装写入 `workspace/skills/<id>/SKILL.md` + 受控 `skill.json`（带 sha256 自校验），安装后默认禁用，启用必须走既有技能同意（无 grant 时拒绝启用），并可按包回滚；运行期由既有能力策略执行（未声明的工具被拒绝，文件权限仍是显式拒绝）。模板正文在应用内编译，不含远程地址或下载
+
+### 技能与扩展
+- **可选技能包** — 内置 Google Calendar / Gmail / Drive、网页搜索、文件管理、机器健康等预设，默认不启用，需要通过旧版技能授权后再开启。Google 相关包调用 Google API，需要你自备 `GOOGLE_ACCESS_TOKEN`，应用内不做 OAuth，也不是读取手机日历/邮箱的路径（问手机日历用 `phone_read`）。GitHub、翻译、代码审查已移出应用包，放在 `docs/skill-examples/` 作为示例。
 - **技能导入** — 支持 URL（Git 仓库）和本地文件（tar.gz/zip）导入
 - **环境变量** — 为技能配置 API Key 等敏感信息
 
@@ -153,6 +161,7 @@ in the [release signing contract](RELEASE_SIGNING.md).
 
 - [Architecture](ARCHITECTURE.md)
 - [Design and interaction contract](DESIGN.md)
+- [Local automation, memory visibility, workflow templates](docs/local-automation.md)
 - [OpenClaw to ClawChat migration archive](docs/migrations/openclaw-to-clawchat.md)
 
 ---
@@ -163,7 +172,7 @@ in the [release signing contract](RELEASE_SIGNING.md).
 - Shell 命令默认从 `/root/workspace` 执行，并带有敏感文件保护
 - TLS 证书校验 + API Host 白名单
 - 输出自动脱敏（API Key、密码模式）
-- SharedPreferences 已从 Android 备份中排除
+- Android 系统备份（cloud backup / 设备迁移）：只包含聊天记录（`app_flutter/clawchat_sessions`）与白名单化的非敏感设置快照（`app_flutter/clawchat_settings_backup.json`）。快照含非秘密的供应商 profile 身份元数据（id / 名称 / 模型 / 采样参数，不含 API Key 与 baseUrl），以便恢复后模型组与当前选择仍可解析；恢复在首次启动时等待全部写入完成后才记录 fresh 标记。`FlutterSharedPreferences.xml` 一律排除，避免升级前遗留的明文 `api_key` / `env_vars` 进入备份；API Key、环境变量、供应商档案、MCP 配置等凭据存放在加密的 FlutterSecureStorage 中，同样不会被备份或恢复
 
 ---
 

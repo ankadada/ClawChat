@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'app.dart' show ClawChatApp, initThemeFromPreferences;
 import 'l10n/app_strings.dart';
 import 'services/app_http.dart';
+import 'services/settings_backup_mirror.dart';
 import 'services/update_service.dart';
 
 void main() {
@@ -43,6 +44,16 @@ void main() {
       await UpdateService().reconcileAtStartup();
     } catch (_) {
       // Durable evidence is retained for the next idempotent reconciliation.
+    }
+    try {
+      // Restore the allowlisted non-secret settings snapshot before the theme
+      // and font notifiers read preferences, then refresh it for the next
+      // Android backup run.
+      final settingsMirror = SettingsBackupMirror();
+      await settingsMirror.restoreIfFresh();
+      await settingsMirror.save();
+    } catch (_) {
+      // A missing or unreadable mirror must never block startup.
     }
     await initThemeFromPreferences();
     runApp(ClawChatApp(

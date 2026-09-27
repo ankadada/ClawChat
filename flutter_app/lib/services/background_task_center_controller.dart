@@ -9,6 +9,30 @@ import 'background_task_foreground_lease.dart';
 import 'background_task_policy_adapter.dart';
 import 'background_task_store.dart';
 import 'preferences_service.dart';
+import 'session_storage.dart';
+import 'tools/untrusted_data_policy.dart';
+
+/// The dedicated pseudo-session every background task is created under.
+///
+/// It never holds chat tool results, so the untrusted-transcript scan must
+/// skip it and read the real chat sessions.
+const String backgroundTaskCenterSessionId = 'background_task_center';
+
+/// Collects untrusted tool-result entries from every stored chat session.
+BackgroundUntrustedTranscriptLoader buildBackgroundUntrustedTranscriptLoader(
+  SessionStorage storage,
+) =>
+    () async {
+      final sessions = await storage.getAllSessions();
+      final entries = <UntrustedTranscriptEntry>[];
+      for (final session in sessions) {
+        if (session.id == backgroundTaskCenterSessionId) continue;
+        entries.addAll(
+          UntrustedDataPolicy.untrustedEntriesFromMessages(session.messages),
+        );
+      }
+      return entries;
+    };
 
 final class PreferencesBackgroundTaskPolicySettings
     implements BackgroundTaskPolicySettings {
@@ -37,7 +61,7 @@ final class BackgroundTaskCenterController extends ChangeNotifier
   BackgroundTaskCenterController({
     required BackgroundTaskCoordinator coordinator,
     required BackgroundTaskProductionDefinitions definitions,
-    this.defaultSessionId = 'background_task_center',
+    this.defaultSessionId = backgroundTaskCenterSessionId,
     bool initializeOnCreate = true,
   })  : _coordinator = coordinator,
         _definitions = definitions {
@@ -46,9 +70,11 @@ final class BackgroundTaskCenterController extends ChangeNotifier
 
   factory BackgroundTaskCenterController.createForApp({
     PreferencesService? preferences,
+    SessionStorage? sessionStorage,
   }) {
     final definitions = BackgroundTaskProductionDefinitions();
     late final BackgroundTaskCenterController controller;
+    final storage = sessionStorage ?? SessionStorage();
     final policy = SharedBackgroundTaskPolicyAdapter(
       bindings: definitions,
       settings: PreferencesBackgroundTaskPolicySettings(
@@ -57,6 +83,10 @@ final class BackgroundTaskCenterController extends ChangeNotifier
       approvals: _DeferredBackgroundTaskApprovalGateway(
         () => controller,
       ),
+      // A background share must not send a value that arrived from untrusted
+      // tool output in any stored chat transcript.
+      untrustedTranscriptLoader:
+          buildBackgroundUntrustedTranscriptLoader(storage),
     );
     final coordinator = BackgroundTaskCoordinator(
       store: SecureBackgroundTaskStore(),

@@ -112,7 +112,8 @@ void main() {
     final verifierSettings =
         File('android/verified-apk-jvm/settings.gradle').readAsStringSync();
 
-    expect(app, contains('ndkVersion = flutter.ndkVersion'));
+    expect(app, contains('ndkVersion = "27.0.12077973"'));
+    expect(app, isNot(contains('ndkVersion = flutter.ndkVersion')));
     expect(app, contains('externalNativeBuild'));
     expect(app, isNot(contains('unitTestOnly')));
     expect(app, isNot(contains('gradle.startParameter.taskNames')));

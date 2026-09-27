@@ -1,14 +1,15 @@
 ---
 name: gws-drive
-description: Google Drive — 查看文件、搜索文件、管理云端硬盘
+description: Google Drive API 预设（自带 token）— 调用 Google API，无应用内 OAuth，需自备 GOOGLE_ACCESS_TOKEN
 tools: [bash]
 ---
 
 ## Use This Skill When
-用户提到 Google Drive、云端硬盘、网盘文件、Google Docs/Sheets
+用户提到 Google Drive、Google 云端硬盘、Google Docs/Sheets
 
 ## Prerequisites
-需要在环境变量中配置 `GOOGLE_ACCESS_TOKEN`（需要 Drive API scope）。
+这是自带 token 的 power-user 预设，调用的是 **Google Drive API**，不是 Android 手机文件、也不读本地存储。
+应用不提供内置 OAuth：用户需要在环境变量中配置自己的 `GOOGLE_ACCESS_TOKEN`（需要 Drive API scope），技能才能工作。未配置 token 时停下来提示用户。
 
 ## Execution Workflow
 
@@ -54,6 +55,8 @@ curl -s "https://www.googleapis.com/drive/v3/files/FILE_ID?fields=id,name,mimeTy
 ```
 
 ## Hard Rules
+- 这是 Google API 技能，不是手机文件系统：不要声称能读手机里的文件
+- 无应用内 OAuth，token 只能由用户自己提供
 - 删除文件操作需要二次确认
 - 展示文件大小时使用人类可读格式
 - 提供 webViewLink 方便用户在浏览器中打开

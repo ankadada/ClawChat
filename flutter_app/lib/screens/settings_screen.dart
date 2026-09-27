@@ -10,18 +10,22 @@ import 'package:url_launcher/url_launcher.dart';
 import '../app.dart' show AppColors, AppRadii, fontScaleNotifier, themeNotifier;
 import '../constants.dart';
 import '../models/mcp_server_config.dart';
+import '../models/skill_template.dart';
 import '../models/update_models.dart';
+import '../services/backup_run_service.dart';
 import '../services/bounded_file_reader.dart';
 import '../services/bundled_legacy_skill_catalog.dart';
 import '../services/config_export_service.dart';
 import '../services/file_attachment_service.dart';
 import '../services/memory_service.dart';
 import '../services/mcp_service.dart';
+import '../services/mcp_proot_bridge.dart';
 import '../services/native_bridge.dart';
 import '../services/preferences_service.dart';
 import '../services/remote_agent_boot.dart';
 import '../services/session_storage.dart';
 import '../services/skill_service.dart';
+import '../services/skill_template_service.dart';
 import '../services/tts_service.dart';
 import '../services/usage_summary_service.dart';
 import '../services/update_service.dart';
@@ -35,6 +39,8 @@ import 'run_trace_screen.dart';
 import 'remote_agent_settings_screen.dart';
 import 'local_data_recovery_screen.dart';
 import 'background_task_center_screen.dart';
+import 'scheduled_tasks_screen.dart';
+import 'workspaces_screen.dart';
 import '../l10n/app_strings.dart';
 import '../layout/foldable_layout.dart';
 
@@ -128,6 +134,11 @@ class SettingsScreen extends StatefulWidget {
         SettingsDestination.dataRecovery, '本地数据恢复', ['会话回收站', '恢复']),
     SettingsControlInfo(SettingsDestination.dataRecovery, '本地任务中心',
         ['后台任务', '恢复', '未知结果', '弃置']),
+    SettingsControlInfo(SettingsDestination.dataRecovery, '计划执行', ['计划', '间隔']),
+    SettingsControlInfo(SettingsDestination.agentTools, '工作区',
+        ['workspace', '切换', '重命名', '创建', '删除', '默认工作区']),
+    SettingsControlInfo(
+        SettingsDestination.updatesExtensions, '工作流模板', ['模板', '安装', '回滚']),
     SettingsControlInfo(
         SettingsDestination.dataRecovery, '导出与导入配置', ['备份', '迁移']),
     SettingsControlInfo(SettingsDestination.dataRecovery, '使用量摘要', ['tokens']),
@@ -479,6 +490,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   int _maxConcurrentAgents = PreferencesService.defaultMaxConcurrentAgents;
   bool _privacyMode = true;
   bool _developerMode = false;
+  bool _agentIslandEnabled = false;
   bool _allowPhoneCall = false;
   bool _allowSms = false;
   bool _anthropicPromptCacheEnabled = true;
@@ -487,8 +499,14 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   Set<String> _deniedToolNames = {};
   List<String> _bashCommandDenyPatterns = [];
   List<McpServerConfig> _mcpServers = [];
+  McpProotReadiness? _mcpReadiness;
   List<String> _memories = [];
+  List<MemoryFactEntry> _memoryFacts = [];
   bool _loadingMemories = false;
+  String? _memoriesLoadError;
+  final SkillTemplateService _skillTemplateService = SkillTemplateService();
+  Map<String, SkillTemplateStatus> _skillTemplateStatuses = {};
+  bool _loadingSkillTemplates = false;
   int _updateStateEpoch = 0;
   Future<AppUpdateStagingState?>? _appUpdateStateFuture;
   final Map<String, Future<ExtensionUpdateState?>>
@@ -559,6 +577,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   Future<void> _refreshSkillsAndUpdateStates() async {
     _extensionUpdateStateFutures.clear();
     await _loadSkills();
+    await _loadSkillTemplates();
   }
 
   Future<void> _loadSettings() async {
@@ -579,6 +598,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       _maxConcurrentAgents = _prefs.maxConcurrentAgents;
       _privacyMode = _prefs.privacyMode;
       _developerMode = _prefs.developerMode;
+      _agentIslandEnabled = _prefs.agentIslandEnabled;
       _allowPhoneCall = _prefs.allowPhoneCall;
       _allowSms = _prefs.allowSms;
       _anthropicPromptCacheEnabled = _prefs.anthropicPromptCacheEnabled;
@@ -587,6 +607,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       _deniedToolNames = _prefs.deniedToolNames;
       _bashCommandDenyPatterns = _prefs.bashCommandDenyPatterns;
       _mcpServers = _prefs.mcpServers;
+      unawaited(_loadMcpReadiness());
       _whisperModelController.text = _prefs.whisperModel ?? '';
       _ttsModelController.text = _prefs.ttsModel ?? '';
 
@@ -606,8 +627,11 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         setState(() => _loading = false);
       }
 
-      _loadSkills();
-      _loadMemories();
+      // Each loader guards its own awaits, so a page that is left while a
+      // read is in flight never calls setState and never leaks an error.
+      unawaited(_loadSkills());
+      unawaited(_loadSkillTemplates());
+      unawaited(_loadMemories());
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -757,6 +781,10 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   }
 
   Future<void> _loadSkills() async {
+    // A disposed page must never start a scan or write state: the install,
+    // consent and update flows can reach here after an await that outlived
+    // the route.
+    if (!mounted) return;
     setState(() {
       _loadingSkills = true;
       _skillsLoadError = null;
@@ -774,6 +802,326 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         _loadingSkills = false;
         _skillsLoadError = '无法读取本地扩展';
       });
+    }
+  }
+
+  Future<void> _loadSkillTemplates() async {
+    if (mounted) setState(() => _loadingSkillTemplates = true);
+    final statuses = <String, SkillTemplateStatus>{};
+    for (final template in _skillTemplateService.templates) {
+      try {
+        statuses[template.id] = await _skillTemplateService.status(template);
+      } catch (_) {
+        // A template that cannot be inspected stays at its default state: not
+        // installed, not enabled. Never show it as ready to use.
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _skillTemplateStatuses = statuses;
+      _loadingSkillTemplates = false;
+    });
+  }
+
+  Future<void> _showSkillTemplatePreview(SkillTemplate template) async {
+    final preview = _skillTemplateService.preview(template);
+    final status = _skillTemplateStatuses[template.id];
+    final install = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: Text('${template.name} · v${template.version}'),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 560),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(template.summary),
+                const SizedBox(height: 12),
+                _subsectionHeader(Theme.of(dialogCtx), '需要的权限'),
+                for (final line in preview.capabilityLines) Text('• $line'),
+                const SizedBox(height: 12),
+                Text(preview.networkLine),
+                const SizedBox(height: 4),
+                Text('隐私数据：${preview.sensitiveDataLines.join('、')}'),
+                const SizedBox(height: 12),
+                _subsectionHeader(Theme.of(dialogCtx), '安装会写入的声明'),
+                for (final line in preview.manifestLines) Text('• $line'),
+                const SizedBox(height: 12),
+                for (final note in preview.riskNotes) Text('• $note'),
+                if (status?.installed == true) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    status?.enabled == true
+                        ? AppStrings.skillTemplateEnabled
+                        : AppStrings.skillTemplateInstalled,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: _skillTemplateService.isInstallable(template)
+                ? () => Navigator.pop(dialogCtx, true)
+                : null,
+            child: const Text(AppStrings.skillTemplateInstall),
+          ),
+        ],
+      ),
+    );
+    if (install != true) return;
+    await _installSkillTemplate(template);
+  }
+
+  /// One row per built-in workflow template. Shared by the Agent and Tools
+  /// section and the updates/extensions panel, so the templates are reachable
+  /// from both settings paths that promise them.
+  List<Widget> _skillTemplateRows() {
+    if (_loadingSkillTemplates) {
+      return const [
+        Center(
+          child: Padding(
+            padding: EdgeInsets.all(16),
+            child: CircularProgressIndicator(),
+          ),
+        ),
+      ];
+    }
+    return [
+      ..._skillTemplateService.templates.map((template) {
+        final status = _skillTemplateStatuses[template.id];
+        final installed = status?.installed ?? false;
+        final enabled = status?.enabled ?? false;
+        final rollbackAvailable = status?.rollbackAvailable ?? false;
+        return ListTile(
+          leading: Icon(
+            enabled ? Icons.toggle_on_outlined : Icons.widgets_outlined,
+          ),
+          title: Text(
+            '${template.name} · v${template.version}',
+          ),
+          subtitle: Text(
+            [
+              status == null
+                  ? AppStrings.notInstalled
+                  : !installed
+                      ? AppStrings.skillTemplateNotInstalled
+                      : enabled
+                          ? AppStrings.skillTemplateEnabled
+                          : AppStrings.skillTemplateInstalled,
+              template.summary,
+            ].join(' · '),
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+          trailing: Wrap(
+            spacing: 0,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.info_outline),
+                tooltip: AppStrings.skillTemplatePreview,
+                onPressed: () => _showSkillTemplatePreview(template),
+              ),
+              if (!installed)
+                IconButton(
+                  icon: const Icon(Icons.download_outlined),
+                  tooltip: AppStrings.skillTemplateInstall,
+                  // Installing writes local files, so the
+                  // row goes through the same permission
+                  // preview as the info action instead
+                  // of installing on one tap.
+                  onPressed: () => _showSkillTemplatePreview(template),
+                )
+              else ...[
+                if (rollbackAvailable)
+                  IconButton(
+                    icon: const Icon(Icons.history),
+                    tooltip: AppStrings.skillTemplateRollback,
+                    onPressed: () => _rollbackSkillTemplate(template),
+                  ),
+                Switch(
+                  value: status?.enabled ?? false,
+                  onChanged: (value) =>
+                      _setSkillTemplateEnabled(template, value),
+                ),
+              ],
+            ],
+          ),
+        );
+      }),
+    ];
+  }
+
+  Future<void> _installSkillTemplate(SkillTemplate template) async {
+    final result = await _skillTemplateService.install(template);
+    if (!mounted) return;
+    if (!result.succeeded) {
+      // Install failure keeps the previous local file; the skill stays off.
+      await _loadSkillTemplates();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('安装失败：${template.name} 保持未安装，本地文件没有变化'),
+          ),
+        );
+      }
+      return;
+    }
+    await _loadSkillTemplates();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '已安装 ${template.name}；默认禁用，启用仍需要你同意它的能力',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _rollbackSkillTemplate(SkillTemplate template) async {
+    final confirmed = await _confirmDelete(
+      AppStrings.skillTemplateRollback,
+      '恢复安装前的本地文件，并保持该技能为未启用。',
+    );
+    if (!confirmed) return;
+    final result = await _skillTemplateService.rollback(template);
+    await _loadSkillTemplates();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          result.succeeded
+              ? '已回滚 ${template.name} 到上一版本，技能保持未启用'
+              : '回滚失败：没有可用的上一版本，本地文件没有变化',
+        ),
+      ),
+    );
+  }
+
+  /// Consent for an installed template whose package the guest scan did not
+  /// list. It reads the template's own manifest and body, then runs the exact
+  /// same consent dialog, grant and enable path the scan-based flow uses.
+  /// Safe classification for the device log: template id and which source the
+  /// consent candidate came from. Never contains file contents or secrets.
+  void _logTemplateEnable(String message) {
+    debugPrint('[clawchat.template] $message');
+  }
+
+  Future<void> _requestTemplateInstallConsent(SkillTemplate template) async {
+    if (!mounted) return;
+    setState(() => _loadingSkills = true);
+    PreparedSkillImport? candidate;
+    try {
+      candidate = await _skillTemplateService.installedCandidate(template);
+    } catch (_) {
+      candidate = null;
+    }
+    if (!mounted) return;
+    setState(() => _loadingSkills = false);
+    if (candidate == null) {
+      _logTemplateEnable(
+        'consent blocked: installed files incomplete for ${template.stableSkillId}',
+      );
+      // Incomplete package: say what is wrong and how to fix it instead of
+      // pretending this is a consent problem.
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('模板文件不完整，无法启用；请重新安装 ${template.name}'),
+        ),
+      );
+      await _loadSkillTemplates();
+      return;
+    }
+    final installed = candidate;
+    _logTemplateEnable(
+      'consent candidate built from installed files for ${installed.id}',
+    );
+    if (!await _confirmSkillConsent(installed)) return;
+    if (!mounted) return;
+    try {
+      await SkillService.installPreparedSkill(
+        installed,
+        enabled: true,
+        inspectionReviewConfirmed: true,
+      );
+    } catch (error) {
+      _logTemplateEnable('enable failed for ${installed.id}: $error');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('启用失败：$error')),
+      );
+      await _loadSkillTemplates();
+      return;
+    }
+    await _loadSkills();
+    await _loadSkillTemplates();
+    if (!mounted) return;
+    // The switch is recorded even when the guest scan cannot list the package.
+    // Runtime execution depends on that scan, so say so instead of implying
+    // the skill is fully live.
+    final listedAtRuntime = _skills.any(
+      (skill) =>
+          skill.id == installed.id ||
+          skill.name == installed.id ||
+          skill.name == installed.name,
+    );
+    if (listedAtRuntime) {
+      _logTemplateEnable('enabled ${installed.id} (listed by scan)');
+      return;
+    }
+    _logTemplateEnable(
+      'enabled ${installed.id} but the guest scan does not list it',
+    );
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('已记录启用；本地扩展扫描暂未列出该技能，运行期执行可能暂不可用。'),
+      ),
+    );
+  }
+
+  Future<void> _setSkillTemplateEnabled(
+    SkillTemplate template,
+    bool enabled,
+  ) async {
+    final result = await _skillTemplateService.setEnabled(template, enabled);
+    if (result.reasonCode == SkillTemplateService.consentRequiredReason) {
+      // Enabling needs the existing installed-skill consent flow; reuse it
+      // rather than flipping a switch the scan would ignore.
+      await _loadSkills();
+      final skill = _skills
+          .where((candidate) =>
+              candidate.id == template.stableSkillId ||
+              candidate.name == template.stableSkillId)
+          .firstOrNull;
+      if (skill != null) {
+        await _requestInstalledSkillConsent(skill);
+        await _loadSkillTemplates();
+      } else {
+        // The guest scan did not list the package (runtime unavailable, or it
+        // reported it as legacy). The installed files are what consent needs,
+        // so build the same candidate from them instead of claiming there is
+        // no local skill file.
+        await _requestTemplateInstallConsent(template);
+      }
+      return;
+    }
+    await _loadSkills();
+    await _loadSkillTemplates();
+    if (!result.succeeded && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('未能切换 ${template.name} 的状态：本地文件没有变化'),
+        ),
+      );
     }
   }
 
@@ -1015,6 +1363,24 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
               ),
             ),
           ),
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(Icons.widgets_outlined),
+                    title: Text(AppStrings.skillTemplates),
+                    subtitle: Text(AppStrings.skillTemplatesDescription),
+                  ),
+                  ..._skillTemplateRows(),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -1188,6 +1554,27 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         ],
       );
 
+  Future<void> _loadMcpReadiness() async {
+    final readiness = await McpPlatformSupport.readiness();
+    if (!mounted) return;
+    setState(() => _mcpReadiness = readiness);
+  }
+
+  Future<void> _setAgentIslandEnabled(bool value) async {
+    final provider = context.read<ChatProvider>();
+    setState(() => _agentIslandEnabled = value);
+    final granted = await provider.setAgentIslandEnabled(value);
+    if (!mounted) return;
+    if (value && !granted) {
+      setState(() => _agentIslandEnabled = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('未获得悬浮窗权限，灵动岛保持关闭。'),
+        ),
+      );
+    }
+  }
+
   Widget _developerPanel(ThemeData theme) => _settingsGroup(
         theme,
         'developer_only',
@@ -1203,10 +1590,22 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
             subtitle: const Text('启用本地 Agent 运行元数据轨迹'),
             value: _developerMode,
             onChanged: (value) {
-              setState(() => _developerMode = value);
+              setState(() {
+                _developerMode = value;
+                if (!value) _agentIslandEnabled = false;
+              });
               context.read<ChatProvider>().setDeveloperMode(value);
             },
           ),
+          if (_developerMode)
+            SwitchListTile(
+              title: const Text('灵动岛 / 悬浮状态'),
+              subtitle: const Text(
+                '默认关闭。开启后才会请求悬浮窗权限，并在应用退到后台时显示状态岛。',
+              ),
+              value: _agentIslandEnabled,
+              onChanged: (value) => _setAgentIslandEnabled(value),
+            ),
           if (_developerMode)
             ListTile(
               leading: const Icon(Icons.account_tree_outlined),
@@ -1434,6 +1833,26 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                   ?.copyWith(color: theme.hintColor),
                             ),
                           ),
+                          _subsectionHeader(theme, AppStrings.phoneReadSection),
+                          const ListTile(
+                            leading: Icon(Icons.calendar_month_outlined),
+                            title: Text(AppStrings.phoneReadCalendar),
+                            subtitle:
+                                Text(AppStrings.phoneReadCalendarSubtitle),
+                          ),
+                          const ListTile(
+                            leading: Icon(Icons.sms_outlined),
+                            title: Text(AppStrings.phoneReadSms),
+                            subtitle: Text(AppStrings.phoneReadSmsSubtitle),
+                          ),
+                          const ListTile(
+                            leading: Icon(Icons.contacts_outlined),
+                            title: Text(AppStrings.phoneReadContacts),
+                            subtitle:
+                                Text(AppStrings.phoneReadContactsSubtitle),
+                          ),
+                          _subsectionHeader(
+                              theme, AppStrings.phoneOutboundSection),
                           SwitchListTile(
                             title: const Text(AppStrings.allowCall),
                             subtitle: const Text(AppStrings.allowCallSubtitle),
@@ -1500,6 +1919,26 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                   ),
                         ),
                       ]),
+                    if (widget.destination == SettingsDestination.agentTools)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+                        child: Card.outlined(
+                          child: ListTile(
+                            key: const ValueKey('settings-workspaces-entry'),
+                            leading: const Icon(Icons.workspaces_outline),
+                            title: const Text(AppStrings.workspacesTitle),
+                            subtitle: const Text(
+                              '管理本地工作区：查看、切换、创建、重命名、删除',
+                            ),
+                            trailing: const Icon(Icons.chevron_right),
+                            onTap: () => Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => const WorkspacesScreen(),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                     if (widget.destination == SettingsDestination.agentTools)
                       _settingsGroup(
                         theme,
@@ -1710,11 +2149,31 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                   ?.copyWith(color: theme.hintColor),
                             ),
                           ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                            child: Text(
+                              AppStrings.mcpEnvNotForGoogleTokens,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
                           if (!McpPlatformSupport.isStdioSupported)
                             Padding(
                               padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                               child: Text(
                                 AppStrings.mcpStdioUnsupportedAndroid,
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.error,
+                                ),
+                              ),
+                            )
+                          else if (_mcpReadiness?.ready == false)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                              child: Text(
+                                '${_mcpReadiness!.message}：'
+                                '${AppStrings.mcpProotNotReadyHint}',
                                 style: theme.textTheme.bodySmall?.copyWith(
                                   color: theme.colorScheme.error,
                                 ),
@@ -1858,8 +2317,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                     icon: const Icon(Icons.info_outline,
                                         size: 18),
                                     label: const Text(
-                                      AppStrings
-                                          .bundledLegacyPresetsUnavailable,
+                                      AppStrings.bundledSkillPresetsInfo,
                                     ),
                                     onPressed:
                                         _showBundledLegacyPresetsUnavailable,
@@ -1953,10 +2411,25 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                         }
                                       : null,
                                 )),
+                          _settingsDivider(theme),
+                          _subsectionHeader(theme, AppStrings.skillTemplates),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                            child: Text(
+                              AppStrings.skillTemplatesDescription,
+                              style: theme.textTheme.bodySmall
+                                  ?.copyWith(color: theme.hintColor),
+                            ),
+                          ),
+                          ..._skillTemplateRows(),
                         ],
                         collapsedBadges: [
                           _countBadge(
                               theme, '${AppStrings.skills} ${_skills.length}'),
+                          _countBadge(
+                            theme,
+                            '${AppStrings.skillTemplates} ${_skillTemplateService.templates.length}',
+                          ),
                           _countBadge(
                             theme,
                             '${AppStrings.mcpServers} ${_mcpServers.length}',
@@ -1995,6 +2468,26 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                             ),
                           ),
                           ListTile(
+                            title: const Text('计划执行'),
+                            subtitle:
+                                const Text('为已批准的本地任务排下次时间；到期后仍需在任务中心手动确认。'),
+                            leading: const Icon(Icons.schedule_outlined),
+                            trailing: const Icon(Icons.chevron_right),
+                            onTap: () => Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => ScheduledTasksScreen(
+                                  onOpenTaskCenter: () =>
+                                      Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) =>
+                                          const BackgroundTaskCenterScreen(),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          ListTile(
                             title: const Text(AppStrings.exportConfig),
                             subtitle:
                                 const Text(AppStrings.exportConfigSubtitle),
@@ -2009,6 +2502,13 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                             leading: const Icon(Icons.download),
                             trailing: const Icon(Icons.chevron_right),
                             onTap: _importConfig,
+                          ),
+                          ListTile(
+                            title: const Text(AppStrings.backupRun),
+                            subtitle: const Text(AppStrings.backupRunSubtitle),
+                            leading: const Icon(Icons.copy_all_outlined),
+                            trailing: const Icon(Icons.chevron_right),
+                            onTap: _runMultiDestinationBackup,
                           ),
                           ListTile(
                             title: const Text(AppStrings.globalUsageSummary),
@@ -2059,7 +2559,27 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                               padding: EdgeInsets.all(16),
                               child: CircularProgressIndicator(),
                             ))
-                          else if (_memories.isEmpty)
+                          else if (_memoriesLoadError != null)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 0, 8, 8),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      _memoriesLoadError!,
+                                      style: TextStyle(
+                                        color: theme.colorScheme.error,
+                                      ),
+                                    ),
+                                  ),
+                                  TextButton(
+                                    onPressed: _loadMemories,
+                                    child: const Text(AppStrings.retry),
+                                  ),
+                                ],
+                              ),
+                            )
+                          else if (_memoryFacts.isEmpty)
                             Padding(
                               padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                               child: Text(AppStrings.noMemories,
@@ -2068,17 +2588,29 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                           theme.colorScheme.onSurfaceVariant)),
                             )
                           else
-                            ..._memories
-                                .asMap()
-                                .entries
-                                .map((entry) => ListTile(
-                                      title: Text(entry.value),
-                                      trailing: IconButton(
-                                        icon: const Icon(Icons.delete_outline),
-                                        onPressed: () =>
-                                            _removeMemory(entry.key),
-                                      ),
-                                    )),
+                            ..._memoryFacts.map((fact) => ListTile(
+                                  title: Text(fact.text),
+                                  subtitle: Text(
+                                    fact.trustLabel,
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: fact.trusted
+                                          ? theme.colorScheme.onSurfaceVariant
+                                          : theme.colorScheme.error,
+                                    ),
+                                  ),
+                                  leading: Icon(
+                                    fact.trusted
+                                        ? Icons.verified_user_outlined
+                                        : Icons.report_gmailerrorred_outlined,
+                                    size: 20,
+                                  ),
+                                  trailing: IconButton(
+                                    icon: const Icon(Icons.delete_outline),
+                                    tooltip: AppStrings.forgetMemory,
+                                    onPressed: () =>
+                                        _forgetMemoryFact(fact.text),
+                                  ),
+                                )),
                         ],
                         collapsedBadges: [
                           _countBadge(theme,
@@ -2488,20 +3020,29 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
     await showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text(AppStrings.bundledLegacyPresetsUnavailable),
+        title: const Text(AppStrings.bundledSkillPresetsInfo),
         content: SingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(AppStrings.bundledLegacyPresetsUnavailableDescription),
+              const Text(AppStrings.bundledSkillPresetsDescription),
+              const SizedBox(height: 12),
+              const Text(AppStrings.bundledGooglePresetsCopy),
               const SizedBox(height: 12),
               for (final preset in BundledLegacySkillCatalog.entries) ...[
-                Text(preset.assetDirectory),
+                Text(
+                  BundledLegacySkillCatalog.googleApiPresetDirectories
+                          .contains(preset.assetDirectory)
+                      ? '${preset.assetDirectory} · Google API'
+                      : preset.assetDirectory,
+                ),
                 Padding(
                   padding: const EdgeInsets.only(bottom: 10),
                   child: Text(preset.reason),
                 ),
               ],
+              const SizedBox(height: 4),
+              const Text(AppStrings.bundledExampleSkillsCopy),
             ],
           ),
         ),
@@ -2539,7 +3080,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         ],
       ),
     );
-    if (url == null || url.isEmpty) return;
+    if (url == null || url.isEmpty || !mounted) return;
 
     setState(() => _loadingSkills = true);
     PreparedSkillImport? candidate;
@@ -2749,7 +3290,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         return;
       }
     }
-    if (path == null || path.isEmpty) return;
+    if (path == null || path.isEmpty || !mounted) return;
 
     setState(() => _loadingSkills = true);
     PreparedSkillImport? candidate;
@@ -2796,6 +3337,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   }
 
   Future<void> _requestInstalledSkillConsent(SkillInfo skill) async {
+    if (!mounted) return;
     setState(() => _loadingSkills = true);
     try {
       final candidate =
@@ -2829,6 +3371,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   }
 
   Future<void> _showRemoteExtensionUpdate(SkillInfo skill) async {
+    if (!mounted) return;
     setState(() => _loadingSkills = true);
     ExtensionUpdatePlan? plan;
     try {
@@ -2914,9 +3457,14 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
     }
     if (metadataPath.isEmpty || archivePath.isEmpty) return;
 
-    setState(() => _loadingSkills = true);
     ExtensionUpdatePlan? plan;
     try {
+      // The page may have been left while the pickers were open. Nothing will
+      // consume the staged copies then, so the finally below drops exactly the
+      // paths this flow created; provider-owned paths are never deleted by
+      // cleanupLocalPath.
+      if (!mounted) return;
+      setState(() => _loadingSkills = true);
       final metadataBytes = await BoundedFileReader.readBytes(
         metadataPath,
         validateBytes: (count) {
@@ -3001,7 +3549,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
           ),
         ) ??
         false;
-    if (!confirmed) return;
+    if (!confirmed || !mounted) return;
     setState(() => _loadingSkills = true);
     try {
       await _updates.rollbackExtension(skill.id);
@@ -3043,7 +3591,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         ],
       ),
     );
-    if (metadataUrl == null || metadataUrl.isEmpty) return;
+    if (metadataUrl == null || metadataUrl.isEmpty || !mounted) return;
     setState(() {
       _lastUpdateCheckAt = DateTime.now();
       _lastUpdateResult = '检查中';
@@ -3146,9 +3694,30 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
   }
 
   Future<void> _loadMemories() async {
-    setState(() => _loadingMemories = true);
-    _memories = List.from(await MemoryService.getMemories());
-    if (mounted) setState(() => _loadingMemories = false);
+    if (!mounted) return;
+    setState(() {
+      _loadingMemories = true;
+      _memoriesLoadError = null;
+    });
+    List<String> memories;
+    List<MemoryFactEntry> facts;
+    try {
+      memories = List.from(await MemoryService.getMemories());
+      facts = await MemoryService.listFacts();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loadingMemories = false;
+        _memoriesLoadError = '无法读取本地记忆';
+      });
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _memories = memories;
+      _memoryFacts = facts;
+      _loadingMemories = false;
+    });
   }
 
   Future<void> _exportDiagnostics() async {
@@ -3421,28 +3990,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
       if (options == null) return;
 
       if (!options.encrypt && options.includePlaintextSecrets) {
-        if (!mounted) return;
-        final confirmed = await showDialog<bool>(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            title: const Text(AppStrings.exportConfigWithoutEncryption),
-            content: const Text(AppStrings.exportConfigPlainWarning),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text(AppStrings.cancel),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                style: FilledButton.styleFrom(
-                  backgroundColor: AppColors.statusRed,
-                  foregroundColor: Colors.white,
-                ),
-                child: const Text(AppStrings.confirm),
-              ),
-            ],
-          ),
-        );
+        final confirmed = await _confirmPlaintextExport();
         if (confirmed != true) return;
       }
 
@@ -3472,6 +4020,126 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         );
       }
     }
+  }
+
+  Future<bool?> _confirmPlaintextExport() {
+    if (!mounted) return Future.value(false);
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.exportConfigWithoutEncryption),
+        content: const Text(AppStrings.exportConfigPlainWarning),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: AppColors.statusRed,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text(AppStrings.confirm),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _runMultiDestinationBackup() async {
+    try {
+      final destinations = await _pickBackupDestinations();
+      if (destinations == null || destinations.isEmpty) return;
+
+      final options = await _showExportConfigDialog();
+      if (options == null) return;
+
+      if (!options.encrypt && options.includePlaintextSecrets) {
+        final confirmed = await _confirmPlaintextExport();
+        if (confirmed != true) return;
+      }
+
+      if (!mounted) return;
+      final service = BackupRunService();
+      final outcome = await showDialog<BackupRunOutcome>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => _BackupRunDialog(
+          progress: service.progress,
+          start: () => service.run(
+            destinations: destinations,
+            includePlaintextSecrets:
+                !options.encrypt && options.includePlaintextSecrets,
+            password: options.encrypt ? options.password : null,
+          ),
+          onCancel: service.cancel,
+        ),
+      );
+      await service.dispose();
+      if (outcome == null || !mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_backupOutcomeMessage(outcome))),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${AppStrings.backupRunFailed}: $e')),
+        );
+      }
+    }
+  }
+
+  Future<List<BackupDestination>?> _pickBackupDestinations() async {
+    final paths = <String>[];
+    while (true) {
+      if (!mounted) return null;
+      final path = await FilePicker.getDirectoryPath(
+        dialogTitle: AppStrings.backupAddFolder,
+      );
+      if (path == null || path.trim().isEmpty) break;
+      if (!paths.contains(path)) paths.add(path);
+      if (!mounted) break;
+      final addAnother = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text(AppStrings.backupAddAnotherFolder),
+          content: Text(AppStrings.backupAddAnotherFolderBody(paths.length)),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text(AppStrings.backupStart),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text(AppStrings.backupAddAnother),
+            ),
+          ],
+        ),
+      );
+      if (addAnother != true) break;
+    }
+    if (paths.isEmpty) return null;
+    return paths.map(BackupDestination.folder).toList();
+  }
+
+  String _backupOutcomeMessage(BackupRunOutcome outcome) {
+    final success = outcome.results.where((result) => result.succeeded).length;
+    final failed = outcome.results
+        .where((result) => result.status == BackupDestinationStatus.failure)
+        .length;
+    final cancelled = outcome.results
+        .where((result) => result.status == BackupDestinationStatus.cancelled)
+        .length;
+    final buffer = StringBuffer(
+      AppStrings.backupRunSummary(success, failed, cancelled),
+    );
+    buffer.write(
+      outcome.localPackageKept
+          ? ' ${AppStrings.backupRunLocalPackageKept}'
+          : ' ${AppStrings.backupRunLocalPackageRemoved}',
+    );
+    return buffer.toString();
   }
 
   Future<_ConfigExportOptions?> _showExportConfigDialog() {
@@ -3826,19 +4494,36 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         ],
       ),
     );
-    if (result != null && result.isNotEmpty) {
+    if (result == null || result.isEmpty) return;
+    try {
       await MemoryService.addMemory(result);
-      await _loadMemories();
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('保存失败，记忆没有变化')),
+      );
+      return;
     }
+    await _loadMemories();
   }
 
-  Future<void> _removeMemory(int index) async {
+  /// Deletes one fact by text, so the trust/taint bookkeeping for it is dropped
+  /// with the fact instead of leaving a dangling provenance entry behind.
+  Future<void> _forgetMemoryFact(String text) async {
     final confirmed = await _confirmDelete(
       AppStrings.deleteMemoryTitle,
-      AppStrings.deleteMemoryConfirm,
+      AppStrings.memoryForgetConfirm,
     );
-    if (!confirmed) return;
-    await MemoryService.removeMemory(index);
+    if (!confirmed || !mounted) return;
+    try {
+      await MemoryService.forgetFact(text);
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('删除失败，记忆没有变化')),
+      );
+      return;
+    }
     await _loadMemories();
   }
 
@@ -3853,6 +4538,152 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
     _whisperModelController.dispose();
     _ttsModelController.dispose();
     super.dispose();
+  }
+}
+
+class _BackupRunDialog extends StatefulWidget {
+  const _BackupRunDialog({
+    required this.progress,
+    required this.start,
+    required this.onCancel,
+  });
+
+  final Stream<BackupRunProgress> progress;
+
+  /// Starts the run. Called once from [initState], after the dialog has
+  /// subscribed, so no progress event is missed.
+  final Future<BackupRunOutcome> Function() start;
+  final VoidCallback onCancel;
+
+  @override
+  State<_BackupRunDialog> createState() => _BackupRunDialogState();
+}
+
+class _BackupRunDialogState extends State<_BackupRunDialog> {
+  StreamSubscription<BackupRunProgress>? _subscription;
+  BackupRunProgress? _progress;
+  var _cancelRequested = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _subscription = widget.progress.listen((progress) {
+      if (mounted) setState(() => _progress = progress);
+    });
+    unawaited(
+      widget.start().then(
+        (result) {
+          if (mounted) Navigator.of(context).pop(result);
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          if (mounted) Navigator.of(context).pop();
+        },
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    unawaited(_subscription?.cancel());
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = _progress;
+    final results = progress?.results ?? const <BackupDestinationResult>[];
+    final currentLabel = progress?.currentLabel;
+    return AlertDialog(
+      title: const Text(AppStrings.backupRunInProgress),
+      content: SizedBox(
+        width: 380,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            LinearProgressIndicator(value: progress?.fraction),
+            const SizedBox(height: 12),
+            Text(
+              AppStrings.backupRunProgressText(
+                progress?.finished ?? 0,
+                progress?.total ?? 0,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  for (final result in results)
+                    ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(_statusIcon(result.status)),
+                      title: Text(result.label),
+                      subtitle: result.error == null
+                          ? null
+                          : Text(
+                              result.error!,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                      trailing: Text(_statusLabel(result.status)),
+                    ),
+                  if (currentLabel != null)
+                    ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: const SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      title: Text(currentLabel),
+                      trailing: const Text(AppStrings.backupDestinationRunning),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _cancelRequested
+              ? null
+              : () {
+                  setState(() => _cancelRequested = true);
+                  widget.onCancel();
+                },
+          child: Text(
+            _cancelRequested
+                ? AppStrings.backupRunCancelling
+                : AppStrings.backupRunCancel,
+          ),
+        ),
+      ],
+    );
+  }
+
+  IconData _statusIcon(BackupDestinationStatus status) {
+    return switch (status) {
+      BackupDestinationStatus.success => Icons.check_circle_outline,
+      BackupDestinationStatus.failure => Icons.error_outline,
+      BackupDestinationStatus.cancelled => Icons.cancel_outlined,
+      BackupDestinationStatus.running => Icons.sync,
+      BackupDestinationStatus.pending => Icons.radio_button_unchecked,
+    };
+  }
+
+  String _statusLabel(BackupDestinationStatus status) {
+    return switch (status) {
+      BackupDestinationStatus.success => AppStrings.backupDestinationSuccess,
+      BackupDestinationStatus.failure => AppStrings.backupDestinationFailure,
+      BackupDestinationStatus.cancelled =>
+        AppStrings.backupDestinationCancelled,
+      BackupDestinationStatus.running => AppStrings.backupDestinationRunning,
+      BackupDestinationStatus.pending => AppStrings.backupDestinationPending,
+    };
   }
 }
 

@@ -342,7 +342,19 @@ final class _AppResolverOutcome<T> {
 /// trust, SNI, and certificate hostname verification remain intact. This
 /// prevents an idle same-authority connection or a previous DNS resolution
 /// from bypassing WebFetch SSRF policy.
-final class AppWebFetchClient extends http.BaseClient {
+/// The send seam `WebFetchTool` uses for each redirect hop.
+///
+/// `AppWebFetchClient` implements it; unit tests can supply a fake that returns
+/// canned redirect responses without touching the network.
+abstract interface class AppWebFetchSendClient {
+  Future<http.StreamedResponse> sendWithDeadline(
+    http.BaseRequest request, {
+    required Duration remainingTimeout,
+  });
+}
+
+final class AppWebFetchClient extends http.BaseClient
+    implements AppWebFetchSendClient {
   AppWebFetchClient(
     AppRuntimeInfo runtimeInfo, {
     AppNativeHttpClientFactory? createNativeClient,
@@ -416,6 +428,7 @@ final class AppWebFetchClient extends http.BaseClient {
 
   /// Sends one already-policy-validated WebFetch hop within the caller's
   /// remaining logical operation budget.
+  @override
   Future<http.StreamedResponse> sendWithDeadline(
     http.BaseRequest request, {
     required Duration remainingTimeout,

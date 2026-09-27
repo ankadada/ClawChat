@@ -1,1 +1,0 @@
-{"schemaVersion":1,"id":"structure.github","fixtureId":"github","kind":"structure","input":{"text":"verify structure"},"expected":{"decision":"match","reasonCode":"structure_valid","selectedSkillId":"github"}}

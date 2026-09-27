@@ -26,6 +26,9 @@ import '../services/mcp_rich_surface_protocol.dart';
 import '../services/llm_service.dart';
 import '../services/native_bridge.dart';
 import '../services/chat_render_window.dart';
+import '../models/workspace.dart';
+import '../services/share_action.dart';
+import '../services/workspace_file_service.dart';
 import '../services/shared_content.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/usage_summary_service.dart';
@@ -33,17 +36,22 @@ import '../services/voice_input_state.dart';
 import '../layout/foldable_layout.dart';
 import '../widgets/streaming_text.dart';
 import '../widgets/reasoning_text_panel.dart';
+import '../widgets/share_action_sheet.dart';
 import '../widgets/tool_call_card.dart';
 import '../widgets/agent_status_bar.dart';
 import '../widgets/compare_view.dart';
 import '../widgets/structured_result_card.dart';
+import '../widgets/app_hardware_shortcuts.dart';
 import '../widgets/mcp_rich_surface_view.dart';
+import '../widgets/pasted_text_blocks.dart';
 import '../services/tts_service.dart';
 import '../services/whisper_service.dart';
 import 'artifact_preview_screen.dart';
 import 'agent_run_center_screen.dart';
 import 'full_response_screen.dart';
 import 'dashboard_screen.dart';
+import 'workspace_browser_screen.dart';
+import 'workspaces_screen.dart';
 import 'model_api_settings_screen.dart';
 import 'settings_screen.dart';
 import 'chat_sessions_screen.dart';
@@ -66,6 +74,26 @@ enum _NativeSpeechOutcome {
 
 const _defaultNewChatModelGroupSelection = '__default_provider_profile__';
 
+/// Reading width for the chat column. The dual pane exists at a 700dp window;
+/// above that the wide chat pane caps message list, composer, and tool status
+/// at the same width and centers them. Phone width keeps the previous rule.
+const double kChatWideReadingMaxWidth = 860.0;
+const double kChatPhoneReadingMaxWidth = 640.0;
+
+@visibleForTesting
+double chatReadingWidthFor({
+  required double windowWidth,
+  required double availableWidth,
+}) {
+  if (windowWidth >= 700) {
+    return math.min(
+      kChatWideReadingMaxWidth,
+      math.max(0, availableWidth - 32),
+    );
+  }
+  return math.min(kChatPhoneReadingMaxWidth, availableWidth * 0.86);
+}
+
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
 
@@ -79,6 +107,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   final _inputController = TextEditingController();
   final _sessionSearchController = TextEditingController();
+  final _pastedBlocks = PastedTextBlocks();
   final _scrollController = ScrollController();
   final _focusNode = FocusNode();
   final stt.SpeechToText _speech = stt.SpeechToText();
@@ -129,7 +158,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _scrollController.addListener(_handleScroll);
     _tts.addListener(_onTtsStateChanged);
     NativeBridge.setShareIntentHandler(_handleSharedContent);
+    // Ctrl/Cmd+F at the app shell opens this screen's session search.
+    AppShortcutTargets.openSessionSearch = _showCurrentSessionSearch;
+    _pastedBlocks.addListener(_onPastedBlocksChanged);
+    _inputController.addListener(_prunePastedBlocks);
     _initSpeech();
+  }
+
+  void _onPastedBlocksChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// A token the user deleted by hand must not leave a chip behind.
+  void _prunePastedBlocks() {
+    if (_pastedBlocks.isEmpty) return;
+    _pastedBlocks.retainReferenced(_inputController.text);
   }
 
   void _onTtsStateChanged() {
@@ -208,6 +251,116 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 child: const Text(AppStrings.close),
               ),
             ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Shows the facts the current session's last reply actually used, with the
+  /// provenance the model saw, plus this session's own memory switch.
+  Future<void> _showMemoryUsageDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => Consumer<ChatProvider>(
+        builder: (_, provider, __) {
+          final session = provider.currentSession;
+          return StatefulBuilder(
+            builder: (dialogCtx, setDialogState) {
+              final used = provider.currentSessionMemoryUsedInLastRun;
+              return AlertDialog(
+                title: const Text(AppStrings.memoryUsageTitle),
+                content: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          AppStrings.memoryUsageDescription,
+                          style:
+                              Theme.of(dialogCtx).textTheme.bodySmall?.copyWith(
+                                    color: Theme.of(dialogCtx)
+                                        .colorScheme
+                                        .onSurfaceVariant,
+                                  ),
+                        ),
+                        const SizedBox(height: 8),
+                        if (used.isEmpty)
+                          const Text(AppStrings.memoryUsageNone)
+                        else
+                          ...used.map(
+                            (line) => ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: Icon(
+                                line.trusted
+                                    ? Icons.verified_user_outlined
+                                    : Icons.report_gmailerrorred_outlined,
+                                color: line.trusted
+                                    ? null
+                                    : Theme.of(dialogCtx).colorScheme.error,
+                              ),
+                              title: Text(line.text),
+                              subtitle: Text(line.trustLabel),
+                              trailing: IconButton(
+                                tooltip: AppStrings.forgetMemory,
+                                icon: const Icon(Icons.delete_outline),
+                                onPressed: () async {
+                                  await MemoryService.forgetFact(line.text);
+                                  if (dialogCtx.mounted) {
+                                    setDialogState(() {});
+                                  }
+                                },
+                              ),
+                            ),
+                          ),
+                        if (session != null) ...[
+                          const Divider(),
+                          FutureBuilder<SessionMemoryToggleState>(
+                            future:
+                                MemoryService.sessionToggleState(session.id),
+                            builder: (_, snapshot) {
+                              final state = snapshot.data;
+                              final enabled = state?.effectiveEnabled ??
+                                  MemoryService.isEnabledForSessionSync(
+                                      session.id);
+                              final subtitle = state == null
+                                  ? null
+                                  : state.isOverride
+                                      ? (state.mode == SessionMemoryMode.enabled
+                                          ? '本会话单独开启（全局${state.globalEnabled ? '开启' : '关闭'}）'
+                                          : '本会话单独关闭（全局${state.globalEnabled ? '开启' : '关闭'}）')
+                                      : AppStrings.sessionMemoryFollowGlobal;
+                              return SwitchListTile(
+                                contentPadding: EdgeInsets.zero,
+                                title: const Text(AppStrings.sessionMemory),
+                                subtitle:
+                                    subtitle == null ? null : Text(subtitle),
+                                value: enabled,
+                                onChanged: (value) async {
+                                  await MemoryService.setSessionEnabled(
+                                      session.id, value);
+                                  if (dialogCtx.mounted) {
+                                    setDialogState(() {});
+                                  }
+                                },
+                              );
+                            },
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text(AppStrings.close),
+                  ),
+                ],
+              );
+            },
           );
         },
       ),
@@ -531,6 +684,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _voiceElapsedTicker?.cancel();
     _speech.cancel();
     _scrollController.removeListener(_handleScroll);
+    AppShortcutTargets.clearSessionSearch(_showCurrentSessionSearch);
+    _pastedBlocks.removeListener(_onPastedBlocksChanged);
+    _inputController.removeListener(_prunePastedBlocks);
+    _pastedBlocks.dispose();
     _inputController.dispose();
     _sessionSearchController.dispose();
     _scrollController.dispose();
@@ -885,8 +1042,60 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Ctrl/Cmd+V in the composer. A long paste becomes a chip; a short one is
+  /// inserted inline exactly as the default paste would.
+  Future<void> _handleComposerPaste() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final pasted = data?.text ?? '';
+    if (pasted.isEmpty) return;
+    if (!PastedTextBlocks.isLongPaste(pasted)) {
+      _insertIntoComposer(pasted);
+      return;
+    }
+    final id = _pastedBlocks.add(pasted);
+    _insertIntoComposer(PastedTextBlocks.tokenFor(id));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${AppStrings.pastedTextChipTitle} ${PastedTextBlocks.tokenFor(id)}',
+          ),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  /// Insert [text] at the composer caret, replacing any selection.
+  void _insertIntoComposer(String text) {
+    final value = _inputController.value;
+    final selection = value.selection.isValid
+        ? value.selection
+        : TextSelection.collapsed(offset: value.text.length);
+    final start = selection.start.clamp(0, value.text.length);
+    final end = selection.end.clamp(start, value.text.length);
+    final updated = value.text.replaceRange(start, end, text);
+    _inputController.value = TextEditingValue(
+      text: updated,
+      selection: TextSelection.collapsed(offset: start + text.length),
+    );
+  }
+
+  void _removePastedBlock(int id) {
+    final token = PastedTextBlocks.tokenFor(id);
+    final updated = _inputController.text.replaceAll(token, '');
+    _pastedBlocks.remove(id);
+    if (updated != _inputController.text) {
+      _inputController.value = TextEditingValue(
+        text: updated,
+        selection: TextSelection.collapsed(offset: updated.length),
+      );
+    }
+  }
+
   Future<void> _sendMessage() async {
-    final text = _inputController.text.trim();
+    // Every [Pasted#N] token is replaced by the full pasted text, in order.
+    final text = _pastedBlocks.expand(_inputController.text).trim();
     final attachments = List<MessageContent>.from(_pendingAttachments);
     final receipts = _pendingAttachmentPreviews
         .map((preview) => preview.workspaceImportReceipt)
@@ -919,6 +1128,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       _inputController.clear();
+      _pastedBlocks.clear();
       _pendingAttachments.clear();
       _pendingAttachmentPreviews.clear();
     });
@@ -1012,6 +1222,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
 
+    // The user picks what this share is for before any session or model call
+    // happens: nothing is sent or written until one of these actions is chosen.
+    final provider = context.read<ChatProvider>();
+    final selection = await showShareActionSheet(
+      context,
+      content: content,
+      prepared: prepared,
+      workspaces: provider.workspaces,
+      // Sharing starts a new session, so the default target is the workspace
+      // this conversation already belongs to.
+      activeWorkspaceId:
+          provider.workspaceForSession(provider.currentSession?.workspaceId).id,
+    );
+    if (!mounted || selection == null) {
+      for (final attachment in prepared.attachments) {
+        final receipt = attachment.workspaceImportReceipt;
+        if (receipt != null) {
+          unawaited(
+            NativeBridge.discardWorkspaceImport(receipt).catchError((_) {}),
+          );
+        }
+      }
+      return;
+    }
+
     await _discardPendingWorkspaceImports();
     if (!mounted) {
       for (final attachment in prepared.attachments) {
@@ -1024,8 +1259,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
       return;
     }
-    final provider = context.read<ChatProvider>();
-    final session = await provider.createSession();
+    // The session, its scope and the save destination all use the workspace the
+    // user picked: nothing waits on an asynchronous active-workspace switch.
+    final targetWorkspace = provider.workspaceById(selection.workspaceId) ??
+        provider.activeWorkspace;
+    final session = await provider.createSession(
+      workspaceId: targetWorkspace.id,
+    );
     if (!mounted) {
       for (final attachment in prepared.attachments) {
         final receipt = attachment.workspaceImportReceipt;
@@ -1065,13 +1305,157 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
 
     if (!mounted) return;
+    final actionPlan = const ShareActionPlanner().plan(
+      kind: selection.kind,
+      content: content,
+      prepared: prepared,
+      workspace: targetWorkspace,
+    );
+    // A save keeps the original share text in the composer until the write
+    // actually succeeded: a failure must never leave a "saved" claim behind.
+    final shareDraft = actionPlan.writePath == null
+        ? actionPlan.draftText
+        : prepared.draftText;
     setState(() {
       _pendingAttachments.addAll(contentBlocks);
       _pendingAttachmentPreviews.addAll(previews);
+      _inputController.text = shareDraft;
+      _inputController.selection = TextSelection.collapsed(
+        offset: _inputController.text.length,
+      );
     });
     provider.saveDraft(session.id, _inputController.text);
     _focusNode.requestFocus();
-    if (plan.showFeedback) _showShareImportSnack(prepared.warnings);
+
+    await _runShareAction(
+      plan: actionPlan,
+      provider: provider,
+      workspace: targetWorkspace,
+      sessionId: session.id,
+      attachments: contentBlocks,
+      warnings: prepared.warnings,
+      showFeedback: plan.showFeedback,
+      shareDraft: shareDraft,
+    );
+  }
+
+  /// Executes the chosen share action. Agent actions send the staged prompt;
+  /// save writes one file inside the workspace root and offers Undo.
+  Future<void> _runShareAction({
+    required ShareActionPlan plan,
+    required ChatProvider provider,
+    required WorkspaceMetadata workspace,
+    required String sessionId,
+    required List<MessageContent> attachments,
+    required List<String> warnings,
+    required bool showFeedback,
+    required String shareDraft,
+  }) async {
+    final writePath = plan.writePath;
+    if (writePath != null) {
+      // Scoped to the workspace the user chose, and never overwriting an
+      // existing name: a conflict gets the next candidate path.
+      final fileService = WorkspaceFileService(workspace: workspace);
+      final savedPath = await fileService.saveTextWithRetry(
+        candidatePaths: plan.writeAttempts,
+        body: plan.writeBody ?? '',
+      );
+      if (!mounted) return;
+      if (savedPath == null) {
+        // Nothing was written: keep the original share text in the composer
+        // (it still says exactly what the user shared), never claim a save,
+        // and never offer an Undo for a file that does not exist.
+        _showShareImportSnack(
+          <String>[
+            ...warnings,
+            '保存失败，内容没有写入工作区：$writePath',
+          ],
+          contentReady: false,
+        );
+        return;
+      }
+      // The write is the only thing that makes the saved-path draft true.
+      _replaceShareDraft(
+        expected: shareDraft,
+        replacement: plan.draftText,
+        sessionId: sessionId,
+        provider: provider,
+      );
+      _showShareUndo(savedPath, workspace, warnings);
+      return;
+    }
+
+    if (!plan.sendImmediately) {
+      if (showFeedback) _showShareImportSnack(warnings);
+      return;
+    }
+    if (provider.providerProfiles.isEmpty) {
+      _showShareImportSnack(
+        <String>[...warnings, '尚未配置模型，内容已放入输入框'],
+        contentReady: true,
+      );
+      return;
+    }
+    if (showFeedback) _showShareImportSnack(warnings);
+    unawaited(
+      provider
+          .sendMessage(
+            plan.draftText,
+            attachments: attachments,
+            targetSessionId: sessionId,
+            traceTrigger: 'share_action',
+          )
+          .catchError((Object _) {}),
+    );
+  }
+
+  /// Replaces the composer text a share flow put there, but only while it is
+  /// still unchanged: an edit the user made in the meantime is never lost, and
+  /// a failed action never rewrites the draft.
+  void _replaceShareDraft({
+    required String expected,
+    required String replacement,
+    required String sessionId,
+    required ChatProvider provider,
+  }) {
+    if (!mounted || _inputController.text != expected) return;
+    _inputController.text = replacement;
+    _inputController.selection = TextSelection.collapsed(
+      offset: replacement.length,
+    );
+    provider.saveDraft(sessionId, replacement);
+  }
+
+  /// Success notice for a saved share, with Undo wired to the same scoped
+  /// native path so the action stays reversible.
+  void _showShareUndo(
+    String path,
+    WorkspaceMetadata workspace,
+    List<String> warnings,
+  ) {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
+    final warningText = warnings.take(2).join('；');
+    final message =
+        warningText.isEmpty ? '已保存到工作区：$path' : '已保存到工作区：$path；$warningText';
+    messenger
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          action: SnackBarAction(
+            label: '撤销',
+            onPressed: () {
+              unawaited(
+                NativeBridge.deleteRootfsFile(
+                  path,
+                  allowedRoots: [workspace.rootPath],
+                ).catchError((_) => false),
+              );
+            },
+          ),
+        ),
+      );
   }
 
   void _showShareImportSnack(
@@ -1813,6 +2197,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
           if (hasSession)
             const _ChatCommandAction(
+              id: 'memory_usage',
+              icon: Icons.psychology_outlined,
+              label: AppStrings.memoryUsage,
+              description: '查看本轮回复用了哪些记忆，并单独开关本会话记忆',
+            ),
+          if (hasSession)
+            const _ChatCommandAction(
               id: 'usage',
               icon: Icons.query_stats,
               label: AppStrings.usageSummary,
@@ -1833,22 +2224,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
         ],
       ),
-      const _ChatCommandGroup(
+      _ChatCommandGroup(
         label: '工作区与工具',
         actions: [
-          _ChatCommandAction(
+          const _ChatCommandAction(
             id: 'terminal',
             icon: Icons.terminal,
             label: AppStrings.terminal,
             description: '打开本机 Alpine 终端',
           ),
           _ChatCommandAction(
+            id: 'workspace_files',
+            icon: Icons.folder_open_outlined,
+            label: '文件浏览器',
+            description:
+                '浏览「${provider.workspaceForSession(provider.currentSession?.workspaceId).name}」'
+                '工作区的文件并插入到会话输入框（确认后发送）',
+          ),
+          const _ChatCommandAction(
+            id: 'workspaces',
+            icon: Icons.workspaces_outline,
+            label: AppStrings.workspacesTitle,
+            description: '查看、切换和重命名本地工作区',
+          ),
+          const _ChatCommandAction(
             id: 'dashboard',
             icon: Icons.dashboard_outlined,
             label: AppStrings.dashboard,
             description: '查看本地运行状态',
           ),
-          _ChatCommandAction(
+          const _ChatCommandAction(
             id: 'session_system_prompt',
             icon: Icons.tune,
             label: AppStrings.systemPromptTitle,
@@ -1912,14 +2317,58 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _showCompareDialog();
       case 'context_summary':
         _showContextSummaryDialog();
+      case 'memory_usage':
+        _showMemoryUsageDialog();
       case 'usage':
         _showSessionUsageDialog();
       case 'terminal':
         Navigator.of(context)
             .push(CupertinoPageRoute(builder: (_) => const TerminalScreen()));
+      case 'workspace_files':
+        unawaited(_openWorkspaceBrowser());
+      case 'workspaces':
+        Navigator.of(context)
+            .push(CupertinoPageRoute(builder: (_) => const WorkspacesScreen()));
       case 'dashboard':
         Navigator.of(context)
             .push(CupertinoPageRoute(builder: (_) => const DashboardScreen()));
+    }
+  }
+
+  /// Opens the workspace file browser. A file the user sends from there comes
+  /// back as a reference inserted into the composer, so nothing is attached or
+  /// sent without another deliberate tap.
+  Future<void> _openWorkspaceBrowser() async {
+    final provider = context.read<ChatProvider>();
+    // The browser opens the workspace this conversation belongs to, not just
+    // whatever workspace happens to be active globally.
+    final workspace = provider.workspaceForSession(
+      provider.currentSession?.workspaceId,
+    );
+    final reference = await Navigator.of(context).push<String>(
+      CupertinoPageRoute(
+        builder: (_) => WorkspaceBrowserScreen(workspace: workspace),
+      ),
+    );
+    if (!mounted || reference == null || reference.trim().isEmpty) return;
+    final existing = _inputController.text.trimRight();
+    _inputController.text =
+        existing.isEmpty ? '$reference\n' : '$existing\n$reference\n';
+    _inputController.selection = TextSelection.collapsed(
+      offset: _inputController.text.length,
+    );
+    final session = provider.currentSession;
+    if (session != null) provider.saveDraft(session.id, _inputController.text);
+    _focusNode.requestFocus();
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger != null) {
+      messenger
+        ..clearSnackBars()
+        ..showSnackBar(
+          const SnackBar(
+            content: Text('已把文件路径放进输入框；确认内容后再发送'),
+          ),
+        );
     }
   }
 
@@ -1935,9 +2384,48 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       appBar: AppBar(
         title: Consumer<ChatProvider>(
           builder: (_, provider, __) {
-            return Text(
-              provider.currentSession?.title ?? AppStrings.appName,
-              overflow: TextOverflow.ellipsis,
+            final session = provider.currentSession;
+            final workspace = provider.workspaceForSession(
+              session?.workspaceId,
+            );
+            return LayoutBuilder(
+              builder: (context, constraints) {
+                // Never a second line: the toolbar keeps its height at 320dp
+                // and 200 percent text. The name shows when it fits; below
+                // that an icon-only chip keeps the current workspace visible
+                // (its semantics label and tooltip still name it) while the
+                // title stays readable.
+                final showName = constraints.maxWidth >= 260;
+                final showChip = constraints.maxWidth >= 56;
+                return Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        session?.title ?? AppStrings.appName,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (showChip) ...[
+                      const SizedBox(width: 8),
+                      ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxWidth: showName ? constraints.maxWidth * 0.45 : 40,
+                        ),
+                        child: _ChatWorkspaceChip(
+                          key: const ValueKey('chat-workspace-chip'),
+                          name: workspace.name,
+                          compact: !showName,
+                          onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => const WorkspacesScreen(),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                );
+              },
             );
           },
         ),
@@ -1968,6 +2456,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             onPressed: _showCommandSurface,
           ),
         ],
+        // The workspace is the scope every file action and new session uses,
+        // so it stays visible under the title instead of only inside menus.
       ),
       body: LayoutBuilder(
         builder: (context, chatConstraints) {
@@ -1978,9 +2468,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           );
           final compareWorkspaceMode =
               hasCompare && chatConstraints.maxHeight < 760;
+          // Item 1: the message list, composer, and tool status share one
+          // reading width and stay centered on a wide chat pane.
+          final readingWidth = chatReadingWidthFor(
+            windowWidth: MediaQuery.sizeOf(context).width,
+            availableWidth: chatConstraints.maxWidth,
+          );
           return Column(
             children: [
-              const AgentStatusBar(),
+              Center(
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: readingWidth),
+                  child: const AgentStatusBar(),
+                ),
+              ),
               Consumer<ChatProvider>(
                 builder: (_, provider, __) {
                   if (!provider.safeMode) return const SizedBox.shrink();
@@ -2026,8 +2527,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 Expanded(
                   child: LayoutBuilder(
                     builder: (context, constraints) {
-                      final maxContentWidth =
-                          math.min(640.0, constraints.maxWidth * 0.86);
+                      final maxContentWidth = readingWidth;
                       final maxStructuredResultHeight = math.max(
                         96.0,
                         constraints.maxHeight - 72,
@@ -2043,6 +2543,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             String modelLabel,
                             bool usesExternalExecutionContext,
                             String executionContextLabel,
+                            String workspaceName,
                           })>(
                         selector: (_, p) => (
                           messages: p.currentSession?.messages ?? [],
@@ -2060,6 +2561,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           usesExternalExecutionContext:
                               p.currentSessionUsesRemoteAgent,
                           executionContextLabel: p.currentExecutionContextLabel,
+                          workspaceName: p
+                              .workspaceForSession(
+                                  p.currentSession?.workspaceId)
+                              .name,
                         ),
                         builder: (context, data, __) {
                           final messages = data.messages;
@@ -2102,6 +2607,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               usesExternalExecutionContext:
                                   data.usesExternalExecutionContext,
                               executionContextLabel: data.executionContextLabel,
+                              workspaceName: data.workspaceName,
                             );
                           }
 
@@ -2123,118 +2629,135 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           if (_userHasScrolledUp && hasStreaming) {
                             _scheduleScrollExtentCompensation();
                           }
-                          return Stack(
-                            children: [
-                              SelectionArea(
-                                child: NotificationListener<ScrollNotification>(
-                                  onNotification: _handleScrollNotification,
-                                  child: ListView.builder(
-                                    key: const ValueKey('chat-message-list'),
-                                    controller: _scrollController,
-                                    reverse: true,
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 16, vertical: 12),
-                                    itemCount: itemCount,
-                                    itemBuilder: (context, index) {
-                                      final virtualIndex =
-                                          itemCount - 1 - index;
-                                      if (virtualIndex ==
-                                              streamingOrTypingIndex &&
-                                          hasStreaming) {
-                                        return Consumer<ChatProvider>(
-                                          builder: (_, provider, __) {
+                          return Center(
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                maxWidth: maxContentWidth,
+                              ),
+                              child: Stack(
+                                children: [
+                                  SelectionArea(
+                                    child: NotificationListener<
+                                        ScrollNotification>(
+                                      onNotification: _handleScrollNotification,
+                                      child: ListView.builder(
+                                        key:
+                                            const ValueKey('chat-message-list'),
+                                        controller: _scrollController,
+                                        reverse: true,
+                                        padding: const EdgeInsets.symmetric(
+                                            horizontal: 16, vertical: 12),
+                                        itemCount: itemCount,
+                                        itemBuilder: (context, index) {
+                                          final virtualIndex =
+                                              itemCount - 1 - index;
+                                          if (virtualIndex ==
+                                                  streamingOrTypingIndex &&
+                                              hasStreaming) {
+                                            return Consumer<ChatProvider>(
+                                              builder: (_, provider, __) {
+                                                return RepaintBoundary(
+                                                  child: _buildStreamingBubble(
+                                                    provider.streamingText,
+                                                    theme,
+                                                    maxContentWidth,
+                                                    reasoningText: provider
+                                                        .streamingReasoningText,
+                                                    reasoningTotalLength: provider
+                                                        .streamingReasoningTotalLength,
+                                                    previousRole: messages
+                                                            .isEmpty
+                                                        ? null
+                                                        : messages.last.role,
+                                                  ),
+                                                );
+                                              },
+                                            );
+                                          }
+                                          if (virtualIndex ==
+                                                  streamingOrTypingIndex &&
+                                              showTyping) {
                                             return RepaintBoundary(
-                                              child: _buildStreamingBubble(
-                                                provider.streamingText,
+                                              child:
+                                                  _buildTypingIndicatorBubble(
                                                 theme,
                                                 maxContentWidth,
-                                                reasoningText: provider
-                                                    .streamingReasoningText,
-                                                reasoningTotalLength: provider
-                                                    .streamingReasoningTotalLength,
                                                 previousRole: messages.isEmpty
                                                     ? null
                                                     : messages.last.role,
                                               ),
                                             );
-                                          },
-                                        );
-                                      }
-                                      if (virtualIndex ==
-                                              streamingOrTypingIndex &&
-                                          showTyping) {
-                                        return RepaintBoundary(
-                                          child: _buildTypingIndicatorBubble(
-                                            theme,
-                                            maxContentWidth,
-                                            previousRole: messages.isEmpty
-                                                ? null
-                                                : messages.last.role,
-                                          ),
-                                        );
-                                      }
-                                      if (hasLoadOlder && virtualIndex == 0) {
-                                        return _buildLoadOlderMessagesAffordance(
-                                          theme,
-                                          hiddenCount: window.hiddenBeforeCount,
-                                          totalMessageCount: messages.length,
-                                        );
-                                      }
-                                      final visibleIndex =
-                                          virtualIndex - virtualMessageStart;
-                                      final message =
-                                          visibleMessages[visibleIndex];
-                                      final originalIndex =
-                                          originalMessageIndexForVisibleIndex(
-                                        windowStartIndex: window.startIndex,
-                                        visibleIndex: visibleIndex,
-                                      );
-                                      final previousRole = visibleIndex > 0
-                                          ? visibleMessages[visibleIndex - 1]
-                                              .role
-                                          : null;
-                                      final nextRole = visibleIndex <
-                                              visibleMessages.length - 1
-                                          ? visibleMessages[visibleIndex + 1]
-                                              .role
-                                          : null;
-                                      final animationId =
-                                          _messageAnimationId(message);
-                                      final animate = _seenMessageAnimationIds
-                                          .add(animationId);
-                                      return _AnimatedMessageEntry(
-                                        key: ValueKey(animationId),
-                                        animate: animate,
-                                        child: KeyedSubtree(
-                                          key: _keyForMessageIndex(
-                                              originalIndex),
-                                          child: RepaintBoundary(
-                                            child: _buildMessageBubble(
-                                              message,
-                                              originalIndex,
+                                          }
+                                          if (hasLoadOlder &&
+                                              virtualIndex == 0) {
+                                            return _buildLoadOlderMessagesAffordance(
                                               theme,
-                                              maxContentWidth,
-                                              maxStructuredResultHeight:
-                                                  maxStructuredResultHeight,
-                                              messages: messages,
-                                              previousRole: previousRole,
-                                              nextRole: nextRole,
-                                              highlighted: originalIndex ==
-                                                  _highlightedSearchMessageIndex,
+                                              hiddenCount:
+                                                  window.hiddenBeforeCount,
+                                              totalMessageCount:
+                                                  messages.length,
+                                            );
+                                          }
+                                          final visibleIndex = virtualIndex -
+                                              virtualMessageStart;
+                                          final message =
+                                              visibleMessages[visibleIndex];
+                                          final originalIndex =
+                                              originalMessageIndexForVisibleIndex(
+                                            windowStartIndex: window.startIndex,
+                                            visibleIndex: visibleIndex,
+                                          );
+                                          final previousRole = visibleIndex > 0
+                                              ? visibleMessages[
+                                                      visibleIndex - 1]
+                                                  .role
+                                              : null;
+                                          final nextRole = visibleIndex <
+                                                  visibleMessages.length - 1
+                                              ? visibleMessages[
+                                                      visibleIndex + 1]
+                                                  .role
+                                              : null;
+                                          final animationId =
+                                              _messageAnimationId(message);
+                                          final animate =
+                                              _seenMessageAnimationIds
+                                                  .add(animationId);
+                                          return _AnimatedMessageEntry(
+                                            key: ValueKey(animationId),
+                                            animate: animate,
+                                            child: KeyedSubtree(
+                                              key: _keyForMessageIndex(
+                                                  originalIndex),
+                                              child: RepaintBoundary(
+                                                child: _buildMessageBubble(
+                                                  message,
+                                                  originalIndex,
+                                                  theme,
+                                                  maxContentWidth,
+                                                  maxStructuredResultHeight:
+                                                      maxStructuredResultHeight,
+                                                  messages: messages,
+                                                  previousRole: previousRole,
+                                                  nextRole: nextRole,
+                                                  highlighted: originalIndex ==
+                                                      _highlightedSearchMessageIndex,
+                                                ),
+                                              ),
                                             ),
-                                          ),
-                                        ),
-                                      );
-                                    },
+                                          );
+                                        },
+                                      ),
+                                    ),
                                   ),
-                                ),
+                                  Positioned(
+                                    right: 16,
+                                    bottom: 16,
+                                    child: _buildScrollToBottomButton(theme),
+                                  ),
+                                ],
                               ),
-                              Positioned(
-                                right: 16,
-                                bottom: 16,
-                                child: _buildScrollToBottomButton(theme),
-                              ),
-                            ],
+                            ),
                           );
                         },
                       );
@@ -2287,11 +2810,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 Flexible(
                   child: SingleChildScrollView(
                     reverse: true,
-                    child: _buildInputArea(theme),
+                    child: _buildInputArea(theme, readingWidth),
                   ),
                 )
               else
-                _buildInputArea(theme),
+                _buildInputArea(theme, readingWidth),
             ],
           );
         },
@@ -2389,6 +2912,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     double maxContentWidth, {
     required bool usesExternalExecutionContext,
     required String executionContextLabel,
+    required String workspaceName,
   }) {
     const prompts = [
       (
@@ -2443,6 +2967,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 icon: Icons.memory_outlined,
                 label: '当前模型',
                 value: modelName,
+              ),
+              const SizedBox(height: 8),
+              // New sessions and file actions are scoped to this workspace; the
+              // empty state names it before the first message is sent.
+              _EmptyStateFactRow(
+                icon: Icons.folder_outlined,
+                label: '当前工作区',
+                value: workspaceName,
+              ),
+              const SizedBox(height: 8),
+              const _EmptyStateFactRow(
+                icon: Icons.smartphone_outlined,
+                label: '手机数据与动作',
+                value: AppStrings.phoneCapabilityNote,
               ),
               const SizedBox(height: 22),
               Text(
@@ -3093,6 +3631,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return buffer.toString().trimRight();
   }
 
+  /// Plain-text form of a message: the full transcript text with markdown
+  /// markers removed. Used by 复制纯文本.
+  String _messageToPlainText(
+    ChatMessage? message, {
+    required String fallbackText,
+  }) {
+    final source = message == null
+        ? fallbackText
+        : _messageToMarkdown(message, fallbackText: fallbackText);
+    return stripMarkdownMarkers(source);
+  }
+
   Future<void> _forkFromMessage(int? messageIndex) async {
     final session = context.read<ChatProvider>().currentSession;
     if (session == null || messageIndex == null) return;
@@ -3240,11 +3790,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   await _showEditMessageDialog(message, messageIndex);
                 },
               ),
+            if (message?.role == 'user' && messageIndex != null)
+              ListTile(
+                leading: const Icon(Icons.delete_sweep_outlined),
+                title: const Text(AppStrings.deleteFromHere),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  await _confirmDeleteFromHere(messageIndex);
+                },
+              ),
             ListTile(
-              leading: const Icon(Icons.copy),
-              title: const Text(AppStrings.copyText),
+              leading: const Icon(Icons.copy_all_outlined),
+              title: const Text(AppStrings.copyFullText),
               onTap: () {
-                Clipboard.setData(ClipboardData(text: actionText));
+                Clipboard.setData(ClipboardData(
+                  text: _messageToMarkdown(message, fallbackText: actionText),
+                ));
                 Navigator.pop(ctx);
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
@@ -3254,11 +3815,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               },
             ),
             ListTile(
-              leading: const Icon(Icons.article_outlined),
-              title: const Text(AppStrings.copyMarkdown),
+              leading: const Icon(Icons.text_snippet_outlined),
+              title: const Text(AppStrings.copyPlainText),
               onTap: () {
                 Clipboard.setData(ClipboardData(
-                  text: _messageToMarkdown(message, fallbackText: actionText),
+                  text: _messageToPlainText(message, fallbackText: actionText),
                 ));
                 Navigator.pop(ctx);
                 ScaffoldMessenger.of(context).showSnackBar(
@@ -3326,6 +3887,52 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// Confirms and applies "从此处删除": remove this message and everything after.
+  Future<void> _confirmDeleteFromHere(int messageIndex) async {
+    final provider = context.read<ChatProvider>();
+    final session = provider.currentSession;
+    if (session == null) return;
+    final status = provider.agentStatus;
+    final runActive = status != AgentStatus.idle && status != AgentStatus.error;
+    if (runActive) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.deleteFromHereBlockedActive)),
+      );
+      return;
+    }
+    final count = session.messages.length - messageIndex;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text(AppStrings.deleteFromHereTitle),
+        content: Text('${AppStrings.deleteFromHereBody}\n\n共 $count 条。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text(AppStrings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(AppStrings.delete),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final deleted = await provider.deleteMessagesFrom(messageIndex);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          deleted
+              ? AppStrings.deleteFromHereDone
+              : AppStrings.deleteFromHereBlockedActive,
+        ),
+        duration: const Duration(seconds: 1),
       ),
     );
   }
@@ -3846,19 +4453,46 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final sessionId = session.id;
     var mode = await MemoryService.getSessionMemoryMode(sessionId);
     if (!mounted) return;
+    final toggle = await MemoryService.sessionToggleState(sessionId)
+        .catchError((Object _) => SessionMemoryToggleState(
+              globalEnabled: false,
+              mode: mode,
+              effectiveEnabled:
+                  MemoryService.isEnabledForSessionSync(sessionId),
+            ));
+    if (!mounted) return;
 
     final result = await showDialog<SessionMemoryMode>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
+          scrollable: true,
           title: const Text(AppStrings.sessionMemory),
           content: Column(
             mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // The effective state answers "is memory injected right now?",
+              // which the three radio labels alone never said.
+              Text(
+                toggle.effectiveEnabled
+                    ? '当前：之后的回复会注入本会话记忆。'
+                    : '当前：之后的回复不会注入本会话记忆。',
+                style: Theme.of(ctx).textTheme.titleSmall,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '开关只影响之后的回复，不会改动已经保存的记忆。',
+                style: Theme.of(ctx).textTheme.bodySmall,
+              ),
               RadioListTile<SessionMemoryMode>(
                 value: SessionMemoryMode.followGlobal,
                 groupValue: mode,
                 title: const Text(AppStrings.sessionMemoryFollowGlobal),
+                subtitle: Text(
+                  '跟随全局设置；全局现在是'
+                  '${toggle.globalEnabled ? '开启' : '关闭'}。',
+                ),
                 onChanged: (value) {
                   if (value != null) setDialogState(() => mode = value);
                 },
@@ -3867,6 +4501,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 value: SessionMemoryMode.enabled,
                 groupValue: mode,
                 title: const Text(AppStrings.sessionMemoryOn),
+                subtitle: const Text('只对本会话开启；其他会话不变。'),
                 onChanged: (value) {
                   if (value != null) setDialogState(() => mode = value);
                 },
@@ -3875,6 +4510,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 value: SessionMemoryMode.disabled,
                 groupValue: mode,
                 title: const Text(AppStrings.sessionMemoryOff),
+                subtitle: const Text('只对本会话关闭；其他会话不变。'),
                 onChanged: (value) {
                   if (value != null) setDialogState(() => mode = value);
                 },
@@ -3895,8 +4531,31 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ),
     );
     if (result == null) return;
-    await MemoryService.setSessionMemoryMode(sessionId, result);
-    if (mounted) setState(() {});
+    try {
+      await MemoryService.setSessionMemoryMode(sessionId, result);
+    } catch (_) {
+      // The service restored the previous mode; report the failure instead of
+      // pretending the toggle changed anything.
+      if (!mounted) return;
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        const SnackBar(content: Text('保存失败，设置未改变')),
+      );
+      return;
+    }
+    if (!mounted) return;
+    setState(() {});
+    final effective = switch (result) {
+      SessionMemoryMode.followGlobal => toggle.globalEnabled,
+      SessionMemoryMode.enabled => true,
+      SessionMemoryMode.disabled => false,
+    };
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(
+        content: Text(
+          effective ? '已保存：之后的回复会使用本会话记忆' : '已保存：之后的回复不会使用本会话记忆',
+        ),
+      ),
+    );
   }
 
   Future<void> _showPromptProfilesDialog() async {
@@ -5394,7 +6053,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     };
   }
 
-  Widget _buildInputArea(ThemeData theme) {
+  Widget _buildInputArea(ThemeData theme, double readingWidth) {
     return Consumer<ChatProvider>(
       builder: (_, provider, __) {
         final isRunning = provider.agentStatus != AgentStatus.idle &&
@@ -5423,7 +6082,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             child: Center(
               child: ConstrainedBox(
                 constraints: BoxConstraints(
-                  maxWidth: 640,
+                  maxWidth: readingWidth,
                   maxHeight: maxInputHeight,
                 ),
                 child: SingleChildScrollView(
@@ -5434,6 +6093,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       _buildAttachmentPreviews(theme),
+                      PastedTextChipRow(
+                        blocks: _pastedBlocks,
+                        onRemove: _removePastedBlock,
+                      ),
                       _buildExecutionContextChip(theme, provider),
                       _buildBackgroundTasksBar(theme, provider),
                       _buildMessageQueueBar(theme, provider, isRunning),
@@ -5458,54 +6121,59 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           ),
                           const SizedBox(width: 8),
                           Expanded(
-                            child: TextField(
-                              controller: _inputController,
-                              focusNode: _focusNode,
-                              enabled: true,
-                              maxLines: 5,
-                              minLines: 1,
-                              textInputAction: TextInputAction.send,
-                              onSubmitted: (_) => _sendMessage(),
-                              decoration: InputDecoration(
-                                hintText: isRunning
-                                    ? (queueFull
-                                        ? AppStrings.messageQueueFullHint(
-                                            provider.messageQueue.length,
-                                            ChatProvider.maxQueuedMessages,
-                                          )
-                                        : AppStrings.queueInputHint)
-                                    : AppStrings.inputHint,
-                                filled: true,
-                                fillColor:
-                                    theme.colorScheme.surfaceContainerHighest,
-                                border: OutlineInputBorder(
-                                  borderRadius:
-                                      BorderRadius.circular(AppRadii.xl),
-                                  borderSide: BorderSide(
-                                    color:
-                                        theme.colorScheme.outline.withAlpha(60),
+                            child: ComposerFieldMarker(
+                              child: ComposerPasteShortcuts(
+                                onPaste: _handleComposerPaste,
+                                child: TextField(
+                                  controller: _inputController,
+                                  focusNode: _focusNode,
+                                  enabled: true,
+                                  maxLines: 5,
+                                  minLines: 1,
+                                  textInputAction: TextInputAction.send,
+                                  onSubmitted: (_) => _sendMessage(),
+                                  decoration: InputDecoration(
+                                    hintText: isRunning
+                                        ? (queueFull
+                                            ? AppStrings.messageQueueFullHint(
+                                                provider.messageQueue.length,
+                                                ChatProvider.maxQueuedMessages,
+                                              )
+                                            : AppStrings.queueInputHint)
+                                        : AppStrings.inputHint,
+                                    filled: true,
+                                    fillColor: theme
+                                        .colorScheme.surfaceContainerHighest,
+                                    border: OutlineInputBorder(
+                                      borderRadius:
+                                          BorderRadius.circular(AppRadii.xl),
+                                      borderSide: BorderSide(
+                                        color: theme.colorScheme.outline
+                                            .withAlpha(60),
+                                      ),
+                                    ),
+                                    enabledBorder: OutlineInputBorder(
+                                      borderRadius:
+                                          BorderRadius.circular(AppRadii.xl),
+                                      borderSide: BorderSide(
+                                        color: theme.colorScheme.outline
+                                            .withAlpha(60),
+                                      ),
+                                    ),
+                                    focusedBorder: OutlineInputBorder(
+                                      borderRadius:
+                                          BorderRadius.circular(AppRadii.xl),
+                                      borderSide: BorderSide(
+                                        color: theme.colorScheme.primary
+                                            .withAlpha(180),
+                                        width: 1.5,
+                                      ),
+                                    ),
+                                    contentPadding: const EdgeInsets.symmetric(
+                                      horizontal: 16,
+                                      vertical: 12,
+                                    ),
                                   ),
-                                ),
-                                enabledBorder: OutlineInputBorder(
-                                  borderRadius:
-                                      BorderRadius.circular(AppRadii.xl),
-                                  borderSide: BorderSide(
-                                    color:
-                                        theme.colorScheme.outline.withAlpha(60),
-                                  ),
-                                ),
-                                focusedBorder: OutlineInputBorder(
-                                  borderRadius:
-                                      BorderRadius.circular(AppRadii.xl),
-                                  borderSide: BorderSide(
-                                    color: theme.colorScheme.primary
-                                        .withAlpha(180),
-                                    width: 1.5,
-                                  ),
-                                ),
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                  vertical: 12,
                                 ),
                               ),
                             ),
@@ -5945,6 +6613,74 @@ class _ChatCommandAction {
   final String description;
 }
 
+/// Compact workspace indicator for the chat app bar.
+///
+/// One line only: it must never grow the toolbar (the 320dp and 200 percent
+/// text layouts depend on that height), and it doubles as the entry to the
+/// workspace screen.
+class _ChatWorkspaceChip extends StatelessWidget {
+  const _ChatWorkspaceChip({
+    super.key,
+    required this.name,
+    this.compact = false,
+    this.onTap,
+  });
+
+  final String name;
+
+  /// Icon only: the toolbar has no room for the name (320dp, large text), but
+  /// the tooltip and semantics label still announce it.
+  final bool compact;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final label = '当前工作区：$name';
+    return Tooltip(
+      message: label,
+      child: Semantics(
+        label: label,
+        button: true,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(999),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            child: compact
+                ? Icon(
+                    Icons.workspaces_outline,
+                    size: 16,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  )
+                : Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.workspaces_outline,
+                        size: 14,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text(
+                          name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ChatCommandSurface extends StatelessWidget {
   const _ChatCommandSurface({super.key, required this.groups});
 
@@ -6264,4 +7000,46 @@ class _TypingDotsState extends State<_TypingDots>
       ),
     );
   }
+}
+
+/// Strips common markdown markers so copied text reads as plain prose.
+///
+/// Used by the message action sheet's 复制纯文本. It keeps the content and the
+/// link targets; it only removes presentation markers.
+@visibleForTesting
+String stripMarkdownMarkers(String source) {
+  var text = source.replaceAll('\r\n', '\n');
+  // Fence markers go; the fenced content stays.
+  text = text.replaceAll(RegExp(r'^\s*```[^\n]*$', multiLine: true), '');
+  // Images: keep alt text.
+  text = text.replaceAllMapped(
+    RegExp(r'!\[([^\]]*)\]\([^)]*\)'),
+    (match) => match.group(1) ?? '',
+  );
+  // Links: keep the label and the target.
+  text = text.replaceAllMapped(RegExp(r'\[([^\]]*)\]\(([^)]*)\)'), (match) {
+    final label = (match.group(1) ?? '').trim();
+    final target = (match.group(2) ?? '').trim();
+    if (label.isEmpty) return target;
+    return target.isEmpty ? label : '$label ($target)';
+  });
+  // Headings, blockquotes and list markers at line start.
+  text = text.replaceAll(RegExp(r'^\s{0,3}#{1,6}\s*', multiLine: true), '');
+  text = text.replaceAll(RegExp(r'^\s{0,3}>\s?', multiLine: true), '');
+  text = text.replaceAll(
+    RegExp(r'^\s{0,3}(?:[-*+]|\d+[.)])\s+', multiLine: true),
+    '',
+  );
+  // Emphasis and inline code markers.
+  text = text.replaceAll('**', '').replaceAll('__', '');
+  text = text.replaceAllMapped(RegExp(r'(?<!\*)\*(?!\*)'), (_) => '');
+  text = text.replaceAllMapped(RegExp(r'(?<!_)_(?!_)'), (_) => '');
+  text = text.replaceAll('`', '');
+  // Horizontal rules.
+  text = text.replaceAll(
+    RegExp(r'^\s{0,3}(?:[-*_]\s*){3,}$', multiLine: true),
+    '',
+  );
+  text = text.replaceAll(RegExp(r'\n{3,}'), '\n\n');
+  return text.trim();
 }

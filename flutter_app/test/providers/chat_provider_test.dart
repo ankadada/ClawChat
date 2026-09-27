@@ -32,6 +32,7 @@ import 'package:clawchat/services/tools/env_var_tool.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:clawchat/services/tools/untrusted_data_policy.dart';
 
 const int _maxContextTokens = 25000;
 
@@ -220,10 +221,7 @@ void main() {
 
     test('switches 2 to 1 to 2 to 1 without reordering versions', () async {
       final provider = ChatProvider();
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
+      addTearDown(provider.dispose);
       await Future<void>.delayed(const Duration(milliseconds: 20));
 
       final session = await provider.createSession();
@@ -276,11 +274,10 @@ void main() {
       final storage = SessionStorage();
       await storage.init();
       final provider = ChatProvider(storage: storage);
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       await provider.moveToFolder(session.id, 'Work');
@@ -951,11 +948,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.createSession();
       PreferencesService().toolApprovalPolicy =
@@ -1042,11 +1038,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final source = await provider.createSession();
       provider.setAppInBackground(true);
@@ -1114,11 +1109,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.createSession();
       provider.setAppInBackground(true);
@@ -1212,11 +1206,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       await provider.createSession();
 
       final send = provider.sendMessage('two approvals');
@@ -1340,11 +1333,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.createSession();
       PreferencesService().toolApprovalPolicy =
@@ -1402,11 +1394,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final target = await provider.createSession();
       await provider.createSession();
@@ -1471,11 +1462,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await provider.createSession();
@@ -1531,11 +1521,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await provider.createSession();
@@ -1609,11 +1598,10 @@ void main() {
             },
           ),
         );
-        addTearDown(() async {
-          await Future<void>.delayed(const Duration(milliseconds: 20));
-          provider.dispose();
-        });
-        await Future<void>.delayed(const Duration(milliseconds: 50));
+        addTearDown(provider.dispose);
+        // Deterministic startup barrier instead of a sleep: the provider's
+        // async init settles before the test drives it and stops on disposal.
+        await provider.initialized;
         PreferencesService().toolApprovalPolicy =
             PreferencesService.toolApprovalAuto;
         await provider.createSession();
@@ -1695,11 +1683,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       final target = await provider.createSession();
@@ -1828,11 +1815,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        recreated.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(recreated.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await recreated.initialized;
       await recreated.selectSession(session.id);
       recreated.setAppInBackground(true);
 
@@ -1879,11 +1865,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       final prefs = PreferencesService()
         ..toolApprovalPolicy = PreferencesService.toolApprovalAuto
         ..deniedToolNames = {'echo'};
@@ -1938,11 +1923,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.createSession();
       final sendFuture = provider.sendMessage('use tool');
@@ -1993,11 +1977,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalSessionFirst;
       await provider.createSession();
@@ -2070,11 +2053,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       final transientUiSnapshots = <String>[];
@@ -2148,11 +2130,10 @@ void main() {
           ],
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       final transientUiSnapshots = <String>[];
@@ -2175,6 +2156,49 @@ void main() {
       expect(events.recent(sessionId: session.id).toString(),
           isNot(contains(sentinel)));
       expect(diagnostics, isNot(contains(sentinel)));
+    });
+
+    test('incomplete stream keeps partial text and marks it interrupted',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => throw UnimplementedError(),
+          // Text is produced, then the stream closes without a completion
+          // event, as when the connection drops mid-reply.
+          onMessageEvents: (_) => [
+            TextDelta('partial answer that already arrived'),
+          ],
+        ),
+      );
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
+
+      final session = await provider.createSession();
+      await provider.sendMessage('tell me something long');
+
+      final stored = await storage.getSession(session.id);
+      final storedText = stored!.messages
+          .where((message) => message.role == 'assistant')
+          .map((message) => message.textContent)
+          .join('\n');
+      expect(storedText, contains('partial answer that already arrived'));
+      expect(storedText, contains('中断'));
+      expect(
+        stored.messages.any((message) => message.role == 'assistant'),
+        isTrue,
+      );
+      // The error surface is additive: the partial assistant message stays.
+      expect(stored.messages.last.hasAssistantError, isTrue);
+      expect(
+        provider.errorMessage,
+        isNotNull,
+      );
     });
 
     test('cancel discards guarded secret bytes before any durable output',
@@ -2270,11 +2294,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final original = await provider.createSession();
       final sendFuture = provider.sendMessage('use tool');
@@ -2837,11 +2860,10 @@ void main() {
           )),
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       await provider.sendMessage('normal request');
@@ -2958,11 +2980,10 @@ void main() {
           )),
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       await provider.sendMessage('normal request');
@@ -3075,11 +3096,10 @@ void main() {
           )),
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       provider.setAppInBackground(true);
@@ -3126,11 +3146,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       await provider.sendMessage('use safe tool');
@@ -3162,11 +3181,10 @@ void main() {
           ),
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        firstProvider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(firstProvider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await firstProvider.initialized;
 
       final session = await firstProvider.createSession();
       await firstProvider.sendMessage('hello');
@@ -3195,11 +3213,10 @@ void main() {
           )),
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        secondProvider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(secondProvider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await secondProvider.initialized;
 
       await secondProvider.selectSession(session.id);
 
@@ -3228,11 +3245,10 @@ void main() {
       );
       await storage.saveSession(session);
       final provider = ChatProvider(storage: storage);
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.selectSession(session.id);
       expect(provider.currentInterruptedAgentRun, isNotNull);
@@ -3271,11 +3287,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.selectSession(session.id);
       expect(provider.currentInterruptedAgentRun, isNotNull);
@@ -3319,11 +3334,10 @@ void main() {
           )),
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       await provider.selectSession(session.id);
 
       await provider.continueInterruptedAgentRun();
@@ -3410,11 +3424,10 @@ void main() {
           )),
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       await provider.selectSession(session.id);
 
       await provider.continueInterruptedAgentRun();
@@ -3644,11 +3657,10 @@ void main() {
           );
         },
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       await provider.selectSession('recovery-repeat-continue');
 
       for (var index = 0; index < 3; index++) {
@@ -3717,11 +3729,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await provider.selectSession(session.id);
@@ -3794,11 +3805,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       await provider.selectSession(session.id);
 
       expect(tool.executionCount, 0);
@@ -3851,11 +3861,10 @@ void main() {
         storage: storage,
         toolRegistry: ToolRegistry()..register(tool, risk: ToolRisk.dangerous),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.selectSession(session.id);
       await Future<void>.delayed(const Duration(milliseconds: 50));
@@ -3942,11 +3951,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.selectSession(session.id);
       expect(provider.currentInterruptedAgentRun!.toolAttempts.single.lifecycle,
@@ -4034,11 +4042,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await provider.selectSession(session.id);
@@ -4172,11 +4179,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        reloaded.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(reloaded.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await reloaded.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await reloaded.selectSession(session.id);
@@ -4288,11 +4294,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await provider.selectSession(session.id);
@@ -4371,11 +4376,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.createSession();
       await provider.sendMessage('hello');
@@ -4424,11 +4428,10 @@ void main() {
             },
           ),
         );
-        addTearDown(() async {
-          await Future<void>.delayed(const Duration(milliseconds: 20));
-          provider.dispose();
-        });
-        await Future<void>.delayed(const Duration(milliseconds: 50));
+        addTearDown(provider.dispose);
+        // Deterministic startup barrier instead of a sleep: the provider's
+        // async init settles before the test drives it and stops on disposal.
+        await provider.initialized;
 
         await provider.createSession();
         await provider.sendMessage('hello ${scenario.$1}');
@@ -4475,11 +4478,10 @@ void main() {
       );
 
       final reloaded = ChatProvider(storage: storage);
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        reloaded.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(reloaded.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await reloaded.initialized;
       await reloaded.selectSession(session.id);
 
       expect(reloaded.agentStatus, AgentStatus.idle);
@@ -4487,6 +4489,49 @@ void main() {
         reloaded.currentSession!.messages.where((m) => m.hasAssistantError),
         isEmpty,
       );
+    });
+  });
+
+  group('message actions', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    test('delete from here drops the message and every later message',
+        () async {
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(storage: storage);
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
+      await provider.createSession();
+      final session = provider.currentSession!;
+      session.messages.addAll([
+        ChatMessage(role: 'user', content: [TextContent('first')]),
+        ChatMessage(role: 'assistant', content: [TextContent('answer')]),
+        ChatMessage(role: 'user', content: [TextContent('second')]),
+      ]);
+      await storage.saveSession(session);
+
+      final removed = await provider.deleteMessagesFrom(1);
+
+      expect(removed, isTrue);
+      expect(provider.currentSession!.messages, hasLength(1));
+      expect(provider.currentSession!.messages.single.textContent, 'first');
+      final stored = await storage.getSession(session.id);
+      expect(stored!.messages, hasLength(1));
+
+      // Out-of-range and negative indexes are no-ops.
+      expect(await provider.deleteMessagesFrom(5), isFalse);
+      expect(await provider.deleteMessagesFrom(-1), isFalse);
+      expect(provider.currentSession!.messages, hasLength(1));
     });
   });
 
@@ -4518,11 +4563,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       final originalId = session.id;
@@ -4608,11 +4652,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       session.messages
@@ -4666,11 +4709,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       session.messages
@@ -4720,11 +4762,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       session.messages
@@ -4775,11 +4816,10 @@ void main() {
           )),
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final session = await provider.createSession();
       session.messages
@@ -5089,11 +5129,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final owner = await provider.createSession();
       owner.messages
@@ -5148,11 +5187,10 @@ void main() {
 
       final provider =
           ChatProvider(storage: storage, startupRestoreGuard: guard);
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       expect(provider.safeMode, isTrue);
       expect(provider.sessions.map((s) => s.id), contains('safe_mode_session'));
@@ -5176,11 +5214,10 @@ void main() {
         storage: _ThrowingInitSessionStorage(),
         startupRestoreGuard: guard,
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        firstProvider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(firstProvider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await firstProvider.initialized;
 
       expect(firstProvider.safeMode, isFalse);
       expect(firstProvider.startupFailureCount, 1);
@@ -5192,11 +5229,10 @@ void main() {
         storage: _ThrowingInitSessionStorage(),
         startupRestoreGuard: guard,
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        secondProvider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(secondProvider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await secondProvider.initialized;
 
       expect(secondProvider.safeMode, isTrue);
       expect(secondProvider.startupFailureCount, 2);
@@ -5223,11 +5259,10 @@ void main() {
         },
       ));
       final provider = ChatProvider(runtimeDebugEvents: events);
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       final report = await provider.buildDiagnosticsReport();
 
@@ -5264,11 +5299,10 @@ void main() {
 
       final secondEvents = _CountingRuntimeDebugEventService();
       final secondProvider = ChatProvider(runtimeDebugEvents: secondEvents);
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        secondProvider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(secondProvider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await secondProvider.initialized;
       expect(secondProvider.developerMode, isTrue);
       expect(secondEvents.setTracingEnabledCalls, 1);
       secondEvents.record(RuntimeDebugEvent(
@@ -5310,10 +5344,7 @@ void main() {
 
       final secondEvents = _CountingRuntimeDebugEventService();
       final secondProvider = await startWithStaleCapture(secondEvents);
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        secondProvider.dispose();
-      });
+      addTearDown(secondProvider.dispose);
       expect(secondProvider.developerMode, isFalse);
       expect(secondEvents.setTracingEnabledCalls, 2);
       expect(secondEvents.recent(), isEmpty);
@@ -5331,11 +5362,10 @@ void main() {
       );
       final events = RuntimeDebugEventService();
       final provider = ChatProvider(runtimeDebugEvents: events);
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       events.startRunTrace('s1');
       events.startRunTrace('s2');
@@ -5450,11 +5480,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       final session = await provider.createSession();
 
       await provider.sendMessage('', attachments: [
@@ -5588,11 +5617,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       await provider.selectSession(session.id);
 
       await provider.continueInterruptedAgentRun();
@@ -5666,11 +5694,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await provider.selectSession(session.id);
@@ -5748,11 +5775,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await provider.selectSession(session.id);
@@ -5848,11 +5874,10 @@ void main() {
           },
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
       PreferencesService().toolApprovalPolicy =
           PreferencesService.toolApprovalAuto;
       await provider.selectSession(session.id);
@@ -6206,11 +6231,10 @@ void main() {
                 ],
         ),
       );
-      addTearDown(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        provider.dispose();
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      addTearDown(provider.dispose);
+      // Deterministic startup barrier instead of a sleep: the provider's
+      // async init settles before the test drives it and stops on disposal.
+      await provider.initialized;
 
       await provider.createSession();
       await provider.sendMessage('hello');
@@ -8042,6 +8066,12 @@ void main() {
         ),
         llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
           config,
+          // 2.9.0 adds three phone tools; an 8K window can no longer hold the
+          // fixed system + tool overhead, so this clamp test uses a window that
+          // still fits the shipped tool surface.
+          resolvedProfile: _resolvedProfileWithCapabilities(
+            const caps.ModelCapabilities(maxContextTokens: 32768),
+          ),
           onMessages: (_) => StreamDone(const LlmResponse(
             stopReason: 'end_turn',
             content: [ContentBlock(type: 'text', text: 'ok')],
@@ -8067,7 +8097,7 @@ void main() {
 
       expect(provider.errorMessage, isNull);
       expect(observedRequest, isNotNull);
-      expect(observedRequest!.maxInputTokens, (8192 * 0.8).floor());
+      expect(observedRequest!.maxInputTokens, (32768 * 0.8).floor());
     });
 
     test('overflow generates summary and injects it into system prompt',
@@ -9818,6 +9848,486 @@ void main() {
     });
   });
 
+  group('model group credential routing', () {
+    setUp(() async {
+      await installPlatformMocks();
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    ProviderProfile profile({
+      required String id,
+      required String model,
+      String apiKey = '',
+      String baseUrl = '',
+    }) {
+      return ProviderProfile.defaults(name: id).copyWith(
+        id: id,
+        apiKey: apiKey,
+        baseUrl: baseUrl,
+        model: model,
+        apiFormat: ProviderProfile.anthropicFormat,
+      );
+    }
+
+    void configureGroup({
+      required List<ProviderProfile> profiles,
+      required String groupPrimaryId,
+      required List<ModelFallbackTarget> targets,
+    }) {
+      final group = ModelGroup(
+        id: 'group',
+        name: 'Group',
+        primaryProfileId: groupPrimaryId,
+        fallbackTargets: targets,
+      );
+      secureStorage['provider_profiles'] = jsonEncode(
+        profiles.map((item) => item.toJson()).toList(),
+      );
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': profiles.first.id,
+        'model_groups': jsonEncode([group.toJson()]),
+        'context_token_budget': 65536,
+        'developer_mode': true,
+      });
+    }
+
+    test('skips a keyless group member and uses a credentialed fallback',
+        () async {
+      final active = profile(
+        id: 'active',
+        model: 'active-model',
+        apiKey: 'sk-active',
+        baseUrl: 'http://active.test',
+      );
+      final keylessPrimary = profile(
+        id: 'keyless-primary',
+        model: 'keyless-primary-model',
+      );
+      final credentialedFallback = profile(
+        id: 'fallback',
+        model: 'fallback-model',
+        apiKey: 'sk-fallback',
+        baseUrl: 'http://fallback.test',
+      );
+      configureGroup(
+        profiles: [active, keylessPrimary, credentialedFallback],
+        groupPrimaryId: 'keyless-primary',
+        targets: const [ModelFallbackTarget(targetProfileId: 'fallback')],
+      );
+
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession(modelGroupId: 'group');
+      await provider.sendMessage('hello');
+
+      expect(attemptedModels, ['fallback-model']);
+    });
+
+    test('excludes a keyless fallback from the group fallback chain',
+        () async {
+      final active = profile(
+        id: 'active',
+        model: 'active-model',
+        apiKey: 'sk-active',
+        baseUrl: 'http://active.test',
+      );
+      final credentialedPrimary = profile(
+        id: 'primary',
+        model: 'primary-model',
+        apiKey: 'sk-primary',
+        baseUrl: 'http://primary.test',
+      );
+      final keylessFallback = profile(
+        id: 'keyless-fallback',
+        model: 'keyless-fallback-model',
+      );
+      configureGroup(
+        profiles: [active, credentialedPrimary, keylessFallback],
+        groupPrimaryId: 'primary',
+        targets: const [
+          ModelFallbackTarget(targetProfileId: 'keyless-fallback'),
+        ],
+      );
+
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            return StreamError(
+              'OpenAI API error (503): temporarily unavailable',
+              cause: Exception('OpenAI API error (503)'),
+            );
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession(modelGroupId: 'group');
+      await provider.sendMessage('hello');
+
+      expect(attemptedModels, ['primary-model']);
+    });
+
+    test('fails closed when no group member has a usable credential',
+        () async {
+      final active = profile(
+        id: 'active',
+        model: 'active-model',
+        apiKey: 'sk-active',
+        baseUrl: 'http://active.test',
+      );
+      final emptyPrimary = profile(id: 'empty-primary', model: 'empty-1');
+      final emptyFallback = profile(id: 'empty-fallback', model: 'empty-2');
+      configureGroup(
+        profiles: [active, emptyPrimary, emptyFallback],
+        groupPrimaryId: 'empty-primary',
+        targets: const [
+          ModelFallbackTarget(targetProfileId: 'empty-fallback'),
+        ],
+      );
+
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession(modelGroupId: 'group');
+      await provider.sendMessage('hello');
+
+      expect(attemptedModels, isEmpty);
+      expect(provider.errorMessage, AppStrings.apiKeyNotConfigured);
+    });
+
+    test('allows a keyless local group member with a custom base URL',
+        () async {
+      final active = profile(
+        id: 'active',
+        model: 'active-model',
+        apiKey: 'sk-active',
+        baseUrl: 'http://active.test',
+      );
+      final local = profile(
+        id: 'local',
+        model: 'local-model',
+        baseUrl: 'http://127.0.0.1:11434',
+      );
+      configureGroup(
+        profiles: [active, local],
+        groupPrimaryId: 'local',
+        targets: const [],
+      );
+
+      final attemptedModels = <String>[];
+      final provider = ChatProvider(
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) {
+            attemptedModels.add(config.model);
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            ));
+          },
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      await provider.createSession(modelGroupId: 'group');
+      await provider.sendMessage('hello');
+
+      expect(attemptedModels, ['local-model']);
+      expect(provider.errorMessage, isNull);
+    });
+  });
+
+  group('bounded manual context summary', () {
+    setUp(() async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1');
+    });
+
+    tearDown(() async {
+      await clearPlatformMocks();
+    });
+
+    Future<ChatSession> sessionWithPreviousSummary(ChatProvider provider) async {
+      final session = await provider.createSession();
+      session.messages.addAll([
+        ChatMessage.user('first prompt'),
+        ChatMessage(
+          role: 'assistant',
+          content: [TextContent('first response')],
+        ),
+      ]);
+      session.contextSummary = _storedSummary('## Goal\nPrevious summary');
+      return session;
+    }
+
+    test('stops at the model-call cap and keeps the previous summary',
+        () async {
+      var modelCalls = 0;
+      final provider = ChatProvider(
+        manualContextSummaryTimeout: const Duration(seconds: 10),
+        contextSummaryServiceFactory: () => ContextSummaryService(
+          llmFactory: (config) => _ScriptedLlmService(
+            config,
+            onMessages: (_) => StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'ok')],
+            )),
+            onChat: (_) {
+              modelCalls++;
+              return const LlmResponse(
+                stopReason: 'end_turn',
+                content: [ContentBlock(type: 'text', text: '')],
+              );
+            },
+          ),
+        ),
+      );
+      addTearDown(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await sessionWithPreviousSummary(provider);
+
+      final result = await provider.rebuildContextSummaryBeforeMessage(2);
+
+      expect(modelCalls, ChatProvider.maxManualContextSummaryModelCalls);
+      expect(modelCalls, 2);
+      expect(result.success, isFalse);
+      expect(result.stage, ManualContextSummaryStage.failed);
+      expect(
+        provider.currentSession!.contextSummary!.text,
+        contains('Previous summary'),
+      );
+      expect(session.messages, hasLength(2));
+    });
+
+    test('timeout fails and keeps the previous summary', () async {
+      final summaryStarted = Completer<void>();
+      final releaseSummary = Completer<void>();
+      final provider = ChatProvider(
+        manualContextSummaryTimeout: const Duration(milliseconds: 40),
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) async {
+            if (!summaryStarted.isCompleted) summaryStarted.complete();
+            await releaseSummary.future;
+            return _summaryForRequest(request);
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSummary.isCompleted) releaseSummary.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await sessionWithPreviousSummary(provider);
+
+      final pending = provider.rebuildContextSummaryBeforeMessage(2);
+      await summaryStarted.future;
+      expect(
+        provider.currentContextSummaryStage,
+        ManualContextSummaryStage.summarizing,
+      );
+      final result = await pending;
+
+      expect(result.success, isFalse);
+      expect(result.stage, ManualContextSummaryStage.failed);
+      expect(
+        provider.currentSession!.contextSummary!.text,
+        contains('Previous summary'),
+      );
+      releaseSummary.complete();
+    });
+
+    test(
+        'late extractive fallback after timeout cannot replace the previous summary',
+        () async {
+      final summaryStarted = Completer<void>();
+      final releaseSummary = Completer<void>();
+      var summaryCalls = 0;
+      final provider = ChatProvider(
+        manualContextSummaryTimeout: const Duration(milliseconds: 40),
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) async {
+            summaryCalls++;
+            if (!summaryStarted.isCompleted) summaryStarted.complete();
+            await releaseSummary.future;
+            // Outlives the provider timeout, then fails so the context manager
+            // converts it into an extractive fallback summary.
+            throw Exception('provider timed out late');
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSummary.isCompleted) releaseSummary.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await sessionWithPreviousSummary(provider);
+      final previousText = session.contextSummary!.text;
+
+      final pending = provider.rebuildContextSummaryBeforeMessage(2);
+      await summaryStarted.future;
+      final result = await pending;
+
+      expect(result.success, isFalse);
+      expect(result.stage, ManualContextSummaryStage.failed);
+      expect(
+        provider.currentContextSummaryStage,
+        ManualContextSummaryStage.failed,
+      );
+      expect(summaryCalls, 1);
+
+      // Let the timed-out call finish and produce its extractive fallback.
+      releaseSummary.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      expect(session.contextSummary!.text, previousText);
+      expect(provider.currentSession!.contextSummary!.text, previousText);
+      expect(
+        provider.currentSession!.contextSummary!.text,
+        isNot(contains('Existing Summary')),
+      );
+      expect(
+        provider.currentContextSummaryStage,
+        ManualContextSummaryStage.failed,
+      );
+    });
+
+    test('cancel fails and keeps the previous summary', () async {
+      final summaryStarted = Completer<void>();
+      final releaseSummary = Completer<void>();
+      final provider = ChatProvider(
+        manualContextSummaryTimeout: const Duration(seconds: 10),
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) async {
+            if (!summaryStarted.isCompleted) summaryStarted.complete();
+            await releaseSummary.future;
+            return _summaryForRequest(request);
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSummary.isCompleted) releaseSummary.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await sessionWithPreviousSummary(provider);
+
+      final pending = provider.rebuildContextSummaryBeforeMessage(2);
+      await summaryStarted.future;
+      provider.cancelManualContextSummary();
+      releaseSummary.complete();
+      final result = await pending;
+
+      expect(result.success, isFalse);
+      expect(result.message, AppStrings.contextSummaryRebuildCancelled);
+      expect(
+        provider.currentSession!.contextSummary!.text,
+        contains('Previous summary'),
+      );
+    });
+
+    test('reports started, summarizing, then done', () async {
+      final summaryStarted = Completer<void>();
+      final releaseSummary = Completer<void>();
+      final provider = ChatProvider(
+        manualContextSummaryTimeout: const Duration(seconds: 10),
+        contextSummaryServiceFactory: () => _ScriptedContextSummaryService(
+          onGenerate: (request) async {
+            if (!summaryStarted.isCompleted) summaryStarted.complete();
+            await releaseSummary.future;
+            return _summaryForRequest(request);
+          },
+        ),
+      );
+      addTearDown(() async {
+        if (!releaseSummary.isCompleted) releaseSummary.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        provider.dispose();
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final session = await sessionWithPreviousSummary(provider);
+
+      final observedStages = <ManualContextSummaryStage?>[];
+      void listener() {
+        observedStages.add(provider.currentContextSummaryStage);
+      }
+
+      provider.addListener(listener);
+      addTearDown(() => provider.removeListener(listener));
+
+      final pending = provider.rebuildContextSummaryBeforeMessage(2);
+      await summaryStarted.future;
+      expect(
+        provider.currentContextSummaryStage,
+        ManualContextSummaryStage.summarizing,
+      );
+      releaseSummary.complete();
+      final result = await pending;
+
+      expect(result.success, isTrue);
+      expect(result.stage, ManualContextSummaryStage.done);
+      expect(observedStages, contains(ManualContextSummaryStage.started));
+      expect(observedStages, contains(ManualContextSummaryStage.summarizing));
+      expect(observedStages, contains(ManualContextSummaryStage.done));
+      expect(
+        session.contextSummary!.text,
+        contains('Test summary'),
+      );
+    });
+  });
+
   group('charCount - string content', () {
     test('counts simple string content', () {
       expect(charCount({'role': 'user', 'content': 'hello'}), 5);
@@ -10497,6 +11007,21 @@ ContextSummary _summaryForRequest(ContextSummaryRequest request) {
   );
 }
 
+ContextSummary _storedSummary(String text) {
+  return ContextSummary(
+    version: ContextSummaryService.version,
+    text: text,
+    coveredMessageCount: 1,
+    coveredDigest: 'previous',
+    sourceEstimatedTokens: 10,
+    summaryEstimatedTokens: 5,
+    createdAt: DateTime.utc(2026),
+    updatedAt: DateTime.utc(2026),
+    model: 'claude',
+    apiFormat: 'anthropic',
+  );
+}
+
 ContextSummary _summaryForRequestWithModel(ContextSummaryRequest request) {
   return ContextSummary(
     version: ContextSummaryService.version,
@@ -10712,6 +11237,7 @@ class _BlockingDangerousTool extends Tool {
     String? sessionId,
     required String operationId,
     required ToolCancellationSignal cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) async {
     executionCount++;
     if (!started.isCompleted) started.complete();
@@ -10750,6 +11276,7 @@ class _CancellableDangerousTool extends Tool {
     String? sessionId,
     required String operationId,
     required ToolCancellationSignal cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) async {
     if (!started.isCompleted) started.complete();
     await cancellationSignal.whenCancelled;
@@ -10807,6 +11334,7 @@ class _DualTrackTool extends Tool {
   Future<ToolResultPayload> executeResult(
     Map<String, dynamic> input, {
     String? sessionId,
+    RunTaintSet? runTaintSet,
   }) async {
     return const ToolResultPayload(
       forUser: 'FULL USER OUTPUT with detailed logs',

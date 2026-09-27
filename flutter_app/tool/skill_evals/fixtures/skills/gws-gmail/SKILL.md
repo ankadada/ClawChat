@@ -1,14 +1,15 @@
 ---
 name: gws-gmail
-description: Gmail — 查看邮件、搜索邮件、发送邮件
+description: Gmail API 预设（自带 token）— 调用 Google API，无应用内 OAuth，需自备 GOOGLE_ACCESS_TOKEN
 tools: [bash]
 ---
 
 ## Use This Skill When
-用户提到邮件、收件箱、Gmail、发邮件、查邮件
+用户提到 Gmail、Google 邮件、发邮件、查邮箱
 
 ## Prerequisites
-需要在环境变量中配置 `GOOGLE_ACCESS_TOKEN`（需要 Gmail API scope）。
+这是自带 token 的 power-user 预设，调用的是 **Google Gmail API**，不是 Android 系统邮箱、也不读取手机本地 inbox。
+应用不提供内置 OAuth：用户需要在环境变量中配置自己的 `GOOGLE_ACCESS_TOKEN`（需要 Gmail API scope），技能才能工作。未配置 token 时停下来提示用户。
 
 ## Execution Workflow
 
@@ -44,6 +45,8 @@ curl -s -X POST "https://www.googleapis.com/gmail/v1/users/me/messages/send" \
 ```
 
 ## Hard Rules
+- 这是 Google API 技能，不是手机邮箱：不要声称能读 Android 本地邮箱
+- 无应用内 OAuth，token 只能由用户自己提供
 - 发送邮件前必须确认收件人和内容
 - 不要展示邮件中的敏感信息（密码、token 等）
 - 搜索时使用 Gmail 搜索语法（from:, to:, subject:, has:attachment 等）

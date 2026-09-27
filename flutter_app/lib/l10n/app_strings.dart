@@ -14,6 +14,15 @@ class AppStrings {
   static const copy = '复制';
   static const copyText = '复制文本';
   static const copyMarkdown = '复制为 Markdown';
+  static const copyFullText = '复制全文';
+  static const copyPlainText = '复制纯文本';
+  static const deleteFromHere = '从此处删除';
+  static const deleteFromHereTitle = '从此处删除？';
+  static const deleteFromHereBody = '将删除这条消息以及之后的全部消息，不可恢复。';
+  static const deleteFromHereDone = '已删除后续消息';
+  static const deleteFromHereBlockedActive = '当前会话正在回复或有排队消息，暂不能删除';
+  static const resultImages = '结果图片';
+  static const resultImageUnavailable = '图片无法显示';
   static const copied = '已复制';
   static const share = '分享';
   static const shareFailed = '分享失败';
@@ -55,7 +64,10 @@ class AppStrings {
   static const useGlobalDefault = '使用全局默认';
   static const leaveEmptyForDefault = '留空则使用全局设置中的模型';
   static const sendMessageToStart = '发送消息开始对话';
-  static const aiAssistantCapabilities = 'AI 助手可以执行命令、读写文件、访问网页';
+  static const aiAssistantCapabilities =
+      '可以执行命令、读写工作区文件、访问网页，并在你授权后读取日历、短信和联系人';
+  static const phoneCapabilityNote = '日历、短信、联系人与闹钟等在本机处理。读取首次使用时请求系统权限，'
+      '不会在后台监听短信；默认不打电话、不发短信。';
   static const emptyPromptSummarizeCode = '总结一下这段代码';
   static const emptyPromptWriteEmail = '帮我写一封邮件';
   static const emptyPromptTranslateText = '翻译这段文字';
@@ -106,6 +118,12 @@ class AppStrings {
   static const contextSummarySelectLaterMessage = '请选择更靠后的消息';
   static const contextSummaryNoSafePrefix = '所选位置之前没有完整、安全的上下文边界';
   static const contextSummaryBusy = '当前会话正在回复或整理上下文，请稍后再试';
+  static const contextSummaryRebuildCancelled = '已取消整理上下文，保留原有摘要';
+  static const contextSummaryTimedOut = '整理上下文超时，已保留原有摘要';
+  static const contextSummaryProgressStarted = '已开始整理上下文';
+  static const contextSummaryProgressSummarizing = '正在整理上下文...';
+  static const contextSummaryProgressDone = '上下文摘要已更新';
+  static const contextSummaryProgressFailed = '上下文摘要未更新，保留原有摘要';
   static String contextSummaryRebuilt(int count) => '已重建上下文摘要（覆盖 $count 条消息）';
   static String contextSummaryRebuildFailed(String error) => '重建摘要失败: $error';
   static String contextSummaryCoverage(int count, int tokens) =>
@@ -429,9 +447,13 @@ class AppStrings {
   static const skillUrl = '技能归档地址';
   static const importButton = '导入';
   static const importFailed = '导入失败';
-  static const bundledLegacyPresetsUnavailable = '预设旧版技能不可用';
-  static const bundledLegacyPresetsUnavailableDescription =
-      '以下随应用附带的旧版预设目前不可用，不会安装或请求二次授权。';
+  static const bundledSkillPresetsInfo = '内置技能预设';
+  static const bundledSkillPresetsDescription =
+      '以下预设随应用提供，安装后默认关闭，需要通过旧版技能授权后再启用。';
+  static const bundledGooglePresetsCopy =
+      'Gmail / Drive / Google 日历调用的是 Google API，不是手机本地邮箱、文件或日历。应用没有内置 OAuth，需要你先在环境变量里提供自己的 GOOGLE_ACCESS_TOKEN 才能工作。问手机日历用 phone_read，不需要 token。';
+  static const bundledExampleSkillsCopy =
+      'github、translator、code-review 不再内置，已作为示例移到 docs/skill-examples。';
   static const archiveSkill = 'Archive (.zip, .tar.gz, .tgz)';
   static const directory = 'Directory';
   static const selectSkillArchive =
@@ -473,11 +495,21 @@ class AppStrings {
       '开启后，shell 输出中检测到的环境变量值在送达模型前会被打码（例如 sk-1********ajhks）。'
       '少于 8 个字符的值会被全部替换为 *。聊天中用户可见的输出保持不变。';
 
-  // ── Phone integration ─────────────────────────────────────────────
-  static const phoneIntegration = '手机集成';
+  // ── Phone data and actions ─────────────────────────────────────────
+  static const phoneIntegration = '手机数据与动作';
   static const phoneIntegrationDesc =
-      'AI 可以通过 phone_intent 工具操作系统：设闹钟、加日历、打开网页、分享等。'
-      '日历/联系人首次使用时会弹运行时权限。下面两项默认关闭，开启后 AI 才能直接打电话或发短信。';
+      'AI 通过 phone_read 读取日历/短信/联系人，通过 phone_act 打开网页、分享、'
+      '设闹钟、加日历等，通过 phone_send 打电话或发短信。'
+      '读取只在你首次使用对应数据时请求系统权限；外发默认关闭。';
+  static const phoneReadSection = '读取（首次使用时请求系统权限）';
+  static const phoneReadCalendar = '日历';
+  static const phoneReadCalendarSubtitle = '查看日历事件（需要日历权限）';
+  static const phoneReadSms = '短信';
+  static const phoneReadSmsSubtitle = '按需读取短信列表和正文（需要短信权限；不常驻后台监听）';
+  static const phoneReadContacts = '联系人';
+  static const phoneReadContactsSubtitle = '搜索联系人姓名与电话（需要联系人权限）';
+  static const phoneOutboundSection = '外发（默认关闭）';
+  static const openPermissionSettings = '打开权限设置';
   static const allowCall = '允许直接拨打电话';
   static const allowCallSubtitle = '关闭时 AI 只能跳到拨号面板等你确认';
   static const allowSms = '允许直接发送短信';
@@ -496,6 +528,11 @@ class AppStrings {
   static const noSearchResults = '没有匹配消息';
   static String searchResultCount(int count) => '$count 条匹配';
   static String searchResultPosition(int index) => '第 ${index + 1} 条消息';
+
+  // ── Long paste chips ──────────────────────────────────────────────
+  static const pastedTextChipTitle = '已粘贴文本';
+  static const pastedTextRemove = '移除';
+  static const pastedTextRemoved = '已移除粘贴内容';
 
   // ── Attach ─────────────────────────────────────────────────────────
   static const attachFile = '添加附件';
@@ -716,6 +753,29 @@ class AppStrings {
       '关闭时，未加密导出会打码 API 密钥、环境变量和 MCP 凭据';
   static const configExported = '配置已导出';
   static const exportConfigFailed = '导出配置失败';
+  // ── Multi-destination backup run ─────────────────────────────────
+  static const backupRun = '多目标备份';
+  static const backupRunSubtitle = '把同一份配置备份到多个本地文件夹，可查看进度并取消';
+  static const backupAddFolder = '选择备份文件夹';
+  static const backupAddAnotherFolder = '再添加一个备份文件夹？';
+  static String backupAddAnotherFolderBody(int count) => '已选择 $count 个文件夹。';
+  static const backupAddAnother = '继续添加';
+  static const backupStart = '开始备份';
+  static const backupRunInProgress = '正在备份';
+  static String backupRunProgressText(int finished, int total) =>
+      '$finished / $total 个目标已完成';
+  static const backupRunCancelling = '正在取消…';
+  static const backupRunCancel = '取消备份';
+  static const backupRunFailed = '备份失败';
+  static const backupRunLocalPackageKept = '本地备份包已保留，可直接重试。';
+  static const backupRunLocalPackageRemoved = '所有目标均成功，本地备份包已删除。';
+  static const backupDestinationSuccess = '成功';
+  static const backupDestinationFailure = '失败';
+  static const backupDestinationCancelled = '已取消';
+  static const backupDestinationRunning = '进行中';
+  static const backupDestinationPending = '等待中';
+  static String backupRunSummary(int success, int failure, int cancelled) =>
+      '备份完成：$success 个成功，$failure 个失败，$cancelled 个已取消。';
   static const importConfigPreview = '导入预览';
   static const configVersion = '版本';
   static const configExportedAt = '导出时间';
@@ -752,9 +812,16 @@ class AppStrings {
 
   // ── MCP ──────────────────────────────────────────────────────────
   static const mcpServers = 'MCP 服务器';
-  static const mcpServersSubtitle = '配置本地 stdio MCP 工具服务器，工具执行仍会经过审批';
+  static const mcpServersSubtitle =
+      '在本机 Alpine 中按需启动 stdio MCP 服务器；子进程随本次 Agent 运行启动与结束，工具结果按不可信数据处理。';
   static const mcpStdioUnsupportedAndroid =
-      '当前 Android 版本暂不启动 stdio MCP 服务器；配置会保留，但不会执行 npx/proot 服务器。';
+      '当前平台不启动 stdio MCP 服务器；配置会保留，但不会执行。';
+  static const mcpEnvNotForGoogleTokens =
+      'MCP 环境变量只填写该服务器自己的键。不要把 Gmail/Drive 的 GOOGLE_ACCESS_TOKEN 写进 MCP 环境变量；那些技能需要自己在环境变量中授权。';
+  static const mcpProotNotReadyHint =
+      'Alpine 运行时未就绪，MCP 服务器暂时无法启动。可在系统健康中检查并重试。';
+  static String mcpServerStartFailed(String name, String message) =>
+      '$name 启动失败：$message';
   static const noMcpServers = '暂无 MCP 服务器';
   static const addMcpServer = '添加 MCP 服务器';
   static const editMcpServer = '编辑 MCP 服务器';
@@ -786,6 +853,42 @@ class AppStrings {
   static const memoryHint = '输入要记住的信息...';
   static const noMemories = '暂无记忆';
   static const memoryDesc = 'AI 会在所有对话中记住这些信息';
+  static const memoryUsage = '本轮记忆';
+  static const memoryUsageTitle = '本轮回复使用的记忆';
+  static const memoryUsageDescription = '这里是最近一次回复实际注入的记忆；开关只影响之后的回复。';
+  static const memoryUsageNone = '本轮回复没有使用记忆。';
+  static const memoryUsagePreview = '下一轮将使用';
+  static const forgetMemory = '删除记忆';
+  static const memoryForgetConfirm = '删除后这条记忆不会再出现在任何对话中。';
+
+  // ── Local workflow templates ─────────────────────────────────────
+  static const skillTemplates = '工作流模板';
+  static const skillTemplatesDescription = '本地内置模板：安装后默认禁用，启用仍走既有技能同意与能力策略。';
+  static const skillTemplatePreview = '权限与数据预览';
+  static const skillTemplateInstall = '安装到工作区';
+  static const skillTemplateRollback = '回滚到上一版本';
+  static const skillTemplateInstalled = '已安装（未启用）';
+
+  /// The template row shows this once the stored switch is on: the
+  /// subtitle follows the real enabled state, not just installed files.
+  static const skillTemplateEnabled = '已启用';
+  static const skillTemplateNotInstalled = '未安装';
+
+  // ── Workspaces ──────────────────────────────────────────────────────────
+  static const workspacesTitle = '工作区';
+  static const workspacesDescription =
+      '工作区决定新会话、文件浏览器和分享保存默认使用的目录。切换只影响之后新建的会话；'
+      '已有会话保留自己的归属。';
+  static const workspaceCreate = '新建工作区';
+  static const workspaceCreateSubtitle = '创建后会切换为当前工作区';
+  static const workspaceSwitch = '切换为当前工作区';
+  static const workspaceRename = '重命名';
+  static const workspaceDelete = '删除工作区';
+  static const workspaceActive = '当前工作区';
+  static const workspaceNameLabel = '名称';
+  static const workspaceNameRequired = '请输入工作区名称';
+  static const previewUnavailable = '预览不可用';
+  static String workspacePathLabel(String path) => '路径：$path';
 
   // ── Alternatives / regenerate branches ────────────────────────────
   static String alternativeOf(int current, int total) => '$current/$total';

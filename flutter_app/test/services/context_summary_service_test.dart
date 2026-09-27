@@ -26,6 +26,7 @@ void main() {
     int summaryBudget = 400,
     int? maxInputTokens,
     LlmConfig config = llmConfig,
+    int maxModelCalls = 1,
   }) {
     return ContextSummaryRequest(
       messages: messages,
@@ -37,6 +38,7 @@ void main() {
       sourceEstimatedTokens: estimator.estimateMessages(messages),
       estimator: estimator,
       maxInputTokens: maxInputTokens,
+      maxModelCalls: maxModelCalls,
     );
   }
 
@@ -316,6 +318,40 @@ void main() {
     expect(observedConfig!.maxTokens, 400);
     expect(observedConfig!.temperature, 0.2);
     expect(observedConfig!.thinkingBudget, 0);
+  });
+
+  test('stops at the model-call cap when output stays unusable', () async {
+    var calls = 0;
+    final service = ContextSummaryService(
+      llmFactory: (config) => _FakeLlmService(
+        config,
+        responseText: '',
+        onChatMessages: (_) => calls++,
+      ),
+    );
+
+    await expectLater(
+      service.generateSummary(request(maxModelCalls: 2)),
+      throwsA(isA<ContextSummaryModelCallLimitExceededException>()),
+    );
+    expect(calls, 2);
+  });
+
+  test('keeps the single-call default for non-manual callers', () async {
+    var calls = 0;
+    final service = ContextSummaryService(
+      llmFactory: (config) => _FakeLlmService(
+        config,
+        responseText: '',
+        onChatMessages: (_) => calls++,
+      ),
+    );
+
+    await expectLater(
+      service.generateSummary(request()),
+      throwsA(isA<ContextSummaryModelCallLimitExceededException>()),
+    );
+    expect(calls, 1);
   });
 
   test('generateSummary keeps slow LLM request alive while backgrounded',

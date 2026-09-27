@@ -13,11 +13,13 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
-    <!-- Phone integration tool (L2/L3). Calendar/contacts requested at use time;
-         CALL_PHONE / SEND_SMS additionally gated by an in-app settings toggle. -->
+    <!-- Phone integration tool (L2/L3). Calendar/contacts/SMS read requested at
+         use time; CALL_PHONE / SEND_SMS additionally gated by an in-app settings
+         toggle. No RECEIVE_SMS and no SMS broadcast watcher. -->
     <uses-permission android:name="android.permission.READ_CALENDAR" />
     <uses-permission android:name="android.permission.WRITE_CALENDAR" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.SEND_SMS" />
 

@@ -227,12 +227,16 @@ class ContextManualSummaryRequest {
   final int contextTokenBudget;
   final TokenEstimator estimator;
 
+  /// Hard upper bound on model calls for this manual rebuild.
+  final int maxModelCalls;
+
   const ContextManualSummaryRequest({
     required this.sessionId,
     required this.apiPrefixMessages,
     required this.llmConfig,
     required this.contextTokenBudget,
     this.estimator = const TokenEstimator(),
+    this.maxModelCalls = 2,
   });
 }
 
@@ -574,6 +578,7 @@ class ContextManager {
       sourceEstimatedTokens: sourceEstimatedTokens,
       estimator: request.estimator,
       maxInputTokens: (request.contextTokenBudget * 0.8).floor(),
+      maxModelCalls: request.maxModelCalls,
     );
     final service = _contextSummaryServiceFactory();
     try {
@@ -588,6 +593,21 @@ class ContextManager {
         },
       );
       return summary;
+    } on ContextSummaryModelCallLimitExceededException catch (e) {
+      // The bounded rebuild used its whole model-call budget without a usable
+      // summary. Fail instead of silently replacing the previous summary with
+      // a degraded extractive one.
+      _recordRuntimeEvent(
+        request.sessionId,
+        'context.summary.manual.failed',
+        {
+          'stage': 'model_call_limit',
+          'errorCode': _safeFailureClass(e),
+          'modelCalls': e.modelCalls,
+          'limit': e.limit,
+        },
+      );
+      rethrow;
     } catch (e) {
       _recordRuntimeEvent(
         request.sessionId,

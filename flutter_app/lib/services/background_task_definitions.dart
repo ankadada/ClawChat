@@ -189,6 +189,7 @@ final class BackgroundTaskProductionDefinitions
   }
 
   static Future<bool> _defaultWriteMemory(String fact, String sessionId) async {
+    await MemoryService.ensureSessionModesLoaded();
     if (!MemoryService.isEnabledForSessionSync(sessionId)) return false;
     final result = await MemoryService.addMemory(
       fact,

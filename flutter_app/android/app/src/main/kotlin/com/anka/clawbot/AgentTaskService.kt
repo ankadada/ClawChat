@@ -31,6 +31,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import io.flutter.plugin.common.MethodChannel
 import androidx.core.content.ContextCompat
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
@@ -142,6 +143,7 @@ class AgentTaskService : Service() {
         private const val EXTRA_OVERLAY_VISIBLE = "overlayVisible"
         private const val EXTRA_APPROVAL_ID = "approvalId"
         private const val EXTRA_APPROVAL_RISK = "approvalRisk"
+        private const val EXTRA_APPROVAL_DETAIL = "approvalDetail"
         private const val EXTRA_APPROVED = "approved"
         private const val EXTRA_COMMAND_OPERATION_ID = "commandOperationId"
         private const val EXTRA_COMMAND_READY_REQUEST_ID = "commandReadyRequestId"
@@ -161,7 +163,7 @@ class AgentTaskService : Service() {
         private const val OWNER_KIND_BACKGROUND_TASK = "backgroundTask"
         private const val ACTION_TOOL_APPROVAL_UPDATE = "com.anka.clawbot.agent.APPROVAL_UPDATE"
         private const val ACTION_TOOL_APPROVAL_DECISION = "com.anka.clawbot.agent.APPROVAL_DECISION"
-        private const val DEFAULT_TEXT = "AI 正在执行任务..."
+        private const val DEFAULT_TEXT = "机器正在执行任务..."
         private const val DEFAULT_STATUS = "thinking"
         private const val WAKE_LOCK_TIMEOUT_MS = 60 * 60 * 1000L
         private const val WAKE_LOCK_RENEWAL_MS = 55 * 60 * 1000L
@@ -359,7 +361,7 @@ class AgentTaskService : Service() {
             val intent = Intent(context, AgentTaskService::class.java).apply {
                 putExtra(EXTRA_SESSION_ID, key.sessionId)
                 putExtra(EXTRA_SESSION_TITLE, "ClawChat")
-                putExtra(EXTRA_TEXT, "命令正在后台运行...")
+                putExtra(EXTRA_TEXT, "命令仍在运行...")
                 putExtra(EXTRA_STATUS, "tooling")
                 putExtra(EXTRA_TOOL_NAME, "bash")
                 putExtra(EXTRA_COMMAND_OPERATION_ID, key.operationId)
@@ -435,7 +437,8 @@ class AgentTaskService : Service() {
             sessionTitle: String,
             approvalId: String,
             toolName: String,
-            risk: String
+            risk: String,
+            detail: String? = null
         ): Boolean {
             if (!canShowApprovalNotification(context)) return false
             val service = instance
@@ -445,7 +448,8 @@ class AgentTaskService : Service() {
                     sessionTitle,
                     approvalId,
                     toolName,
-                    risk
+                    risk,
+                    detail
                 )
                 return true
             }
@@ -456,6 +460,7 @@ class AgentTaskService : Service() {
                 putExtra(EXTRA_APPROVAL_ID, approvalId)
                 putExtra(EXTRA_TOOL_NAME, toolName)
                 putExtra(EXTRA_APPROVAL_RISK, risk)
+                putExtra(EXTRA_APPROVAL_DETAIL, detail)
                 putExtra(EXTRA_STATUS, "tooling")
             }
             startServiceCompat(context, intent)
@@ -514,13 +519,21 @@ class AgentTaskService : Service() {
             }
             val notification = builder
                 .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle("${sessionTitle.ifBlank { "ClawChat" }} - AI 任务完成")
+                .setContentTitle("${sessionTitle.ifBlank { "ClawChat" }} - 机器任务完成")
                 .setContentText(text)
                 .setStyle(Notification.BigTextStyle().bigText(text))
                 .setContentIntent(pendingIntent)
                 .setAutoCancel(true)
                 .setPriority(Notification.PRIORITY_HIGH)
                 .setDefaults(Notification.DEFAULT_ALL)
+                .setVisibility(Notification.VISIBILITY_PRIVATE)
+                .setPublicVersion(
+                    buildPublicNotification(
+                        context,
+                        MainActivity.AGENT_COMPLETE_CHANNEL_ID,
+                        NotificationPrivacy.completion()
+                    )
+                )
                 .build()
             manager.notify(completionNotificationIdFor(sessionId), notification)
         }
@@ -670,6 +683,10 @@ class AgentTaskService : Service() {
         cleanupCoordinator = cleanupCoordinator ?: runCatching {
             CommandCleanupCoordinatorProvider.get(applicationContext)
         }.getOrNull()
+        // The service is established again: a run it owns may start MCP
+        // children, so the register gate closed by the previous teardown is
+        // explicitly reopened here.
+        McpStdioRegistry.openEpoch()
         instance = this
     }
 
@@ -798,12 +815,14 @@ class AgentTaskService : Service() {
         if (intent?.action == ACTION_TOOL_APPROVAL_UPDATE) {
             val approvalId = intent.getStringExtra(EXTRA_APPROVAL_ID)
             val approvalRisk = intent.getStringExtra(EXTRA_APPROVAL_RISK)
+            val approvalDetail = intent.getStringExtra(EXTRA_APPROVAL_DETAIL)
             if (!approvalId.isNullOrBlank() && !toolName.isNullOrBlank() && !approvalRisk.isNullOrBlank()) {
                 state.approval = ToolApprovalNotificationState(
                     sessionId = state.sessionId,
                     approvalId = approvalId,
                     toolName = toolName,
-                    risk = approvalRisk
+                    risk = approvalRisk,
+                    detail = approvalDetail
                 )
             }
         }
@@ -853,6 +872,15 @@ class AgentTaskService : Service() {
     }
 
     override fun onDestroy() {
+        // I5: an MCP child is owned by an agent run, which is owned by this
+        // service. Its teardown therefore closes the MCP register gate: what is
+        // live is stopped (each child publishing its terminal event so no Dart
+        // request is left waiting), and a start that overlapped the teardown is
+        // refused instead of escaping it. The gate stays closed until the
+        // service — or a new Flutter engine — is established again.
+        McpStdioRegistry.closeEpoch("foreground_service_stopped")
+        // Anything a crash or a kill left behind is swept from the same path.
+        ProcessManager.sweepStaleMcpLaunchScriptsIn(File(filesDir, "home"))
         if (!retiringNormally) {
             for (lease in activeBackgroundTaskLeases.values.toList()) {
                 requestBackgroundTaskLeaseInterruption(
@@ -1043,7 +1071,8 @@ class AgentTaskService : Service() {
         sessionTitle: String,
         approvalId: String,
         toolName: String,
-        risk: String
+        risk: String,
+        detail: String? = null
     ) {
         val state = upsertAgentSessionState(
             sessionId,
@@ -1057,7 +1086,8 @@ class AgentTaskService : Service() {
             sessionId = state.sessionId,
             approvalId = approvalId,
             toolName = toolName,
-            risk = risk
+            risk = risk,
+            detail = detail
         )
         if (!isRunning || foregroundSessionId == null) {
             foregroundSessionId = state.sessionId
@@ -1274,16 +1304,16 @@ class AgentTaskService : Service() {
 
     private fun statusTitle(state: AgentSessionNotification): String {
         val statusText = when (state.status) {
-            "thinking" -> "AI 正在思考..."
-            "streaming" -> "AI 正在回复..."
+            "thinking" -> "机器正在思考..."
+            "streaming" -> "机器正在回复..."
             "tooling" -> if (state.toolName.isNullOrBlank()) {
-                "AI 正在执行工具..."
+                "机器正在执行工具..."
             } else {
-                "AI 正在执行工具: ${state.toolName}..."
+                "机器正在执行工具: ${state.toolName}..."
             }
-            "complete" -> "AI 任务完成"
-            "error" -> "AI 任务出错"
-            else -> "AI 正在执行任务..."
+            "complete" -> "机器任务完成"
+            "error" -> "机器任务出错"
+            else -> "机器正在执行任务..."
         }
         return "${state.sessionTitle} - $statusText"
     }
@@ -1325,8 +1355,11 @@ class AgentTaskService : Service() {
         }
 
         val ongoing = state.status != "complete" && state.status != "error"
+        val approvalDetail = approval?.detail?.takeIf { it.isNotBlank() }
         val preview = when {
             approval?.decisionInFlight == true -> "正在提交工具审批决定..."
+            approval != null && approvalDetail != null ->
+                "${approval.toolName} (${approval.risk}) 等待你的明确批准：$approvalDetail"
             approval != null -> "${approval.toolName} (${approval.risk}) 等待你的明确批准"
             else -> compactPreview(state)
         }
@@ -1334,13 +1367,34 @@ class AgentTaskService : Service() {
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(statusTitle(state))
             .setContentText(preview)
-            .setStyle(Notification.BigTextStyle().bigText(state.preview.ifBlank { preview }))
+            .setStyle(
+                Notification.BigTextStyle().bigText(
+                    ApprovalNotificationText.bigText(
+                        approvalDetail,
+                        preview,
+                        state.preview
+                    )
+                )
+            )
             .setContentIntent(openPendingIntent)
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(Notification.PRIORITY_LOW)
             .setGroup(AGENT_GROUP_KEY)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+        // The lock screen only ever sees a generic copy: a reply preview, a
+        // session title, an approval detail, URL, or command stays behind the
+        // unlock.
+        val publicCopy = if (approval != null) {
+            val approvalCopy = ApprovalNotificationText.publicCopy(approval)
+            PublicNotificationCopy(approvalCopy.title, approvalCopy.text)
+        } else {
+            NotificationPrivacy.sessionStatus(state.status)
+        }
+        builder.setPublicVersion(
+            buildPublicNotification(this, MainActivity.CHANNEL_ID, publicCopy)
+        )
         if (approval == null) {
             builder.addAction(R.mipmap.ic_launcher, "查看", openPendingIntent)
         }
@@ -1405,8 +1459,16 @@ class AgentTaskService : Service() {
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(Notification.PRIORITY_LOW)
             .setGroup(AGENT_GROUP_KEY)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
             .addAction(R.mipmap.ic_launcher, "查看", openPendingIntent)
             .addAction(R.mipmap.ic_launcher, "停止", stopPendingIntent)
+        builder.setPublicVersion(
+            buildPublicNotification(
+                this,
+                MainActivity.CHANNEL_ID,
+                NotificationPrivacy.backgroundTask(needsReview)
+            )
+        )
         return builder.build()
     }
 
@@ -1418,14 +1480,14 @@ class AgentTaskService : Service() {
             manager.cancel(SUMMARY_NOTIFICATION_ID)
             return
         }
-        val title = "${activeCount} 个 AI 任务运行中"
-        val agentTitles = activeSessions.values.map { it.sessionTitle }
+        val title = "${activeCount} 个机器任务运行中"
         val taskText = if (activeBackgroundTaskLeases.isEmpty()) {
             emptyList()
         } else {
             listOf("${activeBackgroundTaskLeases.size} 个后台任务")
         }
-        val text = (agentTitles + taskText).joinToString(", ")
+        val text = (listOf("${activeSessions.size} 个会话任务") + taskText)
+            .joinToString(", ")
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, MainActivity.CHANNEL_ID)
         } else {
@@ -1442,6 +1504,14 @@ class AgentTaskService : Service() {
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(Notification.PRIORITY_LOW)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                buildPublicNotification(
+                    this,
+                    MainActivity.CHANNEL_ID,
+                    NotificationPrivacy.summary(activeCount)
+                )
+            )
             .build()
         manager.notify(SUMMARY_NOTIFICATION_ID, notification)
     }
@@ -1485,7 +1555,7 @@ class AgentTaskService : Service() {
             retiredBaseSessions.add(sessionId)
             activeSessions[sessionId]?.let { state ->
                 state.status = "tooling"
-                state.preview = "命令正在后台运行..."
+                state.preview = "命令仍在运行..."
                 state.toolName = "bash"
                 val manager = getSystemService(NotificationManager::class.java)
                 manager.notify(state.notificationId, buildNotification(state))

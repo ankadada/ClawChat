@@ -737,6 +737,7 @@ void main() {
           'originalChars': 24,
         },
         'is_error': false,
+        'trust': 'trusted',
       });
     });
 
@@ -788,6 +789,7 @@ void main() {
           'for_llm': 'compact for model',
           'summary': 'short summary',
           'is_error': false,
+          'trust': 'trusted',
         },
       ]);
     });

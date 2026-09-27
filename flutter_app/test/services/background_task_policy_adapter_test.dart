@@ -37,6 +37,8 @@ void main() {
           bashCommandDenyPatterns: [],
         )),
         approvals: gateway,
+        // A missing loader fails closed; these tests exercise other denies.
+        untrustedTranscriptLoader: () async => const [],
       );
 
       final result = await adapter.hardAndSkillPreflight(
@@ -109,6 +111,7 @@ SharedBackgroundTaskPolicyAdapter _adapter({
       bindings: _Bindings(),
       settings: _Settings(settings),
       approvals: gateway,
+      untrustedTranscriptLoader: () async => const [],
     );
 
 BackgroundTaskRecord _record() => BackgroundTaskRecord(

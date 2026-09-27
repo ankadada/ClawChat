@@ -5,6 +5,7 @@ import '../models/structured_result.dart';
 import 'llm_content_sanitizer.dart';
 import 'legacy_skill_compatibility.dart';
 import 'llm_service.dart';
+import 'memory_service.dart';
 import 'privacy_filter.dart';
 import 'runtime_debug_events.dart';
 import 'skill_capability_policy.dart';
@@ -13,6 +14,8 @@ import 'tools/tool_argument_preflight.dart';
 import 'tools/tool_policy.dart';
 import 'tools/tool_registry.dart';
 import 'tools/tool_result_formatter.dart';
+import 'tool_result_images.dart';
+import 'tools/untrusted_data_policy.dart';
 
 sealed class AgentEvent {
   const AgentEvent();
@@ -193,12 +196,27 @@ class AgentService {
   final Uuid _uuid;
   final ToolArgumentPreflight _toolArgumentPreflight;
   final SkillActivationReference? _historicalSkillActivation;
+
+  /// Run-scoped taint set for untrusted tool results (§7.7).
+  ///
+  /// It is created by the caller beside the run and captured by the
+  /// `ToolPolicy.additionalDenyCheck` closure, so the deny rules see exactly
+  /// the payloads this run produced. It is never widened into a request field.
+  final RunTaintSet runTaintSet;
+
+  /// Untrusted tool results read back from earlier turns of this session.
+  ///
+  /// They seed the run's taint set so a value read in turn 1 is still denied
+  /// in turn 2 unless the triggering user message contains it.
+  final List<UntrustedTranscriptEntry> _replayUntrustedResults;
+
   ToolCancellationSignal _toolCancellationSignal = ToolCancellationSignal();
   final Map<String, _ToolAttemptContext> _inFlightToolAttempts = {};
   final Map<String, _HistoricalSkillCall> _historicalSkillCalls = {};
   final Map<String, String> _ephemeralEnvVarValues = {};
   bool _cancelled = false;
   List<Map<String, dynamic>> _lastMessages = [];
+  String _activeMcpRunId = '';
 
   AgentService({
     required LlmService llm,
@@ -220,6 +238,8 @@ class AgentService {
     Uuid? uuid,
     ToolArgumentPreflight? toolArgumentPreflight,
     SkillActivationReference? historicalSkillActivation,
+    RunTaintSet? runTaintSet,
+    List<UntrustedTranscriptEntry> replayUntrustedResults = const [],
   })  : _llm = llm,
         _tools = tools,
         _systemPrompt = systemPrompt,
@@ -228,8 +248,17 @@ class AgentService {
         runAttemptId = runAttemptId ?? const Uuid().v4(),
         _uuid = uuid ?? const Uuid(),
         _historicalSkillActivation = historicalSkillActivation,
+        runTaintSet = runTaintSet ?? RunTaintSet(),
+        _replayUntrustedResults = replayUntrustedResults,
         _toolArgumentPreflight =
-            toolArgumentPreflight ?? const ToolArgumentPreflight();
+            toolArgumentPreflight ?? const ToolArgumentPreflight() {
+    if (parallelTools) {
+      throw StateError(
+        'parallelTools is not supported: run-scoped untrusted-data taint must '
+        'be observable before the next tool call.',
+      );
+    }
+  }
 
   AgentCancellationSnapshot cancel() {
     final snapshot = AgentCancellationSnapshot(
@@ -240,6 +269,13 @@ class AgentService {
     _ephemeralEnvVarValues.clear();
     _toolCancellationSignal.cancel();
     _llm.dispose();
+    // I5: a cancelled run takes its MCP children with it. No durable MCP
+    // supervisor survives a stop.
+    final mcpRunId = _activeMcpRunId;
+    if (mcpRunId.isNotEmpty) {
+      // Best effort: a destroyed engine already killed the children.
+      unawaited(_tools.endMcpRun(mcpRunId).catchError((_) {}));
+    }
     return snapshot;
   }
 
@@ -253,7 +289,32 @@ class AgentService {
   /// will contain all intermediate messages (assistant responses, tool results)
   /// when the stream completes. A reference is also kept in [_lastMessages] so
   /// that callers can inspect the final conversation via the [messages] getter.
+  ///
+  /// I5: the whole loop is one MCP run scope. Any MCP child started while the
+  /// loop is alive is killed when it returns, throws, or is cancelled.
   Stream<AgentEvent> runAgentLoop(
+    List<Map<String, dynamic>> messages, {
+    AgentMessagesUpdatedCallback? onMessagesUpdated,
+  }) async* {
+    final mcpRunId = _tools.beginMcpRun(sessionId: sessionId);
+    _activeMcpRunId = mcpRunId;
+    try {
+      // I5: enumerate MCP tools inside the run scope so a guest server starts
+      // for this run and dies with it, instead of at app start. The run id is
+      // passed explicitly so a concurrent run never reuses or disposes these
+      // children (and never removes this run's tools from the registry).
+      await _tools.refreshMcpTools(runId: mcpRunId);
+      yield* _runAgentLoopBody(
+        messages,
+        onMessagesUpdated: onMessagesUpdated,
+      );
+    } finally {
+      if (_activeMcpRunId == mcpRunId) _activeMcpRunId = '';
+      await _tools.endMcpRun(mcpRunId);
+    }
+  }
+
+  Stream<AgentEvent> _runAgentLoopBody(
     List<Map<String, dynamic>> messages, {
     AgentMessagesUpdatedCallback? onMessagesUpdated,
   }) async* {
@@ -262,6 +323,9 @@ class AgentService {
     _inFlightToolAttempts.clear();
     _ephemeralEnvVarValues.clear();
     _lastMessages = messages;
+    runTaintSet.clear();
+    runTaintSet.addUserTypedText(_collectUserTypedText(messages));
+    await seedRunTaint(runTaintSet, _replayUntrustedResults);
     await _restoreHistoricalSkillContext(messages);
     var toolDefs = <ToolDefinition>[];
     final effectiveMaxIterations = maxIterations.clamp(1, 99).toInt();
@@ -354,6 +418,20 @@ class AgentService {
       }
 
       if (response == null) {
+        // Item 4: the model stream closed without a completion event (a dropped
+        // connection, for example). Release the text already produced so it is
+        // not lost, then report the interruption. A turn that already showed a
+        // secret-setting tool keeps only the structural marker.
+        if (supportsTools && guardedStreamEvents.isNotEmpty) {
+          if (guardedSecretConfigurationObserved) {
+            yield AgentTextDelta(_secretConfigurationMarker);
+          } else {
+            for (final event in guardedStreamEvents) {
+              yield event;
+            }
+          }
+          guardedStreamEvents.clear();
+        }
         yield AgentError('No LLM response received');
         return;
       }
@@ -467,72 +545,41 @@ class AgentService {
                 )
               : null;
 
-      if (parallelTools &&
-          toolBlocks.length > 1 &&
-          !hasSecretConfiguration &&
-          !skillBatchPlan.requiresSequentialExecution) {
-        final futures = toolBlocks.map((block) async {
-          if (_cancelled) return null;
-          final toolUseId = block.toolUseId;
-          final toolName = block.toolName;
-          if (toolUseId == null || toolName == null) return null;
-          final toolInput = toolInputs[block] ?? block.toolInput ?? {};
-          final attempt = toolAttempts[block];
-          if (attempt == null) return null;
-          return _executeToolWithPolicy(
-            attempt,
-            toolInput,
-            forcedDenial:
-                secretBatchDenialFor(block) ?? skillBatchPlan.denialFor(block),
-            preparedSkillActivation: skillBatchPlan.preparedFor(block),
-          );
-        }).toList();
-        final results = await Future.wait(futures);
+      if (parallelTools) {
+        // Rejected in the constructor; fail closed before any tool starts.
+        throw StateError(
+          'parallelTools is not supported: run-scoped untrusted-data taint '
+          'must be observable before the next tool call.',
+        );
+      }
+      for (final block in toolBlocks) {
         if (_cancelled) return;
-        for (final r in results) {
-          if (r == null) continue;
-          if (r.structuredResult == null) {
-            yield AgentToolDone(
-              r.id,
-              r.output,
-              operationId: r.operationId,
-              isError: r.isError,
-            );
-          } else {
-            deferredStructuredResults.add(r);
-          }
-          toolResults.add(r.toJson());
-        }
-      } else {
-        for (final block in toolBlocks) {
-          if (_cancelled) return;
-          final toolUseId = block.toolUseId;
-          final toolName = block.toolName;
-          if (toolUseId == null || toolName == null) continue;
-          final toolInput = toolInputs[block] ?? block.toolInput ?? {};
-          final attempt = toolAttempts[block];
-          if (attempt == null) continue;
+        final toolUseId = block.toolUseId;
+        final toolName = block.toolName;
+        if (toolUseId == null || toolName == null) continue;
+        final toolInput = toolInputs[block] ?? block.toolInput ?? {};
+        final attempt = toolAttempts[block];
+        if (attempt == null) continue;
 
-          final result = await _executeToolWithPolicy(
-            attempt,
-            toolInput,
-            forcedDenial:
-                secretBatchDenialFor(block) ?? skillBatchPlan.denialFor(block),
-            preparedSkillActivation: skillBatchPlan.preparedFor(block),
+        final result = await _executeToolWithPolicy(
+          attempt,
+          toolInput,
+          forcedDenial:
+              secretBatchDenialFor(block) ?? skillBatchPlan.denialFor(block),
+          preparedSkillActivation: skillBatchPlan.preparedFor(block),
+        );
+        if (_cancelled) return;
+        if (result.structuredResult == null) {
+          yield AgentToolDone(
+            result.id,
+            result.output,
+            operationId: result.operationId,
+            isError: result.isError,
           );
-          if (_cancelled) return;
-          if (result.structuredResult == null) {
-            yield AgentToolDone(
-              result.id,
-              result.output,
-              operationId: result.operationId,
-              isError: result.isError,
-            );
-          } else {
-            deferredStructuredResults.add(result);
-          }
-          toolResults.add(result.toJson());
+        } else {
+          deferredStructuredResults.add(result);
         }
+        toolResults.add(result.toJson());
       }
 
       var structuredDeliveryPersisted = false;
@@ -624,6 +671,51 @@ class AgentService {
     }
   }
 
+  /// Attach resolved tool-result image blocks to [payload] metadata.
+  ///
+  /// Resolution is bounded: a data URL is decoded in place, a `/root/workspace`
+  /// path is read up to 2 MB and only when the bytes are a PNG, JPEG, or WEBP,
+  /// and a network URL is never downloaded. Anything else is left as text.
+  static Future<ToolResultPayload> _attachToolResultImages(
+    ToolResultPayload payload,
+  ) async {
+    if (payload.metadata.containsKey('toolResultImages')) return payload;
+    final text = payload.forLlm ?? payload.forUser;
+    final blocks = await ToolResultImageResolver.resolveBlocks(text);
+    if (blocks.isEmpty) return payload;
+    final entries = blocks
+        .map(ToolResultImageResolver.metadataEntryFor)
+        .whereType<Map<String, dynamic>>()
+        .toList(growable: false);
+    if (entries.isEmpty) return payload;
+    return payload.copyWith(metadata: {
+      ...payload.metadata,
+      'toolResultImages': entries,
+    });
+  }
+
+  /// Seed the run taint set from replayed transcript entries and from untrusted
+  /// stored memories.
+  ///
+  /// The memory half matters even when the session replays no tool result: an
+  /// untrusted fact is written into the system prompt (`buildMemoryPrompt`), so
+  /// without this seed a fresh session could route the value into `curl` or
+  /// `phone_send` as if the user had typed it.
+  static Future<void> seedRunTaint(
+    RunTaintSet taint,
+    List<UntrustedTranscriptEntry> replayed,
+  ) async {
+    for (final entry in replayed) {
+      taint.addPayload(
+        entry.text,
+        source: entry.source ?? resultSourceForTool(entry.toolName),
+      );
+    }
+    for (final entry in await MemoryService.untrustedEntries()) {
+      taint.addPayload(entry.text, source: entry.source);
+    }
+  }
+
   List<Map<String, dynamic>> _messagesForLlm(
     List<Map<String, dynamic>> messages,
   ) {
@@ -707,6 +799,34 @@ class AgentService {
     );
     final sanitized = const LlmContentSanitizer().sanitizeText(raw).text;
     return _maskConfiguredSecrets(sanitized);
+  }
+
+  /// Text the user typed in the message that triggered this run.
+  ///
+  /// Only the triggering message clears taint: an older typed URL must not
+  /// clear a payload that arrived from untrusted data in a later turn.
+  String _collectUserTypedText(List<Map<String, dynamic>> messages) {
+    for (var index = messages.length - 1; index >= 0; index--) {
+      final message = messages[index];
+      if (message['role'] != 'user') continue;
+      final content = message['content'];
+      if (content is String) return content;
+      if (content is! List) continue;
+      final buffer = StringBuffer();
+      var hasText = false;
+      for (final block in content) {
+        // Tool results are also role `user`; only user-written text counts.
+        if (block is Map && block['type'] == 'text') {
+          final text = block['text'];
+          if (text is String) {
+            buffer.writeln(text);
+            hasText = true;
+          }
+        }
+      }
+      if (hasText) return buffer.toString();
+    }
+    return '';
   }
 
   Future<_ToolResult> _executeToolWithPolicy(
@@ -935,19 +1055,79 @@ class AgentService {
         allowedFilesystemWriteScopes: _skillCapabilityPolicy
             ?.activeSkill?.capabilities.filesystemWrite
             .toSet(),
+        // The calling run's taint set; never a shared static, so concurrent
+        // runs cannot clobber each other's redirect or provenance checks.
+        runTaintSet: runTaintSet,
       );
       final operationSecret = _ephemeralEnvVarValues[attempt.operationId];
       if (operationSecret != null && operationSecret.isNotEmpty) {
         rawPayload = _redactOperationSecret(rawPayload, operationSecret);
       }
-      final payload = _protectToolResultPayload(rawPayload);
+      var payload = _protectToolResultPayload(rawPayload);
       if (_cancelled) return _cancelledToolResult(attempt);
+      // Tool-result images: resolve a workspace path (bounded, max 2 MB) or an
+      // inline data URL once, here, so both the provider payload and the
+      // transcript replay carry the decoded image block. A missing, oversized,
+      // or network reference stays text.
+      payload = await _attachToolResultImages(payload);
+      var trust = resultTrustForTool(toolName);
+      // `memory_get` reports stored facts that were written from untrusted tool
+      // data. They are untrusted again for this run, with their original
+      // source, so the laundered value cannot reach a deny sink.
+      final memoryUntrustedValues =
+          UntrustedDataPolicy.reportedUntrustedValues(payload.metadata);
+      if (memoryUntrustedValues != null) {
+        trust = ToolResultTrust.untrusted;
+        for (final entry in memoryUntrustedValues) {
+          runTaintSet.addPayload(entry.text, source: entry.source);
+        }
+      } else if (trust == ToolResultTrust.untrusted) {
+        runTaintSet.addPayload(
+          payload.forLlm ?? payload.forUser,
+          source: resultSourceForTool(toolName),
+        );
+      }
+      // Same-run file copies: a workspace file written from untrusted content
+      // is untrusted, so reading it back seeds the same run taint set instead
+      // of laundering the value.
+      if (toolName == 'write_file') {
+        final writtenPath = executionInput['path']?.toString();
+        final writtenContent = executionInput['content']?.toString();
+        if (writtenPath != null && writtenContent != null) {
+          final writtenSource = runTaintSet.matchIn(writtenContent);
+          if (writtenSource != null) {
+            runTaintSet.markPathTainted(writtenPath, writtenSource);
+          }
+        }
+      } else if (toolName == 'read_file') {
+        final readPath = executionInput['path']?.toString();
+        final readSource =
+            readPath == null ? null : runTaintSet.sourceForPath(readPath);
+        if (readSource != null) {
+          trust = ToolResultTrust.untrusted;
+          runTaintSet.addPayload(
+            payload.forLlm ?? payload.forUser,
+            source: readSource,
+          );
+          payload = payload.copyWith(metadata: {
+            ...payload.metadata,
+            'toolName': toolName,
+            'untrustedSource': readSource.name,
+          });
+        }
+      }
       await _reportToolAttempt(
         attempt,
         ToolAttemptLifecycle.completed,
         executionOutcomeKnown: true,
       );
-      return _ToolResult(toolUseId, attempt.operationId, payload, false);
+      return _ToolResult(
+        toolUseId,
+        attempt.operationId,
+        payload,
+        false,
+        trust: trust,
+      );
     } on ToolExecutionCancelledException catch (e) {
       await _reportToolAttempt(
         attempt,
@@ -1519,6 +1699,7 @@ class _ToolResult {
   final bool isError;
   final StructuredResultIngress? structuredResult;
   final StructuredResultSkillProvenance? structuredResultSkillProvenance;
+  final String trust;
 
   _ToolResult(
     this.id,
@@ -1527,6 +1708,7 @@ class _ToolResult {
     this.isError, {
     this.structuredResult,
     this.structuredResultSkillProvenance,
+    this.trust = ToolResultTrust.trusted,
   });
 
   String get output => payload.forUser;
@@ -1543,6 +1725,7 @@ class _ToolResult {
           'operationId': operationId,
         },
         if (isError) 'is_error': true,
+        'trust': trust,
       };
 }
 

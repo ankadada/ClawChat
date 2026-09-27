@@ -16,6 +16,7 @@ import '../services/agent_service.dart';
 import '../services/attachment_budget.dart';
 import '../services/context_manager.dart';
 import '../services/context_summary_service.dart';
+import '../models/workspace.dart';
 import '../services/diagnostics_export_service.dart';
 import '../services/llm_content_sanitizer.dart';
 import '../services/llm_service.dart';
@@ -28,6 +29,7 @@ import '../services/startup_restore_guard.dart';
 import '../services/structured_action_registry.dart';
 import '../services/tools/tool_policy.dart';
 import '../services/tools/tool_registry.dart';
+import '../services/tools/untrusted_data_policy.dart';
 import '../services/tools/memory_tools.dart';
 import '../services/tool_call_expansion_state.dart';
 import '../services/preferences_service.dart';
@@ -92,6 +94,21 @@ enum AssistantRetryStatus {
 }
 
 enum _ToolApprovalDecisionSource { inApp, notification }
+
+/// The url/query of a web tool call whose target came from a web tool result.
+///
+/// Phone- and MCP-sourced targets are hard-denied before approval, so they
+/// never reach the Ask path. A non-null result means the web→web Ask card must
+/// be shown even when Auto Allow is on, and a confirmed value clears that
+/// taint for the rest of the run.
+String? _taintedWebTarget(
+  UntrustedDataPolicy policy,
+  ToolApprovalRequest request,
+) {
+  final target = UntrustedDataPolicy.approvalDetailFor(request);
+  if (target == null) return null;
+  return policy.taint.matchIn(target) == UntrustedSource.web ? target : null;
+}
 
 typedef SkillCapabilityPolicyFactory = SkillCapabilityPolicy Function(
   Map<String, String> fixedToolDomains,
@@ -368,12 +385,20 @@ final class _RemoteCompositeCommitPermit implements SessionCommitPermit {
   }
 }
 
+enum ManualContextSummaryStage {
+  started,
+  summarizing,
+  done,
+  failed,
+}
+
 class ManualContextSummaryResult {
   final bool success;
   final String message;
   final ContextSummary? summary;
   final int requestedApiMessageCount;
   final int coveredMessageCount;
+  final ManualContextSummaryStage stage;
 
   const ManualContextSummaryResult({
     required this.success,
@@ -381,11 +406,19 @@ class ManualContextSummaryResult {
     this.summary,
     this.requestedApiMessageCount = 0,
     this.coveredMessageCount = 0,
+    this.stage = ManualContextSummaryStage.failed,
   });
 }
 
 class ChatProvider extends ChangeNotifier {
   static const int maxQueuedMessages = 3;
+
+  /// Wall-clock budget for one manual context summary rebuild.
+  static const Duration defaultManualContextSummaryTimeout =
+      Duration(seconds: 30);
+
+  /// Hard cap on model calls for one manual context summary rebuild.
+  static const int maxManualContextSummaryModelCalls = 2;
 
   List<SessionSummary> sessions = [];
   ChatSession? currentSession;
@@ -434,6 +467,110 @@ class ChatProvider extends ChangeNotifier {
     return _prefs.profiles;
   }
 
+  // ── Workspaces ───────────────────────────────────────────────────────
+  //
+  // A workspace is the named view of the local agent tree that new sessions and
+  // the file browser scope to. PreferencesService persists it, and every getter
+  // resolves to the default workspace before preferences are ready, so no
+  // caller ever sees a missing scope.
+
+  static final WorkspaceMetadata _fallbackWorkspace =
+      WorkspaceMetadata.defaultWorkspace();
+
+  List<WorkspaceMetadata> get workspaces =>
+      _prefsInitialized ? _prefs.workspaces : const [];
+
+  WorkspaceMetadata get activeWorkspace =>
+      _prefsInitialized ? _prefs.activeWorkspace : _fallbackWorkspace;
+
+  /// The workspace a session belongs to: its own attachment, else the active
+  /// workspace. Sessions that predate workspaces fall back to the active one.
+  WorkspaceMetadata workspaceForSession(String? workspaceId) =>
+      _prefsInitialized
+          ? _prefs.workspaceForSession(workspaceId)
+          : _fallbackWorkspace;
+
+  /// Monotonic revision of the workspace list and the active workspace.
+  ///
+  /// Rows that resolved a workspace name watch this so a rename, an active
+  /// switch or a deletion refreshes them instead of leaving a stale badge.
+  int get workspaceRevision => _workspaceRevision;
+  int _workspaceRevision = 0;
+
+  /// The workspace a stored session belongs to, or null when the session
+  /// itself could not be read (missing/corrupt).
+  ///
+  /// The sessions list shows one row per stored session and the summary does
+  /// not carry the workspace id, so this reads the session through this
+  /// provider's own storage (the same one [selectSession] uses). A session
+  /// that is found but predates workspaces resolves through the same active
+  /// fallback every other surface uses; a session that is not found keeps no
+  /// badge at all instead of claiming the active workspace.
+  Future<WorkspaceMetadata?> workspaceForStoredSession(
+    String sessionId,
+  ) async {
+    await _ensurePrefs();
+    final session = await _storage.getSession(sessionId);
+    if (session == null) return null;
+    return workspaceForSession(session.workspaceId);
+  }
+
+  WorkspaceMetadata? workspaceById(String? id) =>
+      _prefsInitialized ? _prefs.workspaceById(id) : null;
+
+  Future<void> setActiveWorkspace(String id) async {
+    await _ensurePrefs();
+    await _prefs.setActiveWorkspace(id);
+    _workspaceRevision++;
+    notifyListeners();
+  }
+
+  /// Creates a workspace and makes it the active one.
+  Future<WorkspaceMetadata> createWorkspace({
+    required String name,
+    String rootPath = kDefaultWorkspaceRoot,
+  }) async {
+    await _ensurePrefs();
+    final workspace = await _prefs.saveWorkspace(
+      id: 'ws-${_uuid.v4()}',
+      name: name,
+      rootPath: rootPath,
+    );
+    await _prefs.setActiveWorkspace(workspace.id);
+    _workspaceRevision++;
+    notifyListeners();
+    return workspace;
+  }
+
+  /// Renames an existing workspace. Returns null when the id is unknown.
+  /// Removes a non-default workspace. Sessions keep their stored id and
+  /// resolve through [workspaceForSession], and deleting the active workspace
+  /// falls back to the default one; the workspace directory itself is left
+  /// untouched.
+  Future<bool> deleteWorkspace(String id) async {
+    await _ensurePrefs();
+    final deleted = await _prefs.deleteWorkspace(id);
+    if (deleted) {
+      _workspaceRevision++;
+      notifyListeners();
+    }
+    return deleted;
+  }
+
+  Future<WorkspaceMetadata?> renameWorkspace(String id, String name) async {
+    await _ensurePrefs();
+    final existing = _prefs.workspaceById(id);
+    if (existing == null) return null;
+    final workspace = await _prefs.saveWorkspace(
+      id: existing.id,
+      name: name,
+      rootPath: existing.rootPath,
+    );
+    _workspaceRevision++;
+    notifyListeners();
+    return workspace;
+  }
+
   String? get activeProfileId {
     if (!_prefsInitialized) return null;
     return _prefs.activeProfileId;
@@ -454,6 +591,16 @@ class ChatProvider extends ChangeNotifier {
   List<SkillInfo> _skills = [];
 
   bool _disposed = false;
+  Future<void>? _initFuture;
+
+  /// Completes when the constructor's asynchronous initialization settled.
+  ///
+  /// Await this instead of sleeping after construction: it resolves once the
+  /// startup chain finished. Disposal does not cancel an in-flight init, but
+  /// every step observes [_disposed] and stops before writing state or
+  /// notifying, so the future still completes normally rather than erroring.
+  Future<void> get initialized => _initFuture ?? Future<void>.value();
+
   bool _safeMode = false;
   bool _startupRestoreGuardReady = false;
   String? _pendingStartupSessionId;
@@ -461,12 +608,52 @@ class ChatProvider extends ChangeNotifier {
   bool get safeMode => _safeMode;
   int get startupFailureCount => _startupFailureCount;
   bool get developerMode => runtimeDebugEvents.tracingEnabled;
+  bool get agentIslandEnabled => _prefs.agentIslandEnabled;
 
   void setDeveloperMode(bool enabled) {
     _prefs.developerMode = enabled;
     runtimeDebugEvents.setTracingEnabled(enabled);
     _persistedDeveloperModeApplied = true;
+    if (!enabled) {
+      // I6: the island is developer tooling. Turning Developer Mode off also
+      // turns the island off and hides any existing overlay.
+      _prefs.agentIslandEnabled = false;
+      unawaited(
+        NativeBridge.setAgentOverlayVisible(false).catchError((_) => false),
+      );
+    }
     notifyListeners();
+  }
+
+  /// I6: explicit opt-in for the Dynamic Island. Only reachable from Developer
+  /// Mode. Enabling it is the only path that asks for overlay permission.
+  Future<bool> setAgentIslandEnabled(bool enabled) async {
+    if (_disposed) return false;
+    if (enabled && !_prefs.developerMode) return false;
+    _prefs.agentIslandEnabled = enabled;
+    notifyListeners();
+    if (!enabled) {
+      await NativeBridge.setAgentOverlayVisible(false).catchError((_) => false);
+      // The provider may have been disposed while the overlay was being hidden;
+      // report the safe outcome without touching a dead provider.
+      if (_disposed) return false;
+      return true;
+    }
+    final granted = await NativeBridge.requestAgentOverlayPermissionIfNeeded()
+        .catchError((Object error) {
+      debugPrint('Agent overlay permission prompt failed: $error');
+      return false;
+    });
+    // Disposal during the permission prompt must not write the preference or
+    // notify a disposed notifier; report failure so the caller keeps the old
+    // switch state and the pre-disposal value stays untouched.
+    if (_disposed) return false;
+    if (!granted) {
+      // Permission was not granted, so the island must not stay enabled.
+      _prefs.agentIslandEnabled = false;
+      notifyListeners();
+    }
+    return granted;
   }
 
   int _messageVersion = 0;
@@ -478,6 +665,9 @@ class ChatProvider extends ChangeNotifier {
   int _nextSessionReplayGeneration = 0;
   final Set<String> _deletingSessionIds = {};
   final Set<String> _manualContextSummarySessions = {};
+  final Map<String, ManualContextSummaryStage> _manualContextSummaryStages = {};
+  final Map<String, int> _manualContextSummaryTokens = {};
+  final Duration _manualContextSummaryTimeout;
   String? _fallbackErrorMessage;
   ToolApprovalRequest? pendingApproval;
   AgentState? _pendingApprovalState;
@@ -662,6 +852,17 @@ class ChatProvider extends ChangeNotifier {
 
   ContextSummary? get currentContextSummary => currentSession?.contextSummary;
 
+  /// The exact memory facts the current session's most recent run sent.
+  ///
+  /// Empty means the last response ran without memory. This is a snapshot of
+  /// that run, so turning the switch off afterwards does not change it.
+  List<MemoryPromptLine> get currentSessionMemoryUsedInLastRun =>
+      MemoryService.memoryUsedInLastRun(currentSession?.id);
+
+  /// The memory facts the current session's next run would send.
+  Future<List<MemoryPromptLine>> previewSessionMemoryUsage() =>
+      MemoryService.promptFactsForSession(currentSession?.id);
+
   AgentRunRecoveryMarker? get currentInterruptedAgentRun {
     final session = currentSession;
     final marker = session?.inFlightAgentRun;
@@ -682,6 +883,50 @@ class ChatProvider extends ChangeNotifier {
     final session = currentSession;
     return session != null &&
         _manualContextSummarySessions.contains(session.id);
+  }
+
+  /// Observable progress of the current session's manual summary: `started`
+  /// once the request is accepted, `summarizing` while the model call is in
+  /// flight, then `done` or `failed`. Null before any rebuild in this session.
+  ManualContextSummaryStage? get currentContextSummaryStage {
+    final session = currentSession;
+    if (session == null) return null;
+    return _manualContextSummaryStages[session.id];
+  }
+
+  /// Human-readable label matching [currentContextSummaryStage].
+  String? get currentContextSummaryStageLabel {
+    switch (currentContextSummaryStage) {
+      case ManualContextSummaryStage.started:
+        return AppStrings.contextSummaryProgressStarted;
+      case ManualContextSummaryStage.summarizing:
+        return AppStrings.contextSummaryProgressSummarizing;
+      case ManualContextSummaryStage.done:
+        return AppStrings.contextSummaryProgressDone;
+      case ManualContextSummaryStage.failed:
+        return AppStrings.contextSummaryProgressFailed;
+      case null:
+        return null;
+    }
+  }
+
+  /// Cancels the in-flight manual summary for [sessionId] (defaults to the
+  /// current session). The previous summary is kept; the pending rebuild
+  /// resolves as a failure.
+  void cancelManualContextSummary([String? sessionId]) {
+    final id = sessionId ?? currentSession?.id;
+    if (id == null) return;
+    if (!_manualContextSummarySessions.contains(id)) return;
+    _invalidateManualContextSummary(id);
+    notifyListeners();
+  }
+
+  /// Bumps the per-session attempt token so any value that arrives after the
+  /// cancellation, deadline, or teardown can never be assigned.
+  void _invalidateManualContextSummary(String sessionId) {
+    _manualContextSummaryTokens[sessionId] =
+        (_manualContextSummaryTokens[sessionId] ?? 0) + 1;
+    _manualContextSummaryStages[sessionId] = ManualContextSummaryStage.failed;
   }
 
   bool get canRebuildCurrentContextSummary {
@@ -863,17 +1108,6 @@ class ChatProvider extends ChangeNotifier {
     final generation = ++state.agentServiceGeneration;
     state.agentServiceActive = true;
     state.agentServiceText = text;
-    if (!_appInBackground && !state.agentOverlayPermissionRequestStarted) {
-      state.agentOverlayPermissionRequestStarted = true;
-      unawaited(
-        NativeBridge.requestAgentOverlayPermissionIfNeeded().catchError((
-          Object e,
-        ) {
-          debugPrint('Agent overlay permission prompt failed: $e');
-          return false;
-        }),
-      );
-    }
     try {
       if (shouldStartService) {
         await NativeBridge.startAgentService(
@@ -1192,6 +1426,7 @@ class ChatProvider extends ChangeNotifier {
     RemoteAgentConnector? remoteAgentConnector,
     RemoteConnectorPreflight? beforeRemoteConnectorSendForTesting,
     MessageQueueDrainTimerFactory? messageQueueDrainTimerFactory,
+    Duration? manualContextSummaryTimeout,
   })  : _storage = storage ?? SessionStorage(),
         _llmServiceFactory = llmServiceFactory ?? LlmService.new,
         runtimeDebugEvents = runtimeDebugEvents ?? RuntimeDebugEventService(),
@@ -1209,6 +1444,8 @@ class ChatProvider extends ChangeNotifier {
             beforeRemoteConnectorSendForTesting,
         _messageQueueDrainTimerFactory =
             messageQueueDrainTimerFactory ?? Timer.new,
+        _manualContextSummaryTimeout = manualContextSummaryTimeout ??
+            ChatProvider.defaultManualContextSummaryTimeout,
         _skillCapabilityPolicyFactory = skillCapabilityPolicyFactory ??
             ((fixedToolDomains) => SkillCapabilityPolicy(
                   fixedToolDomains: fixedToolDomains,
@@ -1246,16 +1483,23 @@ class ChatProvider extends ChangeNotifier {
       ),
     );
     NativeBridge.setNavigateToSessionHandler((sessionId) {
+      if (_disposed) return;
       if (!_startupRestoreGuardReady) {
         _pendingStartupSessionId = sessionId;
         return;
       }
       if (!_safeMode) {
-        unawaited(selectSession(sessionId));
+        // The navigation callback is fire-and-forget from the platform side;
+        // it must never leak an unhandled future or run after disposal.
+        unawaited(
+          selectSession(sessionId).catchError((Object error) {
+            debugPrint('Navigate-to-session restore failed: $error');
+          }),
+        );
       }
     });
     _tools = toolRegistry ?? ToolRegistry.withDefaults(prefs: _prefs);
-    _init();
+    _initFuture = _init();
   }
 
   @override
@@ -1297,6 +1541,7 @@ class ChatProvider extends ChangeNotifier {
   }
 
   void _handleRemoteRuntimeChanged() {
+    if (_disposed) return;
     if (_remoteAgentRuntimeBinding.isAttached) {
       for (final state in _agentStates.values) {
         if (!state.isRemoteSessionExecution ||
@@ -1315,36 +1560,58 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> _init() async {
+    if (_disposed) return;
     try {
       await _prefs.init();
+      if (_disposed) return;
       _applyPersistedDeveloperModeOnce();
       await _tools.refreshMcpTools();
+      if (_disposed) return;
       await _contextManager.init();
+      if (_disposed) return;
       _prefsInitialized = true;
       await _storage.init();
+      if (_disposed) return;
       await _reconcileUnclaimedWorkspaceImports();
+      if (_disposed) return;
       final guardState = await _startupRestoreGuard.state();
+      if (_disposed) return;
       _safeMode = guardState.safeMode;
       _startupFailureCount = guardState.failureCount;
       sessions = await _storage.getSessionsSummary();
+      if (_disposed) return;
       _startupRestoreGuardReady = true;
       notifyListeners();
+      // `loadSkills` carries its own disposal guard.
       await loadSkills();
-      MemoryService.getMemories();
+      if (_disposed) return;
+      MemoryService.getMemories().catchError((Object error) {
+        debugPrint('Memory warm-up failed: $error');
+        return const <String>[];
+      });
       await _startupRestoreGuard.recordStartupSuccess();
+      if (_disposed) return;
       if (!_safeMode) {
         _startupFailureCount = 0;
         final pendingSessionId = _pendingStartupSessionId;
         _pendingStartupSessionId = null;
         if (pendingSessionId != null && pendingSessionId.isNotEmpty) {
-          unawaited(selectSession(pendingSessionId));
+          unawaited(
+            selectSession(pendingSessionId).catchError((Object error) {
+              debugPrint('Pending session restore failed: $error');
+            }),
+          );
         }
       } else {
         _pendingStartupSessionId = null;
       }
     } catch (e) {
       debugPrint('ChatProvider init failed: $e');
+      // A disposed provider must not record a startup failure or notify after
+      // its owner is gone.
+      if (_disposed) return;
       final guardState = await _recordStartupFailureBestEffort();
+      if (_disposed) return;
       _safeMode = guardState.safeMode;
       _startupFailureCount = guardState.failureCount;
       _startupRestoreGuardReady = true;
@@ -1357,7 +1624,9 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> loadSkills() async {
-    _skills = await SkillService.scanSkills();
+    final skills = await SkillService.scanSkills();
+    if (_disposed) return;
+    _skills = skills;
     notifyListeners();
   }
 
@@ -1377,7 +1646,14 @@ class ChatProvider extends ChangeNotifier {
     _persistedDeveloperModeApplied = true;
   }
 
-  Future<ChatSession> createSession({String? modelGroupId}) async {
+  /// Creates a session. [workspaceId] binds it to an explicit workspace (the
+  /// share sheet passes the one the user picked); without it the session follows
+  /// whichever workspace is active right now.
+  Future<ChatSession> createSession({
+    String? modelGroupId,
+    String? workspaceId,
+  }) async {
+    await _ensurePrefs();
     String? resolvedModelGroupId;
     final requestedModelGroupId = modelGroupId?.trim();
     if (requestedModelGroupId != null && requestedModelGroupId.isNotEmpty) {
@@ -1389,6 +1665,9 @@ class ChatProvider extends ChangeNotifier {
     final session = ChatSession(
       id: _uuid.v4(),
       modelGroupId: resolvedModelGroupId,
+      // New sessions belong to the workspace that is active right now, so a
+      // later workspace switch does not silently move existing conversations.
+      workspaceId: workspaceById(workspaceId)?.id ?? activeWorkspace.id,
     );
     await _storage.saveSession(session);
     sessions.insert(
@@ -1407,6 +1686,7 @@ class ChatProvider extends ChangeNotifier {
   }
 
   Future<void> selectSession(String id) async {
+    if (_disposed) return;
     if (_safeMode) {
       _fallbackErrorMessage = '安全模式已启用，已跳过自动恢复。请手动退出安全模式后再打开会话。';
       notifyListeners();
@@ -1417,10 +1697,12 @@ class ChatProvider extends ChangeNotifier {
     }
     try {
       final selectedSession = await _storage.getSession(id);
+      if (_disposed) return;
       final storageGeneration = _storage.sessionGeneration(id);
       currentSession = selectedSession;
       if (selectedSession != null) {
         await _reconcileWorkspaceImportsOnReload(selectedSession);
+        if (_disposed) return;
         if (_deletingSessionIds.contains(id) ||
             currentSession?.id != id ||
             !_storage.isSessionGenerationCurrent(id, storageGeneration)) {
@@ -1430,6 +1712,7 @@ class ChatProvider extends ChangeNotifier {
           return;
         }
         await _reconcileInterruptedRunOnReload(selectedSession);
+        if (_disposed) return;
         if (_deletingSessionIds.contains(id) ||
             currentSession?.id != id ||
             !_storage.isSessionGenerationCurrent(id, storageGeneration)) {
@@ -1440,10 +1723,16 @@ class ChatProvider extends ChangeNotifier {
         }
         _restorePersistedAssistantErrorState(selectedSession);
       }
+      if (_disposed) return;
       await _startupRestoreGuard.recordStartupSuccess();
+      if (_disposed) return;
       notifyListeners();
     } catch (e) {
+      // A disposed provider must not record a startup failure, flip safe mode,
+      // or notify after its owner is gone.
+      if (_disposed) return;
       final guardState = await _recordStartupFailureBestEffort();
+      if (_disposed) return;
       _safeMode = guardState.safeMode;
       _startupFailureCount = guardState.failureCount;
       currentSession = null;
@@ -1792,6 +2081,31 @@ class ChatProvider extends ChangeNotifier {
     } finally {
       _deletingSessionIds.remove(id);
     }
+  }
+
+  /// Deletes [index] and every message after it in the current session.
+  ///
+  /// Used by the user-message action sheet ("从此处删除"). Refuses while the
+  /// session is sending so a live run cannot write into a truncated
+  /// transcript. Returns true when the transcript changed.
+  Future<bool> deleteMessagesFrom(int index) async {
+    final session = currentSession;
+    if (session == null) return false;
+    if (index < 0 || index >= session.messages.length) return false;
+    final state = _getState(session.id);
+    if (state != null && state.isSending) return false;
+    session.messages.removeRange(index, session.messages.length);
+    // A recovery marker describes a run over messages that no longer exist.
+    session.inFlightAgentRun = null;
+    session.updatedAt = DateTime.now();
+    if (state != null) {
+      state.pendingAlternatives = null;
+      state.errorMessage = null;
+    }
+    _syncCurrentSessionReference(session);
+    await _storage.saveSession(session);
+    notifyListeners();
+    return true;
   }
 
   Future<bool> restoreDeletedSession(String id) async {
@@ -2544,6 +2858,7 @@ class ChatProvider extends ChangeNotifier {
     AgentState state,
     ToolApprovalRequest request, {
     required _AgentRunToken runToken,
+    bool force = false,
   }) async {
     if (_disposed || !_runMayContinue(runToken)) return false;
     await _ensurePrefs();
@@ -2555,11 +2870,13 @@ class ChatProvider extends ChangeNotifier {
     // preference. Run validity, hard-deny, and interrupted-run reauthorization
     // checks happen before it; lifecycle, session visibility, and notification
     // capability must not downgrade an otherwise valid operation to Ask or Deny.
-    if (!forceRenewedApproval &&
+    if (!force &&
+        !forceRenewedApproval &&
         policy == PreferencesService.toolApprovalAuto) {
       return true;
     }
-    if (!forceRenewedApproval &&
+    if (!force &&
+        !forceRenewedApproval &&
         policy == PreferencesService.toolApprovalSessionFirst &&
         state.sessionApprovedTools.contains(request.toolName)) {
       return true;
@@ -2638,6 +2955,10 @@ class ChatProvider extends ChangeNotifier {
         approvalId: _toolApprovalId(request),
         toolName: request.toolName,
         risk: request.risk.name,
+        // The exact destination being approved. Required for a tainted
+        // web→web Ask: the user must see the URL, and web taint is only
+        // cleared on approval of a surface that showed it.
+        detail: UntrustedDataPolicy.approvalDetailFor(request),
       );
     } catch (e) {
       debugPrint('Failed to show tool approval notification: $e');
@@ -2734,7 +3055,11 @@ class ChatProvider extends ChangeNotifier {
       if (pendingApproval != null && !_disposed) notifyListeners();
     } else {
       if (_activeAgentStates.isNotEmpty) {
-        unawaited(NativeBridge.setAgentOverlayVisible(true));
+        // I6: the island only reflects a run when the developer explicitly
+        // enabled it. The notification path is always on.
+        if (_prefs.agentIslandEnabled) {
+          unawaited(NativeBridge.setAgentOverlayVisible(true));
+        }
         for (final state in _activeAgentStates) {
           unawaited(_updateAgentNativeStatusForState(
             state,
@@ -3118,8 +3443,7 @@ class ChatProvider extends ChangeNotifier {
       }
 
       final providerSnapshot = _captureProviderProfileSnapshot(session);
-      final apiKey = providerSnapshot.activeProfile.apiKey.trim();
-      if (apiKey.isEmpty) {
+      if (providerSnapshot.missingCredential) {
         if (sessionState != null) {
           sessionState.errorMessage = AppStrings.apiKeyNotConfigured;
           sessionState.status = AgentStatus.error;
@@ -3355,7 +3679,7 @@ class ChatProvider extends ChangeNotifier {
           AppConstants.defaultSystemPrompt;
       final skillIndex = SkillService.buildSkillIndex(_skills);
       final memoryPrompt =
-          MemoryService.buildMemoryPrompt(sessionId: activeSession.id);
+          await MemoryService.buildMemoryPrompt(sessionId: activeSession.id);
       final fullPrompt = basePrompt + skillIndex + memoryPrompt;
 
       state.status = AgentStatus.thinking;
@@ -4975,7 +5299,7 @@ class ChatProvider extends ChangeNotifier {
       final session = owner.sessionSnapshot;
       final skillIndex = SkillService.buildSkillIndex(_skills);
       final memoryPrompt =
-          MemoryService.buildMemoryPrompt(sessionId: session.id);
+          await MemoryService.buildMemoryPrompt(sessionId: session.id);
 
       final formatStr =
           session.apiFormatOverride ?? _prefs.apiFormat ?? 'anthropic';
@@ -5204,7 +5528,7 @@ class ChatProvider extends ChangeNotifier {
               _prefs.systemPrompt ??
               AppConstants.defaultSystemPrompt) +
           SkillService.buildSkillIndex(_skills) +
-          MemoryService.buildMemoryPrompt(sessionId: session.id);
+          await MemoryService.buildMemoryPrompt(sessionId: session.id);
       final config = LlmConfig(
         format: format,
         apiKey: apiKey,
@@ -5439,12 +5763,18 @@ class ChatProvider extends ChangeNotifier {
       );
     }
     _manualContextSummarySessions.add(session.id);
+    final token = (_manualContextSummaryTokens[session.id] ?? 0) + 1;
+    _manualContextSummaryTokens[session.id] = token;
+    _manualContextSummaryStages[session.id] = ManualContextSummaryStage.started;
     notifyListeners();
     var requestedApiMessageCount = 0;
     var coveredMessageCount = 0;
     try {
       await _ensurePrefs();
-      if (_prefs.apiKey == null || _prefs.apiKey!.isEmpty) {
+      final snapshot = _captureProviderProfileSnapshot(session);
+      if (snapshot.missingCredential) {
+        _manualContextSummaryStages[session.id] =
+            ManualContextSummaryStage.failed;
         return const ManualContextSummaryResult(
           success: false,
           message: AppStrings.apiKeyNotConfigured,
@@ -5455,6 +5785,8 @@ class ChatProvider extends ChangeNotifier {
       requestedApiMessageCount = requestedPrefix.length;
       final safeCount = _safeManualSummaryPrefixCount(requestedPrefix);
       if (safeCount <= 0) {
+        _manualContextSummaryStages[session.id] =
+            ManualContextSummaryStage.failed;
         return ManualContextSummaryResult(
           success: false,
           message: AppStrings.contextSummaryNoSafePrefix,
@@ -5463,17 +5795,79 @@ class ChatProvider extends ChangeNotifier {
       }
       final safePrefix = requestedPrefix.take(safeCount).toList();
       coveredMessageCount = safePrefix.length;
-      final summary = await _contextManager.buildManualSummary(
-        ContextManualSummaryRequest(
-          sessionId: session.id,
-          apiPrefixMessages: safePrefix,
-          llmConfig: _buildLlmConfig(session),
-          contextTokenBudget: _prefs.contextTokenBudget,
-        ),
-      );
+      _manualContextSummaryStages[session.id] =
+          ManualContextSummaryStage.summarizing;
+      notifyListeners();
+      final stopwatch = Stopwatch()..start();
+      ContextSummary summary;
+      try {
+        summary = await _contextManager
+            .buildManualSummary(
+              ContextManualSummaryRequest(
+                sessionId: session.id,
+                apiPrefixMessages: safePrefix,
+                llmConfig: _buildLlmConfigForProfileSnapshot(
+                  snapshot.activeProfile,
+                  session,
+                ),
+                contextTokenBudget: _prefs.contextTokenBudget,
+                maxModelCalls: ChatProvider.maxManualContextSummaryModelCalls,
+              ),
+            )
+            .timeout(_manualContextSummaryTimeout);
+      } on TimeoutException {
+        // The timed-out call keeps running and can later return an extractive
+        // fallback. Invalidate the attempt so that late value can never be
+        // accepted, then fail without touching the previous summary.
+        _invalidateManualContextSummary(session.id);
+        _recordRuntimeEvent(session.id, 'context.summary.manual.timeout', {
+          'coveredMessageCount': coveredMessageCount,
+          'timeoutMs': _manualContextSummaryTimeout.inMilliseconds,
+        });
+        return ManualContextSummaryResult(
+          success: false,
+          message: AppStrings.contextSummaryTimedOut,
+          requestedApiMessageCount: requestedApiMessageCount,
+          coveredMessageCount: coveredMessageCount,
+          stage: ManualContextSummaryStage.failed,
+        );
+      }
+      if (_disposed || stopwatch.elapsed >= _manualContextSummaryTimeout) {
+        // Torn down, or the value crossed the deadline before `timeout` could
+        // fire. Keep the previous summary and report a failed rebuild.
+        _invalidateManualContextSummary(session.id);
+        _recordRuntimeEvent(session.id, 'context.summary.manual.timeout', {
+          'coveredMessageCount': coveredMessageCount,
+          'timeoutMs': _manualContextSummaryTimeout.inMilliseconds,
+        });
+        return ManualContextSummaryResult(
+          success: false,
+          message: AppStrings.contextSummaryTimedOut,
+          requestedApiMessageCount: requestedApiMessageCount,
+          coveredMessageCount: coveredMessageCount,
+          stage: ManualContextSummaryStage.failed,
+        );
+      }
+      if (_manualContextSummaryTokens[session.id] != token) {
+        // Cancelled while the model was working: keep the previous summary
+        // and report a failed rebuild.
+        _manualContextSummaryStages[session.id] =
+            ManualContextSummaryStage.failed;
+        _recordRuntimeEvent(session.id, 'context.summary.manual.cancelled', {
+          'coveredMessageCount': coveredMessageCount,
+        });
+        return ManualContextSummaryResult(
+          success: false,
+          message: AppStrings.contextSummaryRebuildCancelled,
+          requestedApiMessageCount: requestedApiMessageCount,
+          coveredMessageCount: coveredMessageCount,
+          stage: ManualContextSummaryStage.failed,
+        );
+      }
       session.contextSummary = summary;
       await _storage.saveSession(session);
       _syncCurrentSessionReference(session);
+      _manualContextSummaryStages[session.id] = ManualContextSummaryStage.done;
       notifyListeners();
       return ManualContextSummaryResult(
         success: true,
@@ -5483,8 +5877,13 @@ class ChatProvider extends ChangeNotifier {
         summary: summary,
         requestedApiMessageCount: requestedPrefix.length,
         coveredMessageCount: summary.coveredMessageCount,
+        stage: ManualContextSummaryStage.done,
       );
     } catch (e) {
+      if (!_disposed) {
+        _manualContextSummaryStages[session.id] =
+            ManualContextSummaryStage.failed;
+      }
       _recordRuntimeEvent(session.id, 'context.summary.manual.failed', {
         'stage': 'provider',
         'errorCode': e.runtimeType.toString(),
@@ -5494,6 +5893,7 @@ class ChatProvider extends ChangeNotifier {
         message: AppStrings.contextSummaryRebuildFailed(_briefError(e)),
         requestedApiMessageCount: requestedApiMessageCount,
         coveredMessageCount: coveredMessageCount,
+        stage: ManualContextSummaryStage.failed,
       );
     } finally {
       _manualContextSummarySessions.remove(session.id);
@@ -5660,22 +6060,80 @@ class ChatProvider extends ChangeNotifier {
       final profileById = {
         for (final profile in profiles) profile.id: profile,
       };
-      final primaryProfile = profileById[group.primaryProfileId];
-      if (primaryProfile != null) {
-        activeProfile = primaryProfile.copyWith(
-          fallbackTargets: List<ModelFallbackTarget>.unmodifiable(
-            group.fallbackTargets.map((target) => target.copyWith()),
-          ),
+      final members = _resolveModelGroupMembers(group, profileById);
+      if (members.isEmpty) {
+        // A selected model group whose members all lack a usable credential
+        // must not silently fall through to an unrelated profile. Keep an
+        // unusable placeholder so the existing missing-key check fails closed.
+        return _ProviderProfileSnapshot(
+          activeProfileId: '',
+          activeProfile: ProviderProfile.defaults(name: group.displayName)
+              .copyWith(id: '', apiKey: '', baseUrl: ''),
+          profiles: profiles,
+          missingCredential: true,
         );
-        activeProfileId = primaryProfile.id;
       }
+      final resolved = members.first;
+      activeProfile = resolved.profile.copyWith(
+        fallbackTargets: List<ModelFallbackTarget>.unmodifiable(
+          members.skip(1).map((member) => member.target).toList(),
+        ),
+      );
+      activeProfileId = resolved.profile.id;
+      return _ProviderProfileSnapshot(
+        activeProfileId: activeProfileId,
+        activeProfile: activeProfile,
+        profiles: profiles,
+        // The members were filtered by usable credential, so a keyless local
+        // member resolved here may run without an API key.
+        missingCredential: false,
+      );
     }
 
     return _ProviderProfileSnapshot(
       activeProfileId: activeProfileId,
       activeProfile: activeProfile,
       profiles: profiles,
+      missingCredential: activeProfile.apiKey.trim().isEmpty,
     );
+  }
+
+  /// Resolves a model group to the members that can actually be called, in
+  /// group order: the primary profile first, then the enabled fallback targets.
+  /// A member is skipped when its profile is missing or has neither an API key
+  /// nor a configured endpoint, so selection never lands on an unrelated
+  /// profile while still allowing an explicitly configured keyless local /
+  /// self-hosted member.
+  List<_ResolvedModelGroupMember> _resolveModelGroupMembers(
+    ModelGroup group,
+    Map<String, ProviderProfile> profileById,
+  ) {
+    final members = <_ResolvedModelGroupMember>[];
+    final seen = <String>{};
+
+    void add(ProviderProfile? profile, ModelFallbackTarget? target) {
+      if (profile == null || !_hasUsableCredential(profile)) return;
+      if (!seen.add(profile.id)) return;
+      members.add(_ResolvedModelGroupMember(
+        profile: profile,
+        target: target ?? ModelFallbackTarget(targetProfileId: profile.id),
+      ));
+    }
+
+    add(profileById[group.primaryProfileId.trim()], null);
+    for (final target in group.fallbackTargets) {
+      if (!target.enabled) continue;
+      add(profileById[target.targetProfileId.trim()], target);
+    }
+    return members;
+  }
+
+  /// A profile is usable when it carries an API key, or when it is an
+  /// explicitly configured keyless local / self-hosted endpoint (a custom
+  /// base URL). A default profile with neither is not usable.
+  bool _hasUsableCredential(ProviderProfile profile) {
+    return profile.apiKey.trim().isNotEmpty ||
+        profile.baseUrl.trim().isNotEmpty;
   }
 
   ProviderProfile _snapshotProviderProfile(ProviderProfile profile) {
@@ -5967,7 +6425,7 @@ class ChatProvider extends ChangeNotifier {
       final targetId = target.targetProfileId.trim();
       if (targetId.isEmpty || targetId == activeProfile.id) continue;
       final profile = profiles[targetId];
-      if (profile == null || profile.apiKey.trim().isEmpty) continue;
+      if (profile == null || !_hasUsableCredential(profile)) continue;
       final config = _buildLlmConfigForProfile(
         profile,
         modelOverride:
@@ -6328,19 +6786,41 @@ class ChatProvider extends ChangeNotifier {
           'generate_image': imageDomain,
       },
     );
+    // Run-scoped taint for untrusted tool results. The deny closure and the
+    // approval closure below both capture this exact instance, so a hard deny
+    // and the web→web Ask see the same values this run produced.
+    final runTaintSet = RunTaintSet();
+    final untrustedDataPolicy = UntrustedDataPolicy(runTaintSet);
     return AgentService(
       llm: llm,
       tools: _tools,
       systemPrompt: systemPrompt,
       toolPolicy: ToolPolicy(
-        onApprovalRequired: (request) => _requestToolApproval(
-          state,
-          request,
-          runToken: runToken,
-        ),
+        onApprovalRequired: (request) async {
+          final taintedWebTarget =
+              _taintedWebTarget(untrustedDataPolicy, request);
+          final approved = await _requestToolApproval(
+            state,
+            request,
+            runToken: runToken,
+            // Web→web follow is Ask even when Auto Allow is on: the card shows
+            // the exact URL and a confirmed value clears that taint.
+            force: taintedWebTarget != null,
+          );
+          if (approved && taintedWebTarget != null) {
+            runTaintSet.clearWebContainedIn(taintedWebTarget);
+          }
+          return approved;
+        },
         deniedToolNames: _prefs.deniedToolNames,
         bashCommandDenyPatterns: _prefs.bashCommandDenyPatterns,
-        additionalDenyCheck: skillCapabilityPolicy.denyFor,
+        additionalDenyCheck: (request) =>
+            untrustedDataPolicy.denyFor(request) ??
+            skillCapabilityPolicy.denyFor(request),
+      ),
+      runTaintSet: runTaintSet,
+      replayUntrustedResults: UntrustedDataPolicy.untrustedEntriesFromMessages(
+        activeSession.messages,
       ),
       skillCapabilityPolicy: skillCapabilityPolicy,
       historicalSkillActivation: historicalSkillActivation ??
@@ -6978,7 +7458,25 @@ class ChatProvider extends ChangeNotifier {
             errorCode:
                 state.wasCancelled ? 'user_cancelled' : 'stream_interrupted',
           );
-          completeRun();
+          if (!state.wasCancelled && errorCause == null) {
+            // Item 4: the stream ended without a completion event (a dropped
+            // connection, for example). Keep the text already produced and
+            // mark the turn interrupted instead of discarding it.
+            _flushStreamingNow(state, notify: false);
+            _savePartialAgentResponse(
+              state,
+              interruptionNote: '回复中断：连接在生成结束前关闭，已保留已生成的部分内容。',
+              runToken: runToken,
+            );
+            if (!preserveRecoveryMarker) {
+              activeSession.inFlightAgentRun = null;
+            }
+            _clearStreamingState(state);
+            state.status = AgentStatus.error;
+            state.errorMessage = '回复中断：连接在生成结束前关闭，已保留已生成的部分内容。';
+            notifyListeners();
+          }
+          if (!state.agentCompletionFinalizing) completeRun();
           if (errorCause is! EncryptedContentError) {
             unawaited(
               _stopAgentServiceForState(state, runToken: runToken),
@@ -7289,6 +7787,7 @@ class ChatProvider extends ChangeNotifier {
             :final toolUseId,
             :final payload,
             :final isError,
+            :final trust,
           ):
           sanitized.add(ToolResultContent(
             toolUseId: toolUseId,
@@ -7297,6 +7796,7 @@ class ChatProvider extends ChangeNotifier {
             summary: payload.summary,
             metadata: _sanitizeRecoveryMap(payload.metadata),
             isError: isError,
+            trust: trust,
           ));
         case StructuredResultContent(
             :final document,
@@ -7653,10 +8153,25 @@ class _ProviderProfileSnapshot {
   final ProviderProfile activeProfile;
   final List<ProviderProfile> profiles;
 
+  /// True when the resolved destination has no usable credential and the send
+  /// must stop with the existing missing-key message.
+  final bool missingCredential;
+
   const _ProviderProfileSnapshot({
     required this.activeProfileId,
     required this.activeProfile,
     required this.profiles,
+    this.missingCredential = false,
+  });
+}
+
+class _ResolvedModelGroupMember {
+  final ProviderProfile profile;
+  final ModelFallbackTarget target;
+
+  const _ResolvedModelGroupMember({
+    required this.profile,
+    required this.target,
   });
 }
 

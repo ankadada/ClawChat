@@ -4,6 +4,7 @@ import '../../models/chat_models.dart';
 import '../app_http.dart';
 import 'tool_registry.dart';
 import 'tool_result_formatter.dart';
+import 'untrusted_data_policy.dart';
 
 class WebSearchTool extends Tool {
   WebSearchTool({Uri? endpoint, AppHttpClient? httpClient})
@@ -62,6 +63,7 @@ class WebSearchTool extends Tool {
     String? sessionId,
     required String operationId,
     required ToolCancellationSignal cancellationSignal,
+    RunTaintSet? runTaintSet,
   }) async {
     final output = await _execute(
       input,

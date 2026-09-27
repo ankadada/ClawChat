@@ -121,13 +121,19 @@ class ProviderMessageTransform {
   ) {
     final canonical = transformCanonical(canonicalMessages, options).messages;
     if (options.isAnthropic) {
-      return canonical.expand(_convertMessageToAnthropic).toList();
+      return canonical
+          .expand((msg) => _convertMessageToAnthropic(
+                msg,
+                supportsImages: options.supportsImages,
+              ))
+          .toList();
     }
     if (options.isOpenAI) {
       return canonical
           .expand((msg) => _convertMessageToOpenAI(
                 msg,
                 supportsReasoningContent: options.supportsReasoningContent,
+                supportsImages: options.supportsImages,
               ))
           .toList();
     }
@@ -369,15 +375,19 @@ class ProviderMessageTransform {
           sensitiveStats: sensitiveStats,
         );
       }
+      final rawContent = block['for_llm'] ?? block['content'] ?? block['output'];
+      final text = _sanitizeText(_toolResultText(rawContent), sensitiveStats);
+      final images =
+          options.supportsImages ? _toolResultImageBlocks(rawContent) : const [];
       final clean = {
         'type': 'tool_result',
         'tool_use_id': scrubbedId,
-        'content': _sanitizeText(
-          _stringContent(
-            block['for_llm'] ?? block['content'] ?? block['output'],
-          ),
-          sensitiveStats,
-        ),
+        'content': images.isEmpty
+            ? text
+            : <Map<String, dynamic>>[
+                {'type': 'text', 'text': text},
+                ...images,
+              ],
         if (block['is_error'] == true) 'is_error': true,
       };
       if (cacheControl != null) clean['cache_control'] = cacheControl;
@@ -516,12 +526,14 @@ class ProviderMessageTransform {
   }
 
   List<Map<String, dynamic>> _convertMessageToAnthropic(
-    Map<String, dynamic> msg,
-  ) {
+    Map<String, dynamic> msg, {
+    bool supportsImages = false,
+  }) {
     final role = msg['role'] as String? ?? 'user';
     if (role == 'tool') {
       final toolCallId = msg['tool_call_id']?.toString() ?? '';
       if (toolCallId.isEmpty) return const [];
+      final images = _toolResultImageBlocks(msg['content']);
       return [
         {
           'role': 'user',
@@ -529,7 +541,15 @@ class ProviderMessageTransform {
             {
               'type': 'tool_result',
               'tool_use_id': toolCallId,
-              'content': _stringContent(msg['content']),
+              'content': images.isEmpty
+                  ? _stringContent(msg['content'])
+                  : <Map<String, dynamic>>[
+                      {
+                        'type': 'text',
+                        'text': _toolResultText(msg['content']),
+                      },
+                      ...images,
+                    ],
             }
           ],
         }
@@ -542,7 +562,9 @@ class ProviderMessageTransform {
 
     if (toolCalls is List && role == 'assistant') {
       final blocks = <Map<String, dynamic>>[];
-      blocks.addAll(_anthropicContentBlocks(content));
+      blocks.addAll(
+        _anthropicContentBlocks(content, supportsImages: supportsImages),
+      );
       for (final toolCall in toolCalls) {
         final block = _openAIToolCallToAnthropic(toolCall);
         if (block != null) blocks.add(block);
@@ -557,7 +579,10 @@ class ProviderMessageTransform {
     }
 
     if (content is List) {
-      final blocks = _anthropicContentBlocks(content);
+      final blocks = _anthropicContentBlocks(
+        content,
+        supportsImages: supportsImages,
+      );
       if (blocks.isEmpty) return const [];
       return [
         {
@@ -575,7 +600,10 @@ class ProviderMessageTransform {
     ];
   }
 
-  List<Map<String, dynamic>> _anthropicContentBlocks(Object? content) {
+  List<Map<String, dynamic>> _anthropicContentBlocks(
+    Object? content, {
+    bool supportsImages = false,
+  }) {
     if (content is String) {
       return content.isEmpty
           ? const []
@@ -587,13 +615,17 @@ class ProviderMessageTransform {
 
     final blocks = <Map<String, dynamic>>[];
     for (final block in content) {
-      final converted = _anthropicContentBlock(block);
+      final converted =
+          _anthropicContentBlock(block, supportsImages: supportsImages);
       if (converted != null) blocks.add(converted);
     }
     return blocks;
   }
 
-  Map<String, dynamic>? _anthropicContentBlock(Object? block) {
+  Map<String, dynamic>? _anthropicContentBlock(
+    Object? block, {
+    bool supportsImages = false,
+  }) {
     if (block is! Map) return null;
     final type = block['type'];
     if (type == 'text') {
@@ -627,12 +659,23 @@ class ProviderMessageTransform {
       };
     }
     if (type == 'tool_result') {
+      final rawContent =
+          block['for_llm'] ?? block['content'] ?? block['output'];
+      // ClawChat tool results are a `user` message, so this is the branch that
+      // builds the real Anthropic request body. A content list with validated
+      // image blocks must stay a list; `_stringContent` would jsonEncode it and
+      // the model would receive JSON text instead of an image.
+      final images =
+          supportsImages ? _toolResultImageBlocks(rawContent) : const [];
       return {
         'type': 'tool_result',
         'tool_use_id': block['tool_use_id'],
-        'content': _stringContent(
-          block['for_llm'] ?? block['content'] ?? block['output'],
-        ),
+        'content': images.isEmpty
+            ? _stringContent(rawContent)
+            : <Map<String, dynamic>>[
+                {'type': 'text', 'text': _toolResultText(rawContent)},
+                ...images,
+              ],
         if (block['is_error'] == true) 'is_error': true,
         if (block['cache_control'] != null)
           'cache_control': Map<String, dynamic>.from(
@@ -641,6 +684,40 @@ class ProviderMessageTransform {
       };
     }
     return null;
+  }
+
+  /// The image blocks inside a tool_result content list, re-validated.
+  ///
+  /// They are only kept when the provider supports images; the caller falls
+  /// back to the plain text form otherwise.
+  List<Map<String, dynamic>> _toolResultImageBlocks(Object? content) {
+    if (content is! List) return const [];
+    final blocks = <Map<String, dynamic>>[];
+    for (final item in content) {
+      if (item is! Map) continue;
+      if (item['type'] == 'image') {
+        final normalized = _normalizeAnthropicImageBlock(item);
+        if (normalized != null) blocks.add(normalized);
+      } else if (item['type'] == 'image_url') {
+        final normalized = _openAIImageBlockToAnthropic(item);
+        if (normalized != null) blocks.add(normalized);
+      }
+    }
+    return blocks;
+  }
+
+  /// The text part of a tool_result that may be a content list.
+  String _toolResultText(Object? content) {
+    if (content is List) {
+      final text = content
+          .whereType<Map>()
+          .where((item) => item['type'] == 'text')
+          .map((item) => item['text']?.toString() ?? '')
+          .where((value) => value.isNotEmpty)
+          .join('\n');
+      if (text.isNotEmpty) return text;
+    }
+    return _stringContent(content);
   }
 
   Map<String, dynamic>? _normalizeAnthropicImageBlock(
@@ -766,6 +843,20 @@ class ProviderMessageTransform {
         'type': 'ephemeral',
       };
 
+  Map<String, dynamic>? _anthropicImageBlockToOpenAI(
+    Map<String, dynamic> block,
+  ) {
+    final source = block['source'];
+    if (source is! Map) return null;
+    final mediaType = source['media_type']?.toString();
+    final data = source['data']?.toString();
+    if (mediaType == null || data == null || data.isEmpty) return null;
+    return {
+      'type': 'image_url',
+      'image_url': {'url': 'data:$mediaType;base64,$data'},
+    };
+  }
+
   Map<String, dynamic>? _openAIImageBlockToAnthropic(
     Map<dynamic, dynamic> block,
   ) {
@@ -825,6 +916,7 @@ class ProviderMessageTransform {
   List<Map<String, dynamic>> _convertMessageToOpenAI(
     Map<String, dynamic> msg, {
     required bool supportsReasoningContent,
+    bool supportsImages = false,
   }) {
     final role = msg['role'] as String;
     final content = msg['content'];
@@ -857,12 +949,23 @@ class ProviderMessageTransform {
         return content
             .where((item) => item is Map && item['type'] == 'tool_result')
             .map<Map<String, dynamic>>((item) {
+          final rawContent =
+              item['for_llm'] ?? item['content'] ?? item['output'];
+          final images = supportsImages
+              ? _toolResultImageBlocks(rawContent)
+                  .map(_anthropicImageBlockToOpenAI)
+                  .whereType<Map<String, dynamic>>()
+                  .toList(growable: false)
+              : const <Map<String, dynamic>>[];
           return {
             'role': 'tool',
             'tool_call_id': item['tool_use_id'],
-            'content': _stringContent(
-              item['for_llm'] ?? item['content'] ?? item['output'],
-            ),
+            'content': images.isEmpty
+                ? _stringContent(rawContent)
+                : <Map<String, dynamic>>[
+                    {'type': 'text', 'text': _toolResultText(rawContent)},
+                    ...images,
+                  ],
           };
         }).toList();
       }

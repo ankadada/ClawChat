@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 import '../constants.dart';
 import '../models/mcp_server_config.dart';
 import '../models/provider_profile.dart';
+import '../models/workspace.dart';
 import 'prompt_cache_settings.dart';
 
 enum ConflictResolution { merge, replace, skip }
@@ -91,12 +92,14 @@ class PreferencesService {
   static const _keyNotifyOnComplete = 'notify_on_complete';
   static const _keyPrivacyMode = 'privacy_mode';
   static const _keyDeveloperMode = 'developer_mode';
+  static const _keyAgentIslandEnabled = 'agent_island_enabled';
   static const _keyAgentMaxIterations = 'agent_max_iterations';
   static const _keyMaxConcurrentAgents = 'max_concurrent_agents';
   static const _keyAllowPhoneCall = 'allow_phone_call';
   static const _keyAllowSms = 'allow_sms';
   static const _keyAnthropicPromptCacheEnabled =
       'anthropic_prompt_cache_enabled';
+  static const _keySettingsInitialized = 'settings_initialized_v1';
   static const _keyMemoryEnabled = 'memory_enabled';
   static const _keyToolApprovalPolicy = 'tool_approval_policy';
   static const _keyDeniedToolNames = 'denied_tool_names';
@@ -111,6 +114,8 @@ class PreferencesService {
   static const _keyActiveModelGroupId = 'active_model_group_id';
   static const _keyPromptProfiles = 'prompt_profiles';
   static const _keyMcpServers = 'mcp_servers';
+  static const _keyWorkspaces = 'workspaces';
+  static const _keyActiveWorkspaceId = 'active_workspace_id';
 
   static const toolApprovalAlways = 'always';
   static const toolApprovalSessionFirst = 'session_first';
@@ -132,6 +137,8 @@ class PreferencesService {
   List<ProviderProfile> _cachedProfiles = [];
   List<ModelGroup> _cachedModelGroups = [];
   List<McpServerConfig> _cachedMcpServers = [];
+  List<WorkspaceMetadata> _cachedWorkspaces = [];
+  String? _cachedActiveWorkspaceId;
   String? _cachedActiveProfileId;
   String? _cachedActiveModelGroupId;
 
@@ -159,6 +166,7 @@ class PreferencesService {
     _cachedEnvVars =
         _decodeEnvVars(await _secureStorage.read(key: _keyEnvVars));
     await _loadMcpServers();
+    await _loadWorkspaces();
     PromptCacheSettings.setAnthropicPromptCacheEnabledForProcess(
       _prefs.getBool(_keyAnthropicPromptCacheEnabled) ?? true,
     );
@@ -839,6 +847,165 @@ class PreferencesService {
 
   List<McpServerConfig> get mcpServers => List.unmodifiable(_cachedMcpServers);
 
+  // ── Workspaces ───────────────────────────────────────────────────────
+  //
+  // A workspace is a named view of the agent's local tree. The default one is
+  // created on first read so an install that predates workspaces keeps working
+  // without touching any session.
+
+  /// Every persisted workspace, default first when present.
+  List<WorkspaceMetadata> get workspaces =>
+      List.unmodifiable(_cachedWorkspaces);
+
+  /// The workspace a new session and the file browser start from. Never null
+  /// once [init] ran: a missing or dangling id falls back to the default.
+  WorkspaceMetadata get activeWorkspace {
+    final activeId = _cachedActiveWorkspaceId;
+    for (final workspace in _cachedWorkspaces) {
+      if (workspace.id == activeId) return workspace;
+    }
+    for (final workspace in _cachedWorkspaces) {
+      if (workspace.isDefault) return workspace;
+    }
+    return _cachedWorkspaces.first;
+  }
+
+  String? get activeWorkspaceId => activeWorkspace.id;
+
+  WorkspaceMetadata? workspaceById(String? id) {
+    if (id == null || id.isEmpty) return null;
+    for (final workspace in _cachedWorkspaces) {
+      if (workspace.id == id) return workspace;
+    }
+    return null;
+  }
+
+  /// The workspace a session belongs to: its own attachment, else the active
+  /// one. Persisted sessions that predate workspaces fall back cleanly.
+  WorkspaceMetadata workspaceForSession(String? workspaceId) =>
+      workspaceById(workspaceId) ?? activeWorkspace;
+
+  /// Creates or updates a workspace. Names are trimmed and bounded; ids must
+  /// already be valid (the caller owns id generation).
+  Future<WorkspaceMetadata> saveWorkspace({
+    required String id,
+    required String name,
+    String rootPath = kDefaultWorkspaceRoot,
+  }) async {
+    final validName = WorkspaceMetadata.validateName(name) ?? '工作区';
+    final validRoot =
+        WorkspaceMetadata.validateRootPath(rootPath) ?? kDefaultWorkspaceRoot;
+    final existing = workspaceById(id);
+    final workspace = existing == null
+        ? WorkspaceMetadata(
+            id: id,
+            name: validName,
+            rootPath: validRoot,
+          )
+        : WorkspaceMetadata(
+            id: existing.id,
+            name: validName,
+            rootPath: validRoot,
+            createdAt: existing.createdAt,
+            attributes: existing.attributes,
+          );
+    final updated = [
+      for (final item in _cachedWorkspaces)
+        if (item.id != workspace.id) item,
+      workspace,
+    ];
+    await _persistWorkspaces(updated);
+    return workspace;
+  }
+
+  Future<void> setActiveWorkspace(String id) async {
+    if (workspaceById(id) == null) return;
+    _cachedActiveWorkspaceId = id;
+    await _prefs.setString(_keyActiveWorkspaceId, id);
+  }
+
+  /// Removes a workspace. The default workspace cannot be removed, and removing
+  /// the active one falls back to the default. Sessions keep their stored id,
+  /// so [workspaceForSession] resolves them to the active workspace instead of
+  /// losing context.
+  Future<bool> deleteWorkspace(String id) async {
+    final workspace = workspaceById(id);
+    if (workspace == null) return false;
+    if (workspace.isDefault) return false;
+    final remaining = _cachedWorkspaces
+        .where((item) => item.id != id)
+        .toList(growable: false);
+    if (remaining.isEmpty) return false;
+    await _persistWorkspaces(remaining);
+    if (_cachedActiveWorkspaceId == id) {
+      final fallback = remaining.firstWhere(
+        (item) => item.isDefault,
+        orElse: () => remaining.first,
+      );
+      await setActiveWorkspace(fallback.id);
+    }
+    return true;
+  }
+
+  Future<void> _persistWorkspaces(List<WorkspaceMetadata> workspaces) async {
+    final withDefault = _ensureDefaultWorkspace(workspaces);
+    _cachedWorkspaces = List.unmodifiable(withDefault);
+    await _prefs.setString(
+      _keyWorkspaces,
+      jsonEncode(withDefault.map((item) => item.toJson()).toList()),
+    );
+  }
+
+  List<WorkspaceMetadata> _ensureDefaultWorkspace(
+    List<WorkspaceMetadata> workspaces,
+  ) {
+    if (workspaces.any((item) => item.isDefault)) return workspaces;
+    return [WorkspaceMetadata.defaultWorkspace(), ...workspaces];
+  }
+
+  Future<void> _loadWorkspaces() async {
+    final raw = _prefs.getString(_keyWorkspaces);
+    final parsed = <WorkspaceMetadata>[];
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is List) {
+          final seen = <String>{};
+          for (final entry in decoded) {
+            final workspace = WorkspaceMetadata.tryFromJson(entry);
+            if (workspace == null) continue;
+            if (!seen.add(workspace.id)) continue;
+            parsed.add(workspace);
+          }
+        }
+      } catch (_) {
+        // A corrupt list is replaced by the default workspace below.
+        parsed.clear();
+      }
+    }
+    final workspaces = _ensureDefaultWorkspace(parsed);
+    _cachedWorkspaces = List.unmodifiable(workspaces);
+    if (raw == null || parsed.isEmpty) {
+      await _prefs.setString(
+        _keyWorkspaces,
+        jsonEncode(workspaces.map((item) => item.toJson()).toList()),
+      );
+    } else if (parsed.length != workspaces.length) {
+      await _prefs.setString(
+        _keyWorkspaces,
+        jsonEncode(workspaces.map((item) => item.toJson()).toList()),
+      );
+    }
+    final storedActive = _prefs.getString(_keyActiveWorkspaceId);
+    final active = workspaces.any((item) => item.id == storedActive)
+        ? storedActive
+        : workspaces.first.id;
+    _cachedActiveWorkspaceId = active;
+    if (active != storedActive) {
+      await _prefs.setString(_keyActiveWorkspaceId, active!);
+    }
+  }
+
   Future<McpServerConfig> saveMcpServer({
     String? id,
     required String displayName,
@@ -1087,6 +1254,13 @@ class PreferencesService {
       _initialized ? (_prefs.getBool(_keyDeveloperMode) ?? false) : false;
   set developerMode(bool v) => _prefs.setBool(_keyDeveloperMode, v);
 
+  /// I6: the Dynamic Island / floating overlay is opt-in developer tooling.
+  /// Off by default so a normal install and the first agent run never ask for
+  /// SYSTEM_ALERT_WINDOW.
+  bool get agentIslandEnabled =>
+      _initialized ? (_prefs.getBool(_keyAgentIslandEnabled) ?? false) : false;
+  set agentIslandEnabled(bool v) => _prefs.setBool(_keyAgentIslandEnabled, v);
+
   int get agentMaxIterations =>
       (_prefs.getInt(_keyAgentMaxIterations) ?? defaultAgentMaxIterations)
           .clamp(1, maxAgentMaxIterations)
@@ -1230,6 +1404,106 @@ class PreferencesService {
     }
   }
 
+  /// Whether the non-secret settings have been initialized on this install.
+  ///
+  /// Android backup excludes `FlutterSharedPreferences.xml`, so an absent
+  /// marker after a restore is what tells `SettingsBackupMirror` to import the
+  /// allowlisted snapshot exactly once.
+  bool get settingsInitialized =>
+      _prefs.getBool(_keySettingsInitialized) ?? false;
+
+  /// Marks the non-secret settings as initialized on this install.
+  ///
+  /// The mirror awaits this only after every restored write succeeded, so an
+  /// interrupted restore is retried on the next launch instead of being
+  /// silently skipped.
+  Future<void> markSettingsInitialized() async {
+    await _prefs.setBool(_keySettingsInitialized, true);
+  }
+
+  /// Non-secret identity metadata for every provider profile.
+  ///
+  /// A restored device has no credential-bearing profile, but model groups and
+  /// the active selection reference profile IDs. The mirror keeps only the
+  /// identity and display metadata needed to rebuild a keyless placeholder;
+  /// the API key, base URL and capability overrides never leave the encrypted
+  /// store.
+  List<Map<String, dynamic>> exportProfileMetadata() {
+    return _cachedProfiles
+        .map((profile) => {
+              'id': profile.id,
+              'name': profile.name,
+              'apiFormat': profile.apiFormat,
+              'model': profile.model,
+              'maxTokens': profile.maxTokens,
+              'thinkingBudget': profile.thinkingBudget,
+              'temperature': profile.temperature,
+              if (profile.fallbackTargets.isNotEmpty)
+                'fallbackTargets': profile.fallbackTargets
+                    .map((target) => target.toJson())
+                    .toList(),
+            })
+        .toList();
+  }
+
+  /// Adds a keyless placeholder for every restored profile ID that is missing
+  /// locally, so restored model groups still resolve. Existing profiles are
+  /// never modified. Await the persistence before restoring settings.
+  Future<int> restoreProfilePlaceholders(
+    List<Map<String, dynamic>> metadata,
+  ) async {
+    if (metadata.isEmpty) return 0;
+    final previousProfiles = _copyProfiles(_cachedProfiles);
+    final previousActiveProfileId = _cachedActiveProfileId;
+    final next = _copyProfiles(_cachedProfiles);
+    final existingIds = next.map((profile) => profile.id).toSet();
+    var added = 0;
+    for (final raw in metadata) {
+      final id = raw['id']?.toString().trim();
+      if (id == null || id.isEmpty || !existingIds.add(id)) continue;
+      try {
+        // Explicit allowlist: fromJson only ever sees these fields, so a
+        // tampered mirror file cannot smuggle a key or base URL back in.
+        next.add(ProviderProfile.fromJson({
+          'id': id,
+          'name': raw['name'],
+          'apiFormat': raw['apiFormat'],
+          'model': raw['model'],
+          'maxTokens': raw['maxTokens'],
+          'thinkingBudget': raw['thinkingBudget'],
+          'temperature': raw['temperature'],
+          if (raw['fallbackTargets'] != null)
+            'fallbackTargets': raw['fallbackTargets'],
+        }));
+        added++;
+      } catch (error) {
+        debugPrint('Skipped an unreadable restored provider profile: $error');
+      }
+    }
+    if (added == 0) return 0;
+    try {
+      _cachedProfiles = _sanitizeProviderFallbacks(next);
+      await _persistProfiles();
+    } catch (error) {
+      _cachedProfiles = previousProfiles;
+      _cachedActiveProfileId = previousActiveProfileId;
+      debugPrint('Reverted restored provider placeholders: $error');
+      rethrow;
+    }
+    return added;
+  }
+
+  /// Restores one allowlisted mirror snapshot: profile placeholders first, then
+  /// the settings that reference them. Every write is awaited; the caller must
+  /// write the fresh-restore marker only after this future completes.
+  Future<void> restoreFromMirror({
+    required Map<String, dynamic> settings,
+    required List<Map<String, dynamic>> providerProfiles,
+  }) async {
+    await restoreProfilePlaceholders(providerProfiles);
+    await importAllSettings(settings);
+  }
+
   Map<String, dynamic> exportAllSettings() {
     return {
       'activeProfileId': activeProfileId,
@@ -1258,7 +1532,7 @@ class PreferencesService {
     };
   }
 
-  void importAllSettings(Map<String, dynamic> settings) {
+  Future<void> importAllSettings(Map<String, dynamic> settings) async {
     if (settings.containsKey('systemPrompt')) {
       final value = settings['systemPrompt'];
       if (value is String) {
@@ -1348,20 +1622,15 @@ class PreferencesService {
     final importedTemperature = _finiteDouble(settings['temperature']);
     if (importedTemperature != null) temperature = importedTemperature;
     final importedModelGroups = _modelGroupList(settings['modelGroups']);
+    final previousGroups = _copyModelGroups(_cachedModelGroups);
+    final previousActiveModelGroupId = _cachedActiveModelGroupId;
     if (importedModelGroups != null) {
-      final previousGroups = _copyModelGroups(_cachedModelGroups);
-      final previousActiveModelGroupId = _cachedActiveModelGroupId;
       _cachedModelGroups = _sanitizeModelGroups(importedModelGroups);
       if (_cachedActiveModelGroupId != null &&
           !_cachedModelGroups
               .any((group) => group.id == _cachedActiveModelGroupId)) {
         _cachedActiveModelGroupId = null;
       }
-      unawaited(_persistModelGroups().catchError((Object e) {
-        _cachedModelGroups = previousGroups;
-        _cachedActiveModelGroupId = previousActiveModelGroupId;
-        debugPrint('Reverted imported model groups after persist failure: $e');
-      }));
     }
     if (settings.containsKey('activeModelGroupId')) {
       final value = settings['activeModelGroupId']?.toString().trim();
@@ -1370,10 +1639,91 @@ class PreferencesService {
               _cachedModelGroups.any((group) => group.id == value)
           ? value
           : null;
-      unawaited(_persistActiveModelGroupId().catchError((Object e) {
-        debugPrint('Failed to persist imported active model group: $e');
-      }));
     }
+    if (settings.containsKey('activeProfileId')) {
+      final value = settings['activeProfileId']?.toString().trim();
+      if (value != null &&
+          value.isNotEmpty &&
+          _cachedProfiles.any((profile) => profile.id == value)) {
+        _cachedActiveProfileId = value;
+      }
+    }
+    try {
+      await _persistImportedSettings();
+    } catch (error) {
+      _cachedModelGroups = previousGroups;
+      _cachedActiveModelGroupId = previousActiveModelGroupId;
+      debugPrint(
+          'Reverted imported model groups after persist failure: $error');
+      rethrow;
+    }
+  }
+
+  /// Writes every non-secret setting that [importAllSettings] can change.
+  ///
+  /// The import path re-writes the current normalized values with `await`
+  /// instead of trusting the fire-and-forget setters, so a caller can persist
+  /// a "restore finished" marker only after the bytes are on disk. Writing an
+  /// unchanged value is harmless and keeps this function independent of which
+  /// keys the snapshot carried.
+  Future<void> _persistImportedSettings() async {
+    await Future.wait(<Future<void>>[
+      _writeString(_keySystemPrompt, systemPrompt),
+      _writeString(_keyDarkMode, themeMode),
+      _writeDouble(_keyFontSize, fontScale),
+      _writeInt(_keyContextLength, contextLength),
+      _writeInt(_keyContextTokenBudget, contextTokenBudget),
+      _writeBool(_keyAutoCompact, autoCompact),
+      _writeInt(_keyAgentMaxIterations, agentMaxIterations),
+      _writeInt(_keyMaxConcurrentAgents, maxConcurrentAgents),
+      _writeString(_keyToolApprovalPolicy, toolApprovalPolicy),
+      _writeBool(_keyNotifyOnComplete, notifyOnComplete),
+      _writeBool(_keyPrivacyMode, privacyMode),
+      _writeBool(_keyAllowPhoneCall, allowPhoneCall),
+      _writeBool(_keyAllowSms, allowSms),
+      _writeBool(
+        _keyAnthropicPromptCacheEnabled,
+        anthropicPromptCacheEnabled,
+      ),
+      _writeBool(_keyMemoryEnabled, memoryEnabled),
+      _writeStringList(_keyDeniedToolNames, deniedToolNames.toList()..sort()),
+      _writeStringList(_keyBashCommandDenyPatterns, bashCommandDenyPatterns),
+      _writeString(_keyWhisperModel, whisperModel),
+      _writeString(_keyTtsModel, ttsModel),
+    ]);
+    await _persistModelGroups();
+    await _persistActiveModelGroupId();
+    final activeProfileId = _cachedActiveProfileId;
+    if (activeProfileId != null && activeProfileId.isNotEmpty) {
+      await _prefs.setString(_keyActiveProfileId, activeProfileId);
+    }
+    // `temperature` lives on the active provider profile (secure storage), so
+    // persist profiles as well; this is the same write the setter queued.
+    await _persistProfiles();
+  }
+
+  Future<void> _writeString(String key, String? value) async {
+    if (value == null) {
+      await _prefs.remove(key);
+    } else {
+      await _prefs.setString(key, value);
+    }
+  }
+
+  Future<void> _writeBool(String key, bool value) async {
+    await _prefs.setBool(key, value);
+  }
+
+  Future<void> _writeInt(String key, int value) async {
+    await _prefs.setInt(key, value);
+  }
+
+  Future<void> _writeDouble(String key, double value) async {
+    await _prefs.setDouble(key, value);
+  }
+
+  Future<void> _writeStringList(String key, List<String> value) async {
+    await _prefs.setStringList(key, value);
   }
 
   Future<({int imported, int skipped})> importProfiles(

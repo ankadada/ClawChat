@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:clawchat/models/chat_models.dart';
@@ -28,6 +29,57 @@ void main() {
       expect(content.images.single.name, 'shared.png');
       expect(content.images.single.size, 12);
       expect(content.errors, ['one skipped']);
+    });
+
+    test('truncates oversized native text and subject on UTF-8 boundaries',
+        () {
+      final text = '字' * SharedContentLimits.maxTextBytes;
+      final subject = 's' * (SharedContentLimits.maxSubjectBytes * 2);
+      final content = SharedContent.fromNative({
+        'text': text,
+        'subject': subject,
+      });
+
+      expect(
+        utf8.encode(content.text).length,
+        lessThanOrEqualTo(SharedContentLimits.maxTextBytes),
+      );
+      expect(
+        utf8.decode(utf8.encode(content.text)),
+        content.text,
+      );
+      expect(content.text.contains('\uFFFD'), isFalse);
+      expect(
+        utf8.encode(content.subject!).length,
+        lessThanOrEqualTo(SharedContentLimits.maxSubjectBytes),
+      );
+    });
+
+    test('caps the native image and error lists', () {
+      final content = SharedContent.fromNative({
+        'images': List.generate(
+          20,
+          (index) => {
+            'path': '/tmp/$index.png',
+            'name': 'image-$index.png',
+            'size': 1,
+          },
+        ),
+        'errors': List.generate(50, (index) => 'error $index'),
+      });
+
+      expect(content.images, hasLength(SharedContentLimits.maxImages));
+      expect(content.errors, hasLength(SharedContentLimits.maxErrors));
+    });
+
+    test('leaves content within the caps untouched', () {
+      final content = SharedContent.fromNative({
+        'text': 'short shared note',
+        'subject': 'Example',
+      });
+
+      expect(content.text, 'short shared note');
+      expect(content.subject, 'Example');
     });
 
     test('preserves errors-only native payloads as feedback', () {

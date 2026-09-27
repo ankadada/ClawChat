@@ -1,7 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- fullBackupContent rules for Android ≤11 -->
+<!--
+  fullBackupContent rules for Android 11 and older (auto backup / ADB backup).
+
+  Scope: chat history and an allowlisted, non-secret settings snapshot are
+  backed up; nothing that can hold a credential is.
+
+  - `file` keeps only the chat session directory (`filesDir/app_flutter/
+    clawchat_sessions`) and the settings mirror written by
+    `SettingsBackupMirror` (`filesDir/app_flutter/clawchat_settings_backup.json`).
+    The Alpine rootfs, caches, and every other app file stay out.
+  - `FlutterSharedPreferences.xml` is excluded on purpose. An upgraded install
+    can still hold a legacy plaintext `api_key` / `env_vars` in that file until
+    the first launch migrates them to the encrypted store, and a backup or a
+    device transfer can run before that. Non-secret settings are restored from
+    the allowlisted mirror instead.
+  - The encrypted credential stores are excluded as well.
+-->
 <full-backup-content>
     <include domain="sharedpref" path="." />
+    <include domain="file" path="app_flutter/clawchat_sessions" />
+    <include domain="file" path="app_flutter/clawchat_settings_backup.json" />
+
     <exclude domain="sharedpref" path="FlutterSharedPreferences.xml" />
     <exclude domain="sharedpref" path="FlutterSecureStorage.xml" />
     <exclude domain="sharedpref" path="FlutterSecureKeyStore.xml" />

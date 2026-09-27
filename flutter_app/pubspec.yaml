@@ -1,7 +1,7 @@
 name: clawchat
 description: ClawChat - AI Agent Chat on Android with embedded Alpine Linux.
 publish_to: 'none'
-version: 2.8.0+13
+version: 2.15.0+15
 
 environment:
   sdk: '>=3.5.0 <4.0.0'
@@ -39,10 +39,7 @@ flutter:
   assets:
     - assets/resolv.conf
     - assets/ic_launcher.png
-    - assets/skills/github/SKILL.md
     - assets/skills/web-search/SKILL.md
-    - assets/skills/code-review/SKILL.md
-    - assets/skills/translator/SKILL.md
     - assets/skills/file-manager/SKILL.md
     - assets/skills/system-info/SKILL.md
     - assets/skills/gws-calendar/SKILL.md

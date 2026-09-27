@@ -165,7 +165,7 @@ class ConfigExportService {
     }
 
     if (parsed.settings != null) {
-      prefs.importAllSettings(parsed.settings!);
+      await prefs.importAllSettings(parsed.settings!);
       settingsApplied = true;
     }
 
