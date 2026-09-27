@@ -55,6 +55,10 @@ class AgentState {
   String? agentServiceText;
   int agentServiceGeneration = 0;
   bool agentCompletionFinalizing = false;
+
+  /// True when the final completion message could not be persisted. The run
+  /// then stays recoverable instead of being reported as a clean terminal.
+  bool agentCompletionPersistFailed = false;
   bool partialAgentResponseSaved = false;
   int initialApiMsgCount = 0;
   final Set<String> sessionApprovedTools = {};

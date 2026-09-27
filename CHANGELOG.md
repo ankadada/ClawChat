@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.17.0 — Agent run journal、取消与恢复
+
+- **持久化 run journal（仅本地、加密、有界、脱敏）** — 新增 `RunJournalEntry` / `RunJournalToolAttempt`：每次 run 记录 `runAttemptId`、`sessionId`、起止时间、终态与 `endReason`；每次工具尝试记录 `operationId`、工具名、风险档、策略阶段（proposed / 等待审批 / 已批准 / 已开始 / 结果已保存 / 失败 / 中断）与 `outcomeKnown`。**不保存任何参数、提示词、结果或凭据**：载荷字段是白名单，测试断言整个 payload 不含 `arguments` / `result` / `content` / `prompt` / `apiKey`。存储走加密应用私有存储 `clawchat.run_journal.v1`（sha256 信封，复用与信任标记同一加密桥），上限 24 个 run、每个 run 64 次尝试；损坏或校验不符时 fail-closed（显示为空但仍可写新记录），并保留手动清理入口（设置 → 数据管理 → 运行日志）。
+- **取消语义不放松** — 取消仍保留已生成文本与已完成/已持久化的工具结果；没有结果的工具尝试写 unknown。journal 把终态分为 completed / cancelled / failed / interrupted / unknown_outcome：**任何无法证明结果的终态（包括取消与失败）都会降级为 `unknown_outcome`**，不会显示为成功或干净的取消；终态由既有前台服务停止路径同时收尾，取消后不自动重试、不重复工具调用（源码守卫与既有取消回归测试覆盖）。
+- **进程被杀 / 重启只展示不重跑** — 启动时 `reconcileAtStartup` 把仍是 `running` 的记录标为 `interrupted`（`process_death`），把 `started` 的尝试标为中断且结果未知；在此之前不启动任何模型或工具。手动继续仍在会话横幅 / Agent Run Center，产生新的 `runAttemptId` 与新 `operationId`；journal 页面只是只读视图，没有任何 resume/retry/approve 动作。
+- **前台生命周期收敛** — 终态（完成 / 失败 / 取消）沿既有路径停止前台服务，通知保持粗粒度且不包含正文或参数；`RECEIVE_BOOT_COMPLETED` 仍仅供 `CommandCleanupJobService` 做清理，`AgentTaskService` 无任何 boot 入口（新增源码守卫）。
+- **边界收敛（不做大重构）** — journal 模型/服务作为独立的 Run/ToolAttempt 记录边界，`ChatProvider` 只在既有生命周期点接入 begin / mirror / end / reconcile，不重写状态机；写入等待有界（2s），失败只标记记录不完整并显示出来，不阻塞也不冒充成功。
+- **审查修复（第三轮：终态收尾全覆盖 / writer 真串行）** —
+  - **终态收尾全覆盖**：stream `onError` / `onDone`（流中断）、初次 encrypted recovery 空载荷与重试失败、model fallback（成功与失败）、AgentError / provider 异常、取消、dismiss、截断删除、partial-response 保存等路径统一为「先 await 终态 journal 提交（失败/超时也记录 incomplete，sticky），再清/存 recovery marker，再发布终态」；stream 同步回调里的清 marker 改为 `_endRunFromStreamCallback` 延迟执行；`_persistAssistantFailureMarker` 增加 `terminal` 门槛——pre-fallback 失败不再提前清 marker（run 可能仍会用另一个模型继续），且 helper 不再自己清 marker。
+  - **writer 真串行**：移除「前序超过 2s 跳过」逻辑；显式互斥队列只在**前序底层 write 真正完成后**才启动下一个 operation，2s 仅为调用方等待 deadline（超时只标记 incomplete，不解除串行链）；store 以单调 revision 在底层写完成后校验并拒绝 stale payload。新增 delayed-storage 测试：A 的底层 write 未完成时 B 完全不触底 store；A 落地后 B 才开始且 revision 递增，最终内容为最新 payload。
+  - 保留 H3 sticky incomplete、M1 envelope 预算与 M2 UI guards 不回归。
+- **审查修复（第二轮：全终态屏障 / 严格 writer / sticky 不完整 / envelope 预算）** —
+  - **H1 统一终态顺序**：所有会丢弃 recovery marker 或宣告终态的路径（正常完成、加密内容重试成功、模型 fallback 成功、AgentError/Provider 异常、取消、dismiss、截断删除、流式 AgentComplete）统一为「先有界等待 journal 终态提交（超时/失败则记录 incomplete），再清 marker / 保存 marker / 发布终态 / notify」；`AgentComplete` 的同步回调不再直接清 marker，改由被 await 的终态路径 `_completePositiveTerminal` 完成；终态消息落盘失败时不再宣称干净完成（journal 记 `interrupted/terminal_persist_failed`，marker 保留待用户确认）。
+  - **H2 严格 writer 队列**：显式互斥队列保证 commit 严格串行（不再依赖跨 future 等待，也不会因超时而让旧写晚到覆盖新写），store 额外做单调 revision 的原子拒绝（stale payload 直接丢弃）；调用方等待仍有 2s 上限，队列积压超过上限立即失败并记 incomplete。
+  - **H3 sticky 不完整**：同一 `runAttemptId` 一旦有 commit 失败/超时，后续成功提交不会清除该标记（只有新 run 或 clear/裁剪才重置），且该 run 的终态一律降级为 `unknown_outcome`。
+  - **M1 envelope 预算统一**：service 裁剪时为 schema/revision/checksum 信封预留 512B，store 对最终信封再做 96KB 硬上限，二者不再互相打架。
+  - **UI 守卫**：`run_journal_screen` 所有 await 后有 mounted + generation 守卫，新增 dispose race 与陈旧读取测试；`test/flutter_test_config.dart` 让 widget 测试默认使用内存 journal（生产为加密平台存储）。
+- **第一轮审查修复（commit barrier / 字节预算 / UI 守卫）** — beginRun、工具 dispatch 前的 attempt transition、终态（含清除 recovery marker 之前）改为**有界可观察的 commit barrier**：写入有 `RunJournalService.commitTimeout`（2s）上限，超时或失败把该 run 标记为 incomplete（`isRunIncomplete` / `writeFailed`），UI 明确显示“日志可能不完整”，绝不假称完整轨迹；journal 仍不参与执行授权（recovery marker 仍是唯一安全权威）。实际执行 `maxRunJournalPayloadBytes`（96 KB UTF-8）：service 先按“优先裁剪最旧终态记录、无安全可裁则 fail-closed”的策略处理，store 再做硬上限二次拒绝；不再只依赖 24/64 次数上限。`run_journal_screen` 所有 await 后增加 mounted + generation 守卫，迟到的读取不再写回已销毁或已被新刷新取代的状态。
+- **测试** — 新增 `test/models/run_journal_test.dart`（严格 JSON / 脱敏 / 边界 / markInterrupted）、`test/services/run_journal_service_test.dart`（终态降级、上限、启动 reconcile、损坏 fail-closed、加密信封篡改、载荷白名单）、`test/services/run_journal_commit_barrier_test.dart`（提交顺序、滞死/失败 store、重启窗口、96 KB 预算裁剪、store 硬拒绝）、`test/services/run_lifecycle_source_test.dart`（journal 无执行 API、启动不重跑、boot 边界、终态停服务）、`test/screens/run_journal_screen_test.dart`（中断展示、清理确认、dispose race、陈旧读取不覆盖新刷新、写入失败可见）。
+
+### Residual in 2.17.0
+
+- 远程 Agent run 仍只用会话 recovery marker，不写 journal（下个版本可补）。
+- 本版为 Android 侧载交付；强杀/崩溃/取消/重启真机矩阵（`docs/android-roadmap.md` §4.4）仍需在至少两台真机上执行，未跑项必须标 NOT RUN。
+- journal **不提供导出/分享**（只在设置里查看与清理），也未做 Session/Run/ToolAttempt/Machine 的完整对象拆分（降级为后续版本）。
+- 不做端侧大模型；不做 v2.18 的权限 broker 或 v2.19 的网络韧性。
+
 ## v2.16.0 — Android P0：工作区点击区域、键盘布局与发布质量
 
 - **宽横屏工作区 chip 的整块点击区域** — 聊天顶栏的工作区控件从标题区移入 actions 槽：标题是 AppBar 的 header 语义节点，会把子控件的标签吸收进标题，而可点击的只是 24dp 高的药丸本体，不是整块可见区域。现在它是独立控件，拥有自己的 semantics 节点（label + button + tap 指向同一动作）与 48dp 命中盒（宽度贴合药丸、上限 160dp，不会伸到旁边按钮下面）；宽横屏、320dp 与 200% 字体下，可见区域内的任意位置（含四角）与读屏激活都会进入工作区页。

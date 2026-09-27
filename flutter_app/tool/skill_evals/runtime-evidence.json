@@ -4,11 +4,11 @@
   "files": [
     {
       "path": "lib/l10n/app_strings.dart",
-      "sha256": "562f30ffa61c7d68b2573c8d5a150b8d04cad891977d409a9105563d87732b04"
+      "sha256": "bb7309c11e5168e025db52ac7d72859f37d66f9fe67dd71d949f0a3aeeb3af6a"
     },
     {
       "path": "lib/screens/settings_screen.dart",
-      "sha256": "9aabcb386341ad1767f84b503e3542882f9c1aa5e025f5aaf8125108a645cd34"
+      "sha256": "3f15ea930b01fdaa8dd4274997c94e0179bfccd1c06066a7eca2169eda1444fd"
     },
     {
       "path": "lib/services/bundled_legacy_skill_catalog.dart",

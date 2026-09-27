@@ -39,6 +39,7 @@ import 'run_trace_screen.dart';
 import 'remote_agent_settings_screen.dart';
 import 'local_data_recovery_screen.dart';
 import 'background_task_center_screen.dart';
+import 'run_journal_screen.dart';
 import 'scheduled_tasks_screen.dart';
 import 'workspaces_screen.dart';
 import '../l10n/app_strings.dart';
@@ -135,6 +136,8 @@ class SettingsScreen extends StatefulWidget {
     SettingsControlInfo(SettingsDestination.dataRecovery, '本地任务中心',
         ['后台任务', '恢复', '未知结果', '弃置']),
     SettingsControlInfo(SettingsDestination.dataRecovery, '计划执行', ['计划', '间隔']),
+    SettingsControlInfo(
+        SettingsDestination.dataRecovery, '运行日志', ['journal', '中断', '恢复']),
     SettingsControlInfo(SettingsDestination.agentTools, '工作区',
         ['workspace', '切换', '重命名', '创建', '删除', '默认工作区']),
     SettingsControlInfo(
@@ -2484,6 +2487,18 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
                                     ),
                                   ),
                                 ),
+                              ),
+                            ),
+                          ),
+                          ListTile(
+                            title: const Text(AppStrings.runJournal),
+                            subtitle:
+                                const Text('本机运行记录：状态、工具尝试与结果是否确认；不保存参数或内容。'),
+                            leading: const Icon(Icons.receipt_long_outlined),
+                            trailing: const Icon(Icons.chevron_right),
+                            onTap: () => Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => const RunJournalScreen(),
                               ),
                             ),
                           ),

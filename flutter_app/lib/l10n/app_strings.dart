@@ -861,6 +861,14 @@ class AppStrings {
   static const forgetMemory = '删除记忆';
   static const memoryForgetConfirm = '删除后这条记忆不会再出现在任何对话中。';
 
+  // ── Run journal ──────────────────────────────────────────────────
+  static const runJournal = '运行日志';
+  static const runJournalNoParams = '日志只保存工具名称、策略阶段与结果是否确认，不保存参数、凭据或内容。';
+  static const runJournalEmpty = '暂无运行记录';
+  static const runJournalClear = '清理运行日志';
+  static const runJournalIncomplete = '日志写入曾失败或超时：下列记录可能不完整，不代表完整轨迹。';
+  static const runJournalClearConfirm = '清理后不会影响会话、草稿或待确认的中断记录。';
+
   // ── Local workflow templates ─────────────────────────────────────
   static const skillTemplates = '工作流模板';
   static const skillTemplatesDescription = '本地内置模板：安装后默认禁用，启用仍走既有技能同意与能力策略。';

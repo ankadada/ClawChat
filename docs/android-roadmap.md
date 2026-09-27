@@ -140,21 +140,23 @@ P0-1 与 P0-2 的命中区域 / 键盘部分已在本版（2.16.0+16）完成并
 
 **目标：** 让「这次 run 到底发生了什么」始终可查、可取消、可解释；把 run 从 `ChatProvider` 里拆出来，形成独立状态机。
 
-### 4.1 工作项
+### 4.1 工作项（2.17.0+17 已实现的部分）
 
-| 编号 | 工作项 | 具体内容 | 验收方式 |
-| --- | --- | --- | --- |
-| RUN-1 | Run journal | 持久化 run 记录：`runAttemptId`、会话、起止时间、每次工具尝试（operationId、策略判定、receipt、结果状态）；仅本地加密存储，可清理 | 强杀后重启能看到完整 run 轨迹；轨迹不含工具参数中的敏感值 |
-| RUN-2 | 取消语义 | 单会话取消、通知 Stop、取消后不再派发新工具；已发出的工具结果标记 `cancelled`；部分文本保留 | 三种入口分别取消；取消后无新工具调用、无外发 |
-| RUN-3 | 恢复策略 | 崩溃 / 强杀 / 重启后不自动重跑；未知结果只提供查看与弃置；显式「继续」才产生新 `operationId` | 四类场景矩阵；`unknown_outcome` 与原 receipt 语义不变 |
-| RUN-4 | 前台生命周期 | 前台服务只服务当前 run，结束即停；通知为粗粒度状态 + Stop；App 退到后台不启动新 run；`RECEIVE_BOOT_COMPLETED` 不启动 agent | Kotlin 生命周期单测 + 真机：切后台、锁屏、来电、低内存回收 |
-| RUN-5 | Run 状态机拆分 | Session / Run / ToolAttempt / Machine 四个对象各自持有状态；`ChatProvider` 只做门面映射 | `chat_provider.dart` 不再新增策略代码；现有聊天 / 取消 / 多会话测试全过 |
+| 编号 | 工作项 | 具体内容 | 验收方式 | 状态 |
+| --- | --- | --- | --- | --- |
+| RUN-1 | Run journal | `RunJournalEntry` / `RunJournalToolAttempt`（operationId、toolName、risk、策略阶段、outcomeKnown、resultPersisted），加密应用私有存储（`clawchat.run_journal.v1` + sha256 信封 + 单调 revision）；**commit barrier**：run 开始、工具 dispatch 前的 attempt transition、**所有终态路径（正常完成 / 流中断 / encrypted recovery / fallback / AgentError / 取消 / dismiss / 截断 / partial save，含清除 recovery marker 前）**都等待有界写入完成，失败/超时把该 run 标记为不完整（sticky，后续成功不清除）并在 UI 显示；writer 严格串行且 store 原子拒绝 stale payload；上限 24 runs / 64 attempts per run，以及 **96 KB UTF-8 payload 上限**（优先裁剪最旧的终态记录，安全可裁尽则 fail-closed）；参数与内容一律不落盘 | 模型/服务/屏障/预算单测；强杀重启看到完整轨迹或明确的「不完整」状态；载荷字段白名单断言 | 已完成（代码 + 单测 + commit barrier + 字节预算；**不提供导出**） |
+| RUN-2 | 取消语义 | 取消后不自动重试、不重复工具调用；已开始但无结果的尝试写 unknown；部分文本与已完成结果保留；前台服务与连接在终态停止 | 取消路径源码守卫 + 既有取消回归测试 | 已有实现 + journal 终态记录；真机待验 |
+| RUN-3 | 恢复策略 | 崩溃 / 强杀 / 重启后 `reconcileAtStartup` 只把 `running` 记录标为 interrupted（started 尝试标 unknown），绝不自动执行；手动继续仍走既有会话横幅，产生新 `runAttemptId` | 服务单测 + 启动源码守卫（`_init` 不含发送/继续调用） | 已完成（代码 + 单测）；真机矩阵待验 |
+| RUN-4 | 前台生命周期 | 前台服务只服务当前 run；通知粗粒度且无正文/参数；终态（完成/失败/取消）停止服务；`RECEIVE_BOOT_COMPLETED` 仅 `CommandCleanupJobService`，AgentTaskService 无 boot 入口 | 源码守卫（boot/job 边界）+ Kotlin 单测 + 既有通知隐私测试 | 已有实现 + 新增守卫；真机待验 |
+| RUN-5 | Run 边界收敛 | 新增 journal 模型/服务作为独立的 Run/ToolAttempt 记录边界；`ChatProvider` 在既有生命周期点做**有界 commit barrier 镜像**（run 开始 / 工具 dispatch 前 / 终态与清 marker 前），不重写状态机 | `run_journal_commit_barrier_test` / `run_journal_terminal_order_test` / `chat_provider_dispose_race_test` / 既有会话、取消测试 | 部分完成（未做 Session/Run 拆分） |
 
 ### 4.2 本版不做
 
 - 不做常驻守护进程、不做 WorkManager 定时跑模型、不做后台自动重试。
 - 不做通知监听、无障碍、开机自启。
 - 不做多设备同步或云端 run 记录。
+- 不做 run journal 的导出/分享（只在设置里查看与清理；导出留待 v2.20 或后续版本单独决策）；远程 Agent run 仍只用既有 recovery marker，不写 journal。
+- 不做 Session/Run/ToolAttempt/Machine 的完整对象拆分（保留在后续版本）。
 
 ### 4.3 依赖
 
@@ -164,7 +166,7 @@ P0-1 与 P0-2 的命中区域 / 键盘部分已在本版（2.16.0+16）完成并
 ### 4.4 退出条件
 
 - 强杀、崩溃、取消、重启四类场景的真机矩阵通过。
-- run journal 可导出供排查，导出内容不含凭据与工具原始参数。
+- run journal 在设置内可查看与清理；**本版不提供导出/分享**（导出与导出脱敏在 v2.20 或后续版本再决定）。
 - 取消与重启后不产生任何未确认的外发或网络请求。
 
 ---

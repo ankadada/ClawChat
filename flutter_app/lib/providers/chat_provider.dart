@@ -24,6 +24,8 @@ import '../services/native_bridge.dart';
 import '../services/provider_message_transform.dart';
 import '../services/runtime_debug_events.dart';
 import '../services/skill_capability_policy.dart';
+import '../models/run_journal.dart';
+import '../services/run_journal_service.dart';
 import '../services/session_storage.dart';
 import '../services/startup_restore_guard.dart';
 import '../services/structured_action_registry.dart';
@@ -424,6 +426,12 @@ class ChatProvider extends ChangeNotifier {
   ChatSession? currentSession;
 
   final SessionStorage _storage;
+
+  /// Durable run journal mirror. Display-only: it never starts or resumes a
+  /// run. Lifecycle commits are awaited at bounded barriers (run start, tool
+  /// dispatch, terminal state), so a lost commit is recorded as incomplete
+  /// instead of being silently dropped.
+  final RunJournalService _runJournal;
   final LlmServiceFactory _llmServiceFactory;
   late final ContextManager _contextManager;
   final RuntimeDebugEventService runtimeDebugEvents;
@@ -1427,7 +1435,9 @@ class ChatProvider extends ChangeNotifier {
     RemoteConnectorPreflight? beforeRemoteConnectorSendForTesting,
     MessageQueueDrainTimerFactory? messageQueueDrainTimerFactory,
     Duration? manualContextSummaryTimeout,
+    RunJournalService? runJournal,
   })  : _storage = storage ?? SessionStorage(),
+        _runJournal = runJournal ?? RunJournalService.instance,
         _llmServiceFactory = llmServiceFactory ?? LlmService.new,
         runtimeDebugEvents = runtimeDebugEvents ?? RuntimeDebugEventService(),
         _startupRestoreGuard = startupRestoreGuard ?? StartupRestoreGuard(),
@@ -1580,6 +1590,13 @@ class ChatProvider extends ChangeNotifier {
       _startupFailureCount = guardState.failureCount;
       sessions = await _storage.getSessionsSummary();
       if (_disposed) return;
+      // Any journal entry still marked running belongs to a previous process:
+      // mark it interrupted (display only), never resume it here.
+      unawaited(_runJournal.reconcileAtStartup(
+        liveRunAttemptIds: [
+          for (final token in _activeRunTokens.values) token.runAttemptId,
+        ],
+      ));
       _startupRestoreGuardReady = true;
       notifyListeners();
       // `loadSkills` carries its own disposal guard.
@@ -1742,10 +1759,68 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
+  /// Journal commit barriers.
+  ///
+  /// These are awaited at the points that must be durable: run start, every
+  /// tool-attempt transition that precedes tool dispatch, and the run's
+  /// terminal state (including before the recovery marker is cleared). The
+  /// service bounds every write itself (`RunJournalService.commitTimeout`), so
+  /// awaiting one cannot hang a run; a failed or timed-out commit marks the run
+  /// incomplete and the journal UI stops presenting it as a complete record.
+  ///
+  /// The journal never decides execution authority: the session recovery marker
+  /// stays the only safety authority, and a journal failure never grants a run
+  /// permission to retry, resume, or approve anything.
+  Future<bool> _journalBeginRun(
+    ChatSession session,
+    AgentRunRecoveryMarker marker,
+  ) async {
+    await _runJournal.beginRun(
+      runAttemptId: marker.runAttemptId,
+      sessionId: session.id,
+      now: marker.startedAt,
+    );
+    return !_runJournal.isRunIncomplete(marker.runAttemptId);
+  }
+
+  Future<bool> _journalMirrorMarker(ChatSession session) async {
+    final marker = session.inFlightAgentRun;
+    if (marker == null) return true;
+    await _runJournal.mirrorMarker(
+      runAttemptId: marker.runAttemptId,
+      sessionId: session.id,
+      attempts: marker.toolAttempts,
+    );
+    return !_runJournal.isRunIncomplete(marker.runAttemptId);
+  }
+
+  Future<bool> _journalEndRun(
+    String? runAttemptId,
+    RunJournalState state, {
+    String? endReason,
+  }) async {
+    if (runAttemptId == null) return false;
+    await _runJournal.endRun(
+      runAttemptId: runAttemptId,
+      state: state,
+      endReason: endReason,
+    );
+    return !_runJournal.isRunIncomplete(runAttemptId);
+  }
+
+  bool _isRunLive(String runAttemptId) => _activeRunTokens.values
+      .any((token) => token.runAttemptId == runAttemptId);
+
   Future<void> dismissInterruptedAgentRun() async {
     final session = currentSession;
     if (session?.inFlightAgentRun == null) return;
-    _discardUnpairedInterruptedToolTail(session!);
+    final dismissedMarker = session!.inFlightAgentRun!;
+    _discardUnpairedInterruptedToolTail(session);
+    await _journalEndRun(
+      dismissedMarker.runAttemptId,
+      RunJournalState.interrupted,
+      endReason: 'user_dismissed',
+    );
     session.inFlightAgentRun = null;
     await _storage.saveSession(session);
     _syncCurrentSessionReference(session);
@@ -1836,6 +1911,14 @@ class ChatProvider extends ChangeNotifier {
       );
     } on SessionTombstonedException {
       return;
+    }
+    await _journalMirrorMarker(session);
+    if (!_isRunLive(marker.runAttemptId)) {
+      await _journalEndRun(
+        marker.runAttemptId,
+        RunJournalState.interrupted,
+        endReason: 'process_death',
+      );
     }
   }
 
@@ -2096,6 +2179,12 @@ class ChatProvider extends ChangeNotifier {
     if (state != null && state.isSending) return false;
     session.messages.removeRange(index, session.messages.length);
     // A recovery marker describes a run over messages that no longer exist.
+    final droppedMarker = session.inFlightAgentRun;
+    await _journalEndRun(
+      droppedMarker?.runAttemptId,
+      RunJournalState.interrupted,
+      endReason: 'transcript_truncated',
+    );
     session.inFlightAgentRun = null;
     session.updatedAt = DateTime.now();
     if (state != null) {
@@ -3554,6 +3643,7 @@ class ChatProvider extends ChangeNotifier {
         _removeTrailingAssistantErrorMarkers(activeSession);
       }
       activeSession.inFlightAgentRun = replacementMarker;
+      await _journalBeginRun(activeSession, replacementMarker);
       state.sessionTitle = activeSession.title;
       try {
         await _storage.saveSession(
@@ -3903,7 +3993,14 @@ class ChatProvider extends ChangeNotifier {
               );
               _persistSanitizedMessages(activeSession);
               _appendEncryptedContentRecoveryNotice(activeSession);
-              _clearRecoveryMarkerAfterOwnedPositiveTerminal(
+              // Barrier: the run's terminal journal record lands before the
+              // recovery marker is cleared, so a crash between the two still
+              // leaves a durable terminal record.
+              await _journalEndRun(
+                runToken.runAttemptId,
+                RunJournalState.completed,
+              );
+              await _clearRecoveryMarkerAfterOwnedPositiveTerminal(
                 activeSession,
                 runToken,
               );
@@ -3924,6 +4021,12 @@ class ChatProvider extends ChangeNotifier {
             await rollbackPrimaryPatchIfSafe();
           }
           if (!preservesStartedToolEvidence) {
+            await _journalEndRun(
+              runToken.runAttemptId,
+              RunJournalState.cancelled,
+              endReason: 'user_cancelled',
+            );
+            if (!_runMayContinue(runToken)) return;
             activeSession.inFlightAgentRun = null;
             try {
               await _storage
@@ -3959,6 +4062,12 @@ class ChatProvider extends ChangeNotifier {
           );
           if (!_runMayContinue(runToken)) return;
           if (!fallbackOutcome.success && !state.wasCancelled) {
+            await _journalEndRun(
+              runToken.runAttemptId,
+              RunJournalState.failed,
+              endReason: 'agent_run_failed',
+            );
+            if (!_runMayContinue(runToken)) return;
             await _persistAssistantFailureMarker(
               state: state,
               session: activeSession,
@@ -3967,6 +4076,7 @@ class ChatProvider extends ChangeNotifier {
               fallbackReasonCode: fallbackOutcome.reasonCode,
               runToken: runToken,
               preserveRecoveryMarker: recoveryRequest != null,
+              terminal: true,
             );
           }
         }
@@ -3976,6 +4086,12 @@ class ChatProvider extends ChangeNotifier {
         if (!_runMayContinue(runToken)) return;
         state.status = AgentStatus.error;
         state.errorMessage = _sanitizeProviderErrorMessage(e);
+        await _journalEndRun(
+          runToken.runAttemptId,
+          RunJournalState.failed,
+          endReason: 'provider_exception',
+        );
+        if (!_runMayContinue(runToken)) return;
         await _persistAssistantFailureMarker(
           state: state,
           session: activeSession,
@@ -3983,6 +4099,7 @@ class ChatProvider extends ChangeNotifier {
           source: 'provider_exception',
           runToken: runToken,
           preserveRecoveryMarker: recoveryRequest != null,
+          terminal: true,
         );
         notifyListeners();
       } finally {
@@ -4031,6 +4148,41 @@ class ChatProvider extends ChangeNotifier {
           state.forceToolApprovalForRun = false;
           state.isSending = false;
           if (state.wasCancelled) state.status = AgentStatus.idle;
+          // Terminal journal record. The service downgrades a completion or a
+          // cancellation to unknown_outcome when a tool attempt has no proven
+          // outcome, so the journal never claims an effect it cannot verify.
+          if (state.agentCompletionPersistFailed) {
+            // The transcript could not be persisted: the run is not a clean
+            // terminal, and the recovery marker stays for the user to confirm.
+            await _journalEndRun(
+              token.runAttemptId,
+              RunJournalState.interrupted,
+              endReason: 'terminal_persist_failed',
+            );
+          } else if (!state.wasCancelled && state.status != AgentStatus.error) {
+            // Positive terminal: commit, drop the recovery marker, persist - in
+            // that order - inside the awaited run path so callers that await the
+            // run observe the cleared marker.
+            final session = currentSession?.id == state.sessionId
+                ? currentSession
+                : await _storage.getSession(state.sessionId);
+            if (session != null &&
+                session.inFlightAgentRun?.runAttemptId == token.runAttemptId) {
+              await _completePositiveTerminal(session, token);
+            } else {
+              await _journalEndRun(
+                  token.runAttemptId, RunJournalState.completed);
+            }
+          } else {
+            await _journalEndRun(
+              token.runAttemptId,
+              state.wasCancelled
+                  ? RunJournalState.cancelled
+                  : RunJournalState.failed,
+              endReason:
+                  state.wasCancelled ? 'user_cancelled' : 'agent_run_failed',
+            );
+          }
           notifyListeners();
           _finishRunToken(token);
           _drainMessageQueue(state);
@@ -4402,6 +4554,14 @@ class ChatProvider extends ChangeNotifier {
         );
       }
       if (!preservedToolRecovery) {
+        // Barrier: the cancellation is journaled before the recovery marker is
+        // cleared. The service downgrades it to unknown_outcome when an attempt
+        // has no proven result.
+        await _journalEndRun(
+          runToken.runAttemptId,
+          RunJournalState.cancelled,
+          endReason: 'user_cancelled',
+        );
         try {
           await _clearInFlightAgentRunAwaited(state, runToken).timeout(
             const Duration(milliseconds: 500),
@@ -4490,6 +4650,7 @@ class ChatProvider extends ChangeNotifier {
     }
     if (!preservesStartedToolEvidence) return false;
     session.inFlightAgentRun = nextMarker;
+    await _journalMirrorMarker(session);
     try {
       await _storage
           .saveSession(
@@ -4551,16 +4712,86 @@ class ChatProvider extends ChangeNotifier {
         attempt.lifecycle == ToolAttemptLifecycle.interruptedUnknown;
   }
 
-  void _clearRecoveryMarkerAfterOwnedPositiveTerminal(
+  /// Ordered terminal clear for the synchronous stream callbacks (`onError`,
+  /// `onDone`): the journal terminal commit is awaited before the recovery
+  /// marker is dropped and persisted. A journal failure is recorded by the
+  /// service (incomplete/sticky) and never blocks the marker handling.
+  Future<void> _endRunFromStreamCallback(
+    ChatSession session,
+    _AgentRunToken runToken, {
+    required RunJournalState journalState,
+    required String endReason,
+    required bool preserveRecoveryMarker,
+  }) async {
+    if (preserveRecoveryMarker) {
+      await _journalEndRun(
+        runToken.runAttemptId,
+        journalState,
+        endReason: endReason,
+      );
+      return;
+    }
+    await _journalEndRun(
+      runToken.runAttemptId,
+      journalState,
+      endReason: endReason,
+    );
+    if (session.inFlightAgentRun?.runAttemptId != runToken.runAttemptId) {
+      return;
+    }
+    session.inFlightAgentRun = null;
+    try {
+      await _storage.saveSession(
+        session,
+        expectedGeneration: runToken.storageGeneration,
+      );
+    } catch (error) {
+      debugPrint('Failed to persist stream terminal marker clear: $error');
+    }
+  }
+
+  /// Positive-terminal finalizer for the synchronous stream callback: commit
+  /// the journal terminal state, drop the recovery marker, and persist the
+  /// cleared marker in that order.
+  Future<void> _completePositiveTerminal(
     ChatSession session,
     _AgentRunToken runToken,
-  ) {
+  ) async {
+    final marker = session.inFlightAgentRun;
+    await _clearRecoveryMarkerAfterOwnedPositiveTerminal(session, runToken);
+    if (marker == null || session.inFlightAgentRun != null) return;
+    try {
+      await _storage.saveSession(
+        session,
+        expectedGeneration: runToken.storageGeneration,
+      );
+    } catch (error) {
+      // The clear did not reach storage: restore the marker so the run stays
+      // recoverable instead of losing its recovery state.
+      session.inFlightAgentRun = marker;
+      debugPrint('Failed to persist terminal marker clear: $error');
+      return;
+    }
+    if (_ownsRun(runToken)) _syncCurrentSessionReference(session);
+  }
+
+  /// Terminal order: the journal commit is awaited before the recovery marker
+  /// is dropped. Every positive terminal (normal completion, encrypted-content
+  /// retry, model fallback, streaming AgentComplete) goes through this helper.
+  Future<void> _clearRecoveryMarkerAfterOwnedPositiveTerminal(
+    ChatSession session,
+    _AgentRunToken runToken,
+  ) async {
     final marker = session.inFlightAgentRun;
     if (marker == null ||
         marker.runAttemptId != runToken.runAttemptId ||
         !marker.canClearAfterPositiveTerminal) {
       return;
     }
+    await _journalEndRun(runToken.runAttemptId, RunJournalState.completed);
+    // No ownership re-check after the await: the run may have finished while the
+    // commit was in flight, and the marker identity check above already proved
+    // this marker belongs to this run.
     session.inFlightAgentRun = null;
   }
 
@@ -4576,6 +4807,12 @@ class ChatProvider extends ChangeNotifier {
         session?.inFlightAgentRun?.runAttemptId != runToken.runAttemptId) {
       return;
     }
+    await _journalEndRun(
+      runToken.runAttemptId,
+      RunJournalState.cancelled,
+      endReason: 'user_cancelled',
+    );
+    if (!_ownsRun(runToken)) return;
     session!.inFlightAgentRun = null;
     await _storage.saveSession(
       session,
@@ -5991,6 +6228,7 @@ class ChatProvider extends ChangeNotifier {
     String? fallbackReasonCode,
     _AgentRunToken? runToken,
     bool preserveRecoveryMarker = false,
+    bool terminal = false,
   }) async {
     if (state.wasCancelled || (runToken != null && !_ownsRun(runToken))) {
       return;
@@ -6022,7 +6260,12 @@ class ChatProvider extends ChangeNotifier {
 
     _removeTrailingAssistantErrorMarkers(session);
     session.messages.add(ChatMessage.assistantError(error: metadata));
-    if (!preserveRecoveryMarker) session.inFlightAgentRun = null;
+    // Only a terminal call may drop the marker, and the caller has already
+    // awaited the journal terminal commit for this run. A pre-fallback failure
+    // keeps the marker: the run may still continue with another model.
+    if (terminal && !preserveRecoveryMarker) {
+      session.inFlightAgentRun = null;
+    }
     session.updatedAt = DateTime.now();
     await _storage.saveSession(
       session,
@@ -6349,7 +6592,7 @@ class ChatProvider extends ChangeNotifier {
           fallback: candidate.safeLabel,
           reason: reason.label,
         );
-        _clearRecoveryMarkerAfterOwnedPositiveTerminal(
+        await _clearRecoveryMarkerAfterOwnedPositiveTerminal(
           activeSession,
           runToken,
         );
@@ -6999,6 +7242,9 @@ class ChatProvider extends ChangeNotifier {
       return;
     }
     session.inFlightAgentRun = marker.upsertToolAttempt(attempt);
+    // Barrier: the agent loop awaits this observer before it hands the tool to
+    // the executor, so a tool never starts before its attempt is durable.
+    await _journalMirrorMarker(session);
     await _storage.saveSession(
       session,
       expectedGeneration: runToken.storageGeneration,
@@ -7171,6 +7417,7 @@ class ChatProvider extends ChangeNotifier {
     final completer = Completer<void>();
     state.agentCompleter = completer;
     state.agentCompletionFinalizing = false;
+    state.agentCompletionPersistFailed = false;
     state.initialApiMsgCount = apiMessages.length;
     state.fallbackGuardedOutputObserved = false;
     state.fallbackTextEmitted = false;
@@ -7197,7 +7444,7 @@ class ChatProvider extends ChangeNotifier {
         state.initialApiMsgCount,
       );
       state.initialApiMsgCount = messages.length;
-      _markPersistedToolResults(activeSession);
+      await _markPersistedToolResults(activeSession);
       _syncCurrentSessionReference(activeSession);
       await _storage.saveSession(
         activeSession,
@@ -7317,10 +7564,10 @@ class ChatProvider extends ChangeNotifier {
             );
             _flushStreamingNow(state, notify: false);
             state.status = AgentStatus.idle;
-            _clearRecoveryMarkerAfterOwnedPositiveTerminal(
-              activeSession,
-              runToken,
-            );
+            // The recovery marker is dropped by the run's awaited terminal path
+            // (`_completePositiveTerminal`), after the journal commit: the
+            // synchronous stream callback cannot order an async commit and a
+            // marker clear by itself.
             if (runAgent.messages.length > state.initialApiMsgCount) {
               state.fallbackMessagesPersisted = true;
             }
@@ -7361,6 +7608,7 @@ class ChatProvider extends ChangeNotifier {
                 notifyListeners();
               }
             }).catchError((Object e) {
+              state.agentCompletionPersistFailed = true;
               debugPrint('Failed to persist completed agent response: $e');
             });
             state.agentCompletionFinalizing = true;
@@ -7388,9 +7636,10 @@ class ChatProvider extends ChangeNotifier {
                 interruptionNote: '回复中断，内容可能不完整。',
                 runToken: runToken,
               );
-              if (!preserveRecoveryMarker) {
-                activeSession.inFlightAgentRun = null;
-              }
+              // The recovery marker is not dropped here: this error may still
+              // continue into a model fallback. The terminal paths (fallback
+              // result, failure marker, cancellation) commit the journal first
+              // and then clear it.
               _clearStreamingState(state);
             }
             errorCause = cause ?? _AgentRuntimeError(message);
@@ -7427,9 +7676,17 @@ class ChatProvider extends ChangeNotifier {
             interruptionNote: '回复中断，内容可能不完整。',
             runToken: runToken,
           );
-          if (!preserveRecoveryMarker) {
-            activeSession.inFlightAgentRun = null;
-          }
+          // Ordered terminal clear: commit the journal first (deferred helper),
+          // then drop the marker and persist it.
+          unawaited(
+            _endRunFromStreamCallback(
+              activeSession,
+              runToken,
+              journalState: RunJournalState.failed,
+              endReason: 'stream_error',
+              preserveRecoveryMarker: preserveRecoveryMarker,
+            ),
+          );
           _clearStreamingState(state);
         }
         if (e is EncryptedContentError) {
@@ -7468,9 +7725,15 @@ class ChatProvider extends ChangeNotifier {
               interruptionNote: '回复中断：连接在生成结束前关闭，已保留已生成的部分内容。',
               runToken: runToken,
             );
-            if (!preserveRecoveryMarker) {
-              activeSession.inFlightAgentRun = null;
-            }
+            unawaited(
+              _endRunFromStreamCallback(
+                activeSession,
+                runToken,
+                journalState: RunJournalState.interrupted,
+                endReason: 'stream_interrupted',
+                preserveRecoveryMarker: preserveRecoveryMarker,
+              ),
+            );
             _clearStreamingState(state);
             state.status = AgentStatus.error;
             state.errorMessage = '回复中断：连接在生成结束前关闭，已保留已生成的部分内容。';
@@ -7498,7 +7761,7 @@ class ChatProvider extends ChangeNotifier {
     return errorCause;
   }
 
-  void _markPersistedToolResults(ChatSession session) {
+  Future<void> _markPersistedToolResults(ChatSession session) async {
     final marker = session.inFlightAgentRun;
     if (marker == null || marker.toolAttempts.isEmpty) return;
     final persistedOperationIds = session.messages
@@ -7523,7 +7786,10 @@ class ChatProvider extends ChangeNotifier {
       );
       changed = true;
     }
-    if (changed) session.inFlightAgentRun = nextMarker;
+    if (changed) {
+      session.inFlightAgentRun = nextMarker;
+      await _journalMirrorMarker(session);
+    }
   }
 
   Future<void> _applyContextSessionPatch(
