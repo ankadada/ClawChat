@@ -1134,13 +1134,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       receipts.map((receipt) => receipt.operationId),
     );
     if (!committed) {
-      if (!mounted) {
-        for (final receipt in receipts) {
-          unawaited(
-            NativeBridge.discardWorkspaceImport(receipt).catchError((_) {}),
-          );
-        }
-      }
+      // A refusal happens before the provider takes ownership of the receipts,
+      // so they stay attached to the draft: the user can retry (possibly in a
+      // local session) instead of losing the files, and nothing was ACKed.
+      if (!mounted) return;
+      // §5: a refused send never clears the draft silently. Keep the text and
+      // attachments, and show the reason with a way to act on it.
+      final reason = provider.errorMessage ?? AppStrings.messageNotSent;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            reason == AppStrings.messageNotSent
+                ? reason
+                : '${AppStrings.messageNotSent}（$reason）',
+          ),
+          duration: const Duration(seconds: 6),
+          action: reason == AppStrings.apiKeyNotConfigured
+              ? SnackBarAction(
+                  label: AppStrings.openMessageSettings,
+                  onPressed: () {
+                    if (!mounted) return;
+                    Navigator.of(context).push(
+                      CupertinoPageRoute(
+                        builder: (_) => const SettingsScreen(),
+                      ),
+                    );
+                  },
+                )
+              : null,
+        ),
+      );
       return;
     }
     if (!mounted) return;

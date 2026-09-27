@@ -32,6 +32,20 @@ void main() {
     );
   });
 
+  test('a refused send keeps the draft receipts instead of discarding them',
+      () {
+    final screen = File('lib/screens/chat_screen.dart').readAsStringSync();
+    final refusal = screen.indexOf('if (!committed) {');
+    final successPath = screen.indexOf('_inputController.clear()', refusal);
+    expect(refusal, greaterThan(0));
+    expect(successPath, greaterThan(refusal));
+    final refusalBlock = screen.substring(refusal, successPath);
+    // The provider refuses before taking ownership, so the draft keeps the
+    // receipts for a retry (possibly in a local session).
+    expect(refusalBlock, isNot(contains('discardWorkspaceImport')));
+    expect(refusalBlock, contains('messageNotSent'));
+  });
+
   test('provider persists pending receipt before ACK and recovers on reload',
       () {
     final provider =

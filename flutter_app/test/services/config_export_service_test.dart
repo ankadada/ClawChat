@@ -63,6 +63,83 @@ void main() {
     PreferencesService.resetForTesting();
   }
 
+  group('config import hard cap', () {
+    test('the cap is 50 MiB and the message names file, size and limit', () {
+      expect(ConfigExportService.maxImportBytes, 50 * 1024 * 1024);
+      expect(
+        ConfigExportService.configImportSizeError(
+          fileName: 'huge-config.json',
+          byteLength: ConfigExportService.maxImportBytes,
+        ),
+        isNull,
+        reason: 'the limit itself is allowed',
+      );
+      final message = ConfigExportService.configImportSizeError(
+        fileName: 'huge-config.json',
+        byteLength: 60 * 1024 * 1024,
+      );
+      expect(message, isNotNull);
+      expect(message, contains('huge-config.json'));
+      expect(message, contains('60.0MB'));
+      expect(message, contains('上限 50.0MB'));
+      expect(message, contains('未导入'));
+    });
+
+    test('checkImportBytes fails closed above the cap', () {
+      expect(
+        () => ConfigExportService.checkImportBytes(
+          'huge-config.json',
+          60 * 1024 * 1024,
+        ),
+        throwsA(
+          isA<ConfigImportTooLargeException>().having(
+            (error) => error.message,
+            'message',
+            allOf(contains('huge-config.json'), contains('上限 50.0MB')),
+          ),
+        ),
+      );
+      expect(
+        () => ConfigExportService.checkImportBytes(
+          'ok-config.json',
+          ConfigExportService.maxImportBytes,
+        ),
+        returnsNormally,
+      );
+    });
+
+    test('an oversized payload is refused before any preference is written',
+        () async {
+      final padding = 'a' * (ConfigExportService.maxImportBytes + 1);
+      final payload =
+          '{"version":1,"settings":{},"envVars":{"X":"1"},"padding":"$padding"}';
+
+      final prefs = PreferencesService();
+      await prefs.init();
+      final envVarsBefore = Map<String, String>.from(prefs.envVars);
+      final profileCountBefore = prefs.profiles.length;
+
+      await expectLater(
+        ConfigExportService.importConfig(payload),
+        throwsA(isA<ConfigImportTooLargeException>()),
+      );
+
+      // Nothing was applied: the hard cap is checked before parsing.
+      expect(prefs.envVars, envVarsBefore);
+      expect(prefs.profiles.length, profileCountBefore);
+    });
+
+    test('previewImport refuses an oversized payload too', () {
+      final padding = 'a' * (ConfigExportService.maxImportBytes + 1);
+      expect(
+        () => ConfigExportService.previewImport(
+          '{"version":1,"padding":"$padding"}',
+        ),
+        throwsA(isA<ConfigImportTooLargeException>()),
+      );
+    });
+  });
+
   test('default unencrypted export redacts secrets', () async {
     final prefs = await initPrefs();
     await prefs.setProfiles([

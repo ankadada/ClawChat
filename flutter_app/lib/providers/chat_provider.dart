@@ -35,6 +35,7 @@ import '../services/tools/untrusted_data_policy.dart';
 import '../services/tools/memory_tools.dart';
 import '../services/tool_call_expansion_state.dart';
 import '../services/preferences_service.dart';
+import '../services/privacy_filter.dart';
 import '../services/remote_agent_configuration_service.dart';
 import '../services/remote_agent_connector.dart';
 import '../services/skill_service.dart';
@@ -1159,13 +1160,38 @@ class ChatProvider extends ChangeNotifier {
         sessionId: state.sessionId,
         sessionTitle: _sessionTitleForState(state),
         status: status,
-        previewText: previewText ?? _tailOfStreamBuffer(state, 250),
+        // §5 AND-4: the unlocked notification body may summarize the reply,
+        // but a configured credential must never reach the notification.
+        previewText: maskConfiguredSecretsForNotification(
+          previewText ?? _tailOfStreamBuffer(state, 250),
+        ),
         toolName: toolName,
         overlayVisible: _appInBackground && _activeAgentStates.isNotEmpty,
       );
     } catch (e) {
       debugPrint('Failed to update agent notification: $e');
     }
+  }
+
+  /// Masks every credential the app itself configured (environment variables
+  /// and provider API keys) out of notification text.
+  ///
+  /// The lock screen never receives this text at all (the native side renders a
+  /// generic `publicVersion`); this is the second line for the unlocked body.
+  @visibleForTesting
+  String maskConfiguredSecretsForNotification(String text) {
+    if (text.isEmpty) return text;
+    var masked = text;
+    final envVars = _prefs.envVars;
+    if (envVars.isNotEmpty) {
+      masked = PrivacyFilter.maskEnvVarValues(masked, envVars);
+    }
+    for (final profile in _prefs.profiles) {
+      final key = profile.apiKey.trim();
+      if (key.isEmpty || !PrivacyFilter.isDistinctiveSecret(key)) continue;
+      masked = PrivacyFilter.maskEnvVarValues(masked, {'apiKey': key});
+    }
+    return masked;
   }
 
   String _tailOfStreamBuffer(AgentState state, int maxLength) {
@@ -1514,6 +1540,7 @@ class ChatProvider extends ChangeNotifier {
 
   @override
   void dispose() {
+    if (_disposed) return;
     _disposed = true;
     for (final llm in _compareLlmByModel.values) {
       llm.dispose();
@@ -1542,6 +1569,16 @@ class ChatProvider extends ChangeNotifier {
     _activeRunTokens.clear();
     _agentStates.clear();
     super.dispose();
+  }
+
+  /// Late run continuations (a stream tail, a native callback, a journal
+  /// commit) may still reach this provider after [dispose]. Dropping their
+  /// notification is correct: there is no UI left to update, and the
+  /// `ChangeNotifier` disposed assertion must not be a crash path.
+  @override
+  void notifyListeners() {
+    if (_disposed) return;
+    super.notifyListeners();
   }
 
   void _cancelActiveRemoteAgentOperations() {
@@ -3378,14 +3415,25 @@ class ChatProvider extends ChangeNotifier {
     );
   }
 
+  /// Sends a message and reports whether it was accepted.
+  ///
+  /// `true` means a run was durably accepted (or the message was queued for
+  /// one); `false` means the send was refused before anything was recorded —
+  /// the caller must keep the draft and surface the reason instead of clearing
+  /// the composer as if the message had been sent.
   Future<bool> sendMessageWithWorkspaceImports(
     String text, {
     List<MessageContent> attachments = const [],
     required List<WorkspaceImportReceipt> workspaceImports,
   }) {
+    final acceptance = Completer<bool>();
     if (workspaceImports.isEmpty) {
-      unawaited(sendMessage(text, attachments: attachments));
-      return Future.value(true);
+      unawaited(_sendMessage(
+        text,
+        attachments: attachments,
+        acceptance: acceptance,
+      ));
+      return acceptance.future;
     }
     final commit = Completer<bool>();
     unawaited(_sendMessage(
@@ -3393,8 +3441,16 @@ class ChatProvider extends ChangeNotifier {
       attachments: attachments,
       workspaceImports: List.unmodifiable(workspaceImports),
       workspaceCommit: commit,
+      acceptance: acceptance,
     ));
-    return commit.future;
+    return acceptance.future.then((accepted) async {
+      if (!accepted) {
+        // The refusal already rolled the receipt back; report it as a refusal
+        // so the draft and the imported attachments survive.
+        return false;
+      }
+      return commit.future;
+    });
   }
 
   Future<void> _sendMessage(
@@ -3406,9 +3462,16 @@ class ChatProvider extends ChangeNotifier {
     _RecoveryRunRequest? recoveryRequest,
     List<WorkspaceImportReceipt> workspaceImports = const [],
     Completer<bool>? workspaceCommit,
+    Completer<bool>? acceptance,
     _SessionReplayOperation? sessionReplay,
   }) async {
-    if (sessionReplay != null && !_ownsSessionReplay(sessionReplay)) return;
+    if (sessionReplay != null && !_ownsSessionReplay(sessionReplay)) {
+      // A replay that no longer owns its session is a refusal, not a success.
+      if (acceptance != null && !acceptance.isCompleted) {
+        acceptance.complete(false);
+      }
+      return;
+    }
     final trimmedText = text.trim();
     final pendingAlternativesForSend = pendingAlternatives == null
         ? null
@@ -3497,6 +3560,11 @@ class ChatProvider extends ChangeNotifier {
           notifyListeners();
         } else if (recoveryRequest == null && workspaceImports.isEmpty) {
           _enqueueMessage(sessionState, trimmedText, attachments);
+          // A queued message is accepted: it will run, so the composer may
+          // clear instead of duplicating it on the next tap.
+          if (acceptance != null && !acceptance.isCompleted) {
+            acceptance.complete(true);
+          }
         } else if (workspaceImports.isNotEmpty) {
           sessionState.status = AgentStatus.error;
           sessionState.errorMessage = '当前会话忙碌，请稍后重新发送工作区附件。';
@@ -3521,12 +3589,28 @@ class ChatProvider extends ChangeNotifier {
       }
 
       if (session?.remoteAgentConnectorId != null) {
+        if (workspaceImports.isNotEmpty) {
+          // The remote protocol has no workspace-import acknowledgement, so a
+          // send that carries receipts is refused before any request: the
+          // caller keeps the draft and the receipts instead of the app
+          // degrading them to plain text or stranding staged files.
+          const message = AppStrings.remoteWorkspaceImportUnsupported;
+          if (sessionState != null) {
+            sessionState.status = AgentStatus.error;
+            sessionState.errorMessage = message;
+          } else {
+            _fallbackErrorMessage = message;
+          }
+          notifyListeners();
+          return;
+        }
         await _sendRemoteAgentMessage(
           session!,
           trimmedText,
           attachments: attachments,
           recoveryRequest: recoveryRequest,
           sessionReplay: sessionReplay,
+          acceptance: acceptance,
         );
         return;
       }
@@ -3671,6 +3755,11 @@ class ChatProvider extends ChangeNotifier {
         _syncCurrentSessionReference(activeSession);
         notifyListeners();
         return;
+      }
+      if (acceptance != null && !acceptance.isCompleted) {
+        // Durable acceptance: the user turn and the run marker are stored, so
+        // the composer may clear and the refusal paths below keep the draft.
+        acceptance.complete(true);
       }
       if (workspaceCommit != null && !workspaceCommit.isCompleted) {
         workspaceCommit.complete(true);
@@ -4125,6 +4214,11 @@ class ChatProvider extends ChangeNotifier {
       }
       rethrow;
     } finally {
+      if (acceptance != null && !acceptance.isCompleted) {
+        // Every remaining exit refused the send (missing credential, deleting
+        // session, concurrency limit, a failed durable accept, ...).
+        acceptance.complete(false);
+      }
       if (workspaceCommit != null && !workspaceCommit.isCompleted) {
         workspaceCommit.complete(false);
       }
@@ -4199,6 +4293,7 @@ class ChatProvider extends ChangeNotifier {
     required List<MessageContent> attachments,
     required _RecoveryRunRequest? recoveryRequest,
     _SessionReplayOperation? sessionReplay,
+    Completer<bool>? acceptance,
   }) async {
     final state = _getOrCreateState(session.id);
     if (attachments.isNotEmpty || recoveryRequest != null || text.isEmpty) {
@@ -4274,6 +4369,9 @@ class ChatProvider extends ChangeNotifier {
         commitGuard: sessionReplay?.commitGuard,
       );
       userTurnSaved = true;
+      if (acceptance != null && !acceptance.isCompleted) {
+        acceptance.complete(true);
+      }
       _requireRemoteRuntimeAuthorization(
         runtimeLease,
         sessionReplay,

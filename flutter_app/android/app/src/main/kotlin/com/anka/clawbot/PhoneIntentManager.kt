@@ -164,22 +164,60 @@ class PhoneIntentManager(
     // The Dart/Flutter side should show an appropriate message and retry the call
     // after the user grants the permission in the system dialog.
 
-    private fun ensurePermission(perm: String): Boolean {
-        if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) return true
-        // Ask once per permission per activity lifetime. Re-prompting on every
-        // tool call would loop the system dialog and is never useful.
-        if (permissionRequests.shouldRequest(perm)) {
+    private fun ensurePermission(perm: String): PermissionAskResult {
+        val granted = ContextCompat.checkSelfPermission(activity, perm) ==
+            PackageManager.PERMISSION_GRANTED
+        val showRationale = ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
+        val result = permissionRequests.classify(perm, granted, showRationale)
+        if (result == PermissionAskResult.REQUESTED && permissionRequests.shouldRequest(perm)) {
+            // Ask once per permission per activity lifetime. Re-prompting on every
+            // tool call would loop the system dialog and is never useful.
             activity.runOnUiThread {
                 ActivityCompat.requestPermissions(activity, arrayOf(perm), PERMISSION_REQUEST)
             }
         }
-        return false
+        return result
+    }
+
+    /**
+     * The stable, actionable result for a permission that is not granted.
+     *
+     * A permanently denied permission can only be restored in Settings, so it
+     * gets its own error code and `settingsRequired` flag instead of pretending
+     * another dialog will appear. `requestedRunId` binds the guidance to the
+     * run that hit the denial (the run-scoped explanation the user sees).
+     */
+    private fun permissionError(
+        perm: String,
+        result: PermissionAskResult,
+        runAttemptId: String?,
+    ): Map<String, Any?> {
+        val short = perm.substringAfterLast('.')
+        val base = mapOf<String, Any?>(
+            "ok" to false,
+            "permission" to short,
+            if (runAttemptId.isNullOrEmpty()) "message" to null else "runAttemptId" to runAttemptId,
+        ).filterValues { it != null }
+        return if (result == PermissionAskResult.PERMANENTLY_DENIED) {
+            base + mapOf(
+                "error" to "permission_permanently_denied",
+                "settingsRequired" to true,
+                "message" to
+                    "Permission $short was denied and the system will not ask again. " +
+                    "Open Settings > Apps > ClawChat > Permissions, allow it, then retry.",
+            )
+        } else {
+            base + mapOf(
+                "error" to "permission_required",
+                "message" to "Permission $short requested. Grant it and retry this call.",
+            )
+        }
     }
 
     private fun insertCalendarEvent(p: Map<String, Any?>): Map<String, Any?> {
-        if (!ensurePermission(Manifest.permission.WRITE_CALENDAR)) {
-            return mapOf("ok" to false, "error" to "permission_required", "permission" to "WRITE_CALENDAR",
-                "message" to "Permission requested. Please grant and retry.")
+        val writeCalendarAsk = ensurePermission(Manifest.permission.WRITE_CALENDAR)
+        if (writeCalendarAsk != PermissionAskResult.GRANTED) {
+            return permissionError(Manifest.permission.WRITE_CALENDAR, writeCalendarAsk, p["runAttemptId"] as? String)
         }
         val title = p["title"] as? String ?: error("title required")
         val begin = (p["beginMillis"] as? Number)?.toLong() ?: error("beginMillis required")
@@ -219,8 +257,9 @@ class PhoneIntentManager(
     }
 
     private fun listCalendarEvents(p: Map<String, Any?>): Map<String, Any?> {
-        if (!ensurePermission(Manifest.permission.READ_CALENDAR)) {
-            return mapOf("ok" to false, "error" to "permission_required", "permission" to "READ_CALENDAR")
+        val readCalendarAsk = ensurePermission(Manifest.permission.READ_CALENDAR)
+        if (readCalendarAsk != PermissionAskResult.GRANTED) {
+            return permissionError(Manifest.permission.READ_CALENDAR, readCalendarAsk, p["runAttemptId"] as? String)
         }
         val start = (p["startMillis"] as? Number)?.toLong() ?: startOfTodayMillis()
         val end = (p["endMillis"] as? Number)?.toLong() ?: (start + 7L * 24 * 3600_000L)
@@ -267,8 +306,9 @@ class PhoneIntentManager(
     }
 
     private fun listSms(p: Map<String, Any?>): Map<String, Any?> {
-        if (!ensurePermission(Manifest.permission.READ_SMS)) {
-            return mapOf("ok" to false, "error" to "permission_required", "permission" to "READ_SMS")
+        val readSmsAsk = ensurePermission(Manifest.permission.READ_SMS)
+        if (readSmsAsk != PermissionAskResult.GRANTED) {
+            return permissionError(Manifest.permission.READ_SMS, readSmsAsk, p["runAttemptId"] as? String)
         }
         val box = (p["box"] as? String)?.lowercase() ?: "inbox"
         val uri = when (box) {
@@ -325,8 +365,9 @@ class PhoneIntentManager(
     }
 
     private fun getSms(p: Map<String, Any?>): Map<String, Any?> {
-        if (!ensurePermission(Manifest.permission.READ_SMS)) {
-            return mapOf("ok" to false, "error" to "permission_required", "permission" to "READ_SMS")
+        val readSmsAsk = ensurePermission(Manifest.permission.READ_SMS)
+        if (readSmsAsk != PermissionAskResult.GRANTED) {
+            return permissionError(Manifest.permission.READ_SMS, readSmsAsk, p["runAttemptId"] as? String)
         }
         val id = (p["id"] as? Number)?.toLong()
             ?: return mapOf("ok" to false, "error" to "invalid_args", "message" to "id required")
@@ -368,8 +409,9 @@ class PhoneIntentManager(
     }
 
     private fun listContacts(p: Map<String, Any?>): Map<String, Any?> {
-        if (!ensurePermission(Manifest.permission.READ_CONTACTS)) {
-            return mapOf("ok" to false, "error" to "permission_required", "permission" to "READ_CONTACTS")
+        val readContactsAsk = ensurePermission(Manifest.permission.READ_CONTACTS)
+        if (readContactsAsk != PermissionAskResult.GRANTED) {
+            return permissionError(Manifest.permission.READ_CONTACTS, readContactsAsk, p["runAttemptId"] as? String)
         }
         val query = (p["query"] as? String)?.takeIf { it.isNotBlank() }
         val limit = (((p["limit"] as? Number)?.toInt() ?: 50)).coerceIn(1, 50)
@@ -419,8 +461,9 @@ class PhoneIntentManager(
     // ── L3: high-risk; gated by app-level setting in Dart layer ────
 
     private fun callPhone(p: Map<String, Any?>): Map<String, Any?> {
-        if (!ensurePermission(Manifest.permission.CALL_PHONE)) {
-            return mapOf("ok" to false, "error" to "permission_required", "permission" to "CALL_PHONE")
+        val callPhoneAsk = ensurePermission(Manifest.permission.CALL_PHONE)
+        if (callPhoneAsk != PermissionAskResult.GRANTED) {
+            return permissionError(Manifest.permission.CALL_PHONE, callPhoneAsk, p["runAttemptId"] as? String)
         }
         val number = validatePhoneNumber(p["number"] as? String ?: error("number required"))
         val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number"))
@@ -428,8 +471,9 @@ class PhoneIntentManager(
     }
 
     private fun sendSms(p: Map<String, Any?>): Map<String, Any?> {
-        if (!ensurePermission(Manifest.permission.SEND_SMS)) {
-            return mapOf("ok" to false, "error" to "permission_required", "permission" to "SEND_SMS")
+        val sendSmsAsk = ensurePermission(Manifest.permission.SEND_SMS)
+        if (sendSmsAsk != PermissionAskResult.GRANTED) {
+            return permissionError(Manifest.permission.SEND_SMS, sendSmsAsk, p["runAttemptId"] as? String)
         }
         val number = validatePhoneNumber(p["number"] as? String ?: error("number required"))
         val body = p["body"] as? String ?: error("body required")

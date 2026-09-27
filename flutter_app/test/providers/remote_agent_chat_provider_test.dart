@@ -2,7 +2,10 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:clawchat/constants.dart';
+import 'package:clawchat/l10n/app_strings.dart';
 import 'package:clawchat/models/chat_models.dart';
+import 'package:clawchat/models/workspace_import_receipt.dart';
+import 'package:clawchat/services/native_bridge.dart';
 import 'package:clawchat/models/remote_agent_connector.dart';
 import 'package:clawchat/models/agent_run_center.dart';
 import 'package:clawchat/providers/chat_provider.dart';
@@ -583,6 +586,65 @@ void main() {
     secrets.release.completeError(StateError('late error after dispose'));
     await Future<void>.delayed(Duration.zero);
     expect(fixture.connector.requests, isEmpty);
+  });
+
+  test('a remote session refuses workspace imports before any request',
+      () async {
+    final fixture = await _fixture();
+    addTearDown(fixture.provider.dispose);
+    final session = await fixture.provider.createSession();
+    await fixture.provider.setCurrentSessionRemoteAgentEnabled(true);
+
+    var acknowledged = 0;
+    var discarded = 0;
+    NativeBridge.setWorkspaceImportLifecycleBrokerForTesting(
+      (receipt, discard) async {
+        if (discard) {
+          discarded++;
+        } else {
+          acknowledged++;
+        }
+        return true;
+      },
+    );
+    addTearDown(NativeBridge.resetImportReadStreamForTesting);
+    final receipt = WorkspaceImportReceipt(
+      operationId: 'a' * 32,
+      storedPath: '/root/workspace/uploads/report_${'a' * 32}.bin',
+      size: 3,
+      sha256: 'f' * 64,
+      displayName: 'report.bin',
+    );
+
+    final committed = await fixture.provider.sendMessageWithWorkspaceImports(
+      receipt.marker,
+      workspaceImports: [receipt],
+    );
+
+    // Fail closed: the caller keeps the draft and the receipt.
+    expect(committed, isFalse);
+    expect(
+      fixture.provider.errorMessage,
+      AppStrings.remoteWorkspaceImportUnsupported,
+    );
+    // No remote request, no acknowledgement, and no orphan receipt bound to a
+    // message that never existed.
+    expect(fixture.connector.requests, isEmpty);
+    expect(acknowledged, 0);
+    expect(discarded, 0);
+    final persisted = await fixture.storage.getSession(session.id);
+    expect(persisted!.messages, isEmpty);
+    expect(persisted.pendingWorkspaceImports, isEmpty);
+    expect(persisted.inFlightAgentRun, isNull);
+
+    // The same session still sends plain text to the remote agent.
+    await fixture.provider.sendMessage('plain remote turn');
+    expect(fixture.connector.requests, hasLength(1));
+    expect(
+      fixture.connector.requests.single.messages
+          .map((message) => '${message.role}:${message.text}'),
+      ['user:plain remote turn'],
+    );
   });
 
   test('run center keeps background remote context after switching local',

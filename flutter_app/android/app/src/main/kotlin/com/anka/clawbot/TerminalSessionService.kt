@@ -756,6 +756,9 @@ class TerminalSessionService : Service() {
             .setOnlyAlertOnce(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(Notification.PRIORITY_LOW)
+            // The text is static, but the notification still never renders on
+            // a secure lock screen.
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
         if (candidate != null) {
             val stopIntent = Intent(this, TerminalSessionService::class.java).apply {
                 action = ACTION_STOP

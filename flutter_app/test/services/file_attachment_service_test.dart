@@ -449,6 +449,42 @@ void main() {
       );
     });
 
+    test('an oversized content URI is rejected before native staging',
+        () async {
+      var stagerCalls = 0;
+      NativeBridge.setPickedContentStagersForTesting(
+        stager: (uri, name, maxBytes) async {
+          stagerCalls += 1;
+          return '/tmp/should-not-be-created';
+        },
+      );
+
+      await expectLater(
+        FileAttachmentService.localPathFor(
+          PlatformFile(
+            name: 'too-big.zip',
+            size: 60 * 1024 * 1024,
+            identifier: 'content://downloads/documents/oversized',
+          ),
+        ),
+        throwsA(
+          isA<FilePickerException>()
+              .having((error) => error.reason, 'reason', 'oversized')
+              .having(
+                (error) => error.userMessage,
+                'message',
+                allOf(
+                  contains('too-big.zip'),
+                  contains('60.0 MB'),
+                  contains('上限 50.0 MB'),
+                ),
+              ),
+        ),
+      );
+      expect(stagerCalls, 0,
+          reason: 'an oversized document must not be copied into app cache');
+    });
+
     test('oversized binary import throws before workspace write', () async {
       final file = await writeSparseFile('large.bin', 51 * 1024 * 1024);
 

@@ -59,6 +59,9 @@ abstract class PhoneToolBase extends Tool {
         'message': 'Action `$action` is not available on `$name`.',
       });
     }
+    // Each action whitelists the exact native parameters it forwards, so the
+    // run binding stays on the tool-call/approval layer instead of riding
+    // through this map.
     final params =
         (input['params'] as Map?)?.cast<String, dynamic>() ?? const {};
     try {
@@ -69,17 +72,32 @@ abstract class PhoneToolBase extends Tool {
   }
 
   /// §7.2: a denied permission is a stable, actionable error, not a loop.
+  ///
+  /// A permanent denial (the system will not show the dialog again) is reported
+  /// separately so the UI can send the user to Settings instead of pretending
+  /// another prompt will appear.
   static Map<String, dynamic> _augmentPermissionResult(
     Map<String, dynamic> result,
   ) {
-    if (result['error'] != 'permission_required') return result;
+    final error = result['error'];
+    if (error != 'permission_required' &&
+        error != 'permission_permanently_denied') {
+      return result;
+    }
     final permission = result['permission']?.toString();
     final label = _permissionLabel(permission);
+    final permanent = error == 'permission_permanently_denied' ||
+        result['settingsRequired'] == true;
     return {
       ...result,
-      'fix': '打开 系统设置 → 应用 → ClawChat → 权限，允许$label权限，然后重试。',
+      if (permanent) 'settingsRequired': true,
+      'fix': permanent
+          ? '系统不会再弹出授权窗口。请打开 系统设置 → 应用 → ClawChat → 权限，允许$label权限，然后重试。'
+          : '打开 系统设置 → 应用 → ClawChat → 权限，允许$label权限，然后重试。',
       if (result['message'] == null)
-        'message': '需要$label权限；本次运行不再重复请求，请授权后重试。',
+        'message': permanent
+            ? '$label权限已被永久拒绝；本次运行不再重复请求，请在系统设置中手动开启后重试。'
+            : '需要$label权限；本次运行不再重复请求，请授权后重试。',
     };
   }
 
@@ -146,7 +164,8 @@ abstract class PhoneToolBase extends Tool {
     return null;
   }
 
-  static int clampLimit(Object? value, {required int fallback, required int max}) {
+  static int clampLimit(Object? value,
+      {required int fallback, required int max}) {
     final parsed = asInt(value);
     if (parsed == null) return fallback;
     if (parsed < 1) return 1;
@@ -239,8 +258,8 @@ class PhoneReadTool extends PhoneToolBase {
     Map<String, dynamic> params,
   ) async {
     final query = (params['query'] as String?)?.trim() ?? '';
-    final start = PhoneToolBase.asInt(params['startMillis']) ??
-        startOfTodayMillis();
+    final start =
+        PhoneToolBase.asInt(params['startMillis']) ?? startOfTodayMillis();
     final end = PhoneToolBase.asInt(params['endMillis']) ??
         start + const Duration(days: 7).inMilliseconds;
     final limit = PhoneToolBase.clampLimit(
@@ -512,8 +531,8 @@ final RegExp _redactUrl = RegExp(
   caseSensitive: false,
 );
 final RegExp _redactEmail = RegExp(r'[\w.+-]+@[\w-]+\.[\w.-]+');
-final RegExp _redactTel = RegExp(r'\btel:\s*\+?[\d\s\-()]{3,}',
-    caseSensitive: false);
+final RegExp _redactTel =
+    RegExp(r'\btel:\s*\+?[\d\s\-()]{3,}', caseSensitive: false);
 
 /// Scheme-less meeting-join hosts. Zoom/Meet/Teams links are routinely written
 /// as `zoom.us/j/123` or `meet.google.com/abc-defg` without a scheme.

@@ -28,6 +28,7 @@ import '../services/skill_service.dart';
 import '../services/skill_template_service.dart';
 import '../services/tts_service.dart';
 import '../services/usage_summary_service.dart';
+import '../widgets/export_config_dialog.dart';
 import '../services/update_service.dart';
 import '../services/update_transaction.dart';
 import '../providers/chat_provider.dart';
@@ -89,6 +90,7 @@ class SettingsScreen extends StatefulWidget {
     this.importFlowOnlyForTesting = false,
     this.updateService,
     this.initialDestination,
+    this.importConfigPickerForTesting,
   });
 
   @visibleForTesting
@@ -106,6 +108,11 @@ class SettingsScreen extends StatefulWidget {
   @visibleForTesting
   final UpdateService? updateService;
   final SettingsDestination? initialDestination;
+
+  /// Picker used by the config-import flow in tests, so the oversized-file
+  /// guard can be driven without the platform file picker.
+  @visibleForTesting
+  final Future<FilePickerResult?> Function()? importConfigPickerForTesting;
 
   static const controlInventory = <SettingsControlInfo>[
     SettingsControlInfo(
@@ -353,6 +360,7 @@ class _SettingsHubState extends State<SettingsScreen> {
         skipInitialLoadForTesting: widget.skipInitialLoadForTesting,
         importFlowOnlyForTesting: widget.importFlowOnlyForTesting,
         updateService: widget.updateService,
+        importConfigPickerForTesting: widget.importConfigPickerForTesting,
       );
     }
     return LayoutBuilder(builder: (context, constraints) {
@@ -434,6 +442,7 @@ class SettingsDetailScreen extends StatefulWidget {
     this.diagnosticsReportBuilderForTesting,
     this.diagnosticsShareForTesting,
     this.diagnosticsSaveForTesting,
+    this.importConfigPickerForTesting,
   });
 
   final SettingsDestination destination;
@@ -441,6 +450,9 @@ class SettingsDetailScreen extends StatefulWidget {
     String url,
     SkillImportCancellationToken cancellationToken,
   )? prepareSkillFromUrlForTesting;
+
+  @visibleForTesting
+  final Future<FilePickerResult?> Function()? importConfigPickerForTesting;
   final bool skipInitialLoadForTesting;
   final bool importFlowOnlyForTesting;
   final UpdateService? updateService;
@@ -4157,123 +4169,69 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
     return buffer.toString();
   }
 
-  Future<_ConfigExportOptions?> _showExportConfigDialog() {
-    var encrypt = true;
-    var includePlaintextSecrets = false;
-    final passwordController = TextEditingController();
-    final confirmController = TextEditingController();
-    return showDialog<_ConfigExportOptions>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          title: const Text(AppStrings.exportConfig),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text(AppStrings.encryptSecrets),
-                  subtitle: const Text(AppStrings.encryptSecretsSubtitle),
-                  value: encrypt,
-                  onChanged: (value) => setDialogState(() {
-                    encrypt = value;
-                    if (encrypt) includePlaintextSecrets = false;
-                  }),
-                ),
-                if (!encrypt) ...[
-                  const Padding(
-                    padding: EdgeInsets.only(bottom: 8),
-                    child: Text(AppStrings.exportConfigRedactedByDefault),
-                  ),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: const Text(AppStrings.exportConfigPlaintextSecrets),
-                    subtitle: const Text(
-                      AppStrings.exportConfigPlaintextSecretsSubtitle,
-                    ),
-                    value: includePlaintextSecrets,
-                    onChanged: (value) => setDialogState(
-                      () => includePlaintextSecrets = value,
-                    ),
-                  ),
-                ],
-                if (encrypt) ...[
-                  TextField(
-                    controller: passwordController,
-                    obscureText: true,
-                    decoration: const InputDecoration(
-                      labelText: AppStrings.setPassword,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: confirmController,
-                    obscureText: true,
-                    decoration: const InputDecoration(
-                      labelText: AppStrings.confirmPassword,
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text(AppStrings.cancel),
-            ),
-            FilledButton(
-              onPressed: () {
-                final password = passwordController.text;
-                if (encrypt) {
-                  if (password.isEmpty) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                          content: Text(AppStrings.passwordRequired)),
-                    );
-                    return;
-                  }
-                  if (password != confirmController.text) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                          content: Text(AppStrings.passwordMismatch)),
-                    );
-                    return;
-                  }
-                }
-                Navigator.pop(
-                  ctx,
-                  _ConfigExportOptions(
-                    encrypt: encrypt,
-                    password: password,
-                    includePlaintextSecrets:
-                        !encrypt && includePlaintextSecrets,
-                  ),
-                );
-              },
-              child: const Text(AppStrings.exportConfig),
-            ),
-          ],
-        ),
-      ),
-    ).whenComplete(() {
-      passwordController.dispose();
-      confirmController.dispose();
-    });
+  Future<_ConfigExportOptions?> _showExportConfigDialog() async {
+    // Compact viewports render the primary action as a full-width button
+    // inside the dialog body (see ExportConfigDialog).
+    final options = await showExportConfigDialog(
+      context,
+      semanticsHint: '把配置导出为 JSON 文件',
+    );
+    if (options == null) return null;
+    return _ConfigExportOptions(
+      encrypt: options.encrypt,
+      password: options.password,
+      includePlaintextSecrets: options.includePlaintextSecrets,
+    );
   }
 
   Future<void> _importConfig() async {
     try {
-      final result = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['json'],
-      );
+      final picker = widget.importConfigPickerForTesting;
+      final result = picker != null
+          ? await picker()
+          : await FilePicker.pickFiles(
+              type: FileType.custom,
+              allowedExtensions: ['json'],
+            );
       if (result == null || result.files.isEmpty) return;
-      final path = result.files.single.path;
-      if (path == null) return;
+      final selected = result.files.single;
 
-      final jsonStr = await File(path).readAsString();
+      // §5 AND-3 / AND-6: the picker-declared size is checked before the file
+      // is read, copied or staged, so an oversized config never reaches the
+      // parser and leaves nothing behind.
+      final declaredError = ConfigExportService.configImportSizeError(
+        fileName: selected.name,
+        byteLength: selected.size,
+      );
+      if (declaredError != null) {
+        _showImportConfigMessage(declaredError);
+        return;
+      }
+      final path = selected.path;
+      if (path == null || path.isEmpty) {
+        _showImportConfigMessage(
+          ConfigImportUnreadableException.messageFor(selected.name),
+        );
+        return;
+      }
+
+      // Bounded read: a file that grows after the declared-size check still
+      // cannot exceed the cap, and the partial read leaves no staging behind.
+      final List<int> bytes;
+      try {
+        bytes = await BoundedFileReader.readBytes(
+          path,
+          validateBytes: (byteLength) => ConfigExportService.checkImportBytes(
+            selected.name,
+            byteLength,
+          ),
+        );
+      } on FileSystemException {
+        throw ConfigImportUnreadableException(
+          ConfigImportUnreadableException.messageFor(selected.name),
+        );
+      }
+      final jsonStr = const Utf8Decoder(allowMalformed: false).convert(bytes);
       final preview = ConfigExportService.previewImport(jsonStr);
       final options = await _showImportConfigDialog(preview);
       if (options == null) return;
@@ -4312,6 +4270,10 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
           ],
         ),
       );
+    } on ConfigImportTooLargeException catch (e) {
+      _showImportConfigMessage(e.message);
+    } on ConfigImportUnreadableException catch (e) {
+      _showImportConfigMessage(e.message);
     } on FormatException catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -4320,11 +4282,7 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         );
       }
     } on StateError catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(e.message)),
-        );
-      }
+      _showImportConfigMessage(e.message);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -4332,6 +4290,14 @@ class _SettingsDetailScreenState extends State<SettingsDetailScreen> {
         );
       }
     }
+  }
+
+  /// One visible, actionable line for a refused import (size, unreadable file).
+  void _showImportConfigMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 6)),
+    );
   }
 
   Future<_ConfigImportOptions?> _showImportConfigDialog(

@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'atomic_file_write.dart';
 import 'config_export_service.dart';
+import 'storage_budget.dart';
 
 /// Status of one destination inside a backup run.
 enum BackupDestinationStatus {
@@ -50,10 +52,11 @@ class BackupDestination {
       label: _folderLabel(directoryPath),
       directoryPath: directoryPath,
       writeFile: (fileName, bytes) async {
-        final target = File(
+        // Atomic publish: the folder only ever gains the complete package.
+        await writeFileAtomically(
           '$directoryPath${Platform.pathSeparator}$fileName',
+          bytes,
         );
-        await target.writeAsBytes(bytes, flush: true);
       },
     );
   }
@@ -148,17 +151,21 @@ abstract class BackupPackageStore {
 
 /// Default store: one private temp file per run.
 class FileBackupPackageStore implements BackupPackageStore {
-  FileBackupPackageStore({Directory? directory}) : _directory = directory;
+  FileBackupPackageStore({Directory? directory, AtomicRename? rename})
+      : _directory = directory,
+        _rename = rename;
 
   Directory? _directory;
+  final AtomicRename? _rename;
 
   @override
   Future<String> save(String fileName, List<int> bytes) async {
-    final directory =
-        _directory ??= await Directory.systemTemp.createTemp('clawchat-backup-');
-    final file = File('${directory.path}${Platform.pathSeparator}$fileName');
-    await file.writeAsBytes(bytes, flush: true);
-    return file.path;
+    final directory = _directory ??=
+        await Directory.systemTemp.createTemp('clawchat-backup-');
+    final path = '${directory.path}${Platform.pathSeparator}$fileName';
+    // Atomic publish: the returned path always points at a complete package.
+    await writeFileAtomically(path, bytes, rename: _rename);
+    return path;
   }
 
   @override
@@ -181,9 +188,11 @@ class BackupRunService {
     BackupPackageStore? packageStore,
     BackupPackageBuilder? buildPackage,
     DateTime Function()? now,
+    StorageBudget? storageBudget,
   })  : _packageStore = packageStore ?? FileBackupPackageStore(),
         _buildPackage = buildPackage ?? _defaultBuildPackage,
-        _now = now ?? DateTime.now;
+        _now = now ?? DateTime.now,
+        _storageBudget = storageBudget ?? StorageBudget();
 
   static Future<String> _defaultBuildPackage({
     String? password,
@@ -198,6 +207,7 @@ class BackupRunService {
   final BackupPackageStore _packageStore;
   final BackupPackageBuilder _buildPackage;
   final DateTime Function() _now;
+  final StorageBudget _storageBudget;
 
   final StreamController<BackupRunProgress> _progressController =
       StreamController<BackupRunProgress>.broadcast();
@@ -237,19 +247,29 @@ class BackupRunService {
     final packageName = _packageFileName();
     final results = <BackupDestinationResult>[];
     var localPackagePath = '';
-    var localPackageKept = true;
+    // No package exists until the atomic save succeeded: a failed stage must
+    // never be reported as "local package kept".
+    var localPackageKept = false;
     BackupRunStatus status = BackupRunStatus.running;
     String? runError;
 
     try {
       final List<int> bytes;
       try {
+        // §5 AND-6: fail before staging anything when the disk cannot take it,
+        // so a nearly full device gets one actionable message instead of a
+        // half-written export.
+        final budget = await _storageBudget.ensureCapacity(operation: '导出备份');
+        if (!budget.allowed) {
+          throw StateError(budget.message ?? '存储空间不足，导出已取消。');
+        }
         final jsonStr = await _buildPackage(
           password: password,
           includePlaintextSecrets: includePlaintextSecrets,
         );
         bytes = utf8.encode(jsonStr);
         localPackagePath = await _packageStore.save(packageName, bytes);
+        localPackageKept = true;
       } catch (error) {
         runError = error.toString();
         status = BackupRunStatus.failed;

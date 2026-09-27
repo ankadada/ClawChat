@@ -4,11 +4,11 @@
   "files": [
     {
       "path": "lib/l10n/app_strings.dart",
-      "sha256": "bb7309c11e5168e025db52ac7d72859f37d66f9fe67dd71d949f0a3aeeb3af6a"
+      "sha256": "32a2169f2a676491b438f37e3c6090ea308338043ef8d009e83b50238b0a727a"
     },
     {
       "path": "lib/screens/settings_screen.dart",
-      "sha256": "3f15ea930b01fdaa8dd4274997c94e0179bfccd1c06066a7eca2169eda1444fd"
+      "sha256": "f28c4439917a8a01ee91bb16104cd9548591fb36355ff26b0f9de8dee75aa6a7"
     },
     {
       "path": "lib/services/bundled_legacy_skill_catalog.dart",
@@ -24,7 +24,7 @@
     },
     {
       "path": "lib/services/skill_service.dart",
-      "sha256": "bbdc3270df13c7e2ffe83e38669a39739f9d1aa2215e3d6f2860af7e50f5135a"
+      "sha256": "7541d3aa7c0b0b50ab40fead526bf6f993a6c8adae6657be5b7c31ce708bcc17"
     },
     {
       "path": "lib/services/tools/tool_policy.dart",
@@ -60,7 +60,7 @@
     },
     {
       "path": "test/services/skill_service_test.dart",
-      "sha256": "fb92f34d6f1336837aac609eaecc8178c69de851eb88284462fe6f55a33ceaa3"
+      "sha256": "f9443ec751f7f893c9b34043c180e2985f33a2735d5f95b1cb290352e798494f"
     },
     {
       "path": "test/tool/skill_evals/skill_eval_host_gate_test.dart",

@@ -184,4 +184,49 @@ class ToolApprovalNotificationStateTest {
         assertFalse(inFlightCopy.text.contains(detail))
         assertFalse(inFlightCopy.text.contains("bash"))
     }
+
+    @Test
+    fun lockScreenCopyNeverLeaksACredentialBearingDestination() {
+        // A destination that embeds a credential, a phone number and a command.
+        val detail =
+            "https://api.example/v1?api_key=sk-live-9f8e7d6c5b4a&token=Bearer%20abc123" +
+                "&cmd=curl%20-H%20%22Authorization:%20Bearer%20xyz%22%20/root/.env"
+        val state = ToolApprovalNotificationState(
+            sessionId = "session-secret",
+            approvalId = "approval-secret",
+            toolName = "web_fetch",
+            risk = "high",
+            detail = detail
+        )
+
+        val copy = ApprovalNotificationText.publicCopy(state)
+        val secrets = listOf(
+            detail,
+            "sk-live-9f8e7d6c5b4a",
+            "api_key",
+            "token",
+            "Bearer",
+            "abc123",
+            "Authorization",
+            "/root/.env",
+            "web_fetch",
+            "session-secret",
+            "approval-secret"
+        )
+        for (fragment in secrets) {
+            assertFalse("public title leaked $fragment", copy.title.contains(fragment))
+            assertFalse("public text leaked $fragment", copy.text.contains(fragment))
+        }
+
+        // The unlocked BigText deliberately keeps the destination (the user must
+        // confirm it), so this asserts the lock screen is what stays generic.
+        assertEquals(
+            "确认工具审批",
+            ApprovalNotificationText.bigText(
+                detail,
+                "确认工具审批",
+                "session preview"
+            )
+        )
+    }
 }

@@ -47,7 +47,8 @@ void main() {
         },
       );
 
-      final result = decode(await tool.execute({'action': 'listCalendarEvents'}));
+      final result =
+          decode(await tool.execute({'action': 'listCalendarEvents'}));
 
       expect(result['ok'], true);
       expect(captured!['action'], 'listCalendarEvents');
@@ -94,8 +95,8 @@ void main() {
           ],
         },
       );
-      final result = decode(
-          await tool.execute({'action': 'listCalendarEvents'}));
+      final result =
+          decode(await tool.execute({'action': 'listCalendarEvents'}));
       final event = (result['events'] as List).single as Map;
       final description = event['description'] as String;
       expect(description, contains('[redacted-url]'));
@@ -152,8 +153,7 @@ void main() {
               'title': 'Sync',
               'beginMillis': 1,
               'endMillis': 2,
-              'description':
-                  'Join zoom.us/j/123 or meet.google.com/abc-defg or '
+              'description': 'Join zoom.us/j/123 or meet.google.com/abc-defg or '
                   'teams.microsoft.com/l/meetup-join/x or teams.live.com/meet/9',
             },
           ],
@@ -191,7 +191,127 @@ void main() {
       expect(calls, 2);
     });
 
-    test('filters by query and fetches the full window for filtering', () async {
+    test('every calendar, sms and contacts denial returns labelled guidance',
+        () async {
+      final prefs = await initPrefs(allowSms: true, allowPhoneCall: true);
+      Future<Map<String, dynamic>> denied(
+        String permission,
+        Map<String, dynamic> input,
+      ) async {
+        final tool = input['action'] == 'listCalendarEvents' ||
+                input['action'] == 'listSms' ||
+                input['action'] == 'getSms' ||
+                input['action'] == 'listContacts'
+            ? PhoneReadTool(
+                transport: (action, params, {required allowed}) async => {
+                  'ok': false,
+                  'error': 'permission_required',
+                  'permission': permission,
+                },
+              )
+            : input['action'] == 'callPhone' || input['action'] == 'sendSms'
+                ? PhoneSendTool(
+                    prefs,
+                    transport: (action, params, {required allowed}) async => {
+                      'ok': false,
+                      'error': 'permission_required',
+                      'permission': permission,
+                    },
+                  )
+                : PhoneActTool(
+                    transport: (action, params, {required allowed}) async => {
+                      'ok': false,
+                      'error': 'permission_required',
+                      'permission': permission,
+                    },
+                  );
+        return decode(await tool.execute(input));
+      }
+
+      const cases = <(Map<String, dynamic>, String, String)>[
+        (
+          {'action': 'listCalendarEvents'},
+          'READ_CALENDAR',
+          '日历读取',
+        ),
+        (
+          {
+            'action': 'insertCalendarEvent',
+            'params': {'title': 'x', 'beginMillis': 1},
+          },
+          'WRITE_CALENDAR',
+          '日历写入',
+        ),
+        (
+          {'action': 'listSms'},
+          'READ_SMS',
+          '短信读取',
+        ),
+        (
+          {
+            'action': 'getSms',
+            'params': {'id': 1},
+          },
+          'READ_SMS',
+          '短信读取',
+        ),
+        (
+          {'action': 'listContacts'},
+          'READ_CONTACTS',
+          '联系人读取',
+        ),
+        (
+          {
+            'action': 'callPhone',
+            'params': {'number': '10086'},
+          },
+          'CALL_PHONE',
+          '电话',
+        ),
+        (
+          {
+            'action': 'sendSms',
+            'params': {'number': '10086', 'body': 'hi'},
+          },
+          'SEND_SMS',
+          '短信发送',
+        ),
+      ];
+
+      for (final (input, permission, label) in cases) {
+        final result = await denied(permission, input);
+        expect(result['error'], 'permission_required',
+            reason: '${input['action']} must stay a permission error');
+        expect(result['permission'], permission);
+        expect(result['fix'], contains(label),
+            reason: '${input['action']} must name the $label permission');
+        expect(result['fix'], contains('系统设置'));
+        expect(result['message'], contains('本次运行不再重复请求'));
+      }
+    });
+
+    test('a permanently denied permission points at Settings', () async {
+      final tool = PhoneReadTool(
+        transport: (action, params, {required allowed}) async {
+          return {
+            'ok': false,
+            'error': 'permission_permanently_denied',
+            'permission': 'READ_CONTACTS',
+            'settingsRequired': true,
+          };
+        },
+      );
+      final result = decode(await tool.execute({'action': 'listContacts'}));
+      expect(result['error'], 'permission_permanently_denied');
+      expect(result['settingsRequired'], isTrue);
+      expect(result['fix'], contains('系统不会再弹出授权窗口'));
+      expect(result['fix'], contains('联系人读取'));
+      expect(result['message'], contains('永久拒绝'));
+      expect(result['message'], contains('系统设置'));
+    });
+
+    test('filters by query and fetches the full window for filtering',
+        () async {
       Map<String, dynamic>? captured;
       final tool = PhoneReadTool(
         transport: (action, params, {required allowed}) async {
@@ -363,7 +483,10 @@ void main() {
         return {'ok': true};
       },
     );
-    await tool.execute({'action': 'setAlarm', 'params': {'hour': 7}});
+    await tool.execute({
+      'action': 'setAlarm',
+      'params': {'hour': 7}
+    });
     expect(allowedSeen, false);
   });
 

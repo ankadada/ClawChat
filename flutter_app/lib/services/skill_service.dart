@@ -18,6 +18,8 @@ import 'bundled_legacy_skill_catalog.dart';
 import 'legacy_skill_compatibility.dart';
 import 'native_bridge.dart';
 import 'skill_import_inspector.dart';
+import 'attachment_budget.dart';
+import 'storage_budget.dart';
 
 typedef SkillArchiveStager = Future<String> Function(
   Uri uri,
@@ -476,13 +478,47 @@ class SkillService {
   static const _kDisabledKey = 'disabled_skills';
   static const _kTrustGrantsKey = 'skill_trust_grants_v1';
   static const _trustGrantSchemaVersion = 1;
-  static const _maxLocalArchiveBytes = 25 * 1024 * 1024;
+  static const _maxLocalArchiveBytes = keySkillArchiveMaxBytes;
+
+  /// Public cap for a skill archive (local pick or remote download).
+  static const int keySkillArchiveMaxBytes = 25 * 1024 * 1024;
+
+  /// One actionable size error for every skill-archive import path.
+  static String skillArchiveTooLargeMessage({
+    String? fileName,
+    int? actualBytes,
+    int? limitBytes,
+  }) {
+    final limit = limitBytes ?? keySkillArchiveMaxBytes;
+    final name = fileName?.trim().isNotEmpty == true ? fileName!.trim() : '技能包';
+    final actual = actualBytes == null
+        ? '超过上限'
+        : AttachmentBudget.formatBytes(actualBytes);
+    return '技能包过大，未导入：$name（$actual，上限 '
+        '${AttachmentBudget.formatBytes(limit)}）。'
+        '请压缩技能包或更换更小的文件后重试。';
+  }
+
   static const _maxSkillEntrypointBytes = 1024 * 1024;
   static const _maxManifestBytes = 256 * 1024;
   static final _safeSkillNamePattern = RegExp(r'^[A-Za-z0-9._-]+$');
   static BoundedFileStreamFactory? _localImportReadStreamForTesting;
   static http.Client? _archiveHttpClientForTesting;
   static SkillArchiveStager? _archiveStagerForTesting;
+
+  /// Storage pre-flight for imports (§5 AND-6). Replaceable in tests so import
+  /// behaviour does not depend on the host's free space.
+  static StorageBudget storageBudget = StorageBudget();
+
+  /// Fails closed with a user-readable message when the disk cannot take the
+  /// import. Called only after input validation, right before staging.
+  static Future<void> _requireImportStorage() async {
+    final budget = await storageBudget.ensureCapacity(operation: '导入技能包');
+    if (!budget.allowed) {
+      throw StateError(budget.message ?? '存储空间不足，导入已取消。');
+    }
+  }
+
   static Duration _archiveIdleTimeout = const Duration(seconds: 30);
   static Duration _archiveTotalTimeout = const Duration(seconds: 120);
 
@@ -933,6 +969,8 @@ class SkillService {
         'Remote git and directory imports are unavailable. Use a credential-free HTTPS .zip, .tar.gz, or .tgz archive.',
       );
     }
+    // §5 AND-6: a rejected URL never costs a platform round-trip.
+    await _requireImportStorage();
     final effectiveCancellationToken =
         cancellationToken ?? SkillImportCancellationToken();
     final ownsCancellationToken = cancellationToken == null;
@@ -1032,6 +1070,20 @@ class SkillService {
         'Local skill archive must be a regular non-link file.',
       );
     }
+    // §5 AND-3: an oversized archive is rejected from its size alone, before
+    // any storage check, scratch directory, or copy.
+    final declaredBytes = await io.File(safePath).length();
+    if (declaredBytes > _maxLocalArchiveBytes) {
+      throw FormatException(
+        skillArchiveTooLargeMessage(
+          fileName: safePath.split('/').last,
+          actualBytes: declaredBytes,
+        ),
+      );
+    }
+    // §5 AND-6: check free space only once the input is known-good, so an
+    // invalid archive is still rejected without touching the platform.
+    await _requireImportStorage();
     final staging = _newStagingPath();
     await NativeBridge.runInProot(
       'mkdir -p ${_shellQuote(_stagingDirectory)} && '
@@ -1896,7 +1948,9 @@ class SkillService {
       final declaredLength = response.contentLength;
       if (declaredLength != null && declaredLength > _maxLocalArchiveBytes) {
         await _cancelResponse(response);
-        throw const FormatException('Remote skill archive is too large.');
+        throw FormatException(
+          skillArchiveTooLargeMessage(actualBytes: declaredLength),
+        );
       }
 
       io.IOSink? sink;
@@ -1937,7 +1991,9 @@ class SkillService {
           final chunk = iterator.current;
           final nextBytes = actualBytes + chunk.length;
           if (nextBytes > _maxLocalArchiveBytes) {
-            throw const FormatException('Remote skill archive is too large.');
+            throw FormatException(
+              skillArchiveTooLargeMessage(actualBytes: nextBytes),
+            );
           }
           actualBytes = nextBytes;
           sink.add(chunk);
@@ -2188,7 +2244,6 @@ class SkillService {
     // missing directory from hiding installed skills; a shell that cannot run
     // at all still fails the call.
     return '$searches; true';
-
   }
 
   /// The exact discovery command, for tests that pin its device behaviour.
@@ -2249,7 +2304,12 @@ class SkillService {
         tempFile.path,
         validateBytes: (byteLength) {
           if (byteLength > _maxLocalArchiveBytes) {
-            throw const FormatException('Local skill archive is too large.');
+            throw FormatException(
+              skillArchiveTooLargeMessage(
+                fileName: sourcePath.split('/').last,
+                actualBytes: byteLength,
+              ),
+            );
           }
         },
         streamFactory: _localImportReadStreamForTesting,

@@ -5,7 +5,18 @@ import '../models/chat_models.dart';
 class AttachmentBudgetException implements Exception {
   final String message;
 
-  const AttachmentBudgetException(this.message);
+  /// Size facts for the workspace-import limit, so a caller can rethrow the
+  /// same failure as a picker error without re-parsing the message.
+  final String? fileName;
+  final int? actualBytes;
+  final int? limitBytes;
+
+  const AttachmentBudgetException(
+    this.message, {
+    this.fileName,
+    this.actualBytes,
+    this.limitBytes,
+  });
 
   @override
   String toString() => message;
@@ -25,6 +36,9 @@ class AttachmentBudget {
       throw AttachmentBudgetException(
         '图片过大，无法直接发送：${_label(fileName)}'
         '（${formatBytes(byteLength)}，上限 ${formatBytes(maxInlineImageBytes)}）',
+        fileName: _label(fileName),
+        actualBytes: byteLength,
+        limitBytes: maxInlineImageBytes,
       );
     }
   }
@@ -34,6 +48,9 @@ class AttachmentBudget {
       throw AttachmentBudgetException(
         '文本文件过大，无法直接内联：${_label(fileName)}'
         '（${formatBytes(byteLength)}，上限 ${formatBytes(maxInlineTextBytes)}）',
+        fileName: _label(fileName),
+        actualBytes: byteLength,
+        limitBytes: maxInlineTextBytes,
       );
     }
   }
@@ -41,10 +58,36 @@ class AttachmentBudget {
   void checkWorkspaceImportBytes(int byteLength, {String? fileName}) {
     if (byteLength > maxWorkspaceImportBytes) {
       throw AttachmentBudgetException(
-        '附件过大，无法导入工作区：${_label(fileName)}'
-        '（${formatBytes(byteLength)}，上限 ${formatBytes(maxWorkspaceImportBytes)}）',
+        workspaceImportTooLargeMessage(
+          fileName: fileName,
+          actualBytes: byteLength,
+        ),
+        fileName: _label(fileName),
+        actualBytes: byteLength,
+        limitBytes: maxWorkspaceImportBytes,
       );
     }
+  }
+
+  /// The one actionable, size-specific import message.
+  ///
+  /// Every oversized SAF/workspace import path returns this text (or the same
+  /// numbers through [FilePickerException]) so the user always sees the file,
+  /// the actual size and the limit instead of a generic failure.
+  static String workspaceImportTooLargeMessage({
+    String? fileName,
+    required int actualBytes,
+    int? limitBytes,
+  }) {
+    final limit = limitBytes ?? maxWorkspaceImportBytes;
+    return '文件过大，未导入：${_labelStatic(fileName)}'
+        '（${formatBytes(actualBytes)}，上限 ${formatBytes(limit)}）。'
+        '请选择不超过 ${formatBytes(limit)} 的文件，或先在设备上压缩后再试。';
+  }
+
+  static String _labelStatic(String? fileName) {
+    final safe = fileName?.trim();
+    return safe == null || safe.isEmpty ? '未命名文件' : safe;
   }
 
   void checkMessageAttachments(List<MessageContent> attachments) {

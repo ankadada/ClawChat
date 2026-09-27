@@ -163,13 +163,15 @@ class MainActivity : FlutterActivity() {
             rawUri.length > 4096) {
             throw SecurityException("content URI required")
         }
-        if (maxBytes <= 0L || maxBytes > 50L * 1024L * 1024L) {
+        if (!PickedContentLimits.isValidLimit(maxBytes)) {
             throw IllegalArgumentException("invalid content limit")
         }
         val safeName = sanitizeSharedFileName(displayName).take(120)
         val declaredSize = queryOpenableLong(uri, OpenableColumns.SIZE)
-        if (declaredSize != null && declaredSize > maxBytes) {
-            throw IllegalArgumentException("content exceeds bounded limit")
+        if (PickedContentLimits.exceedsDeclaredLimit(declaredSize, maxBytes)) {
+            // Reject before opening the stream: nothing is copied, so the user
+            // gets the size error and the cache stays clean.
+            throw PickedContentTooLargeException(maxBytes, declaredSize)
         }
         val directory = File(cacheDir, pickedContentCacheDirName).apply {
             mkdirs()
@@ -187,8 +189,8 @@ class MainActivity : FlutterActivity() {
                         if (read < 0) break
                         if (read == 0) continue
                         total += read.toLong()
-                        if (total > maxBytes) {
-                            throw IllegalArgumentException("content exceeds bounded limit")
+                        if (PickedContentLimits.exceedsStreamedLimit(total, maxBytes)) {
+                            throw PickedContentTooLargeException(maxBytes, total)
                         }
                         target.write(buffer, 0, read)
                     }
@@ -291,17 +293,43 @@ class MainActivity : FlutterActivity() {
                     val maxBytes = call.argument<Number>("maxBytes")?.toLong()
                     if (uri == null || displayName == null || maxBytes == null ||
                         !uri.startsWith("content://") || displayName.isBlank() ||
-                        displayName.length > 256 || maxBytes <= 0L ||
-                        maxBytes > 50L * 1024L * 1024L) {
-                        result.error("INVALID_ARGS", "picked content arguments required", null)
+                        displayName.length > 256 ||
+                        !PickedContentLimits.isValidLimit(maxBytes)) {
+                        result.error(
+                            PickedContentLimits.ERROR_INVALID,
+                            "picked content arguments required",
+                            null
+                        )
                     } else {
                         secureImportExecutor.execute {
                             try {
                                 val path = stagePickedContentUri(uri, displayName, maxBytes)
                                 safeRunOnUiThread { result.success(path) }
-                            } catch (_: Throwable) {
+                            } catch (tooLarge: PickedContentTooLargeException) {
+                                // The size error carries the numbers so Dart can
+                                // show "too large (60.0MB, limit 50.0MB)".
                                 safeRunOnUiThread {
-                                    result.error("PICKED_CONTENT_ERROR", "unable to stage picked content", null)
+                                    result.error(
+                                        PickedContentLimits.ERROR_TOO_LARGE,
+                                        "picked content exceeds the size limit",
+                                        mapOf(
+                                            PickedContentLimits.DETAIL_LIMIT_BYTES to
+                                                tooLarge.limitBytes,
+                                            PickedContentLimits.DETAIL_ACTUAL_BYTES to
+                                                tooLarge.actualBytes
+                                        )
+                                    )
+                                }
+                            } catch (error: Throwable) {
+                                safeRunOnUiThread {
+                                    result.error(
+                                        PickedContentLimits.ERROR_UNAVAILABLE,
+                                        "unable to stage picked content",
+                                        mapOf(
+                                            PickedContentLimits.DETAIL_ACTUAL_BYTES to
+                                                null
+                                        )
+                                    )
                                 }
                             }
                         }
@@ -2282,29 +2310,28 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /**
+     * Creates every channel in [NotificationChannelCatalog.specs]. Android
+     * freezes importance at creation time, so each spec is created exactly once
+     * and later edits to a channel only apply to the fields it allows.
+     */
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "ClawChat", NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "ClawChat notifications" }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
-        }
+        createAgentCompleteNotificationChannel()
     }
 
     private fun createAgentCompleteNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java)
             manager.deleteNotificationChannel("clawchat_agent_complete")
-            val channel = NotificationChannel(
-                AGENT_COMPLETE_CHANNEL_ID,
-                "ClawChat Agent",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "AI task completion notifications"
-                enableVibration(true)
+            NotificationChannelCatalog.specs.forEach { spec ->
+                val channel = NotificationChannel(spec.id, spec.name, spec.importance).apply {
+                    description = spec.description
+                    if (spec.lockscreenPrivate) {
+                        lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+                    }
+                }
+                manager.createNotificationChannel(channel)
             }
-            manager.createNotificationChannel(channel)
         }
     }
 
@@ -2332,8 +2359,9 @@ class MainActivity : FlutterActivity() {
             pendingFlags
         )
         val text = "ClawChat 已自动允许 $toolName 执行"
+        val statusChannel = NotificationChannelCatalog.status.id
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
+            Notification.Builder(this, statusChannel)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
@@ -2349,7 +2377,7 @@ class MainActivity : FlutterActivity() {
             .setPublicVersion(
                 buildPublicNotification(
                     this,
-                    CHANNEL_ID,
+                    statusChannel,
                     NotificationPrivacy.toolAutoApproved()
                 )
             )
@@ -2531,13 +2559,13 @@ class MainActivity : FlutterActivity() {
     }
 
     companion object {
-        const val CHANNEL_ID = "clawchat_main"
+        const val CHANNEL_ID = NotificationChannelSpec.LEGACY_MAIN_ID
 
         /** Tool-result images above this size stay text. */
         const val MAX_TOOL_RESULT_IMAGE_BYTES = 2L * 1024L * 1024L
         const val AGENT_CALLBACK_CHANNEL = "com.anka.clawbot/native/agent_callbacks"
         const val SHARE_CALLBACK_CHANNEL = "com.anka.clawbot/native/share_callbacks"
-        const val AGENT_COMPLETE_CHANNEL_ID = "clawchat_agent_complete_v2"
+        const val AGENT_COMPLETE_CHANNEL_ID = NotificationChannelSpec.COMPLETION_ID
         const val NOTIFICATION_PERMISSION_REQUEST = 1001
         const val STORAGE_PERMISSION_REQUEST = 1003
         const val AUDIO_PERMISSION_REQUEST = 1004

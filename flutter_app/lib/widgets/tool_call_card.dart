@@ -35,17 +35,25 @@ class ToolCallCard extends StatefulWidget {
 class _ToolCallCardState extends State<ToolCallCard> {
   bool get _expanded => ToolCallExpansionState.isExpanded(widget.toolUse.id);
 
-  /// True when this result is a denied runtime permission, so the card can
-  /// offer a one-tap path to the OS App details screen.
+  static const _permissionErrors = {
+    'permission_required',
+    'permission_permanently_denied',
+  };
+
+  /// True when this result is a denied runtime permission (including a
+  /// permanent denial), so the card can offer a one-tap path to the OS App
+  /// details screen.
   bool get _needsPermissionFix {
     final output = widget.toolOutput;
     if (output == null || output.isEmpty) return false;
     try {
       final decoded = jsonDecode(output);
-      return decoded is Map && decoded['error'] == 'permission_required';
+      return decoded is Map && _permissionErrors.contains(decoded['error']);
     } catch (_) {
       return output.contains('"error":"permission_required"') ||
-          output.contains('"error": "permission_required"');
+          output.contains('"error": "permission_required"') ||
+          output.contains('"error":"permission_permanently_denied"') ||
+          output.contains('"error": "permission_permanently_denied"');
     }
   }
 
@@ -520,8 +528,9 @@ class _ToolResultImage extends StatelessWidget {
           future: ToolResultImageResolver.readWorkspaceBytes(image.value),
           builder: (context, snapshot) {
             final bytes = snapshot.data;
-            final mediaType =
-                bytes == null ? null : ToolResultImageResolver.detectMediaType(bytes);
+            final mediaType = bytes == null
+                ? null
+                : ToolResultImageResolver.detectMediaType(bytes);
             if (bytes != null && mediaType != null) {
               return _frame(
                 Image.memory(

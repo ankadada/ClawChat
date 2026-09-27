@@ -545,6 +545,10 @@ class NativeBridge {
 
   /// Copies an Android SAF content URI to an app-private bounded cache file.
   /// The URI itself and file bytes never cross the Dart/native bridge together.
+  /// Platform error code for a picked document above the caller's limit.
+  /// Mirrors `PickedContentLimits.ERROR_TOO_LARGE` on the Android side.
+  static const String pickedContentTooLargeCode = 'PICKED_CONTENT_TOO_LARGE';
+
   static Future<String> stagePickedContentUri({
     required String contentUri,
     required String displayName,
@@ -560,13 +564,37 @@ class NativeBridge {
       throw ArgumentError.value(maxBytes, 'maxBytes');
     }
     final stager = _pickedContentUriStagerForTesting;
-    final path = stager != null
-        ? await stager(contentUri, displayName, maxBytes)
-        : await _channel.invokeMethod<String>('stagePickedContentUri', {
-            'uri': contentUri,
-            'displayName': displayName,
-            'maxBytes': maxBytes,
-          });
+    final String? path;
+    try {
+      path = stager != null
+          ? await stager(contentUri, displayName, maxBytes)
+          : await _channel.invokeMethod<String>('stagePickedContentUri', {
+              'uri': contentUri,
+              'displayName': displayName,
+              'maxBytes': maxBytes,
+            });
+    } on PlatformException catch (error) {
+      // A size rejection must stay a size rejection: the caller turns this
+      // into a user-readable "too large (60.0MB, limit 50.0MB)" message.
+      if (error.code == pickedContentTooLargeCode) {
+        final details = error.details;
+        final limit = details is Map && details['limitBytes'] is num
+            ? (details['limitBytes'] as num).toInt()
+            : maxBytes;
+        final actual = details is Map && details['actualBytes'] is num
+            ? (details['actualBytes'] as num).toInt()
+            : null;
+        throw AttachmentBudgetException(
+          AttachmentBudget.workspaceImportTooLargeMessage(
+            actualBytes: actual ?? maxBytes,
+            limitBytes: limit,
+          ),
+          actualBytes: actual ?? maxBytes,
+          limitBytes: limit,
+        );
+      }
+      rethrow;
+    }
     if (path == null ||
         path.isEmpty ||
         !path.startsWith('/') ||

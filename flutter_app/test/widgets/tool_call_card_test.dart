@@ -37,8 +37,10 @@ https://flutter.dev.
   group('web search source helpers', () {
     test('validates launchable schemes', () {
       expect(isLaunchableSearchSource(Uri.parse('http://example.com')), isTrue);
-      expect(isLaunchableSearchSource(Uri.parse('https://example.com/path')), isTrue);
-      expect(isLaunchableSearchSource(Uri.parse('https:///missing-host')), isFalse);
+      expect(isLaunchableSearchSource(Uri.parse('https://example.com/path')),
+          isTrue);
+      expect(isLaunchableSearchSource(Uri.parse('https:///missing-host')),
+          isFalse);
 
       for (final url in [
         'javascript:alert(1)',
@@ -105,8 +107,10 @@ https://example.com/9
 ''');
 
       expect(sources, hasLength(8));
-      expect(sources.map((source) => source.uri.toString()).toSet(), hasLength(8));
-      expect(sources.map((source) => source.uri.toString()), isNot(contains('https://example.com/9')));
+      expect(
+          sources.map((source) => source.uri.toString()).toSet(), hasLength(8));
+      expect(sources.map((source) => source.uri.toString()),
+          isNot(contains('https://example.com/9')));
     });
   });
 
@@ -161,7 +165,51 @@ https://example.com/9
     );
   });
 
-  testWidgets('a readable workspace image renders with Image.memory, a missing '
+  testWidgets('a permanent permission denial still offers the Fix button',
+      (tester) async {
+    ToolCallCard.clearExpansionState();
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: ToolCallCard(
+          toolUse: ToolUseContent(
+            id: 'phone-permanent',
+            name: 'phone_read',
+            input: const {'action': 'listContacts'},
+          ),
+          toolOutput: '{"ok":false,"error":"permission_permanently_denied",'
+              '"permission":"READ_CONTACTS","settingsRequired":true}',
+        ),
+      ),
+    ));
+
+    expect(find.text(AppStrings.openPermissionSettings), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (widget) => widget is FilledButton && widget.onPressed != null,
+      ),
+      findsOneWidget,
+    );
+
+    // A readable output must not grow the button.
+    ToolCallCard.clearExpansionState();
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: ToolCallCard(
+          toolUse: ToolUseContent(
+            id: 'phone-permanent-ok',
+            name: 'phone_read',
+            input: const {'action': 'listContacts'},
+          ),
+          toolOutput: '{"ok":true,"contacts":[]}',
+        ),
+      ),
+    ));
+    expect(find.text(AppStrings.openPermissionSettings), findsNothing);
+  });
+
+  testWidgets(
+      'a readable workspace image renders with Image.memory, a missing '
       'path keeps its label', (tester) async {
     ToolCallCard.clearExpansionState();
     const channel = MethodChannel(AppConstants.channelName);

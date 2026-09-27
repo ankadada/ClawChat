@@ -1,5 +1,44 @@
 # Changelog
 
+## v2.18.0 — Android 原生能力：权限 broker、通知分类与存储前置检查
+
+本版按 `docs/android-roadmap.md` §5 收口 Android 原生能力。**以「验证 + 补缺口」为主，不重写既有分享 / 文件 / 通知管线**：分享入站出站、SAF 备份、锁屏隐私、缓存配额沿用前序版本实现，只修真实缺口。逐条实现 / 缺口矩阵见 `docs/android-v2.18-gap-matrix.md`。
+
+- **AND-5 权限 broker：永久拒绝可识别、可引导** — 新增 `PermissionAskResult` / `PermissionRequestGuard.classify`：已授权 → `GRANTED`；本 Activity 生命周期内尚未请求 → `REQUESTED`（只弹一次系统框）；已请求且系统不再展示 rationale → `PERMANENTLY_DENIED`。`PhoneIntentManager` 的 7 个权限点（日历读写、短信读、联系人、拨号、发短信）统一走 `permissionError()`：永久拒绝返回 `permission_permanently_denied` + `settingsRequired: true`，不再谎称「已请求，请授权后重试」；参数带 `runAttemptId` 时原样回传，便于把引导绑定到具体 run。Dart 侧 `phone_tools` 对两种错误码都给出「系统设置 → 应用 → ClawChat → 权限」的可执行文案（永久拒绝额外说明系统不会再弹框），工具卡片 `_needsPermissionFix` 对两种错误码都显示「打开权限设置」按钮。**撤销后仍能恢复**：`ensurePermission` 每次调用都重新读取实时授权，不缓存结果；权限弹框仍严格限制为每个权限每个 Activity 一次。
+- **AND-4 通知：渠道分类修正** — 新增 `NotificationChannelCatalog`（可 JVM 单测）：`clawchat_status_v2`（`IMPORTANCE_LOW`，静默进度）、`clawchat_approval_v1`（`IMPORTANCE_HIGH`，工具审批与后台任务复查）、`clawchat_agent_complete_v2`（完成提醒），并保留旧 `clawchat_main` 通道用于更新既有通知。修复点：审批提示此前与静默状态通知共用低优先级渠道，agent 卡在等待确认时可能完全无提示；现在按「是否需要用户动作」选渠道，`canShowApprovalNotification` 也改为读取待确认渠道。锁屏隐私不变（`VISIBILITY_PRIVATE` + 通用 `publicVersion`），新渠道全部 `lockscreenVisibility = PRIVATE`；空完成文案沿用「点击查看回复」兜底。
+- **AND-6 存储与清理：统一低存储前置检查** — 新增 `StorageBudget`（64 MiB 基准 + 调用方额外需求，可注入可用空间读取器）：已接入多目标备份（空间不足**不生成包、不写任何目标**，所有目标记失败并给出可执行文案）与技能包导入（URL / 本地路径，空间不足在**任何 staging 命令之前**失败）。决策：**未知可用空间不阻塞**（读取失败或平台未上报时按 `unknown` 放行，写入自身的错误路径仍然可见），避免误报满盘让正常设备无法导入 / 备份；真正的失败不静默。
+- **AND-1 / AND-2 / AND-3 验证结论** — 分享入站（`ACTION_SEND` / `ACTION_SEND_MULTIPLE`、文本/主题/URI 上限 64 KB / 1 KB / 64、缓存配额 64 MiB / 64 文件、不可读来源 fail-closed 反馈）、分享出站（长文本截断提示 + 原生上限）、SAF 导入导出与多目标备份（每个目标独立结果，取消保留本地包）均**已在前序版本实现**，本版未放宽任何语义；工作区范围规则与 `MANAGE_EXTERNAL_STORAGE` 仅限用户发起流程的约束不变。
+- **测试** — 新增 `NotificationChannelCatalogTest.kt`（渠道互异、静默 vs 告警、无 `IMPORTANCE_NONE`、全部锁屏私有、按需选渠道）、`PermissionRequestGuardTest` 扩展 7 例（含撤销后重查、永久拒绝、reset）、`test/services/storage_budget_test.dart`（阈值 / 额外需求 / 未知 / 读取异常 / 文案）、`backup_run_service_test.dart` 新增满盘与未知空间两例、`skill_remote_import_security_test.dart` 新增满盘零 staging 一例、`phone_tools_test.dart` 与 `tool_call_card_test.dart` 各新增永久拒绝一例。
+
+### 真机复现修复（第二轮：SAF 大小上限 / 紧凑弹窗 / 拒发草稿 / 通知正文）
+
+- **超过上限的 SAF 导入不再静默失败（AND-3 / AND-6）** — 原生新增 `PickedContentLimits`：50 MiB 硬上限、`PICKED_CONTENT_TOO_LARGE` / `PICKED_CONTENT_INVALID` / `PICKED_CONTENT_UNAVAILABLE` 三个明确错误码，并用 `PickedContentTooLargeException` 回传 `limitBytes` / `actualBytes`；**声明大小超限时在打开流之前就拒绝**（不复制任何字节）。Dart 侧 `NativeBridge.stagePickedContentUri` 把该错误码翻译成带数字的 `AttachmentBudgetException`，`FileAttachmentService` 在**调用原生 staging 之前**先用选择器上报的 `size` 拦截，且**永不把大小错误降级成通用“无法读取”**（`failClosed` 分支同样抛大小错误）；`FilePickerException` 增加 `fileName`/`actualBytes`/`limitBytes`，文案形如「文件过大，未导入：big.zip（60.0 MB，上限 50.0 MB）…」。技能包导入（本地/远程）同样给出中文可执行文案（「技能包过大：…（26.0 MB，上限 25.0 MB）」），本地归档在**任何 storage 检查、scratch 目录或复制之前**按文件大小拒绝。测试：`PickedContentLimitsTest`（原生契约）、`file_attachment_service_test`（超限内容 URI 不触发 staging）、`skill_service_test`（超限归档零 proot 命令、零桥调用、无 staging 残留）、`chat_oversized_pick_test`（两端到端 SnackBar 文案含文件名与实际大小）。
+- **紧凑态导出配置弹窗主按钮完整命中（AND-2/无障碍）** — 抽出 `lib/widgets/export_config_dialog.dart`：窄屏（< 380dp）或大字号（> 1.3×）时主按钮改为弹窗正文内的**全宽按钮**（不再被 `OverflowBar` 挤到屏幕边缘），所有布局下最小 48dp 高、文案不截断，并带独立 `Semantics(label: 导出配置, hint: …)` 节点；`settings_screen` 改为调用该弹窗。测试：`export_config_dialog_test`（320dp 窄屏、1.8× 大字号下角点点击命中、语义节点含 isButton/isEnabled/tap、宽屏仍走 action row）。
+- **发送被拒绝时不再丢草稿（显式重试入口）** — `sendMessageWithWorkspaceImports` 改为返回**接受结果**：只有 run 已持久化接受（或消息已入队）才返回 `true`；所有拒绝路径（缺 API Key、会话删除中、并发上限、持久化失败、远程仅文本等）在 `finally` 中返回 `false`。`chat_screen` 收到 `false` 时**保留草稿与附件**，并显示「消息未发送，草稿已保留（原因）」；缺凭据时提供「去设置」入口。仍**不自动重跑**：失败 run 的新消息由用户显式发送才启动新 run（回归测试覆盖）。另修：`notifyListeners()` 在 `dispose()` 之后静默丢弃（迟到的 run 续作不再触发 disposed 断言），`dispose()` 幂等。
+- **通知正文合规复核（AND-4）** — 锁屏：审批 publicCopy 在携带凭据的 destination（含 `api_key=`、`Bearer`、命令、电话号码）下仍只输出通用文案（新增 Kotlin 用例）；`publicVersion` / `VISIBILITY_PRIVATE` 由源码守卫逐 builder 校验（`AgentTaskService`/`MainActivity`），终端前台通知补 `VISIBILITY_PRIVATE`，且全套通知无 `setBypassDnd(true)`/`setSound(`（免打扰由系统决定）。解锁态：新增 `ChatProvider.maskConfiguredSecretsForNotification`（环境变量 + 各 Provider API Key），通知预览在进入原生之前先掩码；测试断言流式回显 env secret 与 API Key 时通知预览均不含明文。
+- **可本机验证的通知/权限/备份补测（AND-4/AND-5/AND-6）** — 抽出 `AgentNotificationIds`（会话与完成通知 id 稳定、并行会话不碰撞、完成不覆盖运行中）并加 Kotlin 用例；多目标备份新增**真实目录**用例（两个成功目标落盘字节精确一致、失败目标不留半成品、本地包保留待重试）；`phone_tools` 新增表驱动用例覆盖日历读/写、短信读/发、联系人、电话六个权限点均返回带中文标签与「系统设置」指引的 `permission_required`；新增 `android_notification_privacy_source_test`（锁屏通用文案、完成通知可点击且 auto-cancel、每会话独立通知 id + group summary、无免打扰绕过、终端通知无用户内容）。
+
+### 最终复核修复（第三轮：远程附件拒绝 / 备份原子发布）
+
+- **远程 Agent + 工作区附件 → 发送前明确拒绝（不伪造发送）** — `_sendMessage` 在进入 `_sendRemoteAgentMessage` 之前检查 `workspaceImports`：非空即 fail-closed，置错误文案「远程 Agent 不支持工作区附件导入：请在本地会话中发送，或先移除附件后重试。」，**不发起任何远程请求**，并保持 `acceptance=false`。`chat_screen` 收到拒绝后**保留草稿与附件（receipt 仍归草稿所有）**，不再丢弃 receipt；被拒路径不 ACK、不丢弃、不写入会话（无孤儿 receipt）。远程会话的纯文本发送行为不变。回归测试：`remote_agent_chat_provider_test`（无远程请求、零 ACK/丢弃、会话无消息无 marker、纯文本仍可发送）+ `chat_attachment_receipt_lifecycle_source_test`（拒绝分支不含 `discardWorkspaceImport`）。
+- **备份包与目标文件改为临时文件 + 原子发布** — 新增 `lib/services/atomic_file_write.dart`：先写**同目录随机 `.part`** 文件、`flush()`（fsync）后 `close()`，再 `rename` 覆盖最终路径；**任何异常（含写一半、rename 失败、满盘竞态）都会删除 `.part`**，最终路径要么不存在、要么是完整包。`FileBackupPackageStore.save`（本地暂存包，支持注入 rename 供测试）与 `BackupDestination.folder`（每个备份目标）都改用它。另修：本地包未成功暂存时不再谎称「已保留本地包」（`localPackageKept` 只在暂存成功后为 true，失败时 `localPackagePath` 保持为空）。回归测试：写一半失败无半成品、rename 失败目标路径不存在且目录为空、暂存失败不报「保留」、多目标真实目录一成功一失败且全树无 `.part` 残留。
+
+### 最终复核修复（第四轮：配置导入 50 MiB 硬上限）
+
+- **设置 → 数据与恢复 → 导入配置：超限在选择后立即 fail-closed** — `ConfigExportService` 新增 `maxImportBytes = 50 MiB`、`ConfigImportTooLargeException`、`ConfigImportUnreadableException` 与 `configImportSizeError(...)`。`settings_screen._importConfig` 现在：① 用**选择器上报的声明大小**在读取 / 复制 / staging / 解析之前拦截（超限文案含**文件名 + 实际大小 + 上限**：「配置文件过大，未导入：huge-config.json（60.0MB，上限 50.0MB）…」）；② 无可用路径时给出可执行提示（不再静默 return）；③ 读取改为 `BoundedFileReader.readBytes` + 字节数复查，**选择后变大的文件同样无法越界**，读取失败统一为「无法读取配置文件 xxx。请换一个文件或重新选择。」；④ `importConfig` / `previewImport` 增加二次硬上限（任何调用方都无法解析超限载荷，且在写入任何偏好之前抛出）。**零 staging、零残留**：配置导入不经过原生 staging，超限路径连文件都不会被打开。
+- 测试：`config_export_service_test`（上限为 50 MiB、边界值放行、超限消息含文件名/大小/上限、`checkImportBytes` fail-closed、超限载荷在写入任何偏好之前被拒、`previewImport` 同样拒绝）；新增 `test/screens/settings_config_import_limit_test.dart`（Widget：60 MiB 选择 → 可见文案含文件名+60.0MB+上限 50.0MB 且无 staging 调用、无「导入配置失败」；无路径选择 → 「无法读取配置文件」提示；恰好 50 MiB → 不被大小守卫拒绝且无 staging）。
+
+### 真机验收与 Residual in 2.18.0
+
+- 远程 Agent 的 workspace import 在本版**按设计拒绝**（不是待补功能）：协议没有 receipt acknowledgement，因此带 receipt 的发送在本地就被拦下并给出可执行提示；最新设备因附件选择器限制未能实际生成 receipt，代码测试仍覆盖零请求、零 ACK/丢弃与草稿保留。
+- 最新封板 APK `f0e94b00bad0604413e371bdd9265275a99311427af8e947f9f9aff354b5dd07` 已实测通过：配置导入 60 MiB 上限且无残留、窄屏大字导出按钮、无凭据保留草稿、通知关闭、DND 新通知静音、多会话通知、v2.17 journal、v2.16 workspace/file-browser。
+- 仍为 `PARTIAL` / `NOT RUN`：分享四来源与完整出站矩阵、锁屏实际渲染、电话 / 发短信权限与设置撤销、接近满盘、真机备份失败 / 取消注入、通用 SAF 大文件缓存，以及远程 receipt 真机触发。联系人 / 短信拒绝与永久拒绝有同 hash 前一轮证据；失败 / 中断会话显式重发也有同 hash 前一轮证据。
+- 本版不宣称“全矩阵通过”；逐项状态与证据见 `docs/android-v2.18-gap-matrix.md` §9。所有未运行项保持明确标注，不能用静态测试或旧 APK 结果替代。
+- 永久拒绝判定依赖 `shouldShowRequestPermissionRationale`，部分厂商 ROM 行为有差异，需真机确认。
+- 权限请求的 run 绑定停在工具 / 审批层（`ToolApprovalRequest.runAttemptId`）：Dart 各 action 只白名单转发原生参数，未把 run id 穿透进原生调用。
+- 分享缓存 / 更新 staging 的配额与清理沿用既有实现，本版未新增后台清理策略。
+- 不做端侧大模型；v2.18 不包含 v2.19 的网络韧性与 v2.20 的生态信任更新。
+
 ## v2.17.0 — Agent run journal、取消与恢复
 
 - **持久化 run journal（仅本地、加密、有界、脱敏）** — 新增 `RunJournalEntry` / `RunJournalToolAttempt`：每次 run 记录 `runAttemptId`、`sessionId`、起止时间、终态与 `endReason`；每次工具尝试记录 `operationId`、工具名、风险档、策略阶段（proposed / 等待审批 / 已批准 / 已开始 / 结果已保存 / 失败 / 中断）与 `outcomeKnown`。**不保存任何参数、提示词、结果或凭据**：载荷字段是白名单，测试断言整个 payload 不含 `arguments` / `result` / `content` / `prompt` / `apiKey`。存储走加密应用私有存储 `clawchat.run_journal.v1`（sha256 信封，复用与信任标记同一加密桥），上限 24 个 run、每个 run 64 次尝试；损坏或校验不符时 fail-closed（显示为空但仍可写新记录），并保留手动清理入口（设置 → 数据管理 → 运行日志）。

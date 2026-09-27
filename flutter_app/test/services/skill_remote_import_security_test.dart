@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:clawchat/constants.dart';
 import 'package:clawchat/services/app_http.dart';
 import 'package:clawchat/services/native_bridge.dart';
+import 'package:clawchat/services/storage_budget.dart';
 import 'package:clawchat/services/skill_service.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -20,6 +21,7 @@ void main() {
   late int rootfsWrites;
 
   setUp(() async {
+    SkillService.storageBudget = StorageBudget();
     SkillService.resetLocalImportReadStreamForTesting();
     temp = await Directory.systemTemp.createTemp('clawchat_remote_skill_');
     commands = <String>[];
@@ -40,6 +42,7 @@ void main() {
   });
 
   tearDown(() async {
+    SkillService.storageBudget = StorageBudget();
     SkillService.resetLocalImportReadStreamForTesting();
     NativeBridge.resetImportReadStreamForTesting();
     messenger.setMockMethodCallHandler(channel, null);
@@ -346,7 +349,11 @@ void main() {
       throwsA(isA<FormatException>().having(
         (error) => error.message,
         'message',
-        contains('too large'),
+        allOf(
+          // The failure names the limit so the user can act on it.
+          contains('技能包过大'),
+          contains('上限 25.0 MB'),
+        ),
       )),
     );
 
@@ -634,6 +641,25 @@ void main() {
     expect(manifestReads, 0);
     final prefs = await SharedPreferences.getInstance();
     expect(prefs.getString('skill_trust_grants_v1'), isNull);
+  });
+
+  test('a full device fails the import before any staging command', () async {
+    SkillService.storageBudget = StorageBudget(
+      availableBytesReader: () async => 1024,
+    );
+
+    await expectLater(
+      SkillService.prepareSkillFromUrl('https://example.com/skill.zip'),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('可用存储不足'),
+        ),
+      ),
+    );
+    expect(commands, isEmpty, reason: 'no staging work may start');
+    expect(rootfsWrites, 0);
   });
 }
 

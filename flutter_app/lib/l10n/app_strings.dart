@@ -718,6 +718,15 @@ class AppStrings {
   // ── Chat provider ────────────────────────────────────────────────
   static const apiKeyNotConfigured = '请先在设置中配置 API Key';
 
+  /// A refused send keeps the draft; this is the visible, actionable prompt.
+  static const messageNotSent = '消息未发送，草稿已保留。';
+  static const openMessageSettings = '去设置';
+
+  /// Remote connectors have no workspace-import protocol in this version, so a
+  /// send carrying receipts fails closed instead of silently degrading them.
+  static const remoteWorkspaceImportUnsupported =
+      '远程 Agent 不支持工作区附件导入：请在本地会话中发送，或先移除附件后重试。';
+
   // ── TTS ──────────────────────────────────────────────────────────
   static const ttsPlay = '朗读';
   static const ttsStop = '停止朗读';

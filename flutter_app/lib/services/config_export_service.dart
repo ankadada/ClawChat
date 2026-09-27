@@ -9,9 +9,97 @@ import '../models/mcp_server_config.dart';
 import '../models/provider_profile.dart';
 import 'preferences_service.dart';
 
+/// Thrown when a picked config file exceeds [ConfigExportService.maxImportBytes].
+///
+/// Carries a user-readable [message] naming the file, the actual size and the
+/// limit, so the import UI can show one actionable error instead of a generic
+/// parse failure.
+class ConfigImportTooLargeException implements Exception {
+  const ConfigImportTooLargeException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// Thrown when the picked config file cannot be read at all (for example a
+/// stale picker path or a revoked SAF grant).
+class ConfigImportUnreadableException implements Exception {
+  const ConfigImportUnreadableException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+
+  /// The one actionable message for this failure.
+  static String messageFor(String? fileName) {
+    final name =
+        fileName?.trim().isNotEmpty == true ? fileName!.trim() : '所选文件';
+    return '无法读取配置文件 $name。请换一个文件或重新选择。';
+  }
+}
+
 class ConfigExportService {
   static const int _currentVersion = 1;
   static const int _pbkdf2Iterations = 100000;
+
+  /// §5 AND-3 / AND-6: hard cap for one imported config file (50 MiB).
+  ///
+  /// Checked against the picker-declared size *before* the file is read,
+  /// copied or staged, and again against the actual bytes read, so neither an
+  /// oversized pick nor a file that grows after the check can be parsed.
+  static const int maxImportBytes = 50 * 1024 * 1024;
+
+  /// The actionable message for an oversized config import.
+  static String configImportTooLargeMessage({
+    String? fileName,
+    required int byteLength,
+    int? limitBytes,
+  }) {
+    final limit = limitBytes ?? maxImportBytes;
+    final name =
+        fileName?.trim().isNotEmpty == true ? fileName!.trim() : '未命名配置文件';
+    return '配置文件过大，未导入：$name（${formatImportBytes(byteLength)}，'
+        '上限 ${formatImportBytes(limit)}）。'
+        '请压缩或更换更小的配置文件后重试。';
+  }
+
+  /// Null when [byteLength] fits; the actionable message when it does not.
+  static String? configImportSizeError({
+    String? fileName,
+    required int byteLength,
+    int? limitBytes,
+  }) {
+    final limit = limitBytes ?? maxImportBytes;
+    if (byteLength <= limit) return null;
+    return configImportTooLargeMessage(
+      fileName: fileName,
+      byteLength: byteLength,
+      limitBytes: limit,
+    );
+  }
+
+  /// Fails closed when [byteLength] exceeds the import cap.
+  static void checkImportBytes(String? fileName, int byteLength) {
+    final error = configImportSizeError(
+      fileName: fileName,
+      byteLength: byteLength,
+    );
+    if (error != null) {
+      throw ConfigImportTooLargeException(error);
+    }
+  }
+
+  static String formatImportBytes(int bytes) {
+    if (bytes < 1024) return '${bytes}B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)}GB';
+  }
 
   static Future<String> exportConfig({
     String? password,
@@ -57,6 +145,7 @@ class ConfigExportService {
   }
 
   static ConfigImportPreview previewImport(String jsonStr) {
+    checkImportBytes(null, utf8.encode(jsonStr).length);
     try {
       final data = jsonDecode(jsonStr) as Map<String, dynamic>;
       final version = data['version'] as int? ?? 0;
@@ -99,6 +188,9 @@ class ConfigExportService {
     String? password,
     ConflictResolution conflictResolution = ConflictResolution.merge,
   }) async {
+    // Second line of defense: the caller already bounds the file, and any
+    // other caller still cannot import a payload above the hard cap.
+    checkImportBytes(null, utf8.encode(jsonStr).length);
     final parsed = _parseImportPayload(jsonStr, password: password);
 
     final prefs = PreferencesService();

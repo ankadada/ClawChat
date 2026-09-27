@@ -974,6 +974,56 @@ void main() {
     expect(prefs.getString('skill_trust_grants_v1'), isNull);
   });
 
+  test('an oversized local archive is rejected before any staging work',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final temp = await Directory.systemTemp.createTemp('clawchat_big_archive_');
+    addTearDown(() => temp.delete(recursive: true));
+    final filesDir = Directory('${temp.path}/files')..createSync();
+    // Sparse 26 MiB file: above the 25 MiB skill-archive cap.
+    final archive = File('${temp.path}/too-big.zip');
+    final handle = archive.openSync(mode: FileMode.write);
+    handle.truncateSync(26 * 1024 * 1024);
+    await handle.close();
+    final commands = <String>[];
+    final bridgeCalls = <String>[];
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+      bridgeCalls.add(call.method);
+      if (call.method == 'getFilesDir') return filesDir.path;
+      if (call.method == 'runInProot') {
+        commands.add(args['command'] as String);
+        return '';
+      }
+      return null;
+    });
+
+    await expectLater(
+      SkillService.prepareSkillFromLocalPath(archive.path),
+      throwsA(
+        isA<FormatException>().having(
+          (error) => error.message,
+          'message',
+          allOf(
+            contains('技能包过大'),
+            contains('26.0 MB'),
+            contains('上限 25.0 MB'),
+            contains('too-big.zip'),
+          ),
+        ),
+      ),
+    );
+
+    // Nothing ran and nothing was copied: no proot command, no workspace
+    // import, and no host scratch directory left behind.
+    expect(commands, isEmpty);
+    expect(bridgeCalls, isEmpty);
+    final hostStaging = Directory('${filesDir.path}/skill_imports');
+    expect(await hostStaging.exists(), isFalse);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('skill_trust_grants_v1'), isNull);
+  });
+
   test('local archive replacement after preflight is rejected and cleaned',
       () async {
     SharedPreferences.setMockInitialValues({});

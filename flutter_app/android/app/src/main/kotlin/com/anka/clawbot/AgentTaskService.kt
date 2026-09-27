@@ -477,7 +477,7 @@ class AgentTaskService : Service() {
             val notificationsEnabled = Build.VERSION.SDK_INT < Build.VERSION_CODES.N ||
                 manager.areNotificationsEnabled()
             val channel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                manager.getNotificationChannel(MainActivity.CHANNEL_ID)
+                manager.getNotificationChannel(NotificationChannelCatalog.approval.id)
             } else {
                 null
             }
@@ -608,13 +608,11 @@ class AgentTaskService : Service() {
             )
         }
 
-        private fun notificationIdFor(sessionId: String): Int {
-            return (sessionId.hashCode() and 0x7FFFFFFF) % 100000 + 10000
-        }
+        private fun notificationIdFor(sessionId: String): Int =
+            AgentNotificationIds.session(sessionId)
 
-        private fun completionNotificationIdFor(sessionId: String): Int {
-            return (sessionId.hashCode() and 0x7FFFFFFF) % 100000 + 110000
-        }
+        private fun completionNotificationIdFor(sessionId: String): Int =
+            AgentNotificationIds.completion(sessionId)
     }
 
     private data class AgentSessionNotification(
@@ -1348,8 +1346,9 @@ class AgentTaskService : Service() {
         val approvePendingIntent = approval?.let { approvalPendingIntent(it, true) }
         val denyPendingIntent = approval?.let { approvalPendingIntent(it, false) }
 
+        val sessionChannel = NotificationChannelCatalog.forSession(approval != null).id
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, MainActivity.CHANNEL_ID)
+            Notification.Builder(this, sessionChannel)
         } else {
             Notification.Builder(this)
         }
@@ -1393,7 +1392,7 @@ class AgentTaskService : Service() {
             NotificationPrivacy.sessionStatus(state.status)
         }
         builder.setPublicVersion(
-            buildPublicNotification(this, MainActivity.CHANNEL_ID, publicCopy)
+            buildPublicNotification(this, sessionChannel, publicCopy)
         )
         if (approval == null) {
             builder.addAction(R.mipmap.ic_launcher, "查看", openPendingIntent)
@@ -1444,8 +1443,9 @@ class AgentTaskService : Service() {
         val needsReview = lease.status == "needs_review"
         val title = if (needsReview) "ClawChat 后台任务需要处理" else "ClawChat 后台任务正在执行"
         val text = if (needsReview) "请在应用内查看任务状态" else "任务正在前台执行"
+        val leaseChannel = NotificationChannelCatalog.forBackgroundTask(needsReview).id
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, MainActivity.CHANNEL_ID)
+            Notification.Builder(this, leaseChannel)
         } else {
             Notification.Builder(this)
         }
@@ -1465,7 +1465,7 @@ class AgentTaskService : Service() {
         builder.setPublicVersion(
             buildPublicNotification(
                 this,
-                MainActivity.CHANNEL_ID,
+                leaseChannel,
                 NotificationPrivacy.backgroundTask(needsReview)
             )
         )
@@ -1488,8 +1488,9 @@ class AgentTaskService : Service() {
         }
         val text = (listOf("${activeSessions.size} 个会话任务") + taskText)
             .joinToString(", ")
+        val summaryChannel = NotificationChannelCatalog.status.id
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, MainActivity.CHANNEL_ID)
+            Notification.Builder(this, summaryChannel)
         } else {
             Notification.Builder(this)
         }
@@ -1508,7 +1509,7 @@ class AgentTaskService : Service() {
             .setPublicVersion(
                 buildPublicNotification(
                     this,
-                    MainActivity.CHANNEL_ID,
+                    summaryChannel,
                     NotificationPrivacy.summary(activeCount)
                 )
             )

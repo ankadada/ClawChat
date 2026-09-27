@@ -35,7 +35,31 @@ class PreparedAttachment {
 class FilePickerException implements Exception {
   final String reason;
 
-  const FilePickerException(this.reason);
+  /// Present only for [reason] `oversized`, so the message can name the file
+  /// and the exact limit instead of a generic failure.
+  final String? fileName;
+  final int? actualBytes;
+  final int? limitBytes;
+
+  const FilePickerException(
+    this.reason, {
+    this.fileName,
+    this.actualBytes,
+    this.limitBytes,
+  });
+
+  /// The size-limit failure with the numbers the user needs.
+  factory FilePickerException.oversized({
+    String? fileName,
+    int? actualBytes,
+    required int limitBytes,
+  }) =>
+      FilePickerException(
+        'oversized',
+        fileName: fileName,
+        actualBytes: actualBytes,
+        limitBytes: limitBytes,
+      );
 
   String get userMessage {
     switch (reason) {
@@ -47,7 +71,18 @@ class FilePickerException implements Exception {
       case 'content_stage_failed':
         return '无法读取所选文件，请换一个文件或重新选择。';
       case 'oversized':
-        return '所选文件超过应用允许的大小上限。';
+        final limit = limitBytes ?? AttachmentBudget.maxWorkspaceImportBytes;
+        final actual = actualBytes;
+        if (actual == null) {
+          return '所选文件超过应用允许的大小上限'
+              '（上限 ${AttachmentBudget.formatBytes(limit)}）。'
+              '请换一个更小的文件。';
+        }
+        return AttachmentBudget.workspaceImportTooLargeMessage(
+          fileName: fileName,
+          actualBytes: actual,
+          limitBytes: limit,
+        );
       default:
         return '无法打开文件选择器，请重试。';
     }
@@ -166,8 +201,13 @@ class FileAttachmentService {
       throw const FilePickerException('missing_plugin');
     } on FileSystemException {
       throw const FilePickerException('path_unreadable');
-    } on AttachmentBudgetException {
-      throw const FilePickerException('oversized');
+    } on AttachmentBudgetException catch (error) {
+      throw FilePickerException.oversized(
+        fileName: error.fileName,
+        actualBytes: error.actualBytes,
+        limitBytes:
+            error.limitBytes ?? AttachmentBudget.maxWorkspaceImportBytes,
+      );
     }
   }
 
@@ -189,12 +229,21 @@ class FileAttachmentService {
   /// Android document providers do not consistently map tgz/tar.gz suffixes
   /// to MIME filters. Pick broadly, then apply the exact host-owned suffix
   /// allowlist before any archive inspection or extraction.
-  static Future<PlatformFile?> pickSkillArchive() async {
+  static Future<PlatformFile?> pickSkillArchive({int? maxBytes}) async {
     final files = await pickFiles(type: FileType.any);
     if (files.isEmpty) return null;
     final selected = files.single;
     if (!isSkillArchiveName(selected.name)) {
       throw const FilePickerException('unsupported_archive');
+    }
+    // Reject an oversized archive at selection time: nothing is staged, and
+    // the user sees the limit instead of a later extraction failure.
+    if (maxBytes != null && selected.size > maxBytes) {
+      throw FilePickerException.oversized(
+        fileName: selected.name,
+        actualBytes: selected.size,
+        limitBytes: maxBytes,
+      );
     }
     return selected;
   }
@@ -340,11 +389,23 @@ class FileAttachmentService {
   /// can provide bounded bytes without a filesystem path; stage those bytes in
   /// the app cache so the existing native import broker can still verify and
   /// receipt them. A missing path and missing bytes fail closed.
-  static Future<String> localPathFor(PlatformFile file) => _localPathFor(file);
+  static Future<String> localPathFor(PlatformFile file, {int? limitBytes}) =>
+      _localPathFor(file, limitBytes: limitBytes);
 
-  static Future<String> _localPathFor(PlatformFile file) async {
+  static Future<String> _localPathFor(PlatformFile file,
+      {int? limitBytes}) async {
+    final limit = limitBytes ?? AttachmentBudget.maxWorkspaceImportBytes;
     final path = file.path;
     final bytes = file.bytes;
+    // The picker-reported size is authoritative enough to reject before any
+    // staging work; an unknown size still falls through to the byte counters.
+    if (file.size > limit) {
+      throw FilePickerException.oversized(
+        fileName: sanitizeFileName(file.name),
+        actualBytes: file.size,
+        limitBytes: limit,
+      );
+    }
     if (path != null && path.isNotEmpty) {
       try {
         final handle = await File(path).open();
@@ -354,6 +415,7 @@ class FileAttachmentService {
         final staged = await _stageContentIdentifier(
           file,
           failClosed: bytes == null,
+          limitBytes: limitBytes,
         );
         if (staged != null) return staged;
         if (bytes == null) throw const FilePickerException('path_unreadable');
@@ -386,22 +448,64 @@ class FileAttachmentService {
   static Future<String?> _stageContentIdentifier(
     PlatformFile file, {
     required bool failClosed,
+    int? limitBytes,
   }) async {
     final identifier = file.identifier;
     if (identifier == null || !identifier.startsWith('content://')) {
       return null;
     }
+    final limit = limitBytes ?? AttachmentBudget.maxWorkspaceImportBytes;
+    final safeName = sanitizeFileName(file.name);
+    // §5 AND-3/AND-6: the picker already knows the size. Reject an oversized
+    // document here so nothing is staged and the user gets the limit message
+    // instead of a generic "cannot read" failure.
+    if (file.size > limit) {
+      throw FilePickerException.oversized(
+        fileName: safeName,
+        actualBytes: file.size,
+        limitBytes: limit,
+      );
+    }
     try {
       final path = await NativeBridge.stagePickedContentUri(
         contentUri: identifier,
-        displayName: sanitizeFileName(file.name),
+        displayName: safeName,
+        maxBytes: limit,
       );
       _nativeStagedPaths.add(path);
       return path;
+    } on PlatformException catch (error) {
+      // A size rejection is never downgraded: it is the actionable outcome.
+      if (error.code == NativeBridge.pickedContentTooLargeCode) {
+        throw FilePickerException.oversized(
+          fileName: safeName,
+          actualBytes: _intFromDetails(error.details, 'actualBytes') ??
+              (file.size > 0 ? file.size : null),
+          limitBytes: _intFromDetails(error.details, 'limitBytes') ?? limit,
+        );
+      }
+      if (!failClosed) return null;
+      throw const FilePickerException('content_stage_failed');
+    } on AttachmentBudgetException catch (error) {
+      // NativeBridge already translated the platform size rejection; keep the
+      // numbers and never fall back to a generic read failure.
+      throw FilePickerException.oversized(
+        fileName: safeName,
+        actualBytes: error.actualBytes,
+        limitBytes: error.limitBytes ?? limit,
+      );
     } catch (_) {
       if (!failClosed) return null;
       throw const FilePickerException('content_stage_failed');
     }
+  }
+
+  static int? _intFromDetails(Object? details, String key) {
+    if (details is Map) {
+      final value = details[key];
+      if (value is num) return value.toInt();
+    }
+    return null;
   }
 
   /// Removes only cache files created by this service/native URI staging.

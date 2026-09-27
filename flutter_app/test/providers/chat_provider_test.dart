@@ -716,6 +716,12 @@ void main() {
               .pendingWorkspaceImports
               .isEmpty);
       expect(events, ['ack']);
+      // Let the run finish before teardown disposes the provider: a late
+      // continuation must not be part of what this test measures.
+      await _waitUntil(
+        () => !provider.activeAgentSessionIds
+            .contains(provider.currentSession!.id),
+      );
     });
 
     test('reference save failure never ACKs and leaves draft ownership',
@@ -9943,8 +9949,7 @@ void main() {
       expect(attemptedModels, ['fallback-model']);
     });
 
-    test('excludes a keyless fallback from the group fallback chain',
-        () async {
+    test('excludes a keyless fallback from the group fallback chain', () async {
       final active = profile(
         id: 'active',
         model: 'active-model',
@@ -9994,8 +9999,7 @@ void main() {
       expect(attemptedModels, ['primary-model']);
     });
 
-    test('fails closed when no group member has a usable credential',
-        () async {
+    test('fails closed when no group member has a usable credential', () async {
       final active = profile(
         id: 'active',
         model: 'active-model',
@@ -10094,7 +10098,8 @@ void main() {
       await clearPlatformMocks();
     });
 
-    Future<ChatSession> sessionWithPreviousSummary(ChatProvider provider) async {
+    Future<ChatSession> sessionWithPreviousSummary(
+        ChatProvider provider) async {
       final session = await provider.createSession();
       session.messages.addAll([
         ChatMessage.user('first prompt'),
@@ -10573,6 +10578,245 @@ void main() {
       final result = truncateToFit(msgs);
       expect(result.length, lessThan(8));
       expect(result.length, greaterThanOrEqualTo(2));
+    });
+  });
+  group('v2.18 provider disposal safety', () {
+    test('a late notification after dispose is dropped, not an assertion',
+        () async {
+      await installPlatformMocks();
+      final provider = ChatProvider(storage: SessionStorage());
+      await provider.initialized;
+
+      provider.dispose();
+      // Disposing twice must stay harmless: run teardown and widget teardown
+      // can both reach it.
+      provider.dispose();
+
+      // A run continuation that lives past dispose must not trip the
+      // ChangeNotifier disposed assertion.
+      expect(provider.notifyListeners, returnsNormally);
+    });
+  });
+
+  group('v2.18 send acceptance and resend', () {
+    test('a refused send reports false so the composer keeps the draft',
+        () async {
+      await installPlatformMocks();
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(storage: storage);
+      addTearDown(provider.dispose);
+      await provider.initialized;
+
+      final session = await provider.createSession();
+      final accepted = await provider.sendMessageWithWorkspaceImports(
+        'draft that must survive',
+        workspaceImports: const [],
+      );
+
+      expect(accepted, isFalse,
+          reason: 'the caller must be able to keep the draft');
+      expect(provider.errorMessage, AppStrings.apiKeyNotConfigured);
+      expect(
+        provider.currentSession!.messages.where((m) => m.role == 'user'),
+        isEmpty,
+        reason: 'a refused send records nothing',
+      );
+      final stored = await storage.getSession(session.id);
+      expect(stored!.messages.where((m) => m.role == 'user'), isEmpty);
+    });
+
+    test('an accepted send reports true and records the user turn', () async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1:1');
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [ContentBlock(type: 'text', text: 'ok')],
+          )),
+        ),
+      );
+      addTearDown(provider.dispose);
+      await provider.initialized;
+
+      await provider.createSession();
+      final accepted = await provider.sendMessageWithWorkspaceImports(
+        'accepted message',
+        workspaceImports: const [],
+      );
+
+      expect(accepted, isTrue);
+      expect(
+        provider.currentSession!.messages
+            .any((m) => m.textContent.contains('accepted message')),
+        isTrue,
+      );
+    });
+
+    test('a new message after a failed run still starts a new run', () async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1:1');
+      final storage = SessionStorage();
+      await storage.init();
+      final modelCalls = <String>[];
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (messages) {
+            modelCalls.add('call-${modelCalls.length + 1}');
+            if (modelCalls.length == 1) {
+              return StreamError(
+                'temporary network failure',
+                cause: Exception('temporary network failure'),
+              );
+            }
+            return StreamDone(const LlmResponse(
+              stopReason: 'end_turn',
+              content: [ContentBlock(type: 'text', text: 'second reply')],
+            ));
+          },
+        ),
+      );
+      addTearDown(provider.dispose);
+      await provider.initialized;
+
+      await provider.createSession();
+      await provider.sendMessage('first message');
+      expect(provider.agentStatus, AgentStatus.error);
+
+      // The failure is explicit and the retry is the user's own action: no
+      // automatic rerun happens before this send.
+      expect(modelCalls, hasLength(1));
+      final accepted = await provider.sendMessageWithWorkspaceImports(
+        'second message',
+        workspaceImports: const [],
+      );
+
+      expect(accepted, isTrue);
+      // Acceptance is reported as soon as the run is durably reserved; the
+      // model call itself follows.
+      await _waitUntil(() => modelCalls.length == 2);
+      await _waitUntil(
+        () => provider.currentSession!.messages
+            .any((m) => m.textContent.contains('second message')),
+      );
+      expect(modelCalls, hasLength(2));
+    });
+
+    test('the notification preview never carries a configured credential',
+        () async {
+      await installPlatformMocks();
+      const envSecret = 'env-secret-7f3c9a21b4d8';
+      const apiKey = 'sk-ant-api03-TestKeyNeverOnLockScreen9f';
+      final profile = ProviderProfile.defaults().copyWith(
+        id: 'profile',
+        apiKey: apiKey,
+        apiFormat: ProviderProfile.anthropicFormat,
+        baseUrl: 'http://127.0.0.1:1',
+        model: 'claude-sonnet-4-20250514',
+      );
+      secureStorage['provider_profiles'] = jsonEncode([profile.toJson()]);
+      SharedPreferences.setMockInitialValues({
+        'active_provider_profile_id': 'profile',
+        'context_token_budget': 65536,
+        'developer_mode': true,
+        'env_vars': jsonEncode({'DEMO_TOKEN': envSecret}),
+      });
+      PreferencesService.resetForTesting();
+
+      final previews = <String>[];
+      final toolNames = <String>[];
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(nativeChannel, (call) async {
+        if (call.method == 'updateAgentNotification') {
+          final args = Map<String, dynamic>.from(call.arguments as Map? ?? {});
+          previews.add(args['previewText']?.toString() ?? '');
+          final tool = args['toolName']?.toString();
+          if (tool != null) toolNames.add(tool);
+          return true;
+        }
+        return null;
+      });
+
+      final storage = SessionStorage();
+      await storage.init();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _ScriptedLlmService(
+          config,
+          onMessages: (_) => StreamDone(const LlmResponse(
+            stopReason: 'end_turn',
+            content: [
+              ContentBlock(
+                type: 'text',
+                text: 'echo $envSecret and $apiKey please',
+              ),
+            ],
+          )),
+        ),
+      );
+      addTearDown(provider.dispose);
+      await provider.initialized;
+
+      await provider.createSession();
+      await provider.sendMessage('show me the secrets');
+      await _waitUntil(() => previews.any((preview) => preview.isNotEmpty));
+
+      final joined = previews.join('\n');
+      expect(joined, isNotEmpty);
+      expect(joined, isNot(contains(envSecret)));
+      expect(joined, isNot(contains(apiKey)));
+      expect(toolNames.join(','), isNot(contains(apiKey)));
+
+      // The masking helper itself is the contract under test.
+      expect(
+        provider.maskConfiguredSecretsForNotification('value=$apiKey'),
+        isNot(contains(apiKey)),
+      );
+      expect(
+        provider.maskConfiguredSecretsForNotification('value=$envSecret'),
+        isNot(contains(envSecret)),
+      );
+    });
+
+    test('a message queued while a run is live is still accepted', () async {
+      await installPlatformMocks();
+      configureAnthropicProfile(baseUrl: 'http://127.0.0.1:1');
+      final storage = SessionStorage();
+      await storage.init();
+      final firstStarted = Completer<void>();
+      final releaseFirst = Completer<void>();
+      final provider = ChatProvider(
+        storage: storage,
+        llmServiceFactory: (config, {isInBackground}) => _BlockingLlmService(
+          config,
+          started: firstStarted,
+          release: releaseFirst,
+        ),
+      );
+      addTearDown(provider.dispose);
+      await provider.initialized;
+
+      await provider.createSession();
+      final firstSend = provider.sendMessage('first run');
+      await firstStarted.future.timeout(const Duration(seconds: 2));
+
+      final accepted = await provider.sendMessageWithWorkspaceImports(
+        'queued message',
+        workspaceImports: const [],
+      );
+
+      expect(accepted, isTrue, reason: 'a queued message is not a refusal');
+      expect(provider.messageQueue, hasLength(1));
+      releaseFirst.complete();
+      await firstSend;
     });
   });
 }
